@@ -1,0 +1,26 @@
+[package]
+name = "arrow-compile-compute"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+cranelift = "0.114.0"
+cranelift-jit = "0.114.0"
+cranelift-native = "0.114.0"
+cranelift-module = "0.114.0"
+
+inkwell = { version = "0.5.0", features = ["llvm18-0-force-dynamic"] }
+
+arrow-schema = "53.3"
+arrow-buffer = "53.3"
+arrow-array = "53.3"
+
+[dev-dependencies]
+arrow-ord = "53.3"
+criterion = "0.5"
+fastrand = "2.2.0"
+itertools = "0.13.0"
+
+[[bench]]
+name = "eq_const_bench"
+harness = false
