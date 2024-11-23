@@ -1,344 +1,1212 @@
-use std::mem;
+//! Compiled compute functions for the [arrow-rs](https://github.com/apache/arrow-rs).
+//!
+//! There are two interfaces for using the JIT-compiled compute functions.
+//!
+//! * [`cmp`](cmp/index.html), a simple, `arrow`-like, entrypoint: which provides
+//!   functions like `cmp::eq`. This is probably what you want.
+//!
+//! * [`CodeGen`](struct.CodeGen.html), which allows for more control over the
+//!   underlying LLVM IR and context.
+//!
+//! This crate supports several operations that the vectorized/interpreted
+//! `arrow-rs` packages do not support. See the [package
+//! readme](https://github.com/RyanMarcus/arrow-compile-compute) for more
+//! information.
 
-use arrow_array::{cast::AsArray, types::Int64Type, Array, BooleanArray, Datum};
-use arrow_buffer::{BooleanBuffer, Buffer};
-use cranelift::{
-    codegen::{
-        self,
-        ir::{types, Function, UserFuncName},
-        verify_function,
+use std::{ffi::c_void, sync::Arc};
+
+use arrow_array::{
+    cast::AsArray,
+    types::{
+        Date32Type, Date64Type, Float16Type, Float32Type, Float64Type, Int16Type, Int32Type,
+        Int64Type, Int8Type, UInt16Type, UInt32Type, UInt64Type, UInt8Type,
     },
-    prelude::{
-        isa::CallConv, settings, AbiParam, Block, Configurable, EntityRef, FunctionBuilder,
-        FunctionBuilderContext, InstBuilder, IntCC, MemFlags, Signature, Type, Variable,
-    },
+    Array, ArrayRef, BooleanArray, PrimitiveArray,
 };
-use cranelift_jit::{JITBuilder, JITModule};
-use cranelift_module::Module;
+use arrow_buffer::{BooleanBuffer, Buffer, NullBuffer, ScalarBuffer};
+use arrow_schema::{ArrowError, DataType, Field};
+use inkwell::{
+    builder::Builder,
+    context::Context,
+    execution_engine::JitFunction,
+    module::Module,
+    types::{BasicTypeEnum, VectorType},
+    values::{FunctionValue, IntValue, PointerValue, VectorValue},
+    AddressSpace, IntPredicate, OptimizationLevel,
+};
 
-#[derive(Default)]
-struct VariableGenerator {
-    next_var: usize,
+mod arrow_interface;
+mod compute_funcs;
+mod dict;
+mod primitive;
+mod runend;
+mod scalar;
+
+pub use arrow_interface::cast;
+pub use arrow_interface::cmp;
+pub use arrow_interface::compute;
+
+/// Utility function to create the appropiate `DataType` for a dictionary array
+pub fn dictionary_data_type(key_type: DataType, val_type: DataType) -> DataType {
+    DataType::Dictionary(Box::new(key_type.clone()), Box::new(val_type.clone()))
 }
 
-impl VariableGenerator {
-    pub fn new(&mut self) -> Variable {
-        let var = Variable::new(self.next_var);
-        self.next_var += 1;
-        var
+/// Utility function to create the appropiate `DataType` for a run-end encoded
+/// array
+pub fn run_end_data_type(run_type: &DataType, val_type: &DataType) -> DataType {
+    let f1 = Arc::new(Field::new("run_ends", run_type.clone(), false));
+    let f2 = Arc::new(Field::new("values", val_type.clone(), true));
+    DataType::RunEndEncoded(f1, f2)
+}
+
+fn buffer_to_primitive(b: Buffer, nulls: Option<NullBuffer>, tar_dt: &DataType) -> Box<dyn Array> {
+    let len = b.len() / PrimitiveType::for_arrow_type(tar_dt).width();
+    match tar_dt {
+        DataType::Int8 => Box::new(PrimitiveArray::<Int8Type>::new(
+            ScalarBuffer::new(b, 0, len),
+            nulls,
+        )),
+        DataType::Int16 => Box::new(PrimitiveArray::<Int16Type>::new(
+            ScalarBuffer::new(b, 0, len),
+            nulls,
+        )),
+        DataType::Int32 => Box::new(PrimitiveArray::<Int32Type>::new(
+            ScalarBuffer::new(b, 0, len),
+            nulls,
+        )),
+        DataType::Int64 => Box::new(PrimitiveArray::<Int64Type>::new(
+            ScalarBuffer::new(b, 0, len),
+            nulls,
+        )),
+        DataType::UInt8 => Box::new(PrimitiveArray::<UInt8Type>::new(
+            ScalarBuffer::new(b, 0, len),
+            nulls,
+        )),
+        DataType::UInt16 => Box::new(PrimitiveArray::<UInt16Type>::new(
+            ScalarBuffer::new(b, 0, len),
+            nulls,
+        )),
+        DataType::UInt32 => Box::new(PrimitiveArray::<UInt32Type>::new(
+            ScalarBuffer::new(b, 0, len),
+            nulls,
+        )),
+        DataType::UInt64 => Box::new(PrimitiveArray::<UInt64Type>::new(
+            ScalarBuffer::new(b, 0, len),
+            nulls,
+        )),
+        DataType::Float16 => Box::new(PrimitiveArray::<Float16Type>::new(
+            ScalarBuffer::new(b, 0, len),
+            nulls,
+        )),
+        DataType::Float32 => Box::new(PrimitiveArray::<Float32Type>::new(
+            ScalarBuffer::new(b, 0, len),
+            nulls,
+        )),
+        DataType::Float64 => Box::new(PrimitiveArray::<Float64Type>::new(
+            ScalarBuffer::new(b, 0, len),
+            nulls,
+        )),
+        DataType::Date32 => Box::new(PrimitiveArray::<Date32Type>::new(
+            ScalarBuffer::new(b, 0, len),
+            nulls,
+        )),
+        DataType::Date64 => Box::new(PrimitiveArray::<Date64Type>::new(
+            ScalarBuffer::new(b, 0, len),
+            nulls,
+        )),
+        _ => unreachable!("cannot cast buffer to {}", tar_dt),
     }
 }
 
-struct Iterator {
-    idx: Variable,
-    init_block: Block,
-    reenter_block: Block,
-    iter_block: Block,
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PrimitiveType {
+    I8,
+    I16,
+    I32,
+    I64,
+    U8,
+    U16,
+    U32,
+    U64,
+    F16,
+    F32,
+    F64,
 }
 
-impl Iterator {
-    pub fn declare_iter(fb: &mut FunctionBuilder, vg: &mut VariableGenerator) -> Iterator {
-        Iterator {
-            idx: vg.new(),
-            init_block: fb.create_block(),
-            reenter_block: fb.create_block(),
-            iter_block: fb.create_block(),
+impl PrimitiveType {
+    fn width(&self) -> usize {
+        match self {
+            PrimitiveType::I8 | PrimitiveType::U8 => 1,
+            PrimitiveType::I16 | PrimitiveType::U16 => 2,
+            PrimitiveType::I32 | PrimitiveType::U32 => 4,
+            PrimitiveType::I64 | PrimitiveType::U64 => 8,
+            PrimitiveType::F16 => 2,
+            PrimitiveType::F32 => 4,
+            PrimitiveType::F64 => 8,
         }
     }
 
-    pub fn init_block(&self) -> Block {
-        self.init_block
-    }
-
-    pub fn reenter_block(&self) -> Block {
-        self.reenter_block
-    }
-
-    pub fn define_iter(self, fb: &mut FunctionBuilder, next_block: Block, final_block: Block) {
-        fb.switch_to_block(self.init_block());
-        let ptr = fb.append_block_param(self.init_block(), types::I64);
-        let length = fb.append_block_param(self.init_block(), types::I64);
-        fb.declare_var(self.idx, types::I64);
-        let zero = fb.ins().iconst(types::I64, 0);
-        fb.def_var(self.idx, zero);
-        fb.ins().jump(self.reenter_block(), &[]);
-
-        fb.switch_to_block(self.reenter_block());
-        let curr_idx = fb.use_var(self.idx);
-        let cmp_res = fb.ins().icmp(IntCC::UnsignedLessThan, curr_idx, length);
-        fb.ins()
-            .brif(cmp_res, self.iter_block, &[], final_block, &[]);
-
-        fb.switch_to_block(self.iter_block);
-        let curr_idx = fb.use_var(self.idx);
-        let curr_idx_b = fb.ins().imul_imm(curr_idx, 8);
-        let ptr_offset = fb.ins().iadd(ptr, curr_idx_b);
-        let loaded_val = fb
-            .ins()
-            .load(types::I64, MemFlags::trusted(), ptr_offset, 0);
-        let new_iter_var = fb.ins().iadd_imm(curr_idx, 1);
-        fb.def_var(self.idx, new_iter_var);
-        fb.ins().jump(next_block, &[loaded_val]);
-        fb.seal_block(self.iter_block);
-    }
-}
-
-struct Bitmap {
-    init_block: Block,
-    append_block: Block,
-    store_block: Block,
-    finish_block: Block,
-    store_last_block: Block,
-    curr_buf: Variable,
-    curr_within_u32_idx: Variable,
-    curr_between_u32_idx: Variable,
-}
-
-impl Bitmap {
-    pub fn declare_bitmap(fb: &mut FunctionBuilder, vg: &mut VariableGenerator) -> Bitmap {
-        Bitmap {
-            init_block: fb.create_block(),
-            append_block: fb.create_block(),
-            store_block: fb.create_block(),
-            finish_block: fb.create_block(),
-            store_last_block: fb.create_block(),
-            curr_buf: vg.new(),
-            curr_within_u32_idx: vg.new(),
-            curr_between_u32_idx: vg.new(),
+    fn llvm_type<'a>(&self, ctx: &'a Context) -> BasicTypeEnum<'a> {
+        match self {
+            PrimitiveType::I8 | PrimitiveType::U8 => ctx.i8_type().into(),
+            PrimitiveType::I16 | PrimitiveType::U16 => ctx.i16_type().into(),
+            PrimitiveType::I32 | PrimitiveType::U32 => ctx.i32_type().into(),
+            PrimitiveType::I64 | PrimitiveType::U64 => ctx.i64_type().into(),
+            PrimitiveType::F16 => ctx.f16_type().into(),
+            PrimitiveType::F32 => ctx.f32_type().into(),
+            PrimitiveType::F64 => ctx.f64_type().into(),
         }
     }
 
-    pub fn define_bitmap(
+    fn llvm_vec_type<'a>(&self, ctx: &'a Context, size: u32) -> VectorType<'a> {
+        match self {
+            PrimitiveType::I8 | PrimitiveType::U8 => ctx.i8_type().vec_type(size),
+            PrimitiveType::I16 | PrimitiveType::U16 => ctx.i16_type().vec_type(size),
+            PrimitiveType::I32 | PrimitiveType::U32 => ctx.i32_type().vec_type(size),
+            PrimitiveType::I64 | PrimitiveType::U64 => ctx.i64_type().vec_type(size),
+            PrimitiveType::F16 => ctx.f16_type().vec_type(size),
+            PrimitiveType::F32 => ctx.f32_type().vec_type(size),
+            PrimitiveType::F64 => ctx.f64_type().vec_type(size),
+        }
+    }
+
+    fn for_arrow_type(dt: &DataType) -> Self {
+        match dt {
+            DataType::Int8 => PrimitiveType::I8,
+            DataType::Int16 => PrimitiveType::I16,
+            DataType::Int32 => PrimitiveType::I32,
+            DataType::Int64 => PrimitiveType::I64,
+            DataType::UInt8 => PrimitiveType::U8,
+            DataType::UInt16 => PrimitiveType::U16,
+            DataType::UInt32 => PrimitiveType::U32,
+            DataType::UInt64 => PrimitiveType::U64,
+            DataType::Float16 => PrimitiveType::F16,
+            DataType::Float32 => PrimitiveType::F32,
+            DataType::Float64 => PrimitiveType::F64,
+            DataType::Dictionary(_k, v) => PrimitiveType::for_arrow_type(v),
+            DataType::RunEndEncoded(_k, v) => PrimitiveType::for_arrow_type(v.data_type()),
+            _ => todo!(),
+        }
+    }
+
+    fn as_arrow_type(&self) -> DataType {
+        match self {
+            PrimitiveType::I8 => DataType::Int8,
+            PrimitiveType::I16 => DataType::Int16,
+            PrimitiveType::I32 => DataType::Int32,
+            PrimitiveType::I64 => DataType::Int64,
+            PrimitiveType::U8 => DataType::UInt8,
+            PrimitiveType::U16 => DataType::UInt16,
+            PrimitiveType::U32 => DataType::UInt32,
+            PrimitiveType::U64 => DataType::UInt64,
+            PrimitiveType::F16 => DataType::Float16,
+            PrimitiveType::F32 => DataType::Float32,
+            PrimitiveType::F64 => DataType::Float64,
+        }
+    }
+
+    /// Returns the primitive int type with the given width in bytes.
+    ///
+    /// For example, calling with `width = 8` will give `I64`.
+    fn int_with_width(width: usize) -> PrimitiveType {
+        match width {
+            8 => PrimitiveType::I64,
+            4 => PrimitiveType::I32,
+            2 => PrimitiveType::I16,
+            1 => PrimitiveType::I8,
+            _ => unreachable!("width must be 8, 4, 2, or 1"),
+        }
+    }
+
+    fn is_signed(&self) -> bool {
+        match self {
+            PrimitiveType::I8 | PrimitiveType::I16 | PrimitiveType::I32 | PrimitiveType::I64 => {
+                true
+            }
+            PrimitiveType::U8 | PrimitiveType::U16 | PrimitiveType::U32 | PrimitiveType::U64 => {
+                false
+            }
+            PrimitiveType::F16 | PrimitiveType::F32 | PrimitiveType::F64 => true,
+        }
+    }
+
+    fn is_int(&self) -> bool {
+        match self {
+            PrimitiveType::I8
+            | PrimitiveType::I16
+            | PrimitiveType::I32
+            | PrimitiveType::I64
+            | PrimitiveType::U8
+            | PrimitiveType::U16
+            | PrimitiveType::U32
+            | PrimitiveType::U64 => true,
+            PrimitiveType::F16 | PrimitiveType::F32 | PrimitiveType::F64 => false,
+        }
+    }
+
+    /// Returns the "best" common value to cast both types to in order to
+    /// perform a comparison
+    fn dominant(lhs_prim: PrimitiveType, rhs_prim: PrimitiveType) -> PrimitiveType {
+        if lhs_prim.is_signed() != rhs_prim.is_signed() {
+            PrimitiveType::I64
+        } else if lhs_prim.width() >= rhs_prim.width() {
+            lhs_prim
+        } else {
+            rhs_prim
+        }
+    }
+}
+
+#[derive(Copy, Clone, Hash, PartialEq, Eq)]
+/// Represents different logical predicates that can be used for function
+/// compilation. Signedness is automatically determined.
+pub enum Predicate {
+    Eq,
+    Ne,
+    Lt,
+    Lte,
+    Gt,
+    Gte,
+}
+
+impl Predicate {
+    fn as_int_pred(&self, signed: bool) -> IntPredicate {
+        match (self, signed) {
+            (Predicate::Eq, _) => IntPredicate::EQ,
+            (Predicate::Ne, _) => IntPredicate::NE,
+            (Predicate::Lt, true) => IntPredicate::SLT,
+            (Predicate::Lt, false) => IntPredicate::ULT,
+            (Predicate::Lte, true) => IntPredicate::SLE,
+            (Predicate::Lte, false) => IntPredicate::ULE,
+            (Predicate::Gt, true) => IntPredicate::SGT,
+            (Predicate::Gt, false) => IntPredicate::UGT,
+            (Predicate::Gte, true) => IntPredicate::SGE,
+            (Predicate::Gte, false) => IntPredicate::UGE,
+        }
+    }
+}
+
+#[repr(C)]
+struct PtrHolder {
+    arr1: *const c_void,
+    arr2: *const c_void,
+    phys_len: u64,
+}
+
+/// Turns the given array into a pointer and some optional data. The pointer is
+/// valid for as long as the optional data and the original data are around.
+fn arr_to_ptr(arr: &dyn Array) -> (Option<Box<PtrHolder>>, *const c_void) {
+    match arr.data_type() {
+        DataType::Boolean => (
+            None,
+            arr.as_boolean().values().values().as_ptr() as *const c_void,
+        ),
+        DataType::Int8 => (
+            None,
+            arr.as_primitive::<Int8Type>().values().as_ptr() as *const c_void,
+        ),
+        DataType::Int16 => (
+            None,
+            arr.as_primitive::<Int16Type>().values().as_ptr() as *const c_void,
+        ),
+        DataType::Int32 => (
+            None,
+            arr.as_primitive::<Int32Type>().values().as_ptr() as *const c_void,
+        ),
+        DataType::Int64 => (
+            None,
+            arr.as_primitive::<Int64Type>().values().as_ptr() as *const c_void,
+        ),
+        DataType::UInt8 => (
+            None,
+            arr.as_primitive::<UInt8Type>().values().as_ptr() as *const c_void,
+        ),
+        DataType::UInt16 => (
+            None,
+            arr.as_primitive::<UInt16Type>().values().as_ptr() as *const c_void,
+        ),
+        DataType::UInt32 => (
+            None,
+            arr.as_primitive::<UInt32Type>().values().as_ptr() as *const c_void,
+        ),
+        DataType::UInt64 => (
+            None,
+            arr.as_primitive::<UInt64Type>().values().as_ptr() as *const c_void,
+        ),
+        DataType::Float16 => (
+            None,
+            arr.as_primitive::<Float16Type>().values().as_ptr() as *const c_void,
+        ),
+        DataType::Float32 => (
+            None,
+            arr.as_primitive::<Float32Type>().values().as_ptr() as *const c_void,
+        ),
+        DataType::Float64 => (
+            None,
+            arr.as_primitive::<Float64Type>().values().as_ptr() as *const c_void,
+        ),
+        DataType::Dictionary(_, _) => {
+            let arr = arr.as_any_dictionary();
+            let (key_data, key_ptr) = arr_to_ptr(arr.keys());
+            let (val_data, val_ptr) = arr_to_ptr(arr.values());
+
+            // TODO support nested dictionary arrays
+            assert!(key_data.is_none() && val_data.is_none());
+
+            let holder = Box::new(PtrHolder {
+                arr1: key_ptr,
+                arr2: val_ptr,
+                phys_len: arr.len() as u64,
+            });
+
+            let ptr = &*holder as *const PtrHolder;
+            let ptr = ptr as *const c_void;
+            (Some(holder), ptr)
+        }
+        DataType::RunEndEncoded(_, _) => {
+            let arr_data = arr.to_data();
+            let children = arr_data.child_data();
+            let re_ptr = children[0].buffer::<u8>(0).as_ptr() as *const c_void;
+            let va_ptr = children[1].buffer::<u8>(0).as_ptr() as *const c_void;
+            assert!(!re_ptr.is_null(), "run end pointer was null");
+            assert!(!va_ptr.is_null(), "value pointer was null");
+            assert_eq!(children[0].len(), children[1].len());
+
+            let holder = Box::new(PtrHolder {
+                arr1: re_ptr,
+                arr2: va_ptr,
+                phys_len: children[0].len() as u64,
+            });
+            let ptr = (&*holder as *const PtrHolder) as *const c_void;
+            (Some(holder), ptr)
+        }
+        _ => todo!(),
+    }
+}
+
+#[no_mangle]
+pub(crate) extern "C" fn printd(label: i64, x: i32) {
+    println!("msg {}: {}", label, x);
+}
+
+#[no_mangle]
+pub(crate) extern "C" fn printd64(label: i64, x: i64) {
+    println!("msg {}: {}", label, x);
+}
+
+#[no_mangle]
+pub(crate) extern "C" fn printv64(label: i64, x: *const i64) {
+    let arr: &[i64; 64] = unsafe { &*(x as *const [i64; 64]) };
+    println!("msg {}: {:?}", label, arr);
+}
+
+#[used]
+static EXTERNAL_FN: [extern "C" fn(i64, i32); 1] = [printd];
+#[used]
+static EXTERNAL_FN64: [extern "C" fn(i64, i64); 1] = [printd64];
+#[used]
+static EXTERNAL_FNV64: [extern "C" fn(i64, *const i64); 1] = [printv64];
+
+/// A compiled function that owns its own LLVM context. Maps two arrays to an
+/// array of booleans.
+pub struct CompiledBinaryFunc<'ctx> {
+    _cg: CodeGen<'ctx>,
+    lhs_dt: DataType,
+    lhs_scalar: bool,
+    rhs_dt: DataType,
+    rhs_scalar: bool,
+    f: JitFunction<'ctx, unsafe extern "C" fn(*const c_void, *const c_void, u64, *mut u64)>,
+}
+
+impl CompiledBinaryFunc<'_> {
+    /// Verify that `arr1` and `arr2` match the types this function was compiled
+    /// for, then execute the function and return the result.
+    pub fn call(&self, arr1: &dyn Array, arr2: &dyn Array) -> Result<BooleanArray, ArrowError> {
+        if arr1.data_type() != &self.lhs_dt {
+            return Err(ArrowError::ComputeError(format!(
+                "arg 1 had wrong type (expected {:?}, found {:?})",
+                self.lhs_dt,
+                arr1.data_type()
+            )));
+        }
+        if self.lhs_scalar && arr1.len() != 1 {
+            return Err(ArrowError::ComputeError(format!(
+                "arg 1 was suppoesd to be scalar, but had length {} (should be 1)",
+                arr1.len()
+            )));
+        }
+
+        if arr2.data_type() != &self.rhs_dt {
+            return Err(ArrowError::ComputeError(format!(
+                "arg 2 had wrong type (expected {:?}, found {:?})",
+                self.rhs_dt,
+                arr2.data_type()
+            )));
+        }
+        if self.rhs_scalar && arr2.len() != 1 {
+            return Err(ArrowError::ComputeError(format!(
+                "arg 2 was suppoesd to be scalar, but had length {} (should be 1)",
+                arr2.len()
+            )));
+        }
+
+        if !self.lhs_scalar && !self.rhs_scalar && arr1.len() != arr2.len() {
+            return Err(ArrowError::ComputeError(format!(
+                "arrays did not have same length ({} and {})",
+                arr1.len(),
+                arr2.len()
+            )));
+        }
+
+        // handle length 0 arrays, since our kernels assume len > 0 (this is
+        // mostly so we can do one iteration of the loop prior to checking the
+        // loop condition)
+        if arr1.is_empty() {
+            return Ok(BooleanArray::new_null(0));
+        }
+
+        let (data1, ptr1) = arr_to_ptr(arr1);
+        let (data2, ptr2) = arr_to_ptr(arr2);
+
+        let mut buf = vec![0_u64; arr1.len().div_ceil(64)];
+        unsafe {
+            self.f.call(ptr1, ptr2, arr1.len() as u64, buf.as_mut_ptr());
+        }
+
+        std::mem::drop(data1);
+        std::mem::drop(data2);
+
+        let buf = Buffer::from_vec(buf);
+        let bb = BooleanBuffer::new(buf, 0, arr1.len());
+        let nulls = NullBuffer::union(arr1.nulls(), arr2.nulls());
+        Ok(BooleanArray::new(bb, nulls))
+    }
+}
+
+/// A compiled function that owns its own LLVM context. Maps an array to another
+/// array.
+pub struct CompiledConvertFunc<'ctx> {
+    _cg: CodeGen<'ctx>,
+    src_dt: DataType,
+    tar_dt: DataType,
+    f: JitFunction<'ctx, unsafe extern "C" fn(*const c_void, u64, *mut c_void)>,
+}
+
+impl CompiledConvertFunc<'_> {
+    /// Verify that `arr1` and `arr2` match the types this function was compiled
+    /// for, then execute the function and return the result.
+    pub fn call(&self, arr1: &dyn Array) -> Result<ArrayRef, ArrowError> {
+        if arr1.data_type() != &self.src_dt {
+            return Err(ArrowError::ComputeError(format!(
+                "arg 1 had wrong type (expected {:?}, found {:?})",
+                self.src_dt,
+                arr1.data_type()
+            )));
+        }
+
+        // handle length 0 arrays, since our kernels assume len > 0 (this is
+        // mostly so we can do one iteration of the loop prior to checking the
+        // loop condition)
+        if arr1.is_empty() {
+            let buf = Buffer::from_vec(Vec::<u128>::with_capacity(0));
+            return Ok(buffer_to_primitive(buf, arr1.nulls().cloned(), &self.tar_dt).into());
+        }
+
+        let (data1, ptr1) = arr_to_ptr(arr1);
+
+        let mut buf = vec![
+            0_u8;
+            arr1.len().next_multiple_of(64)
+                * PrimitiveType::for_arrow_type(&self.tar_dt).width()
+        ];
+        unsafe {
+            self.f
+                .call(ptr1, arr1.len() as u64, buf.as_mut_ptr() as *mut c_void);
+        }
+
+        std::mem::drop(data1);
+        let buf = Buffer::from_vec(buf);
+        let unsliced = buffer_to_primitive(buf, arr1.nulls().cloned(), &self.tar_dt);
+        let sliced = unsliced.slice(0, arr1.len());
+        Ok(sliced)
+    }
+}
+
+/// A compiled function that owns its own LLVM context. Maps an array and a
+/// boolean array to another array.
+pub struct CompiledFilterFunc<'ctx> {
+    _cg: CodeGen<'ctx>,
+    src_dt: DataType,
+    f: JitFunction<'ctx, unsafe extern "C" fn(*const c_void, *const c_void, u64, *mut c_void)>,
+}
+
+impl CompiledFilterFunc<'_> {
+    /// Verify that `arr1` matchess the types this function was compiled for,
+    /// then execute the function and return the result.
+    pub fn call(&self, arr1: &dyn Array, ba: &BooleanArray) -> Result<ArrayRef, ArrowError> {
+        if arr1.data_type() != &self.src_dt {
+            return Err(ArrowError::ComputeError(format!(
+                "arg 1 had wrong type (expected {:?}, found {:?})",
+                self.src_dt,
+                arr1.data_type()
+            )));
+        }
+
+        let prim_type = PrimitiveType::for_arrow_type(&self.src_dt);
+
+        // handle length 0 arrays, since our kernels assume len > 0 (this is
+        // mostly so we can do one iteration of the loop prior to checking the
+        // loop condition)
+        let true_count = ba.true_count();
+        if arr1.is_empty() || true_count == 0 {
+            let buf = Buffer::from_vec(Vec::<u128>::with_capacity(0));
+            return Ok(buffer_to_primitive(buf, arr1.nulls().cloned(), &self.src_dt).into());
+        }
+
+        let (data, ptr) = arr_to_ptr(arr1);
+        let (bdata, bptr) = arr_to_ptr(ba);
+
+        let mut buf = vec![0_u8; true_count * prim_type.width()];
+
+        unsafe {
+            self.f.call(
+                ptr,
+                bptr,
+                arr1.len() as u64,
+                buf.as_mut_ptr() as *mut c_void,
+            );
+        }
+
+        std::mem::drop(data);
+        std::mem::drop(bdata);
+        let buf = Buffer::from_vec(buf);
+
+        let unsliced = buffer_to_primitive(buf, arr1.nulls().cloned(), &prim_type.as_arrow_type());
+
+        let sliced = unsliced.slice(0, ba.true_count());
+        Ok(sliced)
+    }
+}
+
+/// Code generation routines. Used to generate `CompiledFunc`s.
+///
+/// The `cmp` interface automatically caches compiled functions for reuse, but
+/// this interface does not (i.e., each time you use a function here, the
+/// underlying kernel will be recompiled).
+pub struct CodeGen<'ctx> {
+    context: &'ctx Context,
+    dbg: FunctionValue<'ctx>,
+    dbg64: FunctionValue<'ctx>,
+    dbgv64: FunctionValue<'ctx>,
+    module: Module<'ctx>,
+}
+
+impl<'ctx> CodeGen<'ctx> {
+    /// Create a new codegen object within an LLVM context.
+    /// ```rust
+    /// use inkwell::context::Context;
+    /// use arrow_compile_compute::CodeGen;
+    /// let ctx = Context::create();
+    /// let cg = CodeGen::new(&ctx);
+    /// ```
+    pub fn new(ctx: &Context) -> CodeGen {
+        let module = ctx.create_module("jit");
+        let ft = ctx
+            .void_type()
+            .fn_type(&[ctx.i64_type().into(), ctx.i32_type().into()], false);
+        let dbg = module.add_function("printd", ft, None);
+
+        let ft = ctx
+            .void_type()
+            .fn_type(&[ctx.i64_type().into(), ctx.i64_type().into()], false);
+        let dbg64 = module.add_function("printd64", ft, None);
+
+        let ft = ctx.void_type().fn_type(
+            &[
+                ctx.i64_type().into(),
+                ctx.ptr_type(AddressSpace::default()).into(),
+            ],
+            false,
+        );
+        let dbgv64 = module.add_function("printv64", ft, None);
+        CodeGen {
+            context: ctx,
+            module,
+            dbg,
+            dbg64,
+            dbgv64,
+        }
+    }
+
+    #[allow(dead_code)]
+    fn debug_val<'a>(&'a self, builder: &'a Builder, label: u64, i: IntValue<'a>) {
+        builder
+            .build_call(
+                self.dbg,
+                &[
+                    self.context.i64_type().const_int(label, false).into(),
+                    i.into(),
+                ],
+                "debug",
+            )
+            .unwrap();
+    }
+
+    #[allow(dead_code)]
+    fn debug_val64<'a>(&'a self, builder: &'a Builder, label: u64, i: IntValue<'a>) {
+        builder
+            .build_call(
+                self.dbg64,
+                &[
+                    self.context.i64_type().const_int(label, false).into(),
+                    i.into(),
+                ],
+                "debug",
+            )
+            .unwrap();
+    }
+
+    #[allow(dead_code)]
+    fn debug_vec64<'a>(&'a self, builder: &'a Builder, label: u64, i: PointerValue<'a>) {
+        builder
+            .build_call(
+                self.dbgv64,
+                &[
+                    self.context.i64_type().const_int(label, false).into(),
+                    i.into(),
+                ],
+                "debug",
+            )
+            .unwrap();
+    }
+
+    fn increment_pointer<'a>(
+        &'a self,
+        builder: &'a Builder,
+        p: PointerValue<'a>,
+        w: usize,
+        inc: IntValue<'a>,
+    ) -> PointerValue<'a>
+    where
+        'ctx: 'a,
+    {
+        let i64_type = self.context.i64_type();
+        let ptr_type = self.context.ptr_type(AddressSpace::default());
+        let as_int = builder.build_ptr_to_int(p, i64_type, "as_int").unwrap();
+        let incr = builder
+            .build_int_mul(inc, i64_type.const_int(w as u64, false), "incr")
+            .unwrap();
+        let incr_int = builder.build_int_add(as_int, incr, "incr_ptr").unwrap();
+        let ptr = builder.build_int_to_ptr(incr_int, ptr_type, "ptr").unwrap();
+        ptr
+    }
+
+    fn gen_convert_vec<'a>(
+        &'a self,
+        builder: &'a Builder,
+        v: VectorValue<'a>,
+        src: PrimitiveType,
+        dst: PrimitiveType,
+    ) -> VectorValue<'a>
+    where
+        'ctx: 'a,
+    {
+        let dst_llvm = dst.llvm_type(self.context);
+
+        if src == dst {
+            return v;
+        }
+
+        match (src.is_int(), dst.is_int()) {
+            // int to int
+            (true, true) => {
+                let dst_vec = dst_llvm.into_int_type().vec_type(64);
+                if src.width() > dst.width() {
+                    builder.build_int_truncate(v, dst_vec, "trunc").unwrap()
+                } else if src.is_signed() {
+                    builder.build_int_s_extend(v, dst_vec, "sext").unwrap()
+                } else {
+                    builder.build_int_z_extend(v, dst_vec, "sext").unwrap()
+                }
+            }
+            // int to float
+            (true, false) => {
+                let dst_vec = dst_llvm.into_float_type().vec_type(64);
+                if src.is_signed() {
+                    builder
+                        .build_signed_int_to_float(v, dst_vec, "sitf")
+                        .unwrap()
+                } else {
+                    builder
+                        .build_signed_int_to_float(v, dst_vec, "uitf")
+                        .unwrap()
+                }
+            }
+            // float to int
+            (false, true) => {
+                let dst_vec = dst_llvm.into_int_type().vec_type(64);
+                if dst.is_signed() {
+                    builder
+                        .build_float_to_signed_int(v, dst_vec, "ftsi")
+                        .unwrap()
+                } else {
+                    builder
+                        .build_float_to_unsigned_int(v, dst_vec, "ftui")
+                        .unwrap()
+                }
+            }
+            // float to float
+            (false, false) => {
+                let dst_vec = dst_llvm.into_float_type().vec_type(64);
+                if src.width() > dst.width() {
+                    builder.build_float_trunc(v, dst_vec, "ftrun").unwrap()
+                } else {
+                    builder.build_float_ext(v, dst_vec, "fext").unwrap()
+                }
+            }
+        }
+    }
+
+    fn gen_iter_for(&self, label: &str, dt: &DataType) -> FunctionValue {
+        match dt {
+            DataType::Int8
+            | DataType::Int16
+            | DataType::Int32
+            | DataType::Int64
+            | DataType::UInt8
+            | DataType::UInt16
+            | DataType::UInt32
+            | DataType::UInt64
+            | DataType::Float16
+            | DataType::Float32
+            | DataType::Float64 => {
+                self.gen_iter_primitive(label, PrimitiveType::for_arrow_type(dt), 64)
+            }
+            DataType::Dictionary(k_dt, v_dt) => self.gen_dict_primitive(
+                label,
+                PrimitiveType::for_arrow_type(k_dt),
+                PrimitiveType::for_arrow_type(v_dt),
+            ),
+            DataType::RunEndEncoded(re_dt, v_dt) => self.gen_re_primitive(
+                label,
+                PrimitiveType::for_arrow_type(re_dt.data_type()),
+                PrimitiveType::for_arrow_type(v_dt.data_type()),
+            ),
+            _ => todo!(),
+        }
+    }
+
+    fn initialize_iter<'a>(
+        &'a self,
+        builder: &'a Builder<'ctx>,
+        ptr: PointerValue<'a>,
+        len: IntValue<'a>,
+        dt: &DataType,
+    ) -> PointerValue<'a> {
+        match dt {
+            DataType::Boolean
+            | DataType::Int8
+            | DataType::Int16
+            | DataType::Int32
+            | DataType::Int64
+            | DataType::UInt8
+            | DataType::UInt16
+            | DataType::UInt32
+            | DataType::UInt64
+            | DataType::Float16
+            | DataType::Float32
+            | DataType::Float64 => self.initialize_iter_primitive(builder, ptr, len),
+            DataType::Dictionary(_k_dt, _v_dt) => self.initialize_iter_dict(builder, ptr, len),
+            DataType::RunEndEncoded(_re_dt, _v_dt) => self.initialize_iter_re(builder, ptr, len),
+            _ => todo!(),
+        }
+    }
+
+    fn has_next_iter<'a>(
+        &'a self,
+        builder: &'a Builder,
+        ptr: PointerValue<'a>,
+        dt: &DataType,
+    ) -> IntValue<'a> {
+        match dt {
+            DataType::Int8
+            | DataType::Int16
+            | DataType::Int32
+            | DataType::Int64
+            | DataType::UInt8
+            | DataType::UInt16
+            | DataType::UInt32
+            | DataType::UInt64
+            | DataType::Float16
+            | DataType::Float32
+            | DataType::Float64 => self.has_next_iter_primitive(builder, ptr),
+            DataType::Dictionary(_, _) => self.has_next_iter_dict(builder, ptr),
+            DataType::RunEndEncoded(_, _) => self.has_next_iter_re(builder, ptr),
+            _ => todo!(),
+        }
+    }
+
+    fn convert_float_for_total_cmp<'a>(
+        &'a self,
+        builder: &'a Builder,
+        fvec: VectorValue<'a>,
+        ptype: PrimitiveType,
+    ) -> VectorValue<'a> {
+        // apply the following algorithm to get a total float ordering
+        // left ^= (((left >> 63) as u64) >> 1) as i64;
+        // right ^= (((right >> 63) as u64) >> 1) as i64;
+        // left.cmp(right)
+
+        let int_type = PrimitiveType::int_with_width(ptype.width())
+            .llvm_type(self.context)
+            .into_int_type();
+
+        let vminus1 = builder
+            .build_insert_element(
+                int_type.vec_type(64).const_zero(),
+                int_type.const_int(ptype.width() as u64 * 8 - 1, false),
+                int_type.const_zero(),
+                "vminus1",
+            )
+            .unwrap();
+        let vminus1 = builder
+            .build_shuffle_vector(
+                vminus1,
+                int_type.vec_type(64).get_undef(),
+                int_type.vec_type(64).const_zero(),
+                "vminus1_bcast",
+            )
+            .unwrap();
+        let v1 = builder
+            .build_insert_element(
+                int_type.vec_type(64).const_zero(),
+                int_type.const_int(1, false),
+                int_type.const_zero(),
+                "v1",
+            )
+            .unwrap();
+        let v1 = builder
+            .build_shuffle_vector(
+                v1,
+                int_type.vec_type(64).get_undef(),
+                int_type.vec_type(64).const_zero(),
+                "v1_bcast",
+            )
+            .unwrap();
+
+        let cleft = builder
+            .build_bit_cast(fvec, int_type.vec_type(64), "cleft")
+            .unwrap()
+            .into_vector_value();
+        let left = builder
+            .build_right_shift(cleft, vminus1, false, "sleft")
+            .unwrap();
+        let left = builder.build_right_shift(left, v1, true, "sleft").unwrap();
+        builder.build_xor(cleft, left, "left").unwrap()
+    }
+
+    /// Generate a `CompiledFunc` for the given datatypes and predicate.
+    pub fn primitive_primitive_cmp(
         self,
-        fb: &mut FunctionBuilder,
-        after_init_block: Block,
-        return_block: Block,
-        after_finish_block: Block,
-    ) {
-        fb.switch_to_block(self.init_block);
-        let ptr = fb.append_block_param(self.init_block, types::I64);
-        fb.declare_var(self.curr_within_u32_idx, types::I8);
-        fb.declare_var(self.curr_between_u32_idx, types::I64);
-        fb.declare_var(self.curr_buf, types::I32);
-        let zero = fb.ins().iconst(types::I8, 0);
-        fb.def_var(self.curr_within_u32_idx, zero);
-        let zero = fb.ins().iconst(types::I64, 0);
-        fb.def_var(self.curr_between_u32_idx, zero);
-        let zero = fb.ins().iconst(types::I32, 0);
-        fb.def_var(self.curr_buf, zero);
-        fb.ins().jump(after_init_block, &[]);
+        lhs_dt: &DataType,
+        lhs_scalar: bool,
+        rhs_dt: &DataType,
+        rhs_scalar: bool,
+        p: Predicate,
+    ) -> Result<CompiledBinaryFunc<'ctx>, ArrowError> {
+        let lhs_prim = PrimitiveType::for_arrow_type(lhs_dt);
+        let rhs_prim = PrimitiveType::for_arrow_type(rhs_dt);
+        let com_prim = PrimitiveType::dominant(lhs_prim, rhs_prim);
+        let builder = self.context.create_builder();
 
-        fb.switch_to_block(self.append_block);
-        let idx = fb.append_block_param(self.append_block, types::I8);
-        // precondition: curr_within_u32 < 32, so we can insert into the buffer
-        let idx = fb.ins().uextend(types::I32, idx);
-        let curr_buff_idx = fb.use_var(self.curr_within_u32_idx);
-        let shifted_idx = fb.ins().ishl(idx, curr_buff_idx);
-        let curr_buf = fb.use_var(self.curr_buf);
-        let new_buf = fb.ins().bor(curr_buf, shifted_idx);
-        fb.def_var(self.curr_buf, new_buf);
-        let new_buff_idx = fb.ins().iadd_imm(curr_buff_idx, 1);
-        fb.def_var(self.curr_within_u32_idx, new_buff_idx);
+        let i64_type = self.context.i64_type();
+        let ptr_type = self.context.ptr_type(AddressSpace::default());
 
-        // check to see if this was our last slot in the buffer
-        let cmp = fb.ins().icmp_imm(IntCC::UnsignedLessThan, new_buff_idx, 32);
-        fb.ins().brif(cmp, return_block, &[], self.store_block, &[]);
+        let lhs_iter_next = if !lhs_scalar {
+            self.gen_iter_for("left", lhs_dt)
+        } else {
+            self.gen_iter_scalar("left", PrimitiveType::for_arrow_type(lhs_dt))
+        };
+        let rhs_iter_next = if !rhs_scalar {
+            self.gen_iter_for("right", rhs_dt)
+        } else {
+            self.gen_iter_scalar("right", PrimitiveType::for_arrow_type(rhs_dt))
+        };
 
-        fb.switch_to_block(self.store_block);
-        let curr_idx = fb.use_var(self.curr_between_u32_idx);
-        let ptr_offset_amt = fb.ins().imul_imm(curr_idx, 4);
-        let offset_ptr = fb.ins().iadd(ptr, ptr_offset_amt);
-        let curr_buf = fb.use_var(self.curr_buf);
-        fb.ins().store(MemFlags::trusted(), curr_buf, offset_ptr, 0);
-        let zero = fb.ins().iconst(types::I8, 0);
-        fb.def_var(self.curr_within_u32_idx, zero);
-        let zero = fb.ins().iconst(types::I32, 0);
-        fb.def_var(self.curr_buf, zero);
-        let new_idx = fb.ins().iadd_imm(curr_idx, 1);
-        fb.def_var(self.curr_between_u32_idx, new_idx);
-        fb.ins().jump(return_block, &[]);
-        fb.seal_block(self.store_block);
+        let fn_type = self.context.void_type().fn_type(
+            &[
+                ptr_type.into(), // arr1
+                ptr_type.into(), // arr2
+                i64_type.into(), // len
+                ptr_type.into(), // out
+            ],
+            false,
+        );
+        let function = self.module.add_function("eq_arr", fn_type, None);
 
-        fb.switch_to_block(self.finish_block);
-        let buf_idx = fb.use_var(self.curr_within_u32_idx);
-        fb.ins()
-            .brif(buf_idx, self.store_last_block, &[], after_finish_block, &[]);
+        let arr1_ptr = function.get_nth_param(0).unwrap().into_pointer_value();
+        let arr2_ptr = function.get_nth_param(1).unwrap().into_pointer_value();
+        let len = function.get_nth_param(2).unwrap().into_int_value();
+        let out_ptr = function.get_nth_param(3).unwrap().into_pointer_value();
 
-        fb.switch_to_block(self.store_last_block);
-        let curr_idx = fb.use_var(self.curr_between_u32_idx);
-        let ptr_offset_amt = fb.ins().imul_imm(curr_idx, 4);
-        let offset_ptr = fb.ins().iadd(ptr, ptr_offset_amt);
-        let curr_buf = fb.use_var(self.curr_buf);
-        fb.ins().store(MemFlags::trusted(), curr_buf, offset_ptr, 0);
-        fb.ins().jump(after_finish_block, &[]);
-        fb.seal_block(self.store_last_block);
-    }
+        let entry = self.context.append_basic_block(function, "entry");
+        let loop_cond = self.context.append_basic_block(function, "loop_cond");
+        let loop_body = self.context.append_basic_block(function, "loop_body");
+        let end = self.context.append_basic_block(function, "end");
 
-    pub fn init_block(&self) -> Block {
-        self.init_block
-    }
+        builder.position_at_end(entry);
+        let lhs_iter_ptr = if !lhs_scalar {
+            self.initialize_iter(&builder, arr1_ptr, len, lhs_dt)
+        } else {
+            self.initialize_iter_scalar(&builder, arr1_ptr, len)
+        };
+        let rhs_iter_ptr = if !rhs_scalar {
+            self.initialize_iter(&builder, arr2_ptr, len, rhs_dt)
+        } else {
+            self.initialize_iter_scalar(&builder, arr2_ptr, len)
+        };
 
-    pub fn append_block(&self) -> Block {
-        self.append_block
-    }
+        let out_idx_ptr = builder.build_alloca(ptr_type, "out_idx_ptr").unwrap();
+        builder
+            .build_store(out_idx_ptr, i64_type.const_zero())
+            .unwrap();
+        builder.build_unconditional_branch(loop_body).unwrap();
 
-    fn finish_block(&self) -> Block {
-        self.finish_block
-    }
-}
-
-pub struct CompiledEqConst {
-    _module: JITModule,
-    dt: arrow_schema::DataType,
-    func: Box<dyn Fn(&dyn Array, &dyn Datum) -> BooleanArray>,
-}
-
-impl CompiledEqConst {
-    pub fn execute(&self, array: &dyn Array, datum: &dyn Datum) -> BooleanArray {
-        (self.func)(array, datum)
-    }
-}
-
-pub fn compile_eq_const() -> CompiledEqConst {
-    let mut ctx = codegen::Context::new();
-    let mut sig = Signature::new(CallConv::SystemV);
-    let native = cranelift_native::builder().unwrap();
-    let ptr_type = Type::triple_pointer_type(native.triple());
-
-    // ptr
-    sig.params.push(AbiParam::new(ptr_type));
-
-    // length
-    sig.params.push(AbiParam::new(types::I64));
-
-    // value
-    sig.params.push(AbiParam::new(types::I64));
-
-    // bitmap pointer
-    sig.params.push(AbiParam::new(ptr_type));
-
-    ctx.func = Function::with_name_signature(UserFuncName::user(0, 0), sig);
-
-    let mut fbctx = FunctionBuilderContext::new();
-    let mut fb = FunctionBuilder::new(&mut ctx.func, &mut fbctx);
-    let mut vg = VariableGenerator::default();
-
-    let entry_block = fb.create_block();
-    let preloop_block = fb.create_block();
-    let loop_body = fb.create_block();
-    let end_loop = fb.create_block();
-    let end_block = fb.create_block();
-    let iter = Iterator::declare_iter(&mut fb, &mut vg);
-    let bitmap = Bitmap::declare_bitmap(&mut fb, &mut vg);
-
-    fb.switch_to_block(entry_block);
-    fb.append_block_params_for_function_params(entry_block);
-    let data_ptr = fb.block_params(entry_block)[0];
-    let len = fb.block_params(entry_block)[1];
-    let const_val = fb.block_params(entry_block)[2];
-    let bitmap_ptr = fb.block_params(entry_block)[3];
-    fb.ins().jump(bitmap.init_block(), &[bitmap_ptr]);
-    fb.seal_block(entry_block);
-
-    fb.switch_to_block(preloop_block);
-    fb.ins().jump(iter.init_block(), &[data_ptr, len]);
-
-    fb.switch_to_block(loop_body);
-    fb.append_block_param(loop_body, types::I64);
-    let loaded_val = fb.block_params(loop_body)[0];
-    let cmp_result = fb.ins().icmp(IntCC::Equal, loaded_val, const_val);
-    fb.ins().jump(bitmap.append_block(), &[cmp_result]);
-
-    fb.switch_to_block(end_loop);
-    fb.ins().jump(bitmap.finish_block(), &[]);
-
-    fb.switch_to_block(end_block);
-    fb.ins().return_(&[]);
-
-    bitmap.define_bitmap(&mut fb, preloop_block, iter.reenter_block(), end_block);
-    fb.seal_block(preloop_block);
-    iter.define_iter(&mut fb, loop_body, end_loop);
-
-    fb.seal_all_blocks();
-    fb.finalize();
-
-    let settings_builder = settings::builder();
-    let flags = settings::Flags::new(settings_builder);
-    verify_function(&ctx.func, &flags).unwrap();
-
-    let builder = JITBuilder::with_flags(
-        &[("opt_level", "speed")],
-        cranelift_module::default_libcall_names(),
-    )
-    .unwrap();
-    let mut module = JITModule::new(builder);
-
-    let count_eq_id = module
-        .declare_function(
-            "count_eq",
-            cranelift_module::Linkage::Export,
-            &ctx.func.signature,
-        )
+        builder.position_at_end(loop_body);
+        let lhs_chunk = builder
+            .build_call(lhs_iter_next, &[lhs_iter_ptr.into()], "lhs")
+            .unwrap()
+            .try_as_basic_value()
+            .unwrap_left()
+            .into_vector_value();
+        let lhs_chunk = self.gen_convert_vec(&builder, lhs_chunk, lhs_prim, com_prim);
+        let rhs_chunk = builder
+            .build_call(rhs_iter_next, &[rhs_iter_ptr.into()], "rhs")
+            .unwrap()
+            .try_as_basic_value()
+            .unwrap_left()
+            .into_vector_value();
+        let rhs_chunk = self.gen_convert_vec(&builder, rhs_chunk, rhs_prim, com_prim);
+        let mask = if com_prim.is_int() {
+            builder.build_int_compare(
+                p.as_int_pred(com_prim.is_signed()),
+                lhs_chunk,
+                rhs_chunk,
+                "mask",
+            )
+        } else {
+            let left = self.convert_float_for_total_cmp(&builder, lhs_chunk, com_prim);
+            let right = self.convert_float_for_total_cmp(&builder, rhs_chunk, com_prim);
+            builder.build_int_compare(p.as_int_pred(true), left, right, "mask")
+        }
         .unwrap();
 
-    module.define_function(count_eq_id, &mut ctx).unwrap();
+        let mask = builder
+            .build_bit_cast(mask, i64_type, "mask_casted")
+            .unwrap();
+        let out_idx = builder
+            .build_load(i64_type, out_idx_ptr, "out_idx")
+            .unwrap()
+            .into_int_value();
+        let this_out_ptr = self.increment_pointer(&builder, out_ptr, 8, out_idx);
+        builder.build_store(this_out_ptr, mask).unwrap();
+        let next_out_idx = builder
+            .build_int_add(out_idx, i64_type.const_int(1, false), "next_out_idx")
+            .unwrap();
+        builder.build_store(out_idx_ptr, next_out_idx).unwrap();
+        builder.build_unconditional_branch(loop_cond).unwrap();
 
-    module.clear_context(&mut ctx);
-    module.finalize_definitions().unwrap();
-
-    let code = module.get_finalized_function(count_eq_id);
-
-    let runnable_fn =
-        unsafe { mem::transmute::<_, fn(*const i64, u64, i64, *mut u32) -> u64>(code) };
-
-    let func = Box::new(move |arr: &dyn Array, c: &dyn Datum| {
-        let arr = arr.as_primitive::<Int64Type>();
-        let c = {
-            let (c, is_scalar) = c.get();
-            assert!(is_scalar);
-            c.as_primitive::<Int64Type>().value(0)
+        builder.position_at_end(loop_cond);
+        let has_next = if !lhs_scalar {
+            self.has_next_iter(&builder, lhs_iter_ptr, lhs_dt)
+        } else {
+            self.has_next_iter_scalar(&builder, lhs_iter_ptr)
         };
-        let mut bitmap_buf = vec![0_u32; arr.len().div_ceil(32)];
-        runnable_fn(
-            arr.values().as_ptr(),
-            arr.len() as u64,
-            c,
-            bitmap_buf.as_mut_ptr(),
-        );
-        let b = BooleanBuffer::new(Buffer::from_vec(bitmap_buf), 0, arr.len());
-        BooleanArray::new(b, None)
-    });
 
-    CompiledEqConst {
-        dt: arrow_schema::DataType::Int64,
-        _module: module,
-        func,
+        builder
+            .build_conditional_branch(has_next, loop_body, end)
+            .unwrap();
+
+        builder.position_at_end(end);
+        builder.build_return(None).unwrap();
+
+        //self.module.print_to_stderr();
+        self.module
+            .verify()
+            .map_err(|e| ArrowError::ComputeError(format!("Error compiling kernel: {}", e)))?;
+        let ee = self
+            .module
+            .create_jit_execution_engine(OptimizationLevel::Aggressive)
+            .unwrap();
+        ee.add_global_mapping(&self.dbg, printd as usize);
+        ee.add_global_mapping(&self.dbg64, printd64 as usize);
+        ee.add_global_mapping(&self.dbgv64, printv64 as usize);
+
+        /*Target::initialize_native(&inkwell::targets::InitializationConfig::default()).unwrap();
+        let triple = TargetMachine::get_default_triple();
+        let cpu = TargetMachine::get_host_cpu_name().to_string();
+        let features = TargetMachine::get_host_cpu_features().to_string();
+        let target = Target::from_triple(&triple).unwrap();
+        let machine = target
+            .create_target_machine(
+                &triple,
+                &cpu,
+                &features,
+                OptimizationLevel::None,
+                RelocMode::Default,
+                CodeModel::Default,
+            )
+            .unwrap();
+
+        machine
+            .write_to_file(&self.module, FileType::Assembly, "out.asm".as_ref())
+            .unwrap();*/
+
+        Ok(CompiledBinaryFunc {
+            _cg: self,
+            lhs_dt: lhs_dt.clone(),
+            lhs_scalar,
+            rhs_dt: rhs_dt.clone(),
+            rhs_scalar,
+            f: unsafe { ee.get_function("eq_arr").ok().unwrap() },
+        })
+    }
+
+    pub fn cast_to_primitive(
+        self,
+        src_dt: &DataType,
+        tar_dt: &DataType,
+    ) -> Result<CompiledConvertFunc<'ctx>, ArrowError> {
+        let builder = self.context.create_builder();
+
+        let i64_type = self.context.i64_type();
+        let ptr_type = self.context.ptr_type(AddressSpace::default());
+
+        let fn_type = self.context.void_type().fn_type(
+            &[
+                ptr_type.into(), // src
+                i64_type.into(), // len
+                ptr_type.into(), // tar
+            ],
+            false,
+        );
+        let function = self.module.add_function("cast_to_prim", fn_type, None);
+
+        let arr1_ptr = function.get_nth_param(0).unwrap().into_pointer_value();
+        let len = function.get_nth_param(1).unwrap().into_int_value();
+        let out_ptr = function.get_nth_param(2).unwrap().into_pointer_value();
+
+        let next = self.gen_iter_for("source", src_dt);
+        let entry = self.context.append_basic_block(function, "entry");
+        let loop_cond = self.context.append_basic_block(function, "loop_cond");
+        let loop_body = self.context.append_basic_block(function, "loop_body");
+        let end = self.context.append_basic_block(function, "end");
+
+        let src_prim_type = PrimitiveType::for_arrow_type(src_dt);
+        let tar_prim_type = PrimitiveType::for_arrow_type(tar_dt);
+
+        builder.position_at_end(entry);
+        let out_idx_ptr = builder.build_alloca(i64_type, "out_idx_ptr").unwrap();
+        builder
+            .build_store(out_idx_ptr, i64_type.const_zero())
+            .unwrap();
+        let iter_ptr = self.initialize_iter(&builder, arr1_ptr, len, src_dt);
+        builder.build_unconditional_branch(loop_body).unwrap();
+
+        builder.position_at_end(loop_body);
+        let block = builder
+            .build_call(next, &[iter_ptr.into()], "block")
+            .unwrap()
+            .try_as_basic_value()
+            .unwrap_left()
+            .into_vector_value();
+        let block = self.gen_convert_vec(&builder, block, src_prim_type, tar_prim_type);
+        let out_idx = builder
+            .build_load(i64_type, out_idx_ptr, "out_idx")
+            .unwrap()
+            .into_int_value();
+        let out_pos = self.increment_pointer(&builder, out_ptr, tar_prim_type.width(), out_idx);
+        builder.build_store(out_pos, block).unwrap();
+
+        let inc_out_pos = builder
+            .build_int_add(out_idx, i64_type.const_int(64, false), "inc_out_pos")
+            .unwrap();
+        builder.build_store(out_idx_ptr, inc_out_pos).unwrap();
+        builder.build_unconditional_branch(loop_cond).unwrap();
+
+        builder.position_at_end(loop_cond);
+        let out_pos = builder
+            .build_load(i64_type, out_idx_ptr, "out_pos")
+            .unwrap()
+            .into_int_value();
+        let cmp = builder
+            .build_int_compare(IntPredicate::SGE, out_pos, len, "cmp")
+            .unwrap();
+        builder
+            .build_conditional_branch(cmp, end, loop_body)
+            .unwrap();
+
+        builder.position_at_end(end);
+        builder.build_return(None).unwrap();
+
+        self.module
+            .verify()
+            .map_err(|e| ArrowError::ComputeError(format!("Error compiling kernel: {}", e)))?;
+        let ee = self
+            .module
+            .create_jit_execution_engine(OptimizationLevel::Aggressive)
+            .unwrap();
+        ee.add_global_mapping(&self.dbg, printd as usize);
+        ee.add_global_mapping(&self.dbg64, printd64 as usize);
+        ee.add_global_mapping(&self.dbgv64, printv64 as usize);
+
+        /*Target::initialize_native(&inkwell::targets::InitializationConfig::default()).unwrap();
+        let triple = TargetMachine::get_default_triple();
+        let cpu = TargetMachine::get_host_cpu_name().to_string();
+        let features = TargetMachine::get_host_cpu_features().to_string();
+        let target = Target::from_triple(&triple).unwrap();
+        let machine = target
+            .create_target_machine(
+                &triple,
+                &cpu,
+                &features,
+                OptimizationLevel::None,
+                RelocMode::Default,
+                CodeModel::Default,
+            )
+            .unwrap();
+
+        machine
+            .write_to_file(&self.module, FileType::Assembly, "out.asm".as_ref())
+            .unwrap();*/
+        Ok(CompiledConvertFunc {
+            _cg: self,
+            src_dt: src_dt.clone(),
+            tar_dt: tar_dt.clone(),
+            f: unsafe { ee.get_function("cast_to_prim").ok().unwrap() },
+        })
     }
 }
 
 #[cfg(test)]
-mod tests {
-    use arrow_array::Int64Array;
-    use arrow_ord::cmp;
+pub mod test_utils {
+    use arrow_array::{types::Int64Type, Int64Array, RunArray};
+    use itertools::Itertools;
 
-    use super::*;
-
-    #[test]
-    fn test_eq_const() {
-        let f = compile_eq_const();
-        let data = Int64Array::from(vec![1, 2, 3, 3, 4, 5, 3]);
-        let r = f.execute(&data, &Int64Array::new_scalar(3));
-        assert_eq!(r.true_count(), 3);
-
-        let arrow_result = cmp::eq(&data, &Int64Array::new_scalar(3)).unwrap();
-        assert_eq!(arrow_result, r);
-
-        let data: Vec<i64> = (0..200).collect();
-        let data = Int64Array::from(data);
-        let r = f.execute(&data, &Int64Array::new_scalar(199));
-        assert_eq!(r.true_count(), 1);
-
-        let arrow_result = cmp::eq(&data, &Int64Array::new_scalar(199)).unwrap();
-        assert_eq!(arrow_result, r);
+    pub fn generate_random_ree_array(num_run_ends: usize) -> RunArray<Int64Type> {
+        let mut rng = fastrand::Rng::with_seed(42 + num_run_ends as u64);
+        let ree_array_run_ends = (0..num_run_ends)
+            .map(|_| rng.i64(1..40))
+            .scan(0, |acc, x| {
+                *acc = *acc + x;
+                Some(*acc)
+            })
+            .collect_vec();
+        let ree_array_values = (0..num_run_ends).map(|_| rng.i64(-5..5)).collect_vec();
+        RunArray::try_new(
+            &Int64Array::from(ree_array_run_ends),
+            &Int64Array::from(ree_array_values),
+        )
+        .unwrap()
     }
 }

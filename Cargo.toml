@@ -2,25 +2,41 @@
 name = "arrow-compile-compute"
 version = "0.1.0"
 edition = "2021"
+license = "GPL-3.0"
 
 [dependencies]
-cranelift = "0.114.0"
-cranelift-jit = "0.114.0"
-cranelift-native = "0.114.0"
-cranelift-module = "0.114.0"
-
-inkwell = { version = "0.5.0", features = ["llvm18-0-force-dynamic"] }
+inkwell = { version = "0.5.0", features = ["llvm18-0-prefer-dynamic"] }
 
 arrow-schema = "53.3"
 arrow-buffer = "53.3"
+arrow-data = "53.3"
 arrow-array = "53.3"
+ouroboros = "0.18"
 
 [dev-dependencies]
+half = "2.4.1"
 arrow-ord = "53.3"
+arrow-cast = "53.3"
+arrow-select = "53.3"
 criterion = "0.5"
 fastrand = "2.2.0"
 itertools = "0.13.0"
+proptest = "1.5"
+rayon = "1.10"
 
 [[bench]]
 name = "eq_const_bench"
+harness = false
+
+
+[[bench]]
+name = "cast_bench"
+harness = false
+
+[[bench]]
+name = "parallel_bench"
+harness = false
+
+[[bench]]
+name = "filter_bench"
 harness = false
