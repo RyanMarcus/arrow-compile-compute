@@ -394,8 +394,6 @@ fn arr_to_ptr(arr: &dyn Array) -> (Option<Box<PtrHolder>>, *const c_void) {
                 _ => unreachable!("invalid run end type (i16, i32, i64 are supported)"),
             };
 
-            println!("start at: {} remaining: {}", start_at, remaining);
-
             let arr_data = arr.to_data();
             let children = arr_data.child_data();
             let re_ptr = children[0].buffer::<u8>(0).as_ptr() as *const c_void;

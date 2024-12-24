@@ -8,12 +8,7 @@ use proptest::collection::vec;
 use proptest::strategy::Strategy;
 
 fn vecs_of_equal_length() -> impl Strategy<Value = (Vec<i32>, Vec<i32>)> {
-    (1usize..1000).prop_flat_map(|len| {
-        (
-            vec(any::<i32>(), len.clone()),
-            vec(any::<i32>(), len.clone()),
-        )
-    })
+    (1usize..1000).prop_flat_map(|len| (vec(any::<i32>(), len), vec(any::<i32>(), len)))
 }
 
 fn u32_vecs_of_equal_length() -> impl Strategy<Value = (Vec<u32>, Vec<u32>)> {
