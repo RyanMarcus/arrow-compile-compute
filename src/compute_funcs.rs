@@ -239,7 +239,7 @@ impl<'a> CodeGen<'a> {
         let i64_type = self.context.i64_type();
         let ptr_type = self.context.ptr_type(AddressSpace::default());
         let prim_type = PrimitiveType::for_arrow_type(dt);
-        let prim_block_type = prim_type.llvm_vec_type(&self.context, 64);
+        let prim_block_type = prim_type.llvm_vec_type(self.context, 64);
         let bool_block_type = self.context.bool_type().vec_type(64);
 
         let cstore = Intrinsic::find("llvm.masked.compressstore").unwrap();
