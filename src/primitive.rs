@@ -534,6 +534,28 @@ mod tests {
     }
 
     #[test]
+    fn test_prim_sliced_i32() {
+        let mut rng = fastrand::Rng::with_seed(42);
+        let ctx = Context::create();
+        let cg = CodeGen::new(&ctx);
+        let f = cg
+            .primitive_primitive_cmp(
+                &DataType::Int32,
+                false,
+                &DataType::Int32,
+                true,
+                Predicate::Eq,
+            )
+            .unwrap();
+
+        let arr1 = Int32Array::from((0..1000).map(|_| rng.i32(-10..10)).collect_vec());
+        let sliced = arr1.slice(10, 50);
+        let res = f.call(&sliced, &Int32Array::from(vec![0])).unwrap();
+        let arrow_res = cmp::eq(&sliced, &Int32Array::new_scalar(0)).unwrap();
+        assert_eq!(res, arrow_res);
+    }
+
+    #[test]
     fn test_cast_prim_i32_to_prim_i64() {
         // Create a context
         let ctx = Context::create();

@@ -360,4 +360,23 @@ mod tests {
         }
         assert_eq!(result.len(), int32_array.len());
     }
+
+    #[test]
+    fn test_dict_sliced_i32() {
+        let mut rng = fastrand::Rng::with_seed(42);
+        let ctx = Context::create();
+        let cg = CodeGen::new(&ctx);
+        let dict_dt = dictionary_data_type(DataType::Int8, DataType::Int32);
+        let f = cg
+            .primitive_primitive_cmp(&dict_dt, false, &DataType::Int32, true, Predicate::Eq)
+            .unwrap();
+
+        let arr1 = Int32Array::from((0..1000).map(|_| rng.i32(-5..5)).collect_vec());
+        let arr1 = arrow_cast::cast(&arr1, &dict_dt).unwrap();
+
+        let sliced = arr1.slice(10, 50);
+        let res = f.call(&sliced, &Int32Array::from(vec![0])).unwrap();
+        let arrow_res = cmp::eq(&sliced, &Int32Array::new_scalar(0)).unwrap();
+        assert_eq!(res, arrow_res);
+    }
 }

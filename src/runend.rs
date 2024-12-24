@@ -15,11 +15,11 @@ impl<'ctx> CodeGen<'ctx> {
         let i64_type = self.context.i64_type();
         self.context.struct_type(
             &[
-                ptr_type.into(),
-                ptr_type.into(),
+                ptr_type.into(), // run ends
+                ptr_type.into(), // values
                 i64_type.into(), // curr pos
-                i64_type.into(), // remaining
-                i64_type.into(), // physical len
+                i64_type.into(), // remaining in run
+                i64_type.into(), // remaining overall
             ],
             false,
         )
@@ -29,7 +29,7 @@ impl<'ctx> CodeGen<'ctx> {
         &'a self,
         builder: &'a Builder<'a>,
         ptr: PointerValue<'a>,
-        _logical_len: IntValue,
+        logical_len: IntValue,
     ) -> PointerValue<'a>
     where
         'ctx: 'a,
@@ -51,6 +51,27 @@ impl<'ctx> CodeGen<'ctx> {
                 "run_end_ptr",
             )
             .unwrap();
+        let _phys_len = builder
+            .build_load(
+                i64_type,
+                self.increment_pointer(builder, ptr, 8, i64_type.const_int(2, false)),
+                "phys_len",
+            )
+            .unwrap();
+        let start_at = builder
+            .build_load(
+                ptr_type,
+                self.increment_pointer(builder, ptr, 8, i64_type.const_int(3, false)),
+                "offset",
+            )
+            .unwrap();
+        let remaining = builder
+            .build_load(
+                ptr_type,
+                self.increment_pointer(builder, ptr, 8, i64_type.const_int(4, false)),
+                "offset",
+            )
+            .unwrap();
 
         let to_return = builder.build_alloca(iter_type, "iter_ptr").unwrap();
         let struct_re_ptr_ptr = builder
@@ -66,28 +87,17 @@ impl<'ctx> CodeGen<'ctx> {
         let curr_pos_ptr = builder
             .build_struct_gep(iter_type, to_return, 2, "curr_pos_ptr")
             .unwrap();
-        builder
-            .build_store(curr_pos_ptr, i64_type.const_zero())
-            .unwrap();
+        builder.build_store(curr_pos_ptr, start_at).unwrap();
 
         let remaining_ptr = builder
             .build_struct_gep(iter_type, to_return, 3, "remaining_ptr")
             .unwrap();
-        builder
-            .build_store(remaining_ptr, i64_type.const_zero())
-            .unwrap();
+        builder.build_store(remaining_ptr, remaining).unwrap();
 
         let len_ptr = builder
             .build_struct_gep(iter_type, to_return, 4, "len_ptr")
             .unwrap();
-        let phys_len = builder
-            .build_load(
-                i64_type,
-                self.increment_pointer(builder, ptr, 8, i64_type.const_int(2, false)),
-                "phys_len",
-            )
-            .unwrap();
-        builder.build_store(len_ptr, phys_len).unwrap();
+        builder.build_store(len_ptr, logical_len).unwrap();
 
         to_return
     }
@@ -102,42 +112,22 @@ impl<'ctx> CodeGen<'ctx> {
     {
         let i64_type = self.context.i64_type();
         let iter_type = self.struct_for_iter_re();
-        let curr_pos_ptr = builder
-            .build_struct_gep(iter_type, iter, 2, "curr_pos_ptr")
-            .unwrap();
-        let curr_pos = builder
-            .build_load(i64_type, curr_pos_ptr, "curr_pos")
-            .unwrap()
-            .into_int_value();
-        let len_ptr = builder
+        let overall_remaining_ptr = builder
             .build_struct_gep(iter_type, iter, 4, "len_ptr")
             .unwrap();
-        let len = builder
-            .build_load(i64_type, len_ptr, "len")
-            .unwrap()
-            .into_int_value();
-        let remaining_ptr = builder
-            .build_struct_gep(iter_type, iter, 3, "remaining_ptr")
-            .unwrap();
-        let remainaing = builder
-            .build_load(i64_type, remaining_ptr, "remaining")
+        let overall_remaining = builder
+            .build_load(i64_type, overall_remaining_ptr, "overall_remaining")
             .unwrap()
             .into_int_value();
 
-        let before_end = builder
-            .build_int_compare(IntPredicate::ULT, curr_pos, len, "before_end")
-            .unwrap();
-
-        let some_remaining = builder
+        builder
             .build_int_compare(
-                inkwell::IntPredicate::NE,
-                remainaing,
+                IntPredicate::UGT,
+                overall_remaining,
                 i64_type.const_zero(),
-                "none_remaining",
+                "is_overall_remaining_positive",
             )
-            .unwrap();
-
-        builder.build_or(before_end, some_remaining, "cmp").unwrap()
+            .unwrap()
     }
 
     pub(crate) fn gen_re_primitive(
@@ -217,16 +207,10 @@ impl<'ctx> CodeGen<'ctx> {
         let remaining_ptr = builder
             .build_struct_gep(iter_type, ptr, 3, "remaining_ptr")
             .unwrap();
-        let len = builder
-            .build_load(
-                i64_type,
-                builder
-                    .build_struct_gep(iter_type, ptr, 4, "len_ptr")
-                    .unwrap(),
-                "len",
-            )
-            .unwrap()
-            .into_int_value();
+        let overall_remaining_ptr = builder
+            .build_struct_gep(iter_type, ptr, 4, "len_ptr")
+            .unwrap();
+
         let to_return = builder.build_alloca(chunk_type, "chunk").unwrap();
         builder
             .build_store(to_return, chunk_type.const_zero())
@@ -323,12 +307,17 @@ impl<'ctx> CodeGen<'ctx> {
         // Check next run: see if there is another run to load, if not, exit.
         //
         builder.position_at_end(check_has_another_run);
-        let curr_pos = builder
-            .build_load(i64_type, curr_pos_ptr, "curr_pos")
+        let overall_remaining = builder
+            .build_load(i64_type, overall_remaining_ptr, "overall_reamining")
             .unwrap()
             .into_int_value();
         let cmp = builder
-            .build_int_compare(IntPredicate::UGE, curr_pos, len, "cmp")
+            .build_int_compare(
+                IntPredicate::EQ,
+                overall_remaining,
+                i64_type.const_zero(),
+                "cmp",
+            )
             .unwrap();
         builder
             .build_conditional_branch(cmp, exit, load_new_run)
@@ -356,12 +345,14 @@ impl<'ctx> CodeGen<'ctx> {
             .build_load(run_end_type, prev_run_end_ptr, "prev_run_end")
             .unwrap()
             .into_int_value();
+
         let new_remaining = builder
             .build_int_sub(new_run_end, prev_run_end, "new_remaining")
             .unwrap();
         let casted_new_remaining = builder
-            .build_int_s_extend(new_remaining, i64_type, "sext")
+            .build_int_z_extend(new_remaining, i64_type, "zext")
             .unwrap();
+
         builder
             .build_store(remaining_ptr, casted_new_remaining)
             .unwrap();
@@ -501,6 +492,27 @@ impl<'ctx> CodeGen<'ctx> {
             .build_int_sub(remaining_in_run, to_fill, "new_remaining")
             .unwrap();
         builder.build_store(remaining_ptr, new_remaining).unwrap();
+
+        let remaining_overall = builder
+            .build_load(i64_type, overall_remaining_ptr, "remaining_overall")
+            .unwrap()
+            .into_int_value();
+        let filled = builder
+            .build_call(
+                umin_f,
+                &[remaining_overall.into(), to_fill.into()],
+                "filled",
+            )
+            .unwrap()
+            .try_as_basic_value()
+            .unwrap_left()
+            .into_int_value();
+        let new_remaining_overall = builder
+            .build_int_sub(remaining_overall, filled, "new_remaining_overall")
+            .unwrap();
+        builder
+            .build_store(overall_remaining_ptr, new_remaining_overall)
+            .unwrap();
 
         builder
             .build_unconditional_branch(check_chunk_full)
@@ -715,5 +727,32 @@ mod tests {
                 .clone();
             assert_eq!(result, our_result);
         }
+    }
+
+    #[test]
+    fn test_ree_sliced_i32() {
+        let ctx = Context::create();
+        let cg = CodeGen::new(&ctx);
+        let run_ends = Int32Array::from(vec![10, 20, 30]);
+        let values = Int32Array::from(vec![1, 2, 3]);
+        let ree_array = RunArray::try_new(&run_ends, &values).unwrap();
+
+        let f = cg
+            .primitive_primitive_cmp(
+                &ree_array.data_type(),
+                false,
+                &DataType::Int32,
+                true,
+                Predicate::Eq,
+            )
+            .unwrap();
+
+        let sliced = ree_array.slice(15, 10);
+        let res = f.call(&sliced, &Int32Array::from(vec![0])).unwrap();
+
+        let typed = sliced.downcast::<Int32Array>().unwrap();
+        let arr_array = Int32Array::from_iter(typed);
+        let arrow_res = cmp::eq(&arr_array, &Int32Array::new_scalar(0)).unwrap();
+        assert_eq!(res, arrow_res);
     }
 }

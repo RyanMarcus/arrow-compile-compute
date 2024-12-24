@@ -21,7 +21,7 @@ use arrow_array::{
         Date32Type, Date64Type, Float16Type, Float32Type, Float64Type, Int16Type, Int32Type,
         Int64Type, Int8Type, UInt16Type, UInt32Type, UInt64Type, UInt8Type,
     },
-    Array, ArrayRef, BooleanArray, PrimitiveArray,
+    Array, ArrayRef, BooleanArray, PrimitiveArray, RunArray,
 };
 use arrow_buffer::{BooleanBuffer, Buffer, NullBuffer, ScalarBuffer};
 use arrow_schema::{ArrowError, DataType, Field};
@@ -291,6 +291,8 @@ struct PtrHolder {
     arr1: *const c_void,
     arr2: *const c_void,
     phys_len: u64,
+    start_at: u64,
+    remaining: u64,
 }
 
 /// Turns the given array into a pointer and some optional data. The pointer is
@@ -357,13 +359,43 @@ fn arr_to_ptr(arr: &dyn Array) -> (Option<Box<PtrHolder>>, *const c_void) {
                 arr1: key_ptr,
                 arr2: val_ptr,
                 phys_len: arr.len() as u64,
+                start_at: 0,
+                remaining: 0,
             });
 
             let ptr = &*holder as *const PtrHolder;
             let ptr = ptr as *const c_void;
             (Some(holder), ptr)
         }
-        DataType::RunEndEncoded(_, _) => {
+        DataType::RunEndEncoded(run_type, _va_type) => {
+            let run_type = run_type.data_type();
+            let (start_at, remaining) = match run_type {
+                DataType::Int16 => {
+                    let ra = arr.as_any().downcast_ref::<RunArray<Int16Type>>().unwrap();
+                    let start_at = ra.get_start_physical_index();
+                    let starting_run_end = ra.run_ends().inner().get(start_at).unwrap();
+                    let remaining = *starting_run_end as usize - arr.offset();
+                    (start_at, remaining)
+                }
+                DataType::Int32 => {
+                    let ra = arr.as_any().downcast_ref::<RunArray<Int32Type>>().unwrap();
+                    let start_at = ra.get_start_physical_index();
+                    let starting_run_end = ra.run_ends().inner().get(start_at).unwrap();
+                    let remaining = *starting_run_end as usize - arr.offset();
+                    (start_at, remaining)
+                }
+                DataType::Int64 => {
+                    let ra = arr.as_any().downcast_ref::<RunArray<Int64Type>>().unwrap();
+                    let start_at = ra.get_start_physical_index();
+                    let starting_run_end = ra.run_ends().inner().get(start_at).unwrap();
+                    let remaining = *starting_run_end as usize - arr.offset();
+                    (start_at, remaining)
+                }
+                _ => unreachable!("invalid run end type (i16, i32, i64 are supported)"),
+            };
+
+            println!("start at: {} remaining: {}", start_at, remaining);
+
             let arr_data = arr.to_data();
             let children = arr_data.child_data();
             let re_ptr = children[0].buffer::<u8>(0).as_ptr() as *const c_void;
@@ -376,6 +408,8 @@ fn arr_to_ptr(arr: &dyn Array) -> (Option<Box<PtrHolder>>, *const c_void) {
                 arr1: re_ptr,
                 arr2: va_ptr,
                 phys_len: children[0].len() as u64,
+                start_at: start_at as u64 + 1,
+                remaining: remaining as u64,
             });
             let ptr = (&*holder as *const PtrHolder) as *const c_void;
             (Some(holder), ptr)
