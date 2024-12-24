@@ -1,28 +1,6 @@
-use arrow_array::{
-    cast::AsArray, types::Int64Type, Array, BooleanArray, Int32Array, Int64Array, Int8Array,
-    RunArray,
-};
-use arrow_compile_compute::dictionary_data_type;
-use arrow_schema::DataType;
+use arrow_array::{Array, BooleanArray, Int32Array};
 use criterion::{criterion_group, criterion_main, Criterion};
 use itertools::Itertools;
-
-fn generate_random_ree_array(num_run_ends: usize) -> RunArray<Int64Type> {
-    let mut rng = fastrand::Rng::with_seed(42 + num_run_ends as u64);
-    let ree_array_run_ends = (0..num_run_ends)
-        .map(|_| rng.i64(1..40))
-        .scan(0, |acc, x| {
-            *acc = *acc + x;
-            Some(*acc)
-        })
-        .collect_vec();
-    let ree_array_values = (0..num_run_ends).map(|_| rng.i64(-5..5)).collect_vec();
-    RunArray::try_new(
-        &Int64Array::from(ree_array_run_ends),
-        &Int64Array::from(ree_array_values),
-    )
-    .unwrap()
-}
 
 pub fn criterion_benchmark(c: &mut Criterion) {
     let mut rng = fastrand::Rng::with_seed(42);

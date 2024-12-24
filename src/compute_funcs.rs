@@ -1,9 +1,5 @@
 use arrow_schema::{ArrowError, DataType};
-use inkwell::{
-    intrinsics::Intrinsic,
-    targets::{CodeModel, FileType, RelocMode, Target, TargetMachine},
-    AddressSpace, OptimizationLevel,
-};
+use inkwell::{intrinsics::Intrinsic, AddressSpace, OptimizationLevel};
 
 use crate::{
     printd, printd64, printv64, CodeGen, CompiledConvertFunc, CompiledFilterFunc, PrimitiveType,
@@ -379,6 +375,7 @@ impl<'a> CodeGen<'a> {
         ee.add_global_mapping(&self.dbg64, printd64 as usize);
         ee.add_global_mapping(&self.dbgv64, printv64 as usize);
 
+        /*
         Target::initialize_native(&inkwell::targets::InitializationConfig::default()).unwrap();
         let triple = TargetMachine::get_default_triple();
         let cpu = TargetMachine::get_host_cpu_name().to_string();
@@ -398,6 +395,7 @@ impl<'a> CodeGen<'a> {
         machine
             .write_to_file(&self.module, FileType::Assembly, "out.asm".as_ref())
             .unwrap();
+            */
         Ok(CompiledFilterFunc {
             _cg: self,
             src_dt: dt.clone(),
