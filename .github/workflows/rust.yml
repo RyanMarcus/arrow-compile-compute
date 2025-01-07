@@ -2,27 +2,26 @@ name: Rust
 
 on:
   push:
-    branches: [ "main" ]
+    branches: ["main"]
   pull_request:
-    branches: [ "main" ]
+    branches: ["main"]
 
 env:
   CARGO_TERM_COLOR: always
 
 jobs:
   build:
-
     runs-on: ubuntu-latest
 
     steps:
-    - uses: actions/checkout@v4
-    - name: Get LLVM install script
-      run: wget https://apt.llvm.org/llvm.sh
-    - name: Set permissions
-      run: chmod +x llvm.sh
-    - name: Install LLVM 18
-      run: sudo ./llvm.sh 18
-    - name: Build
-      run: cargo build --verbose
-    - name: Run tests
-      run: cargo test --verbose
+      - uses: actions/checkout@v4
+      - name: Get LLVM install script
+        run: wget https://apt.llvm.org/llvm.sh
+      - name: Set permissions
+        run: chmod +x llvm.sh
+      - name: Install LLVM 18
+        run: sudo ./llvm.sh 18 all
+      - name: Build
+        run: cargo build --verbose
+      - name: Run tests
+        run: cargo test --verbose
