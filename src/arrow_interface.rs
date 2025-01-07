@@ -3,7 +3,10 @@ use std::{
     sync::{LazyLock, RwLock},
 };
 
-use crate::{CompiledBinaryFunc, CompiledConvertFunc, CompiledFilterFunc, Predicate};
+use crate::{
+    aggregate::Aggregation, CompiledAggFunc, CompiledBinaryFunc, CompiledConvertFunc,
+    CompiledFilterFunc, Predicate,
+};
 use arrow_array::{Array, ArrayRef, BooleanArray, Datum};
 use arrow_schema::{ArrowError, DataType};
 use inkwell::context::Context;
@@ -45,6 +48,17 @@ pub struct SelfContainedFilterFunc {
 }
 unsafe impl Send for SelfContainedFilterFunc {}
 unsafe impl Sync for SelfContainedFilterFunc {}
+
+#[self_referencing]
+pub struct SelfContainedAggFunc {
+    ctx: Context,
+
+    #[borrows(ctx)]
+    #[not_covariant]
+    cf: CompiledAggFunc<'this>,
+}
+unsafe impl Send for SelfContainedAggFunc {}
+unsafe impl Sync for SelfContainedAggFunc {}
 
 fn build_prim_prim_cmp(
     dt1: &DataType,
@@ -101,13 +115,27 @@ fn build_filter(src: &DataType) -> Result<SelfContainedFilterFunc, ArrowError> {
     .try_build()
 }
 
+fn build_agg(src: &DataType, agg: Aggregation) -> Result<SelfContainedAggFunc, ArrowError> {
+    let ctx = Context::create();
+    SelfContainedAggFuncTryBuilder {
+        ctx,
+        cf_builder: |ctx| {
+            let cg = CodeGen::new(ctx);
+            cg.compile_ungrouped_aggregation(src, agg)
+        },
+    }
+    .try_build()
+}
+
 type CmpFuncSig = (DataType, bool, DataType, bool, Predicate);
 type CovFuncSig = (DataType, DataType);
+type AggFuncSig = (DataType, Aggregation);
 struct ProgramCache {
     cmp_cache: RwLock<HashMap<CmpFuncSig, SelfContainedBinaryFunc>>,
     cov_cache: RwLock<HashMap<CovFuncSig, SelfContainedConvertFunc>>,
     hash_cache: RwLock<HashMap<DataType, SelfContainedConvertFunc>>,
     flt_cache: RwLock<HashMap<DataType, SelfContainedFilterFunc>>,
+    agg_cache: RwLock<HashMap<AggFuncSig, SelfContainedAggFunc>>,
 }
 
 impl ProgramCache {
@@ -117,6 +145,7 @@ impl ProgramCache {
             cov_cache: RwLock::default(),
             hash_cache: RwLock::default(),
             flt_cache: RwLock::default(),
+            agg_cache: RwLock::default(),
         }
     }
 
@@ -213,6 +242,26 @@ impl ProgramCache {
         let new_f = build_filter(arr1.data_type())?;
         let result = new_f.with_cf(|cf| cf.call(arr1, bool));
         self.flt_cache.write().unwrap().insert(sig, new_f);
+        result
+    }
+
+    fn agg(&self, arr1: &dyn Array, agg: Aggregation) -> Result<Option<ArrayRef>, ArrowError> {
+        let sig = (arr1.data_type().clone(), agg);
+
+        {
+            let lcache = self.agg_cache.read().unwrap();
+            if let Some(f) = lcache.get(&sig) {
+                return f.with_cf(|cf| cf.call(arr1));
+            }
+        }
+
+        // small race here: it is possible that multiple different threads will
+        // see there is no function, then compile it, then store it. This is
+        // fine a price to pay for not holding the lock for all function
+        // compilation.
+        let new_f = build_agg(arr1.data_type(), agg)?;
+        let result = new_f.with_cf(|cf| cf.call(arr1));
+        self.agg_cache.write().unwrap().insert(sig, new_f);
         result
     }
 }
@@ -333,6 +382,8 @@ pub mod compute {
     use arrow_array::{cast::AsArray, Array, ArrayRef, BooleanArray, UInt64Array};
     use arrow_schema::ArrowError;
 
+    use crate::aggregate::Aggregation;
+
     use super::GLOBAL_PROGRAM_CACHE;
 
     pub fn hash(arr1: &dyn Array) -> Result<UInt64Array, ArrowError> {
@@ -342,11 +393,18 @@ pub mod compute {
     }
 
     pub fn filter(arr1: &dyn Array, filter: &BooleanArray) -> Result<ArrayRef, ArrowError> {
-        if let Some(darr) = arr1.as_any_dictionary_opt() {
-            let filtered = GLOBAL_PROGRAM_CACHE.filter(darr.values(), filter)?;
-            Ok(darr.with_values(filtered))
-        } else {
-            GLOBAL_PROGRAM_CACHE.filter(arr1, filter)
-        }
+        GLOBAL_PROGRAM_CACHE.filter(arr1, filter)
+    }
+
+    pub fn min(arr1: &dyn Array) -> Result<Option<ArrayRef>, ArrowError> {
+        GLOBAL_PROGRAM_CACHE.agg(arr1, Aggregation::Min)
+    }
+
+    pub fn max(arr1: &dyn Array) -> Result<Option<ArrayRef>, ArrowError> {
+        GLOBAL_PROGRAM_CACHE.agg(arr1, Aggregation::Max)
+    }
+
+    pub fn sum(arr1: &dyn Array) -> Result<Option<ArrayRef>, ArrowError> {
+        GLOBAL_PROGRAM_CACHE.agg(arr1, Aggregation::Sum)
     }
 }

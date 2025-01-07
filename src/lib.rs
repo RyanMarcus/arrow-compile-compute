@@ -25,16 +25,20 @@ use arrow_array::{
 };
 use arrow_buffer::{BooleanBuffer, Buffer, NullBuffer, ScalarBuffer};
 use arrow_schema::{ArrowError, DataType, Field};
+use half::f16;
 use inkwell::{
     builder::Builder,
     context::Context,
     execution_engine::JitFunction,
     module::Module,
+    passes::PassBuilderOptions,
+    targets::{CodeModel, RelocMode, Target, TargetMachine},
     types::{BasicTypeEnum, VectorType},
-    values::{FunctionValue, IntValue, PointerValue, VectorValue},
+    values::{BasicValue, BasicValueEnum, FunctionValue, IntValue, PointerValue, VectorValue},
     AddressSpace, IntPredicate, OptimizationLevel,
 };
 
+mod aggregate;
 mod arrow_interface;
 mod compute_funcs;
 mod dict;
@@ -253,6 +257,102 @@ impl PrimitiveType {
             lhs_prim
         } else {
             rhs_prim
+        }
+    }
+
+    fn zero<'a>(&self, ctx: &'a Context) -> BasicValueEnum<'a> {
+        self.llvm_type(ctx).const_zero()
+    }
+
+    fn max_value<'a>(&self, ctx: &'a Context) -> BasicValueEnum<'a> {
+        match self {
+            PrimitiveType::I8 => self
+                .llvm_type(&ctx)
+                .into_int_type()
+                .const_int(i8::MAX as u64, true)
+                .as_basic_value_enum(),
+            PrimitiveType::I16 => self
+                .llvm_type(&ctx)
+                .into_int_type()
+                .const_int(i16::MAX as u64, true)
+                .as_basic_value_enum(),
+            PrimitiveType::I32 => self
+                .llvm_type(&ctx)
+                .into_int_type()
+                .const_int(i32::MAX as u64, true)
+                .as_basic_value_enum(),
+            PrimitiveType::I64 => self
+                .llvm_type(&ctx)
+                .into_int_type()
+                .const_int(i8::MAX as u64, true)
+                .as_basic_value_enum(),
+            PrimitiveType::U8 | PrimitiveType::U16 | PrimitiveType::U32 | PrimitiveType::U64 => {
+                self.llvm_type(&ctx)
+                    .into_int_type()
+                    .const_all_ones()
+                    .as_basic_value_enum()
+            }
+            PrimitiveType::F16 => self
+                .llvm_type(&ctx)
+                .into_float_type()
+                .const_float(f16::INFINITY.to_f64())
+                .as_basic_value_enum(),
+            PrimitiveType::F32 => self
+                .llvm_type(&ctx)
+                .into_float_type()
+                .const_float(f32::INFINITY as f64)
+                .as_basic_value_enum(),
+            PrimitiveType::F64 => self
+                .llvm_type(&ctx)
+                .into_float_type()
+                .const_float(f64::INFINITY)
+                .as_basic_value_enum(),
+        }
+    }
+
+    fn min_value<'a>(&self, ctx: &'a Context) -> BasicValueEnum<'a> {
+        match self {
+            PrimitiveType::I8 => self
+                .llvm_type(&ctx)
+                .into_int_type()
+                .const_int(i8::MIN as u64, true)
+                .as_basic_value_enum(),
+            PrimitiveType::I16 => self
+                .llvm_type(&ctx)
+                .into_int_type()
+                .const_int(i16::MIN as u64, true)
+                .as_basic_value_enum(),
+            PrimitiveType::I32 => self
+                .llvm_type(&ctx)
+                .into_int_type()
+                .const_int(i32::MIN as u64, true)
+                .as_basic_value_enum(),
+            PrimitiveType::I64 => self
+                .llvm_type(&ctx)
+                .into_int_type()
+                .const_int(i64::MIN as u64, true)
+                .as_basic_value_enum(),
+            PrimitiveType::U8 | PrimitiveType::U16 | PrimitiveType::U32 | PrimitiveType::U64 => {
+                self.llvm_type(&ctx)
+                    .into_int_type()
+                    .const_zero()
+                    .as_basic_value_enum()
+            }
+            PrimitiveType::F16 => self
+                .llvm_type(&ctx)
+                .into_float_type()
+                .const_float(f16::NEG_INFINITY.to_f64())
+                .as_basic_value_enum(),
+            PrimitiveType::F32 => self
+                .llvm_type(&ctx)
+                .into_float_type()
+                .const_float(f32::NEG_INFINITY as f64)
+                .as_basic_value_enum(),
+            PrimitiveType::F64 => self
+                .llvm_type(&ctx)
+                .into_float_type()
+                .const_float(f64::NEG_INFINITY)
+                .as_basic_value_enum(),
         }
     }
 }
@@ -592,7 +692,9 @@ impl CompiledFilterFunc<'_> {
         let true_count = ba.true_count();
         if arr1.is_empty() || true_count == 0 {
             let buf = Buffer::from_vec(Vec::<u128>::with_capacity(0));
-            return Ok(buffer_to_primitive(buf, arr1.nulls().cloned(), &self.src_dt).into());
+            return Ok(
+                buffer_to_primitive(buf, arr1.nulls().cloned(), &prim_type.as_arrow_type()).into(),
+            );
         }
 
         let (data, ptr) = arr_to_ptr(arr1);
@@ -620,6 +722,51 @@ impl CompiledFilterFunc<'_> {
     }
 }
 
+/// A compiled function that owns its own LLVM context. Maps an array to a
+/// single value.
+pub struct CompiledAggFunc<'ctx> {
+    _cg: CodeGen<'ctx>,
+    src_dt: DataType,
+    f: JitFunction<'ctx, unsafe extern "C" fn(*const c_void, u64, *mut c_void)>,
+}
+
+impl CompiledAggFunc<'_> {
+    /// Verify that `arr1` matchess the types this function was compiled for,
+    /// then execute the function and return the result.
+    pub fn call(&self, arr1: &dyn Array) -> Result<Option<ArrayRef>, ArrowError> {
+        if arr1.data_type() != &self.src_dt {
+            return Err(ArrowError::ComputeError(format!(
+                "arg 1 had wrong type (expected {:?}, found {:?})",
+                self.src_dt,
+                arr1.data_type()
+            )));
+        }
+
+        let prim_type = PrimitiveType::for_arrow_type(&self.src_dt);
+
+        // handle length 0 arrays
+        if arr1.is_empty() {
+            return Ok(None);
+        }
+
+        let (data, ptr) = arr_to_ptr(arr1);
+
+        let mut buf = vec![0_u8; prim_type.width()];
+
+        unsafe {
+            self.f
+                .call(ptr, arr1.len() as u64, buf.as_mut_ptr() as *mut c_void);
+        }
+
+        std::mem::drop(data);
+
+        let buf = Buffer::from_vec(buf);
+        let res = buffer_to_primitive(buf, None, &prim_type.as_arrow_type());
+
+        Ok(Some(res.into()))
+    }
+}
+
 /// Code generation routines. Used to generate `CompiledFunc`s.
 ///
 /// The `cmp` interface automatically caches compiled functions for reuse, but
@@ -627,9 +774,6 @@ impl CompiledFilterFunc<'_> {
 /// underlying kernel will be recompiled).
 pub struct CodeGen<'ctx> {
     context: &'ctx Context,
-    dbg: FunctionValue<'ctx>,
-    dbg64: FunctionValue<'ctx>,
-    dbgv64: FunctionValue<'ctx>,
     module: Module<'ctx>,
 }
 
@@ -643,73 +787,33 @@ impl<'ctx> CodeGen<'ctx> {
     /// ```
     pub fn new(ctx: &Context) -> CodeGen {
         let module = ctx.create_module("jit");
-        let ft = ctx
-            .void_type()
-            .fn_type(&[ctx.i64_type().into(), ctx.i32_type().into()], false);
-        let dbg = module.add_function("printd", ft, None);
-
-        let ft = ctx
-            .void_type()
-            .fn_type(&[ctx.i64_type().into(), ctx.i64_type().into()], false);
-        let dbg64 = module.add_function("printd64", ft, None);
-
-        let ft = ctx.void_type().fn_type(
-            &[
-                ctx.i64_type().into(),
-                ctx.ptr_type(AddressSpace::default()).into(),
-            ],
-            false,
-        );
-        let dbgv64 = module.add_function("printv64", ft, None);
         CodeGen {
             context: ctx,
             module,
-            dbg,
-            dbg64,
-            dbgv64,
         }
     }
 
-    #[allow(dead_code)]
-    fn debug_val<'a>(&'a self, builder: &'a Builder, label: u64, i: IntValue<'a>) {
-        builder
-            .build_call(
-                self.dbg,
-                &[
-                    self.context.i64_type().const_int(label, false).into(),
-                    i.into(),
-                ],
-                "debug",
+    fn optimize(&self) -> Result<(), ArrowError> {
+        Target::initialize_native(&inkwell::targets::InitializationConfig::default()).unwrap();
+        let triple = TargetMachine::get_default_triple();
+        let cpu = TargetMachine::get_host_cpu_name().to_string();
+        let features = TargetMachine::get_host_cpu_features().to_string();
+        let target = Target::from_triple(&triple).unwrap();
+        let machine = target
+            .create_target_machine(
+                &triple,
+                &cpu,
+                &features,
+                OptimizationLevel::Aggressive,
+                RelocMode::Default,
+                CodeModel::Default,
             )
             .unwrap();
-    }
 
-    #[allow(dead_code)]
-    fn debug_val64<'a>(&'a self, builder: &'a Builder, label: u64, i: IntValue<'a>) {
-        builder
-            .build_call(
-                self.dbg64,
-                &[
-                    self.context.i64_type().const_int(label, false).into(),
-                    i.into(),
-                ],
-                "debug",
-            )
-            .unwrap();
-    }
-
-    #[allow(dead_code)]
-    fn debug_vec64<'a>(&'a self, builder: &'a Builder, label: u64, i: PointerValue<'a>) {
-        builder
-            .build_call(
-                self.dbgv64,
-                &[
-                    self.context.i64_type().const_int(label, false).into(),
-                    i.into(),
-                ],
-                "debug",
-            )
-            .unwrap();
+        self.module
+            .run_passes("default<O3>", &machine, PassBuilderOptions::create())
+            .map_err(|e| ArrowError::ComputeError(format!("Error optimizing kernel: {}", e)))?;
+        Ok(())
     }
 
     fn increment_pointer<'a>(
@@ -743,11 +847,11 @@ impl<'ctx> CodeGen<'ctx> {
     where
         'ctx: 'a,
     {
-        let dst_llvm = dst.llvm_type(self.context);
-
         if src == dst {
             return v;
         }
+
+        let dst_llvm = dst.llvm_type(self.context);
 
         match (src.is_int(), dst.is_int()) {
             // int to int
@@ -1062,7 +1166,7 @@ impl<'ctx> CodeGen<'ctx> {
         builder.position_at_end(end);
         builder.build_return(None).unwrap();
 
-        //self.module.print_to_stderr();
+        self.optimize()?;
         self.module
             .verify()
             .map_err(|e| ArrowError::ComputeError(format!("Error compiling kernel: {}", e)))?;
@@ -1070,29 +1174,6 @@ impl<'ctx> CodeGen<'ctx> {
             .module
             .create_jit_execution_engine(OptimizationLevel::Aggressive)
             .unwrap();
-        ee.add_global_mapping(&self.dbg, printd as usize);
-        ee.add_global_mapping(&self.dbg64, printd64 as usize);
-        ee.add_global_mapping(&self.dbgv64, printv64 as usize);
-
-        /*Target::initialize_native(&inkwell::targets::InitializationConfig::default()).unwrap();
-        let triple = TargetMachine::get_default_triple();
-        let cpu = TargetMachine::get_host_cpu_name().to_string();
-        let features = TargetMachine::get_host_cpu_features().to_string();
-        let target = Target::from_triple(&triple).unwrap();
-        let machine = target
-            .create_target_machine(
-                &triple,
-                &cpu,
-                &features,
-                OptimizationLevel::None,
-                RelocMode::Default,
-                CodeModel::Default,
-            )
-            .unwrap();
-
-        machine
-            .write_to_file(&self.module, FileType::Assembly, "out.asm".as_ref())
-            .unwrap();*/
 
         Ok(CompiledBinaryFunc {
             _cg: self,
@@ -1181,6 +1262,7 @@ impl<'ctx> CodeGen<'ctx> {
         builder.position_at_end(end);
         builder.build_return(None).unwrap();
 
+        //self.optimize()?;
         self.module
             .verify()
             .map_err(|e| ArrowError::ComputeError(format!("Error compiling kernel: {}", e)))?;
@@ -1188,29 +1270,7 @@ impl<'ctx> CodeGen<'ctx> {
             .module
             .create_jit_execution_engine(OptimizationLevel::Aggressive)
             .unwrap();
-        ee.add_global_mapping(&self.dbg, printd as usize);
-        ee.add_global_mapping(&self.dbg64, printd64 as usize);
-        ee.add_global_mapping(&self.dbgv64, printv64 as usize);
 
-        /*Target::initialize_native(&inkwell::targets::InitializationConfig::default()).unwrap();
-        let triple = TargetMachine::get_default_triple();
-        let cpu = TargetMachine::get_host_cpu_name().to_string();
-        let features = TargetMachine::get_host_cpu_features().to_string();
-        let target = Target::from_triple(&triple).unwrap();
-        let machine = target
-            .create_target_machine(
-                &triple,
-                &cpu,
-                &features,
-                OptimizationLevel::None,
-                RelocMode::Default,
-                CodeModel::Default,
-            )
-            .unwrap();
-
-        machine
-            .write_to_file(&self.module, FileType::Assembly, "out.asm".as_ref())
-            .unwrap();*/
         Ok(CompiledConvertFunc {
             _cg: self,
             src_dt: src_dt.clone(),

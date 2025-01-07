@@ -215,7 +215,7 @@ impl<'ctx> CodeGen<'ctx> {
 #[cfg(test)]
 mod tests {
 
-    use arrow_array::{cast::AsArray, Int32Array, Int64Array};
+    use arrow_array::{cast::AsArray, BooleanArray, Int32Array, Int64Array};
     use arrow_ord::cmp;
     use arrow_schema::DataType;
     use inkwell::context::Context;
@@ -378,5 +378,27 @@ mod tests {
         let res = f.call(&sliced, &Int32Array::from(vec![0])).unwrap();
         let arrow_res = cmp::eq(&sliced, &Int32Array::new_scalar(0)).unwrap();
         assert_eq!(res, arrow_res);
+    }
+
+    #[test]
+    fn test_dict_filter_simple() {
+        let ctx = Context::create();
+        let cg = CodeGen::new(&ctx);
+        let dict_type = DataType::Dictionary(Box::new(DataType::Int8), Box::new(DataType::Int32));
+
+        let f = cg.compile_filter(&dict_type).unwrap();
+
+        let data = Int32Array::from(vec![1, 1, 1, 2, 2, 2, 3, 3, 3, 10]);
+        let data = arrow_cast::cast(&data, &dict_type).unwrap();
+
+        let ba = BooleanArray::from(vec![
+            true, false, false, true, false, true, false, false, false, true,
+        ]);
+
+        let true_result = Int32Array::from(vec![1, 2, 2, 10]);
+        let our_filtered: Int32Array = f.call(&data, &ba).unwrap().as_primitive().clone();
+
+        assert_eq!(our_filtered.len(), 4);
+        assert_eq!(true_result, our_filtered);
     }
 }

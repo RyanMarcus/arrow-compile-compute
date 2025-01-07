@@ -1,9 +1,7 @@
 use arrow_schema::{ArrowError, DataType};
 use inkwell::{intrinsics::Intrinsic, AddressSpace, OptimizationLevel};
 
-use crate::{
-    printd, printd64, printv64, CodeGen, CompiledConvertFunc, CompiledFilterFunc, PrimitiveType,
-};
+use crate::{CodeGen, CompiledConvertFunc, CompiledFilterFunc, PrimitiveType};
 
 const MURMUR_C1: u64 = 0xff51afd7ed558ccd;
 const MURMUR_C2: u64 = 0xc4ceb9fe1a85ec53;
@@ -187,6 +185,7 @@ impl<'a> CodeGen<'a> {
         builder.position_at_end(end);
         builder.build_return(None).unwrap();
 
+        self.optimize()?;
         self.module
             .verify()
             .map_err(|e| ArrowError::ComputeError(format!("Error compiling kernel: {}", e)))?;
@@ -194,29 +193,7 @@ impl<'a> CodeGen<'a> {
             .module
             .create_jit_execution_engine(OptimizationLevel::Aggressive)
             .unwrap();
-        ee.add_global_mapping(&self.dbg, printd as usize);
-        ee.add_global_mapping(&self.dbg64, printd64 as usize);
-        ee.add_global_mapping(&self.dbgv64, printv64 as usize);
 
-        /*Target::initialize_native(&inkwell::targets::InitializationConfig::default()).unwrap();
-        let triple = TargetMachine::get_default_triple();
-        let cpu = TargetMachine::get_host_cpu_name().to_string();
-        let features = TargetMachine::get_host_cpu_features().to_string();
-        let target = Target::from_triple(&triple).unwrap();
-        let machine = target
-            .create_target_machine(
-                &triple,
-                &cpu,
-                &features,
-                OptimizationLevel::None,
-                RelocMode::Default,
-                CodeModel::Default,
-            )
-            .unwrap();
-
-        machine
-            .write_to_file(&self.module, FileType::Assembly, "out.asm".as_ref())
-            .unwrap();*/
         Ok(CompiledConvertFunc {
             _cg: self,
             src_dt: dt.clone(),
@@ -364,6 +341,7 @@ impl<'a> CodeGen<'a> {
         builder.position_at_end(end);
         builder.build_return(None).unwrap();
 
+        self.optimize()?;
         self.module
             .verify()
             .map_err(|e| ArrowError::ComputeError(format!("Error compiling kernel: {}", e)))?;
@@ -371,31 +349,7 @@ impl<'a> CodeGen<'a> {
             .module
             .create_jit_execution_engine(OptimizationLevel::Aggressive)
             .unwrap();
-        ee.add_global_mapping(&self.dbg, printd as usize);
-        ee.add_global_mapping(&self.dbg64, printd64 as usize);
-        ee.add_global_mapping(&self.dbgv64, printv64 as usize);
 
-        /*
-        Target::initialize_native(&inkwell::targets::InitializationConfig::default()).unwrap();
-        let triple = TargetMachine::get_default_triple();
-        let cpu = TargetMachine::get_host_cpu_name().to_string();
-        let features = TargetMachine::get_host_cpu_features().to_string();
-        let target = Target::from_triple(&triple).unwrap();
-        let machine = target
-            .create_target_machine(
-                &triple,
-                &cpu,
-                &features,
-                OptimizationLevel::None,
-                RelocMode::Default,
-                CodeModel::Default,
-            )
-            .unwrap();
-
-        machine
-            .write_to_file(&self.module, FileType::Assembly, "out.asm".as_ref())
-            .unwrap();
-            */
         Ok(CompiledFilterFunc {
             _cg: self,
             src_dt: dt.clone(),
