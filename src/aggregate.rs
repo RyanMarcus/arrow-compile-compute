@@ -25,7 +25,7 @@ impl Aggregation {
         match self {
             Aggregation::Min => format!("{}min", prefix),
             Aggregation::Max => format!("{}max", prefix),
-            Aggregation::Sum => format!("{}add", prefix),
+            Aggregation::Sum => "add".into(),
         }
     }
 }
@@ -51,7 +51,10 @@ impl<'ctx> CodeGen<'ctx> {
             "llvm.vector.reduce.{}",
             agg.llvm_func_suffix(prim)
         ))
-        .unwrap();
+        .expect(&format!(
+            "unable to find intrinsic for suffix {}",
+            agg.llvm_func_suffix(prim)
+        ));
         let agg_f = agg_intrinsic
             .get_declaration(&self.module, &[prim_block_type.into()])
             .unwrap();
