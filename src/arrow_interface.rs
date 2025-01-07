@@ -245,7 +245,11 @@ impl ProgramCache {
         result
     }
 
-    fn agg(&self, arr1: &dyn Array, agg: Aggregation) -> Result<Option<ArrayRef>, ArrowError> {
+    fn agg(
+        &self,
+        arr1: &dyn Array,
+        agg: Aggregation,
+    ) -> Result<Option<Box<dyn Array>>, ArrowError> {
         let sig = (arr1.data_type().clone(), agg);
 
         {
@@ -396,15 +400,15 @@ pub mod compute {
         GLOBAL_PROGRAM_CACHE.filter(arr1, filter)
     }
 
-    pub fn min(arr1: &dyn Array) -> Result<Option<ArrayRef>, ArrowError> {
+    pub fn min(arr1: &dyn Array) -> Result<Option<Box<dyn Array>>, ArrowError> {
         GLOBAL_PROGRAM_CACHE.agg(arr1, Aggregation::Min)
     }
 
-    pub fn max(arr1: &dyn Array) -> Result<Option<ArrayRef>, ArrowError> {
+    pub fn max(arr1: &dyn Array) -> Result<Option<Box<dyn Array>>, ArrowError> {
         GLOBAL_PROGRAM_CACHE.agg(arr1, Aggregation::Max)
     }
 
-    pub fn sum(arr1: &dyn Array) -> Result<Option<ArrayRef>, ArrowError> {
+    pub fn sum(arr1: &dyn Array) -> Result<Option<Box<dyn Array>>, ArrowError> {
         GLOBAL_PROGRAM_CACHE.agg(arr1, Aggregation::Sum)
     }
 }

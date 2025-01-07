@@ -733,7 +733,7 @@ pub struct CompiledAggFunc<'ctx> {
 impl CompiledAggFunc<'_> {
     /// Verify that `arr1` matchess the types this function was compiled for,
     /// then execute the function and return the result.
-    pub fn call(&self, arr1: &dyn Array) -> Result<Option<ArrayRef>, ArrowError> {
+    pub fn call(&self, arr1: &dyn Array) -> Result<Option<Box<dyn Array>>, ArrowError> {
         if arr1.data_type() != &self.src_dt {
             return Err(ArrowError::ComputeError(format!(
                 "arg 1 had wrong type (expected {:?}, found {:?})",
