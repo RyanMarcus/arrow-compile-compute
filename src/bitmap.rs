@@ -101,54 +101,6 @@ impl<'ctx> CodeGen<'ctx> {
         ptr
     }
 
-    pub(crate) fn has_next_iter_bitmap<'a>(
-        &'a self,
-        builder: &'a Builder<'a>,
-        iter: PointerValue<'a>,
-    ) -> IntValue<'a>
-    where
-        'ctx: 'a,
-    {
-        let i64_type = self.context.i64_type();
-        let iter_type = self.struct_for_bitmap_iter();
-
-        let idx_ptr = builder
-            .build_struct_gep(iter_type, iter, 1, "idx_ptr")
-            .unwrap();
-        let idx = builder
-            .build_load(i64_type, idx_ptr, "idx")
-            .unwrap()
-            .into_int_value();
-
-        let chunk_ptr = builder
-            .build_struct_gep(iter_type, iter, 2, "chunk_ptr")
-            .unwrap();
-        let chunk = builder
-            .build_load(i64_type, chunk_ptr, "chunk")
-            .unwrap()
-            .into_int_value();
-
-        let len_ptr = builder
-            .build_struct_gep(iter_type, iter, 3, "len_ptr")
-            .unwrap();
-        let len_bits = builder
-            .build_load(i64_type, len_ptr, "len")
-            .unwrap()
-            .into_int_value();
-        let len_bytes = self.div_ceil(builder, len_bits, 8);
-
-        let before_end = builder
-            .build_int_compare(IntPredicate::ULT, idx, len_bytes, "at_end")
-            .unwrap();
-        let chunk_nonempty = builder
-            .build_int_compare(IntPredicate::NE, chunk, i64_type.const_zero(), "empty")
-            .unwrap();
-
-        builder
-            .build_or(before_end, chunk_nonempty, "has_next")
-            .unwrap()
-    }
-
     pub(crate) fn gen_iter_bitmap(&self, label: &str) -> FunctionValue {
         let i64_type = self.context.i64_type();
         let i1_type = self.context.bool_type();
@@ -168,9 +120,10 @@ impl<'ctx> CodeGen<'ctx> {
             )
             .unwrap();
 
-        let fn_type = i64_type.fn_type(
+        let fn_type = i1_type.fn_type(
             &[
                 ptr_type.into(), // iter struct
+                ptr_type.into(), // output value
             ],
             false,
         );
@@ -186,6 +139,8 @@ impl<'ctx> CodeGen<'ctx> {
             function,
             entry,          // start
             check_curr,     // check if there are values in the current chunk
+            has_next,       // check to see if there is any more data to read
+            none_left,      // no items left, return false
             use_curr_chunk, // return a value from the current chunk
             fetch_next,     // load another chunk, either a full chunk or a partial chunk
             fetch_full,     // fetch a full chunk
@@ -194,6 +149,7 @@ impl<'ctx> CodeGen<'ctx> {
 
         builder.position_at_end(entry);
         let iter_ptr = function.get_nth_param(0).unwrap().into_pointer_value();
+        let out_ptr = function.get_nth_param(1).unwrap().into_pointer_value();
         let data_ptr = builder
             .build_load(
                 ptr_type,
@@ -236,11 +192,10 @@ impl<'ctx> CodeGen<'ctx> {
             )
             .unwrap();
         builder
-            .build_conditional_branch(have_more, use_curr_chunk, fetch_next)
+            .build_conditional_branch(have_more, use_curr_chunk, has_next)
             .unwrap();
 
-        builder.position_at_end(fetch_next);
-        // check to see if there are at least 8 bytes left
+        builder.position_at_end(has_next);
         let curr_idx = builder
             .build_load(i64_type, curr_idx_ptr, "curr_idx")
             .unwrap()
@@ -248,6 +203,18 @@ impl<'ctx> CodeGen<'ctx> {
         let curr_bit_idx = builder
             .build_int_mul(curr_idx, i64_type.const_int(8, false), "curr_bit_idx")
             .unwrap();
+        let gte_len = builder
+            .build_int_compare(IntPredicate::UGE, curr_bit_idx, len, "gte_len")
+            .unwrap();
+        builder
+            .build_conditional_branch(gte_len, none_left, fetch_next)
+            .unwrap();
+
+        builder.position_at_end(none_left);
+        builder.build_return(Some(&i1_type.const_zero())).unwrap();
+
+        builder.position_at_end(fetch_next);
+        // check to see if there are at least 8 bytes left
         let remaining_bits = builder
             .build_int_sub(len, curr_bit_idx, "remaining")
             .unwrap();
@@ -365,7 +332,10 @@ impl<'ctx> CodeGen<'ctx> {
             .unwrap();
         let new_chunk = builder.build_xor(curr_chunk, tmp, "new_chunk").unwrap();
         builder.build_store(curr_chunk_ptr, new_chunk).unwrap();
-        builder.build_return(Some(&res)).unwrap();
+        builder.build_store(out_ptr, res).unwrap();
+        builder
+            .build_return(Some(&i1_type.const_int(1, false)))
+            .unwrap();
         function
     }
 
@@ -386,6 +356,7 @@ impl<'ctx> CodeGen<'ctx> {
         let len = function.get_nth_param(1).unwrap().into_int_value();
         let out_ptr = function.get_nth_param(2).unwrap().into_pointer_value();
         let iter = self.initialize_iter_bitmap(&builder, data_ptr, len);
+        let curr_val_ptr = builder.build_alloca(i64_type, "curr_val_ptr").unwrap();
         let curr_out_idx_ptr = builder.build_alloca(i64_type, "curr_out_idx_ptr").unwrap();
         builder
             .build_store(curr_out_idx_ptr, i64_type.const_zero())
@@ -393,17 +364,20 @@ impl<'ctx> CodeGen<'ctx> {
         builder.build_unconditional_branch(loop_cond).unwrap();
 
         builder.position_at_end(loop_cond);
-        let has_next = self.has_next_iter_bitmap(&builder, iter);
+        let has_next = builder
+            .build_call(next, &[iter.into(), curr_val_ptr.into()], "val_to_add")
+            .unwrap()
+            .try_as_basic_value()
+            .unwrap_left()
+            .into_int_value();
         builder
             .build_conditional_branch(has_next, loop_body, exit)
             .unwrap();
 
         builder.position_at_end(loop_body);
         let val_to_add = builder
-            .build_call(next, &[iter.into()], "val_to_add")
+            .build_load(i64_type, curr_val_ptr, "val_to_add")
             .unwrap()
-            .try_as_basic_value()
-            .unwrap_left()
             .into_int_value();
         let curr_out_idx = builder
             .build_load(i64_type, curr_out_idx_ptr, "curr_out_idx")
@@ -426,17 +400,16 @@ impl<'ctx> CodeGen<'ctx> {
         builder.build_return(Some(&curr_out_idx)).unwrap();
 
         self.module.verify().unwrap();
-        //self.optimize()?;
-        self.module.print_to_stderr();
+        self.optimize()?;
         let ee = self
             .module
-            .create_jit_execution_engine(OptimizationLevel::None)
+            .create_jit_execution_engine(OptimizationLevel::Aggressive)
             .unwrap();
 
-        ee.add_global_mapping(&self.debug_2x_u64, debug_2x_u64 as usize);
+        /*ee.add_global_mapping(&self.debug_2x_u64, debug_2x_u64 as usize);
         ee.add_global_mapping(&self.debug_u64b, debug_u64b as usize);
         ee.add_global_mapping(&self.debug_flag1, debug_flag1 as usize);
-        ee.add_global_mapping(&self.debug_flag2, debug_flag2 as usize);
+        ee.add_global_mapping(&self.debug_flag2, debug_flag2 as usize);*/
 
         Ok(CompiledConvertFunc {
             _cg: self,
@@ -462,6 +435,36 @@ mod tests {
 
         let mut rng = fastrand::Rng::with_seed(42);
         let values: Vec<bool> = (0..1000).map(|_| rng.bool()).collect_vec();
+        let array = BooleanArray::from(values.clone());
+
+        let cf = codegen.compile_bitmap_to_vec().unwrap();
+        let result: UInt64Array = cf.call(&array).unwrap().as_primitive().clone();
+
+        // Verify the results
+        let true_indexes = values
+            .iter()
+            .enumerate()
+            .filter_map(|(idx, val)| val.then(|| idx as u64))
+            .collect_vec();
+        let our_indexes = result.values().to_vec();
+        assert_eq!(true_indexes, our_indexes);
+    }
+
+    #[test]
+    fn test_bitmap_to_vec_empty_ends() {
+        let ctx = Context::create();
+        let codegen = CodeGen::new(&ctx);
+
+        let mut rng = fastrand::Rng::with_seed(42);
+        let values: Vec<bool> = (0..300)
+            .map(|idx| {
+                if idx < 100 || idx > 200 {
+                    false
+                } else {
+                    rng.bool()
+                }
+            })
+            .collect_vec();
         let array = BooleanArray::from(values.clone());
 
         let cf = codegen.compile_bitmap_to_vec().unwrap();

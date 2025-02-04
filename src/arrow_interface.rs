@@ -81,6 +81,17 @@ fn build_prim_prim_cmp(
 
 fn build_cast(src: &DataType, tar: &DataType) -> Result<SelfContainedConvertFunc, ArrowError> {
     let ctx = Context::create();
+    if matches!(src, DataType::Boolean) && matches!(tar, DataType::UInt64) {
+        return Ok(SelfContainedConvertFuncTryBuilder {
+            ctx,
+            cf_builder: |ctx| {
+                let cg = CodeGen::new(ctx);
+                cg.compile_bitmap_to_vec()
+            },
+        }
+        .try_build()?);
+    }
+
     SelfContainedConvertFuncTryBuilder {
         ctx,
         cf_builder: |ctx| {

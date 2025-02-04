@@ -50,3 +50,7 @@ harness = false
 [[bench]]
 name = "agg_bench"
 harness = false
+
+[[bench]]
+name = "bitmap_bench"
+harness = false

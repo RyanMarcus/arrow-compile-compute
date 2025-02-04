@@ -685,7 +685,6 @@ impl CompiledConvertFunc<'_> {
         }
 
         let (data1, ptr1) = arr_to_ptr(arr1);
-        println!("is some: {}, ptr: {:?}", data1.is_some(), ptr1);
         let mut buf = vec![
             0_u8;
             arr1.len().next_multiple_of(64)
@@ -697,7 +696,6 @@ impl CompiledConvertFunc<'_> {
         };
         std::mem::drop(data1);
 
-        println!("final len: {}", final_len);
         let buf = Buffer::from_vec(buf);
         let unsliced = buffer_to_primitive(buf, arr1.nulls().cloned(), &self.tar_dt);
         let sliced = unsliced.slice(0, final_len as usize);
@@ -901,7 +899,7 @@ impl<'ctx> CodeGen<'ctx> {
             .unwrap();
 
         self.module
-            .run_passes("default<O3>", &machine, PassBuilderOptions::create())
+            .run_passes("default<O1>", &machine, PassBuilderOptions::create())
             .map_err(|e| ArrowError::ComputeError(format!("Error optimizing kernel: {}", e)))?;
         Ok(())
     }
