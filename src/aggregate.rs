@@ -1,9 +1,10 @@
 use arrow_schema::{ArrowError, DataType};
+use enum_as_inner::EnumAsInner;
 use inkwell::{intrinsics::Intrinsic, AddressSpace, IntPredicate, OptimizationLevel};
 
 use crate::{CodeGen, CompiledAggFunc, PrimitiveType};
 
-#[derive(Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Clone, Copy, PartialEq, Eq, Hash, EnumAsInner)]
 pub enum Aggregation {
     Min,
     Max,
@@ -259,7 +260,7 @@ impl<'ctx> CodeGen<'ctx> {
         Ok(CompiledAggFunc {
             _cg: self,
             src_dt: dt.clone(),
-            f: unsafe { ee.get_function("agg").ok().unwrap() },
+            f: unsafe { ee.get_function("agg").unwrap() },
         })
     }
 }

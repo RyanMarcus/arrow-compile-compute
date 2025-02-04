@@ -1,7 +1,7 @@
 use arrow_array::{
     cast::AsArray,
     types::{Int32Type, Int64Type},
-    Int32Array, Int64Array,
+    Int32Array, Int64Array, StringArray,
 };
 use arrow_compile_compute::dictionary_data_type;
 use arrow_schema::DataType;
@@ -65,7 +65,35 @@ pub fn criterion_benchmark(c: &mut Criterion) {
             })
         });
     }
+
+    {
+        let data = (0..1_000_000)
+            .map(|_| {
+                let size = rng.usize(0..32);
+                String::from_utf8((0..size).map(|_| rng.u8(32..126)).collect_vec()).unwrap()
+            })
+            .collect_vec();
+        let data = StringArray::from(data);
+
+        let arr_res = str_min(&data);
+        let our_res = arrow_compile_compute::compute::min(&data)
+            .unwrap()
+            .unwrap()
+            .as_string::<i32>()
+            .clone();
+        assert_eq!(our_res, arr_res);
+
+        c.bench_function("min string/llvm", |b| {
+            b.iter(|| arrow_compile_compute::compute::min(&data).unwrap().unwrap())
+        });
+
+        c.bench_function("min string/manual", |b| b.iter(|| str_min(&data)));
+    }
 }
 
+fn str_min(arr: &StringArray) -> StringArray {
+    let min = arr.iter().map(|s| s.unwrap()).min().unwrap().to_string();
+    StringArray::from(vec![min])
+}
 criterion_group!(benches, criterion_benchmark);
 criterion_main!(benches);

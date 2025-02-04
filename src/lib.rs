@@ -21,7 +21,7 @@ use arrow_array::{
         Date32Type, Date64Type, Float16Type, Float32Type, Float64Type, Int16Type, Int32Type,
         Int64Type, Int8Type, UInt16Type, UInt32Type, UInt64Type, UInt8Type,
     },
-    Array, ArrayRef, BooleanArray, PrimitiveArray, RunArray,
+    Array, ArrayRef, BooleanArray, PrimitiveArray, RunArray, StringArray,
 };
 use arrow_buffer::{BooleanBuffer, Buffer, NullBuffer, ScalarBuffer};
 use arrow_schema::{ArrowError, DataType, Field};
@@ -40,15 +40,29 @@ use inkwell::{
 
 mod aggregate;
 mod arrow_interface;
+mod bitmap;
 mod compute_funcs;
 mod dict;
 mod primitive;
 mod runend;
 mod scalar;
+mod string;
 
 pub use arrow_interface::cast;
 pub use arrow_interface::cmp;
 pub use arrow_interface::compute;
+
+/// Declare a set of basic blocks at once
+macro_rules! declare_blocks {
+    ($ctx:expr, $func:expr, $name:ident) => {
+        let $name = $ctx.append_basic_block($func, stringify!($name));
+    };
+    ($ctx:expr, $func:expr, $name:ident, $($more:ident),+) => {
+        let $name = $ctx.append_basic_block($func, stringify!($name));
+        declare_blocks!($ctx, $func, $($more),+);
+    };
+}
+pub(crate) use declare_blocks;
 
 /// Utility function to create the appropiate `DataType` for a dictionary array
 pub fn dictionary_data_type(key_type: DataType, val_type: DataType) -> DataType {
@@ -512,6 +526,32 @@ fn arr_to_ptr(arr: &dyn Array) -> (Option<Box<PtrHolder>>, *const c_void) {
             let ptr = (&*holder as *const PtrHolder) as *const c_void;
             (Some(holder), ptr)
         }
+        DataType::Utf8 => {
+            let arr = arr.as_string::<i32>();
+            let holder = Box::new(PtrHolder {
+                arr1: arr.offsets().as_ptr() as *const c_void,
+                arr2: arr.value_data().as_ptr() as *const c_void,
+                phys_len: arr.len() as u64,
+                start_at: 0,
+                remaining: 0,
+            });
+
+            let ptr = (&*holder as *const PtrHolder) as *const c_void;
+            (Some(holder), ptr)
+        }
+        DataType::LargeUtf8 => {
+            let arr = arr.as_string::<i64>();
+            let holder = Box::new(PtrHolder {
+                arr1: arr.offsets().as_ptr() as *const c_void,
+                arr2: arr.value_data().as_ptr() as *const c_void,
+                phys_len: arr.len() as u64,
+                start_at: 0,
+                remaining: 0,
+            });
+
+            let ptr = (&*holder as *const PtrHolder) as *const c_void;
+            (Some(holder), ptr)
+        }
         _ => todo!(),
     }
 }
@@ -621,7 +661,7 @@ pub struct CompiledConvertFunc<'ctx> {
     _cg: CodeGen<'ctx>,
     src_dt: DataType,
     tar_dt: DataType,
-    f: JitFunction<'ctx, unsafe extern "C" fn(*const c_void, u64, *mut c_void)>,
+    f: JitFunction<'ctx, unsafe extern "C" fn(*const c_void, u64, *mut c_void) -> u64>,
 }
 
 impl CompiledConvertFunc<'_> {
@@ -645,21 +685,22 @@ impl CompiledConvertFunc<'_> {
         }
 
         let (data1, ptr1) = arr_to_ptr(arr1);
-
+        println!("is some: {}, ptr: {:?}", data1.is_some(), ptr1);
         let mut buf = vec![
             0_u8;
             arr1.len().next_multiple_of(64)
                 * PrimitiveType::for_arrow_type(&self.tar_dt).width()
         ];
-        unsafe {
+        let final_len = unsafe {
             self.f
-                .call(ptr1, arr1.len() as u64, buf.as_mut_ptr() as *mut c_void);
-        }
-
+                .call(ptr1, arr1.len() as u64, buf.as_mut_ptr() as *mut c_void)
+        };
         std::mem::drop(data1);
+
+        println!("final len: {}", final_len);
         let buf = Buffer::from_vec(buf);
         let unsliced = buffer_to_primitive(buf, arr1.nulls().cloned(), &self.tar_dt);
-        let sliced = unsliced.slice(0, arr1.len());
+        let sliced = unsliced.slice(0, final_len as usize);
         Ok(sliced)
     }
 }
@@ -731,7 +772,7 @@ pub struct CompiledAggFunc<'ctx> {
 }
 
 impl CompiledAggFunc<'_> {
-    /// Verify that `arr1` matchess the types this function was compiled for,
+    /// Verify that `arr1` matches the types this function was compiled for,
     /// then execute the function and return the result.
     pub fn call(&self, arr1: &dyn Array) -> Result<Option<Box<dyn Array>>, ArrowError> {
         if arr1.data_type() != &self.src_dt {
@@ -742,8 +783,6 @@ impl CompiledAggFunc<'_> {
             )));
         }
 
-        let prim_type = PrimitiveType::for_arrow_type(&self.src_dt);
-
         // handle length 0 arrays
         if arr1.is_empty() {
             return Ok(None);
@@ -751,8 +790,8 @@ impl CompiledAggFunc<'_> {
 
         let (data, ptr) = arr_to_ptr(arr1);
 
-        let mut buf = vec![0_u8; prim_type.width()];
-
+        let output_size = self.src_dt.primitive_width().unwrap_or(16);
+        let mut buf = vec![0_u8; output_size];
         unsafe {
             self.f
                 .call(ptr, arr1.len() as u64, buf.as_mut_ptr() as *mut c_void);
@@ -760,11 +799,43 @@ impl CompiledAggFunc<'_> {
 
         std::mem::drop(data);
 
-        let buf = Buffer::from_vec(buf);
-        let res = buffer_to_primitive(buf, None, &prim_type.as_arrow_type());
-
-        Ok(Some(res.into()))
+        if matches!(self.src_dt, DataType::Utf8 | DataType::LargeUtf8) {
+            let start_ptr = u64::from_le_bytes(buf[0..8].try_into().unwrap()) as *const u8;
+            let end_ptr = u64::from_le_bytes(buf[8..].try_into().unwrap()) as *const u8;
+            let buf = unsafe {
+                let len = end_ptr.offset_from(start_ptr);
+                assert!(len >= 0, "end_ptr was before start_ptr");
+                let len = len as usize;
+                let mut buf: Vec<u8> = vec![0; len];
+                std::ptr::copy_nonoverlapping(start_ptr, buf.as_mut_ptr(), len);
+                buf
+            };
+            let result_str =
+                String::from_utf8(buf).expect("Invalid UTF-8 sequence during conversion");
+            Ok(Some(Box::new(StringArray::from(vec![result_str]))))
+        } else {
+            let prim_type = PrimitiveType::for_arrow_type(&self.src_dt);
+            let buf = Buffer::from_vec(buf);
+            let res = buffer_to_primitive(buf, None, &prim_type.as_arrow_type());
+            Ok(Some(res.into()))
+        }
     }
+}
+
+fn debug_2x_u64(v1: u64, v2: u64) {
+    println!("v1: {} v2: {}", v1, v2);
+}
+
+fn debug_u64b(v1: u64) {
+    println!("v1: {:b}", v1);
+}
+
+fn debug_flag1() {
+    println!("flag 1");
+}
+
+fn debug_flag2() {
+    println!("flag 2");
 }
 
 /// Code generation routines. Used to generate `CompiledFunc`s.
@@ -775,6 +846,10 @@ impl CompiledAggFunc<'_> {
 pub struct CodeGen<'ctx> {
     context: &'ctx Context,
     module: Module<'ctx>,
+    debug_2x_u64: FunctionValue<'ctx>,
+    debug_u64b: FunctionValue<'ctx>,
+    debug_flag1: FunctionValue<'ctx>,
+    debug_flag2: FunctionValue<'ctx>,
 }
 
 impl<'ctx> CodeGen<'ctx> {
@@ -787,9 +862,24 @@ impl<'ctx> CodeGen<'ctx> {
     /// ```
     pub fn new(ctx: &Context) -> CodeGen {
         let module = ctx.create_module("jit");
+        let debug_2x_u64_t = ctx
+            .void_type()
+            .fn_type(&[ctx.i64_type().into(), ctx.i64_type().into()], false);
+        let debug_2x_u64 = module.add_function("debug_2x_u64", debug_2x_u64_t, None);
+
+        let debug_flag_t = ctx.void_type().fn_type(&[], false);
+        let debug_flag1 = module.add_function("debug_flag1", debug_flag_t, None);
+        let debug_flag2 = module.add_function("debug_flag2", debug_flag_t, None);
+
+        let debug_1x_u64_t = ctx.void_type().fn_type(&[ctx.i64_type().into()], false);
+        let debug_u64b = module.add_function("debug_u64b", debug_1x_u64_t, None);
         CodeGen {
             context: ctx,
             module,
+            debug_2x_u64,
+            debug_u64b,
+            debug_flag1,
+            debug_flag2,
         }
     }
 
@@ -835,6 +925,22 @@ impl<'ctx> CodeGen<'ctx> {
         let incr_int = builder.build_int_add(as_int, incr, "incr_ptr").unwrap();
         let ptr = builder.build_int_to_ptr(incr_int, ptr_type, "ptr").unwrap();
         ptr
+    }
+
+    fn pointer_diff<'a>(
+        &'a self,
+        builder: &'a Builder,
+        p1: PointerValue<'a>,
+        p2: PointerValue<'a>,
+    ) -> IntValue<'a>
+    where
+        'ctx: 'a,
+    {
+        let i64_type = self.context.i64_type();
+        let as_int1 = builder.build_ptr_to_int(p1, i64_type, "as_int1").unwrap();
+        let as_int2 = builder.build_ptr_to_int(p2, i64_type, "as_int2").unwrap();
+        let diff = builder.build_int_sub(as_int2, as_int1, "diff").unwrap();
+        diff
     }
 
     fn gen_convert_vec<'a>(
@@ -928,6 +1034,7 @@ impl<'ctx> CodeGen<'ctx> {
                 PrimitiveType::for_arrow_type(re_dt.data_type()),
                 PrimitiveType::for_arrow_type(v_dt.data_type()),
             ),
+            DataType::Boolean => self.gen_iter_bitmap(label),
             _ => todo!(),
         }
     }
@@ -1195,7 +1302,7 @@ impl<'ctx> CodeGen<'ctx> {
         let i64_type = self.context.i64_type();
         let ptr_type = self.context.ptr_type(AddressSpace::default());
 
-        let fn_type = self.context.void_type().fn_type(
+        let fn_type = self.context.i64_type().fn_type(
             &[
                 ptr_type.into(), // src
                 i64_type.into(), // len
@@ -1260,7 +1367,7 @@ impl<'ctx> CodeGen<'ctx> {
             .unwrap();
 
         builder.position_at_end(end);
-        builder.build_return(None).unwrap();
+        builder.build_return(Some(&len)).unwrap();
 
         //self.optimize()?;
         self.module

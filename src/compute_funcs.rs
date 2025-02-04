@@ -15,7 +15,7 @@ impl<'a> CodeGen<'a> {
         let ptr_type = self.context.ptr_type(AddressSpace::default());
         let prim_type = PrimitiveType::for_arrow_type(dt);
 
-        let fn_type = self.context.void_type().fn_type(
+        let fn_type = self.context.i64_type().fn_type(
             &[
                 ptr_type.into(), // src
                 i64_type.into(), // len
@@ -183,7 +183,7 @@ impl<'a> CodeGen<'a> {
             .unwrap();
 
         builder.position_at_end(end);
-        builder.build_return(None).unwrap();
+        builder.build_return(Some(&len)).unwrap();
 
         self.optimize()?;
         self.module

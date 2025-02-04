@@ -5,7 +5,7 @@ use std::{
 
 use crate::{
     aggregate::Aggregation, CompiledAggFunc, CompiledBinaryFunc, CompiledConvertFunc,
-    CompiledFilterFunc, Predicate,
+    CompiledFilterFunc, Predicate, PrimitiveType,
 };
 use arrow_array::{Array, ArrayRef, BooleanArray, Datum};
 use arrow_schema::{ArrowError, DataType};
@@ -121,7 +121,11 @@ fn build_agg(src: &DataType, agg: Aggregation) -> Result<SelfContainedAggFunc, A
         ctx,
         cf_builder: |ctx| {
             let cg = CodeGen::new(ctx);
-            cg.compile_ungrouped_aggregation(src, agg)
+            match src {
+                DataType::Utf8 => cg.string_minmax(PrimitiveType::I32, agg),
+                DataType::LargeUtf8 => cg.string_minmax(PrimitiveType::I64, agg),
+                _ => cg.compile_ungrouped_aggregation(src, agg),
+            }
         },
     }
     .try_build()
