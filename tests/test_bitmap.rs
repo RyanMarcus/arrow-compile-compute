@@ -1,4 +1,4 @@
-use arrow_array::{cast::AsArray, BooleanArray, Int32Array, UInt64Array};
+use arrow_array::{cast::AsArray, BooleanArray, UInt64Array};
 use arrow_schema::DataType;
 use proptest::proptest;
 

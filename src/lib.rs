@@ -820,22 +820,6 @@ impl CompiledAggFunc<'_> {
     }
 }
 
-fn debug_2x_u64(v1: u64, v2: u64) {
-    println!("v1: {} v2: {}", v1, v2);
-}
-
-fn debug_u64b(v1: u64) {
-    println!("v1: {:b}", v1);
-}
-
-fn debug_flag1() {
-    println!("flag 1");
-}
-
-fn debug_flag2() {
-    println!("flag 2");
-}
-
 /// Code generation routines. Used to generate `CompiledFunc`s.
 ///
 /// The `cmp` interface automatically caches compiled functions for reuse, but
@@ -844,10 +828,6 @@ fn debug_flag2() {
 pub struct CodeGen<'ctx> {
     context: &'ctx Context,
     module: Module<'ctx>,
-    debug_2x_u64: FunctionValue<'ctx>,
-    debug_u64b: FunctionValue<'ctx>,
-    debug_flag1: FunctionValue<'ctx>,
-    debug_flag2: FunctionValue<'ctx>,
 }
 
 impl<'ctx> CodeGen<'ctx> {
@@ -860,24 +840,9 @@ impl<'ctx> CodeGen<'ctx> {
     /// ```
     pub fn new(ctx: &Context) -> CodeGen {
         let module = ctx.create_module("jit");
-        let debug_2x_u64_t = ctx
-            .void_type()
-            .fn_type(&[ctx.i64_type().into(), ctx.i64_type().into()], false);
-        let debug_2x_u64 = module.add_function("debug_2x_u64", debug_2x_u64_t, None);
-
-        let debug_flag_t = ctx.void_type().fn_type(&[], false);
-        let debug_flag1 = module.add_function("debug_flag1", debug_flag_t, None);
-        let debug_flag2 = module.add_function("debug_flag2", debug_flag_t, None);
-
-        let debug_1x_u64_t = ctx.void_type().fn_type(&[ctx.i64_type().into()], false);
-        let debug_u64b = module.add_function("debug_u64b", debug_1x_u64_t, None);
         CodeGen {
             context: ctx,
             module,
-            debug_2x_u64,
-            debug_u64b,
-            debug_flag1,
-            debug_flag2,
         }
     }
 
@@ -899,7 +864,7 @@ impl<'ctx> CodeGen<'ctx> {
             .unwrap();
 
         self.module
-            .run_passes("default<O1>", &machine, PassBuilderOptions::create())
+            .run_passes("default<O3>", &machine, PassBuilderOptions::create())
             .map_err(|e| ArrowError::ComputeError(format!("Error optimizing kernel: {}", e)))?;
         Ok(())
     }

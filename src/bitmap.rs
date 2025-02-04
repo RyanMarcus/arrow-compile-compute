@@ -8,10 +8,7 @@ use inkwell::{
     AddressSpace, IntPredicate, OptimizationLevel,
 };
 
-use crate::{
-    debug_2x_u64, debug_flag1, debug_flag2, debug_u64b, declare_blocks, CodeGen,
-    CompiledConvertFunc,
-};
+use crate::{declare_blocks, CodeGen, CompiledConvertFunc};
 
 impl<'ctx> CodeGen<'ctx> {
     pub(crate) fn div_ceil<'a>(
@@ -244,34 +241,7 @@ impl<'ctx> CodeGen<'ctx> {
         builder.build_unconditional_branch(check_curr).unwrap();
 
         builder.position_at_end(fetch_partial);
-        // divide by 8, rounding up
-        let eight = i64_type.const_int(8, false);
-        let div = builder
-            .build_int_unsigned_div(remaining_bits, eight, "div")
-            .unwrap();
-        let remainder = builder
-            .build_int_unsigned_rem(remaining_bits, eight, "remainder")
-            .unwrap();
-        let has_remainder = builder
-            .build_int_compare(
-                IntPredicate::NE,
-                remainder,
-                i64_type.const_zero(),
-                "has_remainder",
-            )
-            .unwrap();
-        let remaining_bytes = builder
-            .build_select(
-                has_remainder,
-                builder
-                    .build_int_add(div, i64_type.const_int(1, false), "one")
-                    .unwrap(),
-                div,
-                "remaining_bytes",
-            )
-            .unwrap()
-            .into_int_value();
-
+        let remaining_bytes = self.div_ceil(&builder, remaining_bits, 8);
         builder
             .build_call(
                 memcpy_f,
