@@ -1,7 +1,7 @@
 use inkwell::{
     builder::Builder,
     module::Linkage,
-    types::StructType,
+    types::{BasicType, StructType},
     values::{FunctionValue, IntValue, PointerValue},
     AddressSpace, IntPredicate,
 };
@@ -234,6 +234,49 @@ impl<'ctx> CodeGen<'ctx> {
             .unwrap()
             .into_vector_value();
         builder.build_return(Some(&partial_chunk)).unwrap();
+
+        function
+    }
+
+    pub(crate) fn gen_random_access_primitive(
+        &self,
+        label: &str,
+        prim_type: PrimitiveType,
+    ) -> FunctionValue {
+        let builder = self.context.create_builder();
+
+        let i64_type = self.context.i64_type();
+        let ptr_type = self.context.ptr_type(AddressSpace::default());
+        let dtype = prim_type.llvm_type(self.context);
+        let iter_type = self.struct_for_iter_primitive();
+
+        let fn_type = dtype.fn_type(
+            &[
+                ptr_type.into(), // iter struct
+                i64_type.into(), // index
+            ],
+            false,
+        );
+        let function = self.module.add_function(
+            &format!("{}_primitive_random_access", label),
+            fn_type,
+            Some(Linkage::Private),
+        );
+
+        let entry = self.context.append_basic_block(function, "entry");
+        builder.position_at_end(entry);
+        let ptr = function.get_nth_param(0).unwrap().into_pointer_value();
+        let idx = function.get_nth_param(1).unwrap().into_int_value();
+        let arr_ptr_ptr = builder
+            .build_struct_gep(iter_type, ptr, 0, "arr_ptr_ptr")
+            .unwrap();
+        let arr_ptr = builder
+            .build_load(ptr_type, arr_ptr_ptr, "arr_ptr")
+            .unwrap()
+            .into_pointer_value();
+        let val_ptr = self.increment_pointer(&builder, arr_ptr, prim_type.width(), idx);
+        let val = builder.build_load(dtype, val_ptr, "val").unwrap();
+        builder.build_return(Some(&val)).unwrap();
 
         function
     }

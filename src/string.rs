@@ -389,15 +389,17 @@ impl<'ctx> CodeGen<'ctx> {
 
         let builder = self.context.create_builder();
         let i64_type = self.context.i64_type();
+        let i1_type = self.context.bool_type();
         let ptr_type = self.context.ptr_type(AddressSpace::default());
         let str_type = self.string_return_type();
 
         let next = self.gen_iter_string_primitive("agg_iter", offset_type);
         let memcmp = self.add_memcmp();
 
-        let fn_type = self.context.void_type().fn_type(
+        let fn_type = i1_type.fn_type(
             &[
                 ptr_type.into(), // data
+                ptr_type.into(), // null map (null for this function)
                 i64_type.into(), // len
                 ptr_type.into(), // output
             ],
@@ -436,8 +438,8 @@ impl<'ctx> CodeGen<'ctx> {
             )
             .unwrap()
             .into_pointer_value();
-        let len = function.get_nth_param(1).unwrap().into_int_value();
-        let out_ptr = function.get_nth_param(2).unwrap().into_pointer_value();
+        let len = function.get_nth_param(2).unwrap().into_int_value();
+        let out_ptr = function.get_nth_param(3).unwrap().into_pointer_value();
 
         let iter = self.initialize_iter_string_primitive(&builder, offset_ptr, data_ptr, len);
         let curr_best_ptr = builder.build_alloca(str_type, "curr_best_ptr").unwrap();
@@ -498,10 +500,11 @@ impl<'ctx> CodeGen<'ctx> {
             .unwrap()
             .into_struct_value();
         builder.build_store(out_ptr, curr_best).unwrap();
-        builder.build_return(None).unwrap();
+        builder
+            .build_return(Some(&i1_type.const_all_ones()))
+            .unwrap();
 
         self.module.verify().unwrap();
-        //self.module.print_to_stderr();
         self.optimize()?;
         let ee = self
             .module
@@ -510,6 +513,7 @@ impl<'ctx> CodeGen<'ctx> {
 
         Ok(CompiledAggFunc {
             _cg: self,
+            nullable: false,
             src_dt: match offset_type {
                 PrimitiveType::I32 => DataType::Utf8,
                 PrimitiveType::I64 => DataType::LargeUtf8,

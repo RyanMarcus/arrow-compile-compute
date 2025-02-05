@@ -766,7 +766,11 @@ impl CompiledFilterFunc<'_> {
 pub struct CompiledAggFunc<'ctx> {
     _cg: CodeGen<'ctx>,
     src_dt: DataType,
-    f: JitFunction<'ctx, unsafe extern "C" fn(*const c_void, u64, *mut c_void)>,
+    nullable: bool,
+    f: JitFunction<
+        'ctx,
+        unsafe extern "C" fn(*const c_void, *const c_void, u64, *mut c_void) -> bool,
+    >,
 }
 
 impl CompiledAggFunc<'_> {
@@ -787,15 +791,40 @@ impl CompiledAggFunc<'_> {
         }
 
         let (data, ptr) = arr_to_ptr(arr1);
+        let (ndata, nptr) = match arr1.nulls() {
+            None => {
+                assert!(!self.nullable, "non-null data to nullable aggregation");
+                (None, std::ptr::null())
+            }
+            Some(nulls) if nulls.null_count() == 0 => {
+                assert!(!self.nullable, "data w/ 0 nulls to nullable aggregation");
+                (None, std::ptr::null())
+            }
+            Some(nulls) => {
+                assert!(self.nullable, "nullable data to non-nullable aggregation");
+                let ba = BooleanArray::new(nulls.inner().clone(), None);
+                arr_to_ptr(&ba)
+            }
+        };
 
         let output_size = self.src_dt.primitive_width().unwrap_or(16);
         let mut buf = vec![0_u8; output_size];
-        unsafe {
-            self.f
-                .call(ptr, arr1.len() as u64, buf.as_mut_ptr() as *mut c_void);
-        }
+
+        let had_result = unsafe {
+            self.f.call(
+                ptr,
+                nptr,
+                arr1.len() as u64,
+                buf.as_mut_ptr() as *mut c_void,
+            )
+        };
 
         std::mem::drop(data);
+        std::mem::drop(ndata);
+
+        if !had_result {
+            return Ok(None);
+        }
 
         if matches!(self.src_dt, DataType::Utf8 | DataType::LargeUtf8) {
             let start_ptr = u64::from_le_bytes(buf[0..8].try_into().unwrap()) as *const u8;
@@ -998,6 +1027,26 @@ impl<'ctx> CodeGen<'ctx> {
                 PrimitiveType::for_arrow_type(v_dt.data_type()),
             ),
             DataType::Boolean => self.gen_iter_bitmap(label),
+            _ => todo!(),
+        }
+    }
+
+    fn gen_random_access_for(&self, label: &str, dt: &DataType) -> FunctionValue {
+        match dt {
+            DataType::Boolean => todo!(),
+            DataType::Int8
+            | DataType::Int16
+            | DataType::Int32
+            | DataType::Int64
+            | DataType::UInt8
+            | DataType::UInt16
+            | DataType::UInt32
+            | DataType::UInt64
+            | DataType::Float16
+            | DataType::Float32
+            | DataType::Float64 => {
+                self.gen_random_access_primitive(label, PrimitiveType::for_arrow_type(dt))
+            }
             _ => todo!(),
         }
     }

@@ -126,16 +126,42 @@ fn build_filter(src: &DataType) -> Result<SelfContainedFilterFunc, ArrowError> {
     .try_build()
 }
 
-fn build_agg(src: &DataType, agg: Aggregation) -> Result<SelfContainedAggFunc, ArrowError> {
+fn build_agg(
+    src: &DataType,
+    nullable: bool,
+    agg: Aggregation,
+) -> Result<SelfContainedAggFunc, ArrowError> {
     let ctx = Context::create();
     SelfContainedAggFuncTryBuilder {
         ctx,
         cf_builder: |ctx| {
             let cg = CodeGen::new(ctx);
             match src {
-                DataType::Utf8 => cg.string_minmax(PrimitiveType::I32, agg),
-                DataType::LargeUtf8 => cg.string_minmax(PrimitiveType::I64, agg),
-                _ => cg.compile_ungrouped_aggregation(src, agg),
+                DataType::Utf8 => {
+                    if nullable {
+                        return Err(ArrowError::ComputeError(
+                            "nullable string aggs not yet supported".into(),
+                        ));
+                    } else {
+                        cg.string_minmax(PrimitiveType::I32, agg)
+                    }
+                }
+                DataType::LargeUtf8 => {
+                    if nullable {
+                        return Err(ArrowError::ComputeError(
+                            "nullable string aggs not yet supported".into(),
+                        ));
+                    } else {
+                        cg.string_minmax(PrimitiveType::I64, agg)
+                    }
+                }
+                _ => {
+                    if nullable {
+                        cg.compile_ungrouped_agg_with_nulls(src, agg)
+                    } else {
+                        cg.compile_ungrouped_aggregation(src, agg)
+                    }
+                }
             }
         },
     }
@@ -144,7 +170,7 @@ fn build_agg(src: &DataType, agg: Aggregation) -> Result<SelfContainedAggFunc, A
 
 type CmpFuncSig = (DataType, bool, DataType, bool, Predicate);
 type CovFuncSig = (DataType, DataType);
-type AggFuncSig = (DataType, Aggregation);
+type AggFuncSig = (DataType, bool, Aggregation);
 struct ProgramCache {
     cmp_cache: RwLock<HashMap<CmpFuncSig, SelfContainedBinaryFunc>>,
     cov_cache: RwLock<HashMap<CovFuncSig, SelfContainedConvertFunc>>,
@@ -265,7 +291,11 @@ impl ProgramCache {
         arr1: &dyn Array,
         agg: Aggregation,
     ) -> Result<Option<Box<dyn Array>>, ArrowError> {
-        let sig = (arr1.data_type().clone(), agg);
+        let nullable = arr1
+            .nulls()
+            .map(|nulls| nulls.null_count() > 0)
+            .unwrap_or(false);
+        let sig = (arr1.data_type().clone(), nullable, agg);
 
         {
             let lcache = self.agg_cache.read().unwrap();
@@ -278,7 +308,7 @@ impl ProgramCache {
         // see there is no function, then compile it, then store it. This is
         // fine a price to pay for not holding the lock for all function
         // compilation.
-        let new_f = build_agg(arr1.data_type(), agg)?;
+        let new_f = build_agg(arr1.data_type(), nullable, agg)?;
         let result = new_f.with_cf(|cf| cf.call(arr1));
         self.agg_cache.write().unwrap().insert(sig, new_f);
         result

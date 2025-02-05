@@ -2,7 +2,7 @@ use arrow_schema::{ArrowError, DataType};
 use enum_as_inner::EnumAsInner;
 use inkwell::{intrinsics::Intrinsic, AddressSpace, IntPredicate, OptimizationLevel};
 
-use crate::{CodeGen, CompiledAggFunc, PrimitiveType};
+use crate::{declare_blocks, CodeGen, CompiledAggFunc, PrimitiveType};
 
 #[derive(Clone, Copy, PartialEq, Eq, Hash, EnumAsInner)]
 pub enum Aggregation {
@@ -44,6 +44,7 @@ impl<'ctx> CodeGen<'ctx> {
 
         let builder = self.context.create_builder();
         let i64_type = self.context.i64_type();
+        let i1_type = self.context.bool_type();
         let ptr_type = self.context.ptr_type(AddressSpace::default());
 
         let next = self.gen_iter_for("iter", dt);
@@ -63,9 +64,10 @@ impl<'ctx> CodeGen<'ctx> {
             .get_declaration(&self.module, &[pair_type.into()])
             .unwrap();
 
-        let fn_type = self.context.void_type().fn_type(
+        let fn_type = i1_type.fn_type(
             &[
                 ptr_type.into(), // arr1
+                ptr_type.into(), // null pointer (for null bitmap)
                 i64_type.into(), // len
                 ptr_type.into(), // out
             ],
@@ -74,8 +76,8 @@ impl<'ctx> CodeGen<'ctx> {
         let function = self.module.add_function("agg", fn_type, None);
 
         let arr1_ptr = function.get_nth_param(0).unwrap().into_pointer_value();
-        let len = function.get_nth_param(1).unwrap().into_int_value();
-        let out_ptr = function.get_nth_param(2).unwrap().into_pointer_value();
+        let len = function.get_nth_param(2).unwrap().into_int_value();
+        let out_ptr = function.get_nth_param(3).unwrap().into_pointer_value();
 
         let entry = self.context.append_basic_block(function, "entry");
         let loop_cond = self.context.append_basic_block(function, "loop_cond");
@@ -249,8 +251,11 @@ impl<'ctx> CodeGen<'ctx> {
             .build_load(prim_llvm_type, accum_ptr, "curr_agg")
             .unwrap();
         builder.build_store(out_ptr, curr_agg).unwrap();
-        builder.build_return(None).unwrap();
+        builder
+            .build_return(Some(&i1_type.const_all_ones()))
+            .unwrap();
 
+        self.module.verify().unwrap();
         self.optimize()?;
         let ee = self
             .module
@@ -259,6 +264,137 @@ impl<'ctx> CodeGen<'ctx> {
 
         Ok(CompiledAggFunc {
             _cg: self,
+            nullable: false,
+            src_dt: dt.clone(),
+            f: unsafe { ee.get_function("agg").unwrap() },
+        })
+    }
+
+    pub fn compile_ungrouped_agg_with_nulls(
+        self,
+        dt: &DataType,
+        agg: Aggregation,
+    ) -> Result<CompiledAggFunc<'ctx>, ArrowError> {
+        let ptr_type = self.context.ptr_type(AddressSpace::default());
+        let i64_type = self.context.i64_type();
+        let i1_type = self.context.bool_type();
+        let prim = PrimitiveType::for_arrow_type(dt);
+        let dtype = prim.llvm_type(self.context);
+
+        let next_bit = self.gen_iter_bitmap("agg");
+        let access = self.gen_random_access_for("agg", dt);
+
+        let agg_intrinsic = Intrinsic::find(&format!("llvm.{}", agg.llvm_func_suffix(prim)))
+            .expect(&format!(
+                "unable to find intrinsic for suffix {}",
+                agg.llvm_func_suffix(prim)
+            ));
+        let agg_f = agg_intrinsic
+            .get_declaration(&self.module, &[dtype.into()])
+            .unwrap();
+
+        let fn_type = i1_type.fn_type(
+            &[
+                ptr_type.into(), // arr1
+                ptr_type.into(), // null map
+                i64_type.into(), // len
+                ptr_type.into(), // out
+            ],
+            false,
+        );
+        let function = self.module.add_function("agg", fn_type, None);
+
+        let arr1_ptr = function.get_nth_param(0).unwrap().into_pointer_value();
+        let nulls_ptr = function.get_nth_param(1).unwrap().into_pointer_value();
+        let len = function.get_nth_param(2).unwrap().into_int_value();
+        let out_ptr = function.get_nth_param(3).unwrap().into_pointer_value();
+
+        let builder = self.context.create_builder();
+        declare_blocks!(self.context, function, entry, loop_cond, loop_body, exit);
+
+        builder.position_at_end(entry);
+        let null_iter = self.initialize_iter_bitmap(&builder, nulls_ptr, len);
+        let data_iter = self.initialize_iter(&builder, arr1_ptr, len, dt);
+        let idx_out_ptr = builder.build_alloca(i64_type, "idx_out_ptr").unwrap();
+
+        // store the first value
+        let had_first = builder
+            .build_call(
+                next_bit,
+                &[null_iter.into(), idx_out_ptr.into()],
+                "had_first",
+            )
+            .unwrap()
+            .try_as_basic_value()
+            .unwrap_left()
+            .into_int_value();
+        let first_idx = builder
+            .build_load(i64_type, idx_out_ptr, "first_idx")
+            .unwrap();
+        let val = builder
+            .build_call(access, &[data_iter.into(), first_idx.into()], "value")
+            .unwrap()
+            .try_as_basic_value()
+            .unwrap_left();
+        builder.build_store(out_ptr, val).unwrap();
+
+        builder
+            .build_conditional_branch(had_first, loop_cond, exit)
+            .unwrap();
+
+        builder.position_at_end(loop_cond);
+        let had_next = builder
+            .build_call(
+                next_bit,
+                &[null_iter.into(), idx_out_ptr.into()],
+                "next_bit",
+            )
+            .unwrap()
+            .try_as_basic_value()
+            .unwrap_left()
+            .into_int_value();
+        builder
+            .build_conditional_branch(had_next, loop_body, exit)
+            .unwrap();
+
+        builder.position_at_end(loop_body);
+        let idx = builder
+            .build_load(i64_type, idx_out_ptr, "idx")
+            .unwrap()
+            .into_int_value();
+        let val = builder
+            .build_call(access, &[data_iter.into(), idx.into()], "value")
+            .unwrap()
+            .try_as_basic_value()
+            .unwrap_left();
+        let curr_val = builder.build_load(dtype, out_ptr, "curr_val").unwrap();
+        let new_val = builder
+            .build_call(agg_f, &[val.into(), curr_val.into()], "new_val")
+            .unwrap()
+            .try_as_basic_value()
+            .unwrap_left();
+        builder.build_store(out_ptr, new_val).unwrap();
+        builder.build_unconditional_branch(loop_cond).unwrap();
+
+        builder.position_at_end(exit);
+        let had_any = builder.build_phi(i1_type, "had_any").unwrap();
+        had_any.add_incoming(&[
+            (&i1_type.const_zero(), entry), // if we are coming from entry, no values
+            (&i1_type.const_all_ones(), loop_cond), // otherwise, we did have values
+        ]);
+        let had_any = had_any.as_basic_value().into_int_value();
+        builder.build_return(Some(&had_any)).unwrap();
+
+        self.module.verify().unwrap();
+        self.optimize()?;
+        let ee = self
+            .module
+            .create_jit_execution_engine(OptimizationLevel::Aggressive)
+            .unwrap();
+
+        Ok(CompiledAggFunc {
+            _cg: self,
+            nullable: true,
             src_dt: dt.clone(),
             f: unsafe { ee.get_function("agg").unwrap() },
         })
@@ -268,6 +404,7 @@ impl<'ctx> CodeGen<'ctx> {
 #[cfg(test)]
 mod tests {
     use arrow_array::{cast::AsArray, types::Int32Type, Int32Array, UInt32Array};
+    use arrow_buffer::NullBuffer;
     use arrow_schema::DataType;
     use inkwell::context::Context;
     use itertools::Itertools;
@@ -277,6 +414,29 @@ mod tests {
     use super::Aggregation;
 
     const SIZES_TO_TRY: &[usize] = &[5, 50, 64, 100, 128, 200, 2048, 2049, 14415];
+
+    #[test]
+    fn test_i32_min_agg_nulls() {
+        let data = vec![10, 20, 5, 1, -20, 30, 0];
+        let mask = vec![true, true, true, true, false, true, false];
+
+        let arr = Int32Array::from(data);
+        let arr_with_nulls =
+            Int32Array::try_new(arr.values().clone(), Some(NullBuffer::from(mask))).unwrap();
+        let ctx = Context::create();
+        let cg = CodeGen::new(&ctx);
+        let f = cg
+            .compile_ungrouped_agg_with_nulls(&DataType::Int32, Aggregation::Min)
+            .unwrap();
+        let r: Int32Array = f
+            .call(&arr_with_nulls)
+            .unwrap()
+            .unwrap()
+            .as_primitive()
+            .clone();
+        assert_eq!(r.len(), 1);
+        assert_eq!(r.value(0), 1);
+    }
 
     #[test]
     fn test_i32_min_agg() {

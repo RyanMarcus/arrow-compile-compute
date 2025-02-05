@@ -1,14 +1,29 @@
 use arrow_array::{
     cast::AsArray,
     types::{Float32Type, Int32Type, UInt32Type},
-    Float32Array, Int32Array, StringArray, UInt32Array,
+    BooleanArray, Float32Array, Int32Array, StringArray, UInt32Array,
 };
+use arrow_buffer::NullBuffer;
+use itertools::Itertools;
 use proptest::proptest;
 
 proptest! {
     #[test]
     fn test_prim_i32_min(arr: Vec<i32>) {
         let arr1 = Int32Array::from(arr.clone());
+
+        let our_res = arrow_compile_compute::compute::min(&arr1).unwrap().map(|arr| arr.as_primitive::<Int32Type>().value(0));
+        let arrow_res = arrow_arith::aggregate::min(&arr1);
+        assert_eq!(our_res, arrow_res);
+    }
+
+    #[test]
+    fn test_prim_i32_min_nullable(arr: Vec<(bool, i32)>) {
+        let mask = arr.iter().map(|(b, _)| *b).collect_vec();
+        let data = arr.iter().map(|(_, i)| *i).collect_vec();
+        let arr1 = Int32Array::from(data);
+        let arr1 =
+            Int32Array::try_new(arr1.values().clone(), Some(NullBuffer::from(mask))).unwrap();
 
         let our_res = arrow_compile_compute::compute::min(&arr1).unwrap().map(|arr| arr.as_primitive::<Int32Type>().value(0));
         let arrow_res = arrow_arith::aggregate::min(&arr1);
