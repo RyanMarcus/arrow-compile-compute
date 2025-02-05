@@ -1,7 +1,7 @@
 use arrow_array::{
     cast::AsArray,
     types::{Float32Type, Int32Type, UInt32Type},
-    BooleanArray, Float32Array, Int32Array, StringArray, UInt32Array,
+    Float32Array, Int32Array, StringArray, UInt32Array,
 };
 use arrow_buffer::NullBuffer;
 use itertools::Itertools;
