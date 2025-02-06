@@ -90,4 +90,20 @@ proptest! {
             our_res, our_res.as_ref().map(|s| s.bytes())
         );
     }
+
+    #[test]
+    fn test_string_min(arr: Vec<String>) {
+        let arr1 = StringArray::from(arr.clone());
+
+        let true_min = arr.iter().min().cloned();
+        let our_res = arrow_compile_compute::compute::min(&arr1).unwrap().map(|arr| {
+            let arr = arr.as_string::<i32>();
+            arr.value(0).to_string()
+        });
+        assert_eq!(true_min, our_res,
+            "expected {:?} ({:?}), got {:?} ({:?})",
+            true_min, true_min.as_ref().map(|s| s.bytes()),
+            our_res, our_res.as_ref().map(|s| s.bytes())
+        );
+    }
 }

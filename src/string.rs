@@ -225,39 +225,87 @@ impl<'ctx> CodeGen<'ctx> {
         ptr
     }
 
-    pub(crate) fn has_next_iter_string_primitive<'a>(
-        &'a self,
-        builder: &'a Builder<'a>,
-        iter: PointerValue<'a>,
-    ) -> IntValue<'a>
-    where
-        'ctx: 'a,
-    {
+    pub(crate) fn gen_iter_string_primitive(
+        &self,
+        label: &str,
+        prim_width_type: PrimitiveType,
+    ) -> FunctionValue {
+        assert!(
+            matches!(prim_width_type, PrimitiveType::I32)
+                || matches!(prim_width_type, PrimitiveType::I64),
+            "Only I32 and I64 widths are supported for string iterators"
+        );
+
+        let access =
+            self.generate_string_random_access(&format!("{}_getter", label), prim_width_type);
+        let builder = self.context.create_builder();
+
         let i64_type = self.context.i64_type();
+        let i1_type = self.context.bool_type();
+        let ptr_type = self.context.ptr_type(AddressSpace::default());
         let iter_type = self.struct_for_iter_string_primitive();
 
+        let fn_type = i1_type.fn_type(
+            &[
+                ptr_type.into(), // iter struct
+                ptr_type.into(), // out
+            ],
+            false,
+        );
+        let function = self.module.add_function(
+            &format!("{}_primitive_iter_string", label),
+            fn_type,
+            Some(Linkage::Private),
+        );
+
+        declare_blocks!(self.context, function, entry, load, exit);
+        builder.position_at_end(entry);
+        let iter_ptr = function.get_nth_param(0).unwrap().into_pointer_value();
+        let out_ptr = function.get_nth_param(1).unwrap().into_pointer_value();
         let idx_ptr = builder
-            .build_struct_gep(iter_type, iter, 2, "idx_ptr")
+            .build_struct_gep(iter_type, iter_ptr, 2, "idx_ptr")
+            .unwrap();
+        let len_ptr = builder
+            .build_struct_gep(iter_type, iter_ptr, 3, "len_ptr")
             .unwrap();
         let idx = builder
             .build_load(i64_type, idx_ptr, "idx")
             .unwrap()
             .into_int_value();
-
-        let len_ptr = builder
-            .build_struct_gep(iter_type, iter, 3, "len_ptr")
-            .unwrap();
         let len = builder
             .build_load(i64_type, len_ptr, "len")
             .unwrap()
             .into_int_value();
 
-        builder
-            .build_int_compare(IntPredicate::ULT, idx, len, "has_next")
+        let cmp = builder
+            .build_int_compare(IntPredicate::SGE, idx, len, "cmp")
+            .unwrap();
+        builder.build_conditional_branch(cmp, exit, load).unwrap();
+
+        builder.position_at_end(load);
+        let val = builder
+            .build_call(access, &[iter_ptr.into(), idx.into()], "val")
             .unwrap()
+            .try_as_basic_value()
+            .unwrap_left()
+            .into_struct_value();
+        builder.build_store(out_ptr, val).unwrap();
+
+        let inc_index = builder
+            .build_int_add(idx, i64_type.const_int(1, false), "inc_index")
+            .unwrap();
+        builder.build_store(idx_ptr, inc_index).unwrap();
+        builder
+            .build_return(Some(&i1_type.const_all_ones()))
+            .unwrap();
+
+        builder.position_at_end(exit);
+        builder.build_return(Some(&i1_type.const_zero())).unwrap();
+
+        function
     }
 
-    pub(crate) fn gen_iter_string_primitive(
+    pub(crate) fn generate_string_random_access(
         &self,
         label: &str,
         prim_width_type: PrimitiveType,
@@ -279,11 +327,12 @@ impl<'ctx> CodeGen<'ctx> {
         let fn_type = ret_type.fn_type(
             &[
                 ptr_type.into(), // iter struct
+                i64_type.into(), // index
             ],
             false,
         );
         let function = self.module.add_function(
-            &format!("{}_primitive_iter_string", label),
+            &format!("{}_primitive_access_string", label),
             fn_type,
             Some(Linkage::Private),
         );
@@ -305,13 +354,7 @@ impl<'ctx> CodeGen<'ctx> {
             .build_load(ptr_type, data_ptr_ptr, "data_ptr")
             .unwrap()
             .into_pointer_value();
-        let idx_ptr = builder
-            .build_struct_gep(iter_type, iter_ptr, 2, "idx_ptr")
-            .unwrap();
-        let idx = builder
-            .build_load(i64_type, idx_ptr, "idx")
-            .unwrap()
-            .into_int_value();
+        let idx = function.get_nth_param(1).unwrap().into_int_value();
 
         let off1 = builder
             .build_load(
@@ -362,11 +405,6 @@ impl<'ctx> CodeGen<'ctx> {
             .build_insert_value(to_return, ptr2, 1, "to_return")
             .unwrap();
 
-        let inc_index = builder
-            .build_int_add(idx, i64_type.const_int(1, false), "inc_index")
-            .unwrap();
-        builder.build_store(idx_ptr, inc_index).unwrap();
-
         builder.build_return(Some(&to_return)).unwrap();
 
         function
@@ -393,13 +431,26 @@ impl<'ctx> CodeGen<'ctx> {
         let ptr_type = self.context.ptr_type(AddressSpace::default());
         let str_type = self.string_return_type();
 
-        let next = self.gen_iter_string_primitive("agg_iter", offset_type);
+        let next = /*if nullable {
+            let next_bit = self.gen_iter_bitmap("null_iter");
+            let f = self.module.add_function(
+                "get_next_nonnull",
+                str_type.fn_type(&[ptr_type.into(), ptr_type.into()], false),
+                Some(Linkage::Private),
+            );
+            declare_blocks!(self.context, f, entry);
+            builder.position_at_end(entry);
+            let next_bit = builder.build_direct_call(next_bit, args, name)
+            todo!()
+        } else {*/
+            self.gen_iter_string_primitive("agg_iter", offset_type);
+        //};
         let memcmp = self.add_memcmp();
 
         let fn_type = i1_type.fn_type(
             &[
                 ptr_type.into(), // data
-                ptr_type.into(), // null map (null for this function)
+                ptr_type.into(), // null map
                 i64_type.into(), // len
                 ptr_type.into(), // output
             ],
@@ -439,31 +490,35 @@ impl<'ctx> CodeGen<'ctx> {
             .unwrap()
             .into_pointer_value();
         let len = function.get_nth_param(2).unwrap().into_int_value();
-        let out_ptr = function.get_nth_param(3).unwrap().into_pointer_value();
+        let curr_best_ptr = function.get_nth_param(3).unwrap().into_pointer_value();
 
         let iter = self.initialize_iter_string_primitive(&builder, offset_ptr, data_ptr, len);
-        let curr_best_ptr = builder.build_alloca(str_type, "curr_best_ptr").unwrap();
-        let first = builder
-            .build_call(next, &[iter.into()], "curr_best")
+        let candidate_ptr = builder.build_alloca(str_type, "candidate_ptr").unwrap();
+        let had_any = builder
+            .build_call(next, &[iter.into(), curr_best_ptr.into()], "curr_best")
             .unwrap()
             .try_as_basic_value()
             .unwrap_left()
-            .into_struct_value();
-        builder.build_store(curr_best_ptr, first).unwrap();
-        builder.build_unconditional_branch(loop_cond).unwrap();
+            .into_int_value();
+        builder
+            .build_conditional_branch(had_any, loop_cond, end)
+            .unwrap();
 
         builder.position_at_end(loop_cond);
-        let has_next = self.has_next_iter_string_primitive(&builder, iter);
+        let had_next = builder
+            .build_call(next, &[iter.into(), candidate_ptr.into()], "candidate")
+            .unwrap()
+            .try_as_basic_value()
+            .unwrap_left()
+            .into_int_value();
         builder
-            .build_conditional_branch(has_next, loop_body, end)
+            .build_conditional_branch(had_next, loop_body, end)
             .unwrap();
 
         builder.position_at_end(loop_body);
         let next = builder
-            .build_call(next, &[iter.into()], "next")
+            .build_load(str_type, candidate_ptr, "next")
             .unwrap()
-            .try_as_basic_value()
-            .unwrap_left()
             .into_struct_value();
         let curr_best = builder
             .build_load(str_type, curr_best_ptr, "curr_best")
@@ -495,13 +550,14 @@ impl<'ctx> CodeGen<'ctx> {
         builder.build_unconditional_branch(loop_cond).unwrap();
 
         builder.position_at_end(end);
-        let curr_best = builder
-            .build_load(str_type, curr_best_ptr, "curr_best")
-            .unwrap()
-            .into_struct_value();
-        builder.build_store(out_ptr, curr_best).unwrap();
+        let wrote_result = builder.build_phi(i1_type, "wrote_result").unwrap();
+        wrote_result.add_incoming(&[
+            (&i1_type.const_all_ones(), loop_cond),
+            (&i1_type.const_zero(), entry),
+        ]);
+
         builder
-            .build_return(Some(&i1_type.const_all_ones()))
+            .build_return(Some(&wrote_result.as_basic_value().into_int_value()))
             .unwrap();
 
         self.module.verify().unwrap();
