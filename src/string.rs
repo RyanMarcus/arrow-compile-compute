@@ -414,6 +414,7 @@ impl<'ctx> CodeGen<'ctx> {
         self,
         offset_type: PrimitiveType,
         agg: Aggregation,
+        nullable: bool,
     ) -> Result<CompiledAggFunc<'ctx>, ArrowError> {
         let is_min = match agg {
             Aggregation::Min => true,
@@ -430,21 +431,65 @@ impl<'ctx> CodeGen<'ctx> {
         let i1_type = self.context.bool_type();
         let ptr_type = self.context.ptr_type(AddressSpace::default());
         let str_type = self.string_return_type();
-
-        let next = /*if nullable {
-            let next_bit = self.gen_iter_bitmap("null_iter");
-            let f = self.module.add_function(
-                "get_next_nonnull",
-                str_type.fn_type(&[ptr_type.into(), ptr_type.into()], false),
+        // Create a function called `next` that handles both the nullable and
+        // non-nullable case. Each call to next will produce a new string value.
+        // Note that the branch between nullable and non-nullable does not
+        // appear in the compiled code.
+        let next = {
+            let next_f = self.module.add_function(
+                "get_next",
+                i1_type.fn_type(&[ptr_type.into(), ptr_type.into(), ptr_type.into()], false),
                 Some(Linkage::Private),
             );
-            declare_blocks!(self.context, f, entry);
+            declare_blocks!(self.context, next_f, entry);
+            let str_iter_ptr = next_f.get_nth_param(0).unwrap().into_pointer_value();
+            let bit_iter_ptr = next_f.get_nth_param(1).unwrap().into_pointer_value();
+            let out_ptr = next_f.get_nth_param(2).unwrap().into_pointer_value();
             builder.position_at_end(entry);
-            let next_bit = builder.build_direct_call(next_bit, args, name)
-            todo!()
-        } else {*/
-            self.gen_iter_string_primitive("agg_iter", offset_type);
-        //};
+            if nullable {
+                declare_blocks!(self.context, next_f, load_str, exit);
+                let string_getter =
+                    self.generate_string_random_access("string_getter", offset_type);
+                let next_bit = self.gen_iter_bitmap("null_map");
+
+                let idx_ptr = builder.build_alloca(i64_type, "idx_ptr").unwrap();
+                let had_next = builder
+                    .build_call(next_bit, &[bit_iter_ptr.into(), idx_ptr.into()], "had_next")
+                    .unwrap()
+                    .try_as_basic_value()
+                    .unwrap_left()
+                    .into_int_value();
+                builder
+                    .build_conditional_branch(had_next, load_str, exit)
+                    .unwrap();
+
+                builder.position_at_end(load_str);
+                let idx = builder.build_load(i64_type, idx_ptr, "idx").unwrap();
+                let res = builder
+                    .build_call(string_getter, &[str_iter_ptr.into(), idx.into()], "string")
+                    .unwrap()
+                    .try_as_basic_value()
+                    .unwrap_left();
+                builder.build_store(out_ptr, res).unwrap();
+                builder
+                    .build_return(Some(&i1_type.const_all_ones()))
+                    .unwrap();
+
+                builder.position_at_end(exit);
+                builder.build_return(Some(&i1_type.const_zero())).unwrap();
+            } else {
+                let next_str = self.gen_iter_string_primitive("next_string", offset_type);
+                let res = builder
+                    .build_call(next_str, &[str_iter_ptr.into(), out_ptr.into()], "string")
+                    .unwrap()
+                    .try_as_basic_value()
+                    .unwrap_left();
+                builder.build_return(Some(&res)).unwrap();
+            }
+
+            next_f
+        };
+
         let memcmp = self.add_memcmp();
 
         let fn_type = i1_type.fn_type(
@@ -489,13 +534,20 @@ impl<'ctx> CodeGen<'ctx> {
             )
             .unwrap()
             .into_pointer_value();
+        let null_map_ptr = function.get_nth_param(1).unwrap().into_pointer_value();
         let len = function.get_nth_param(2).unwrap().into_int_value();
         let curr_best_ptr = function.get_nth_param(3).unwrap().into_pointer_value();
 
         let iter = self.initialize_iter_string_primitive(&builder, offset_ptr, data_ptr, len);
+        let nulls = self.initialize_iter_bitmap(&builder, null_map_ptr, len);
+
         let candidate_ptr = builder.build_alloca(str_type, "candidate_ptr").unwrap();
         let had_any = builder
-            .build_call(next, &[iter.into(), curr_best_ptr.into()], "curr_best")
+            .build_call(
+                next,
+                &[iter.into(), nulls.into(), curr_best_ptr.into()],
+                "curr_best",
+            )
             .unwrap()
             .try_as_basic_value()
             .unwrap_left()
@@ -506,7 +558,11 @@ impl<'ctx> CodeGen<'ctx> {
 
         builder.position_at_end(loop_cond);
         let had_next = builder
-            .build_call(next, &[iter.into(), candidate_ptr.into()], "candidate")
+            .build_call(
+                next,
+                &[iter.into(), nulls.into(), candidate_ptr.into()],
+                "candidate",
+            )
             .unwrap()
             .try_as_basic_value()
             .unwrap_left()
@@ -569,7 +625,7 @@ impl<'ctx> CodeGen<'ctx> {
 
         Ok(CompiledAggFunc {
             _cg: self,
-            nullable: false,
+            nullable,
             src_dt: match offset_type {
                 PrimitiveType::I32 => DataType::Utf8,
                 PrimitiveType::I64 => DataType::LargeUtf8,
@@ -594,7 +650,7 @@ mod tests {
         let ctx = Context::create();
         let cg = CodeGen::new(&ctx);
         let f = cg
-            .string_minmax(crate::PrimitiveType::I32, Aggregation::Min)
+            .string_minmax(crate::PrimitiveType::I32, Aggregation::Min, false)
             .unwrap();
 
         let expected = StringArray::from(vec!["a"]);
@@ -609,7 +665,7 @@ mod tests {
         let ctx = Context::create();
         let cg = CodeGen::new(&ctx);
         let f = cg
-            .string_minmax(crate::PrimitiveType::I32, Aggregation::Max)
+            .string_minmax(crate::PrimitiveType::I32, Aggregation::Max, false)
             .unwrap();
 
         let expected = StringArray::from(vec!["this"]);
@@ -626,7 +682,7 @@ mod tests {
         let ctx = Context::create();
         let cg = CodeGen::new(&ctx);
         let f = cg
-            .string_minmax(crate::PrimitiveType::I32, Aggregation::Max)
+            .string_minmax(crate::PrimitiveType::I32, Aggregation::Max, false)
             .unwrap();
 
         assert!("®" > " ");
@@ -642,7 +698,7 @@ mod tests {
         let ctx = Context::create();
         let cg = CodeGen::new(&ctx);
         let f = cg
-            .string_minmax(crate::PrimitiveType::I32, Aggregation::Min)
+            .string_minmax(crate::PrimitiveType::I32, Aggregation::Min, false)
             .unwrap();
 
         let expected = StringArray::from(vec!["this"]);
@@ -657,10 +713,25 @@ mod tests {
         let ctx = Context::create();
         let cg = CodeGen::new(&ctx);
         let f = cg
-            .string_minmax(crate::PrimitiveType::I32, Aggregation::Max)
+            .string_minmax(crate::PrimitiveType::I32, Aggregation::Max, false)
             .unwrap();
 
         let expected = StringArray::from(vec!["thiszz"]);
+        let result = f.call(&data).unwrap().unwrap();
+        assert_eq!(&result, &(Box::new(expected) as Box<dyn Array>));
+    }
+
+    #[test]
+    fn test_string_max_null() {
+        let data = StringArray::from(vec![Some("this"), None, Some("a"), Some("test")]);
+
+        let ctx = Context::create();
+        let cg = CodeGen::new(&ctx);
+        let f = cg
+            .string_minmax(crate::PrimitiveType::I32, Aggregation::Max, true)
+            .unwrap();
+
+        let expected = StringArray::from(vec!["this"]);
         let result = f.call(&data).unwrap().unwrap();
         assert_eq!(&result, &(Box::new(expected) as Box<dyn Array>));
     }

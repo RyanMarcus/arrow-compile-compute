@@ -34,6 +34,30 @@ pub fn criterion_benchmark(c: &mut Criterion) {
     }
 
     {
+        let data = (0..10_000_000)
+            .map(|_| if rng.bool() { Some(rng.i32(..)) } else { None })
+            .collect_vec();
+        let data = Int32Array::from(data);
+
+        let arr_res = arrow_arith::aggregate::min(&data).unwrap();
+        let our_res = arrow_compile_compute::compute::min(&data)
+            .unwrap()
+            .unwrap()
+            .as_primitive::<Int32Type>()
+            .clone()
+            .value(0);
+        assert_eq!(our_res, arr_res);
+
+        c.bench_function("min nullable i32/llvm", |b| {
+            b.iter(|| arrow_compile_compute::compute::min(&data).unwrap().unwrap());
+        });
+
+        c.bench_function("min nullable i32/arrow", |b| {
+            b.iter(|| arrow_arith::aggregate::min(&data).unwrap());
+        });
+    }
+
+    {
         let vec_data = (0..10_000_000).map(|_| rng.i64(-50..50)).collect_vec();
         let prim_data = Int64Array::from(vec_data);
         let data = arrow_cast::cast::cast(

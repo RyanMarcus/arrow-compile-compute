@@ -106,4 +106,17 @@ proptest! {
             our_res, our_res.as_ref().map(|s| s.bytes())
         );
     }
+
+    #[test]
+    fn test_string_min_nullable(arr: Vec<(bool, String)>) {
+        let mask = arr.iter().map(|(b, _)| *b).collect_vec();
+        let data = arr.iter().map(|(_, i)| i.clone()).collect_vec();
+        let arr1 = StringArray::from(data);
+        let arr1 = StringArray::try_new(arr1.offsets().clone(), arr1.values().clone(), Some(NullBuffer::from(mask))).unwrap();
+        let min = arr.iter().filter_map(|(a, b)| a.then(|| b)).min().cloned();
+
+
+        let our_res = arrow_compile_compute::compute::min(&arr1).unwrap().map(|arr| arr.as_string::<i32>().value(0).to_string());
+        assert_eq!(our_res, min);
+    }
 }

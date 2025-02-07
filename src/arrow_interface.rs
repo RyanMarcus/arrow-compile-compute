@@ -137,24 +137,8 @@ fn build_agg(
         cf_builder: |ctx| {
             let cg = CodeGen::new(ctx);
             match src {
-                DataType::Utf8 => {
-                    if nullable {
-                        return Err(ArrowError::ComputeError(
-                            "nullable string aggs not yet supported".into(),
-                        ));
-                    } else {
-                        cg.string_minmax(PrimitiveType::I32, agg)
-                    }
-                }
-                DataType::LargeUtf8 => {
-                    if nullable {
-                        return Err(ArrowError::ComputeError(
-                            "nullable string aggs not yet supported".into(),
-                        ));
-                    } else {
-                        cg.string_minmax(PrimitiveType::I64, agg)
-                    }
-                }
+                DataType::Utf8 => cg.string_minmax(PrimitiveType::I32, agg, nullable),
+                DataType::LargeUtf8 => cg.string_minmax(PrimitiveType::I64, agg, nullable),
                 _ => {
                     if nullable {
                         cg.compile_ungrouped_agg_with_nulls(src, agg)
@@ -422,6 +406,22 @@ pub mod cast {
 
     use super::GLOBAL_PROGRAM_CACHE;
 
+    /// Allows casting from various types to primitive types. For example, you
+    /// can cast from an run-end encoded array to a primitive array:
+    /// ```
+    /// use arrow_array::{Int64Array, Int32Array, PrimitiveArray, RunArray};
+    /// let res = Int32Array::from(vec![5, 6, 10, 11, 12]);
+    /// let val = Int64Array::from(vec![1, 2, 3, 4, 5]);
+    /// let ree_arr = RunArray::try_new(&PrimitiveArray::from(res), &PrimitiveArray::from(val)).unwrap();
+    /// let ree_arr = ree_arr.downcast::<Int64Array>().unwrap();
+    ///
+    /// let result = Int64Array::from_iter(ree_arr).values().to_vec();
+    /// let expected = vec![1, 1, 1, 1, 1, 2, 3, 3, 3, 3, 4, 5];
+    /// assert_eq!(result, expected);
+    /// ```
+    ///
+    /// You can also cast a boolean array to a `UInt64Array`, resulting in the
+    /// indexes of the "on" bits.
     pub fn cast(arr1: &dyn Array, target: &DataType) -> Result<ArrayRef, ArrowError> {
         GLOBAL_PROGRAM_CACHE.cast(arr1, target)
     }
