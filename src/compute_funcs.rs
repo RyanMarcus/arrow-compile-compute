@@ -1,7 +1,10 @@
 use arrow_schema::{ArrowError, DataType};
-use inkwell::{intrinsics::Intrinsic, AddressSpace, OptimizationLevel};
+use inkwell::{intrinsics::Intrinsic, AddressSpace, IntPredicate, OptimizationLevel};
 
-use crate::{CodeGen, CompiledConvertFunc, CompiledFilterFunc, PrimitiveType};
+use crate::{
+    declare_blocks, CodeGen, CompiledConvertFunc, CompiledFilterFunc, CompiledTakeFunc,
+    PrimitiveType,
+};
 
 const MURMUR_C1: u64 = 0xff51afd7ed558ccd;
 const MURMUR_C2: u64 = 0xc4ceb9fe1a85ec53;
@@ -356,6 +359,114 @@ impl<'a> CodeGen<'a> {
             f: unsafe { ee.get_function("filter").ok().unwrap() },
         })
     }
+
+    /// Compiles a function to take elements from an array based on indices.
+    pub fn compile_take(
+        self,
+        idx_dt: &DataType,
+        data_dt: &DataType,
+    ) -> Result<CompiledTakeFunc<'a>, ArrowError> {
+        let builder = self.context.create_builder();
+
+        let i64_type = self.context.i64_type();
+        let ptr_type = self.context.ptr_type(AddressSpace::default());
+        let prim_type = PrimitiveType::for_arrow_type(data_dt);
+
+        let fn_type = self.context.void_type().fn_type(
+            &[
+                ptr_type.into(), // src
+                ptr_type.into(), // idx array
+                i64_type.into(), // len of idx array
+                ptr_type.into(), // output
+            ],
+            false,
+        );
+        let function = self.module.add_function("take", fn_type, None);
+
+        let data_ptr = function.get_nth_param(0).unwrap().into_pointer_value();
+        let take_ptr = function.get_nth_param(1).unwrap().into_pointer_value();
+        let len = function.get_nth_param(2).unwrap().into_int_value();
+        let out_ptr = function.get_nth_param(3).unwrap().into_pointer_value();
+
+        let access_idx = self.gen_random_access_for("get_idx", idx_dt);
+        let access_data = self.gen_random_access_for("get_dat", data_dt);
+
+        declare_blocks!(self.context, function, entry, loop_cond, loop_body, exit);
+
+        builder.position_at_end(entry);
+        let curr_idx_ptr = builder.build_alloca(i64_type, "curr_idx_ptr").unwrap();
+        builder
+            .build_store(curr_idx_ptr, i64_type.const_zero())
+            .unwrap();
+        let idx_iter = self.initialize_iter(&builder, take_ptr, len, idx_dt);
+        let data_iter = self.initialize_iter(&builder, data_ptr, len, data_dt);
+        builder.build_unconditional_branch(loop_cond).unwrap();
+
+        builder.position_at_end(loop_cond);
+        let curr_idx = builder
+            .build_load(i64_type, curr_idx_ptr, "curr_idx")
+            .unwrap()
+            .into_int_value();
+        let cond = builder
+            .build_int_compare(IntPredicate::ULT, curr_idx, len, "cond")
+            .unwrap();
+        builder
+            .build_conditional_branch(cond, loop_body, exit)
+            .unwrap();
+
+        builder.position_at_end(loop_body);
+        let curr_idx = builder
+            .build_load(i64_type, curr_idx_ptr, "curr_idx")
+            .unwrap()
+            .into_int_value();
+
+        let data_idx = builder
+            .build_call(access_idx, &[idx_iter.into(), curr_idx.into()], "data_idx")
+            .unwrap()
+            .try_as_basic_value()
+            .unwrap_left()
+            .into_int_value();
+
+        let data_idx = builder
+            .build_int_z_extend_or_bit_cast(data_idx, i64_type, "zext")
+            .unwrap();
+
+        let next_data = builder
+            .build_call(
+                access_data,
+                &[data_iter.into(), data_idx.into()],
+                "next_data",
+            )
+            .unwrap()
+            .try_as_basic_value()
+            .unwrap_left();
+        let out_loc = self.increment_pointer(&builder, out_ptr, prim_type.width(), curr_idx);
+        builder.build_store(out_loc, next_data).unwrap();
+        let inc_idx = builder
+            .build_int_add(curr_idx, i64_type.const_int(1, false), "inc_idx")
+            .unwrap();
+        builder.build_store(curr_idx_ptr, inc_idx).unwrap();
+        builder.build_unconditional_branch(loop_cond).unwrap();
+
+        builder.position_at_end(exit);
+        builder.build_return(None).unwrap();
+
+        self.optimize()?;
+        self.module
+            .verify()
+            .map_err(|e| ArrowError::ComputeError(format!("Error compiling kernel: {}", e)))?;
+        let ee = self
+            .module
+            .create_jit_execution_engine(OptimizationLevel::Aggressive)
+            .unwrap();
+
+        Ok(CompiledTakeFunc {
+            _cg: self,
+            data_dt: data_dt.clone(),
+            take_dt: idx_dt.clone(),
+            f: unsafe { ee.get_function("take").ok().unwrap() },
+        })
+    }
 }
 
 #[cfg(test)]
@@ -455,5 +566,29 @@ mod tests {
             .clone();
 
         assert_eq!(arr_filtered, result);
+    }
+
+    #[test]
+    fn test_take_i32() {
+        let data = Int32Array::from(vec![1, 2, 3, 4, 5]);
+        let indices = Int32Array::from(vec![0, 2, 4]);
+
+        let arr_taken = arrow_select::take::take(&data, &indices, None)
+            .unwrap()
+            .as_primitive::<Int32Type>()
+            .clone();
+
+        let ctx = Context::create();
+        let codegen = CodeGen::new(&ctx);
+        let compiled_func = codegen
+            .compile_take(indices.data_type(), data.data_type())
+            .expect("Failed to compile take function");
+        let result = compiled_func
+            .call(&data, &indices)
+            .unwrap()
+            .as_primitive::<Int32Type>()
+            .clone();
+
+        assert_eq!(arr_taken, result);
     }
 }

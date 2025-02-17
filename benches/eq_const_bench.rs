@@ -153,29 +153,31 @@ pub fn criterion_benchmark(c: &mut Criterion) {
     }
 
     {
-        let data1 = Int32Array::from((0..10_000_000).map(|_| rng.i32(0..1000)).collect_vec());
+        let data1 = Int32Array::from((0..1048576).map(|_| rng.i32(0..1000)).collect_vec());
         let data2 = Int32Array::new_scalar(50);
+        let data2_u64 = Int64Array::new_scalar(50);
         let ctx = Context::create();
         let cg = CodeGen::new(&ctx);
         let f = cg
             .primitive_primitive_cmp(
                 &arrow_schema::DataType::Int32,
                 false,
-                &arrow_schema::DataType::Int32,
+                &arrow_schema::DataType::Int64,
                 true,
-                Predicate::Eq,
+                Predicate::Gte,
             )
             .unwrap();
 
-        let arrow_answer = arrow_ord::cmp::eq(&data1, &data2).unwrap();
-        let llvm_answer = f.call(&data1, data2.get().0).unwrap();
+        let arrow_answer = arrow_ord::cmp::gt_eq(&data1, &data2).unwrap();
+        let llvm_answer = f.call(&data1, data2_u64.get().0).unwrap();
         assert_eq!(arrow_answer, llvm_answer);
 
         c.bench_function("i32scalar/execute arrow", |b| {
-            b.iter(|| arrow_ord::cmp::eq(&data1, &data2).unwrap())
+            b.iter(|| arrow_ord::cmp::gt_eq(&data1, &data2).unwrap())
         });
+
         c.bench_function("i32scalar/execute llvm", |b| {
-            b.iter(|| f.call(&data1, data2.get().0));
+            b.iter(|| arrow_compile_compute::cmp::gt_eq(&data1, &data2_u64).unwrap());
         });
     }
 

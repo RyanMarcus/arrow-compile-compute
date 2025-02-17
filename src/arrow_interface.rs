@@ -7,7 +7,15 @@ use crate::{
     aggregate::Aggregation, CompiledAggFunc, CompiledBinaryFunc, CompiledConvertFunc,
     CompiledFilterFunc, Predicate, PrimitiveType,
 };
-use arrow_array::{Array, ArrayRef, BooleanArray, Datum};
+
+use arrow_array::array::{
+    Int16Array, Int32Array, Int64Array, Int8Array, UInt16Array, UInt32Array, UInt64Array,
+    UInt8Array,
+};
+use arrow_array::types::{
+    Int16Type, Int32Type, Int64Type, Int8Type, UInt16Type, UInt32Type, UInt64Type, UInt8Type,
+};
+use arrow_array::{cast::AsArray, Array, ArrayRef, BooleanArray, Datum};
 use arrow_schema::{ArrowError, DataType};
 use inkwell::context::Context;
 use ouroboros::self_referencing;
@@ -15,6 +23,38 @@ use ouroboros::self_referencing;
 use crate::CodeGen;
 
 static GLOBAL_PROGRAM_CACHE: LazyLock<ProgramCache> = LazyLock::new(ProgramCache::new);
+
+macro_rules! convert_int {
+    ($ty:ty, $arr_type:ty,$arr:expr) => {
+        match $arr.data_type() {
+            DataType::Int8 => <$ty>::try_from($arr.as_primitive::<Int8Type>().value(0))
+                .ok()
+                .map(|i| Arc::new(<$arr_type>::from(vec![i])) as ArrayRef),
+            DataType::Int16 => <$ty>::try_from($arr.as_primitive::<Int16Type>().value(0))
+                .ok()
+                .map(|i| Arc::new(<$arr_type>::from(vec![i])) as ArrayRef),
+            DataType::Int32 => <$ty>::try_from($arr.as_primitive::<Int32Type>().value(0))
+                .ok()
+                .map(|i| Arc::new(<$arr_type>::from(vec![i])) as ArrayRef),
+            DataType::Int64 => <$ty>::try_from($arr.as_primitive::<Int64Type>().value(0))
+                .ok()
+                .map(|i| Arc::new(<$arr_type>::from(vec![i])) as ArrayRef),
+            DataType::UInt8 => <$ty>::try_from($arr.as_primitive::<UInt8Type>().value(0))
+                .ok()
+                .map(|i| Arc::new(<$arr_type>::from(vec![i])) as ArrayRef),
+            DataType::UInt16 => <$ty>::try_from($arr.as_primitive::<UInt16Type>().value(0))
+                .ok()
+                .map(|i| Arc::new(<$arr_type>::from(vec![i])) as ArrayRef),
+            DataType::UInt32 => <$ty>::try_from($arr.as_primitive::<UInt32Type>().value(0))
+                .ok()
+                .map(|i| Arc::new(<$arr_type>::from(vec![i])) as ArrayRef),
+            DataType::UInt64 => <$ty>::try_from($arr.as_primitive::<UInt64Type>().value(0))
+                .ok()
+                .map(|i| Arc::new(<$arr_type>::from(vec![i])) as ArrayRef),
+            _ => None,
+        }
+    };
+}
 
 #[self_referencing]
 pub struct SelfContainedBinaryFunc {
@@ -26,6 +66,31 @@ pub struct SelfContainedBinaryFunc {
 }
 unsafe impl Send for SelfContainedBinaryFunc {}
 unsafe impl Sync for SelfContainedBinaryFunc {}
+
+impl SelfContainedBinaryFunc {
+    pub fn build(
+        dt1: &DataType,
+        lhs_scalar: bool,
+        dt2: &DataType,
+        rhs_scalar: bool,
+        pred: Predicate,
+    ) -> Result<SelfContainedBinaryFunc, ArrowError> {
+        let ctx = Context::create();
+
+        SelfContainedBinaryFuncTryBuilder {
+            ctx,
+            cf_builder: |ctx| {
+                let cg = CodeGen::new(ctx);
+                cg.primitive_primitive_cmp(dt1, lhs_scalar, dt2, rhs_scalar, pred)
+            },
+        }
+        .try_build()
+    }
+
+    pub fn call(&self, arr1: &dyn Datum, arr2: &dyn Datum) -> Result<BooleanArray, ArrowError> {
+        self.with_cf(|cf| cf.call(arr1.get().0, arr2.get().0))
+    }
+}
 
 #[self_referencing]
 pub struct SelfContainedConvertFunc {
@@ -59,25 +124,6 @@ pub struct SelfContainedAggFunc {
 }
 unsafe impl Send for SelfContainedAggFunc {}
 unsafe impl Sync for SelfContainedAggFunc {}
-
-fn build_prim_prim_cmp(
-    dt1: &DataType,
-    lhs_scalar: bool,
-    dt2: &DataType,
-    rhs_scalar: bool,
-    pred: Predicate,
-) -> Result<SelfContainedBinaryFunc, ArrowError> {
-    let ctx = Context::create();
-
-    SelfContainedBinaryFuncTryBuilder {
-        ctx,
-        cf_builder: |ctx| {
-            let cg = CodeGen::new(ctx);
-            cg.primitive_primitive_cmp(dt1, lhs_scalar, dt2, rhs_scalar, pred)
-        },
-    }
-    .try_build()
-}
 
 fn build_cast(src: &DataType, tar: &DataType) -> Result<SelfContainedConvertFunc, ArrowError> {
     let ctx = Context::create();
@@ -180,14 +226,40 @@ impl ProgramCache {
         arr2: &dyn Datum,
         pred: Predicate,
     ) -> Result<BooleanArray, ArrowError> {
-        let (arr1, arr2) = normalize_order(arr1, arr2);
-        let (d1, is_scalar1) = arr1.get();
-        let (d2, is_scalar2) = arr2.get();
+        let (d1, d2) = normalize_order(arr1, arr2);
+        let (arr1, is_scalar1) = d1.get();
+        let (arr2, is_scalar2) = d2.get();
+
+        let new_arr2 = if arr1.data_type().is_primitive()
+            && arr2.data_type().is_primitive()
+            && arr1.data_type() != arr2.data_type()
+            && is_scalar2
+        {
+            // see if we can convert arr2 (scalar) to arr1's type
+            match arr1.data_type() {
+                DataType::Int8 => convert_int!(i8, Int8Array, arr2),
+                DataType::Int16 => convert_int!(i16, Int16Array, arr2),
+                DataType::Int32 => convert_int!(i32, Int32Array, arr2),
+                DataType::Int64 => convert_int!(i64, Int64Array, arr2),
+                DataType::UInt8 => convert_int!(u8, UInt8Array, arr2),
+                DataType::UInt16 => convert_int!(u16, UInt16Array, arr2),
+                DataType::UInt32 => convert_int!(u32, UInt32Array, arr2),
+                DataType::UInt64 => convert_int!(u64, UInt64Array, arr2),
+                //DataType::Float16 => convert_float!(f16, Float16Array, arr2),
+                //DataType::Float32 => convert_float!(f32, Float32Array, arr2),
+                //DataType::Float64 => convert_float!(f64, Float64Array, arr2),
+                _ => None,
+            }
+        } else {
+            None
+        };
+
+        let arr2 = new_arr2.as_deref().unwrap_or(arr2);
 
         let sig = (
-            d1.data_type().clone(),
+            arr1.data_type().clone(),
             is_scalar1,
-            d2.data_type().clone(),
+            arr2.data_type().clone(),
             is_scalar2,
             pred,
         );
@@ -195,7 +267,7 @@ impl ProgramCache {
         {
             let lcache = self.cmp_cache.read().unwrap();
             if let Some(f) = lcache.get(&sig) {
-                return f.with_cf(|cf| cf.call(d1, d2));
+                return f.with_cf(|cf| cf.call(arr1, arr2));
             }
         }
 
@@ -203,9 +275,14 @@ impl ProgramCache {
         // see there is no function, then compile it, then store it. This is
         // fine a price to pay for not holding the lock for all function
         // compilation.
-        let new_f =
-            build_prim_prim_cmp(d1.data_type(), is_scalar1, d2.data_type(), is_scalar2, pred)?;
-        let result = new_f.with_cf(|cf| cf.call(d1, d2));
+        let new_f = SelfContainedBinaryFunc::build(
+            arr1.data_type(),
+            is_scalar1,
+            arr2.data_type(),
+            is_scalar2,
+            pred,
+        )?;
+        let result = new_f.with_cf(|cf| cf.call(arr1, arr2));
         self.cmp_cache.write().unwrap().insert(sig, new_f);
         result
     }
@@ -298,25 +375,17 @@ impl ProgramCache {
         result
     }
 }
+use std::sync::Arc;
 
-/// if either of dt1 or dt2 is a primitive, put it first
+/// If either of dt1 or dt2 is a primitive, put it first. If one is scalar and a
+/// different type, check the range of the scalar and possibly convert it.
 fn normalize_order<'a>(d1: &'a dyn Datum, d2: &'a dyn Datum) -> (&'a dyn Datum, &'a dyn Datum) {
     let (arr1, scalar1) = d1.get();
     let (arr2, scalar2) = d2.get();
 
-    if scalar1 {
-        return (d2, d1);
-    }
+    let (d1, d2) = if scalar1 { (d2, d1) } else { (d1, d2) };
 
-    if scalar2 {
-        return (d1, d2);
-    }
-
-    if arr1.data_type().is_primitive() {
-        return (d1, d2);
-    }
-
-    if arr2.data_type().is_primitive() {
+    if !arr1.data_type().is_primitive() && (!scalar2 && arr2.data_type().is_primitive()) {
         return (d2, d1);
     }
 
@@ -428,6 +497,7 @@ pub mod cast {
 }
 
 pub mod compute {
+
     use arrow_array::{cast::AsArray, Array, ArrayRef, BooleanArray, UInt64Array};
     use arrow_schema::ArrowError;
 

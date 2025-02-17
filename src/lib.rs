@@ -51,6 +51,7 @@ mod string;
 pub use arrow_interface::cast;
 pub use arrow_interface::cmp;
 pub use arrow_interface::compute;
+pub use arrow_interface::SelfContainedBinaryFunc;
 
 /// Declare a set of basic blocks at once
 macro_rules! declare_blocks {
@@ -64,12 +65,12 @@ macro_rules! declare_blocks {
 }
 pub(crate) use declare_blocks;
 
-/// Utility function to create the appropiate `DataType` for a dictionary array
+/// Utility function to create the appropriate `DataType` for a dictionary array
 pub fn dictionary_data_type(key_type: DataType, val_type: DataType) -> DataType {
     DataType::Dictionary(Box::new(key_type.clone()), Box::new(val_type.clone()))
 }
 
-/// Utility function to create the appropiate `DataType` for a run-end encoded
+/// Utility function to create the appropriate `DataType` for a run-end encoded
 /// array
 pub fn run_end_data_type(run_type: &DataType, val_type: &DataType) -> DataType {
     let f1 = Arc::new(Field::new("run_ends", run_type.clone(), false));
@@ -203,7 +204,7 @@ impl PrimitiveType {
             DataType::Float64 => PrimitiveType::F64,
             DataType::Dictionary(_k, v) => PrimitiveType::for_arrow_type(v),
             DataType::RunEndEncoded(_k, v) => PrimitiveType::for_arrow_type(v.data_type()),
-            _ => todo!(),
+            _ => todo!("no prim type for {:?}", dt),
         }
     }
 
@@ -641,6 +642,7 @@ impl CompiledBinaryFunc<'_> {
         let (data2, ptr2) = arr_to_ptr(arr2);
 
         let mut buf = vec![0_u64; arr1.len().div_ceil(64)];
+
         unsafe {
             self.f.call(ptr1, ptr2, arr1.len() as u64, buf.as_mut_ptr());
         }
@@ -712,7 +714,7 @@ pub struct CompiledFilterFunc<'ctx> {
 }
 
 impl CompiledFilterFunc<'_> {
-    /// Verify that `arr1` matchess the types this function was compiled for,
+    /// Verify that `arr1` matches the types this function was compiled for,
     /// then execute the function and return the result.
     pub fn call(&self, arr1: &dyn Array, ba: &BooleanArray) -> Result<ArrayRef, ArrowError> {
         if arr1.data_type() != &self.src_dt {
@@ -757,6 +759,78 @@ impl CompiledFilterFunc<'_> {
         let unsliced = buffer_to_primitive(buf, arr1.nulls().cloned(), &prim_type.as_arrow_type());
 
         let sliced = unsliced.slice(0, ba.true_count());
+        Ok(sliced)
+    }
+}
+
+/// A compiled function that owns its own LLVM context. Indexes using one array
+/// into another.
+pub struct CompiledTakeFunc<'ctx> {
+    _cg: CodeGen<'ctx>,
+    take_dt: DataType,
+    data_dt: DataType,
+    f: JitFunction<'ctx, unsafe extern "C" fn(*const c_void, *const c_void, u64, *mut c_void)>,
+}
+
+impl CompiledTakeFunc<'_> {
+    /// Verify that datatypes matches the types this function was compiled for,
+    /// then execute the function and return the result.
+    pub fn call(&self, data: &dyn Array, indexes: &dyn Array) -> Result<ArrayRef, ArrowError> {
+        if data.data_type() != &self.data_dt {
+            return Err(ArrowError::ComputeError(format!(
+                "arg 1 had wrong type (expected {:?}, found {:?})",
+                self.data_dt,
+                data.data_type()
+            )));
+        }
+
+        if indexes.data_type() != &self.take_dt {
+            return Err(ArrowError::ComputeError(format!(
+                "arg 2 had wrong type (expected {:?}, found {:?})",
+                self.take_dt,
+                indexes.data_type()
+            )));
+        }
+
+        if indexes.is_nullable() {
+            return Err(ArrowError::ComputeError(
+                "indexes in take cannot have null values".to_string(),
+            ));
+        }
+
+        let prim_type = PrimitiveType::for_arrow_type(&self.data_dt);
+
+        // handle length 0 arrays, since our kernels assume len > 0 (this is
+        // mostly so we can do one iteration of the loop prior to checking the
+        // loop condition)
+        if data.is_empty() || indexes.is_empty() {
+            let buf = Buffer::from_vec(Vec::<u128>::with_capacity(0));
+            return Ok(
+                buffer_to_primitive(buf, data.nulls().cloned(), &prim_type.as_arrow_type()).into(),
+            );
+        }
+
+        let (data, ptr) = arr_to_ptr(data);
+        let (take, tptr) = arr_to_ptr(indexes);
+
+        let mut buf = vec![0_u8; indexes.len() * prim_type.width()];
+
+        unsafe {
+            self.f.call(
+                ptr,
+                tptr,
+                indexes.len() as u64,
+                buf.as_mut_ptr() as *mut c_void,
+            );
+        }
+
+        std::mem::drop(data);
+        std::mem::drop(take);
+        let buf = Buffer::from_vec(buf);
+
+        let unsliced = buffer_to_primitive(buf, None, &prim_type.as_arrow_type());
+
+        let sliced = unsliced.slice(0, indexes.len());
         Ok(sliced)
     }
 }
@@ -960,7 +1034,7 @@ impl<'ctx> CodeGen<'ctx> {
                 } else if src.is_signed() {
                     builder.build_int_s_extend(v, dst_vec, "sext").unwrap()
                 } else {
-                    builder.build_int_z_extend(v, dst_vec, "sext").unwrap()
+                    builder.build_int_z_extend(v, dst_vec, "zext").unwrap()
                 }
             }
             // int to float
@@ -1177,17 +1251,6 @@ impl<'ctx> CodeGen<'ctx> {
         let i64_type = self.context.i64_type();
         let ptr_type = self.context.ptr_type(AddressSpace::default());
 
-        let lhs_iter_next = if !lhs_scalar {
-            self.gen_iter_for("left", lhs_dt)
-        } else {
-            self.gen_iter_scalar("left", PrimitiveType::for_arrow_type(lhs_dt))
-        };
-        let rhs_iter_next = if !rhs_scalar {
-            self.gen_iter_for("right", rhs_dt)
-        } else {
-            self.gen_iter_scalar("right", PrimitiveType::for_arrow_type(rhs_dt))
-        };
-
         let fn_type = self.context.void_type().fn_type(
             &[
                 ptr_type.into(), // arr1
@@ -1203,6 +1266,17 @@ impl<'ctx> CodeGen<'ctx> {
         let arr2_ptr = function.get_nth_param(1).unwrap().into_pointer_value();
         let len = function.get_nth_param(2).unwrap().into_int_value();
         let out_ptr = function.get_nth_param(3).unwrap().into_pointer_value();
+
+        let lhs_iter_next = if !lhs_scalar {
+            self.gen_iter_for("left", lhs_dt)
+        } else {
+            self.gen_iter_scalar("left", PrimitiveType::for_arrow_type(lhs_dt))
+        };
+        let rhs_iter_next = if !rhs_scalar {
+            self.gen_iter_for("right", rhs_dt)
+        } else {
+            self.gen_iter_scalar("right", PrimitiveType::for_arrow_type(rhs_dt))
+        };
 
         let entry = self.context.append_basic_block(function, "entry");
         let loop_cond = self.context.append_basic_block(function, "loop_cond");
