@@ -340,46 +340,46 @@ impl PrimitiveType {
     fn max_value<'a>(&self, ctx: &'a Context) -> BasicValueEnum<'a> {
         match self {
             PrimitiveType::I8 => self
-                .llvm_type(&ctx)
+                .llvm_type(ctx)
                 .into_int_type()
                 .const_int(i8::MAX as u64, true)
                 .as_basic_value_enum(),
             PrimitiveType::I16 => self
-                .llvm_type(&ctx)
+                .llvm_type(ctx)
                 .into_int_type()
                 .const_int(i16::MAX as u64, true)
                 .as_basic_value_enum(),
             PrimitiveType::I32 => self
-                .llvm_type(&ctx)
+                .llvm_type(ctx)
                 .into_int_type()
                 .const_int(i32::MAX as u64, true)
                 .as_basic_value_enum(),
             PrimitiveType::I64 => self
-                .llvm_type(&ctx)
+                .llvm_type(ctx)
                 .into_int_type()
-                .const_int(i8::MAX as u64, true)
+                .const_int(i64::MAX as u64, true)
                 .as_basic_value_enum(),
             PrimitiveType::U8
             | PrimitiveType::U16
             | PrimitiveType::U32
             | PrimitiveType::U64
             | PrimitiveType::U128 => self
-                .llvm_type(&ctx)
+                .llvm_type(ctx)
                 .into_int_type()
                 .const_all_ones()
                 .as_basic_value_enum(),
             PrimitiveType::F16 => self
-                .llvm_type(&ctx)
+                .llvm_type(ctx)
                 .into_float_type()
                 .const_float(f16::INFINITY.to_f64())
                 .as_basic_value_enum(),
             PrimitiveType::F32 => self
-                .llvm_type(&ctx)
+                .llvm_type(ctx)
                 .into_float_type()
                 .const_float(f32::INFINITY as f64)
                 .as_basic_value_enum(),
             PrimitiveType::F64 => self
-                .llvm_type(&ctx)
+                .llvm_type(ctx)
                 .into_float_type()
                 .const_float(f64::INFINITY)
                 .as_basic_value_enum(),
@@ -389,22 +389,22 @@ impl PrimitiveType {
     fn min_value<'a>(&self, ctx: &'a Context) -> BasicValueEnum<'a> {
         match self {
             PrimitiveType::I8 => self
-                .llvm_type(&ctx)
+                .llvm_type(ctx)
                 .into_int_type()
                 .const_int(i8::MIN as u64, true)
                 .as_basic_value_enum(),
             PrimitiveType::I16 => self
-                .llvm_type(&ctx)
+                .llvm_type(ctx)
                 .into_int_type()
                 .const_int(i16::MIN as u64, true)
                 .as_basic_value_enum(),
             PrimitiveType::I32 => self
-                .llvm_type(&ctx)
+                .llvm_type(ctx)
                 .into_int_type()
                 .const_int(i32::MIN as u64, true)
                 .as_basic_value_enum(),
             PrimitiveType::I64 => self
-                .llvm_type(&ctx)
+                .llvm_type(ctx)
                 .into_int_type()
                 .const_int(i64::MIN as u64, true)
                 .as_basic_value_enum(),
@@ -413,22 +413,22 @@ impl PrimitiveType {
             | PrimitiveType::U32
             | PrimitiveType::U64
             | PrimitiveType::U128 => self
-                .llvm_type(&ctx)
+                .llvm_type(ctx)
                 .into_int_type()
                 .const_zero()
                 .as_basic_value_enum(),
             PrimitiveType::F16 => self
-                .llvm_type(&ctx)
+                .llvm_type(ctx)
                 .into_float_type()
                 .const_float(f16::NEG_INFINITY.to_f64())
                 .as_basic_value_enum(),
             PrimitiveType::F32 => self
-                .llvm_type(&ctx)
+                .llvm_type(ctx)
                 .into_float_type()
                 .const_float(f32::NEG_INFINITY as f64)
                 .as_basic_value_enum(),
             PrimitiveType::F64 => self
-                .llvm_type(&ctx)
+                .llvm_type(ctx)
                 .into_float_type()
                 .const_float(f64::NEG_INFINITY)
                 .as_basic_value_enum(),
@@ -978,7 +978,7 @@ impl CompiledAggFunc<'_> {
             let prim_type = PrimitiveType::for_arrow_type(&self.src_dt);
             let buf = Buffer::from_vec(buf);
             let res = buffer_to_primitive(buf, None, &prim_type.as_arrow_type());
-            Ok(Some(res.into()))
+            Ok(Some(res))
         }
     }
 }
@@ -1090,8 +1090,7 @@ impl<'ctx> CodeGen<'ctx> {
         let i64_type = self.context.i64_type();
         let as_int1 = builder.build_ptr_to_int(p1, i64_type, "as_int1").unwrap();
         let as_int2 = builder.build_ptr_to_int(p2, i64_type, "as_int2").unwrap();
-        let diff = builder.build_int_sub(as_int2, as_int1, "diff").unwrap();
-        diff
+        builder.build_int_sub(as_int2, as_int1, "diff").unwrap()
     }
 
     fn gen_convert_vec<'a>(

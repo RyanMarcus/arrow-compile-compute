@@ -38,9 +38,9 @@ impl<'ctx> CodeGen<'ctx> {
         agg: Aggregation,
     ) -> Result<CompiledAggFunc<'ctx>, ArrowError> {
         let prim = PrimitiveType::for_arrow_type(dt);
-        let prim_llvm_type = prim.llvm_type(&self.context);
-        let pair_type = prim.llvm_vec_type(&self.context, 2);
-        let prim_block_type = prim.llvm_vec_type(&self.context, 64);
+        let prim_llvm_type = prim.llvm_type(self.context);
+        let pair_type = prim.llvm_vec_type(self.context, 2);
+        let prim_block_type = prim.llvm_vec_type(self.context, 64);
 
         let builder = self.context.create_builder();
         let i64_type = self.context.i64_type();
@@ -53,10 +53,12 @@ impl<'ctx> CodeGen<'ctx> {
             "llvm.vector.reduce.{}",
             agg.llvm_func_suffix(prim)
         ))
-        .expect(&format!(
-            "unable to find intrinsic for suffix {}",
-            agg.llvm_func_suffix(prim)
-        ));
+        .unwrap_or_else(|| {
+            panic!(
+                "unable to find intrinsic for suffix {}",
+                agg.llvm_func_suffix(prim)
+            )
+        });
         let agg_f = agg_intrinsic
             .get_declaration(&self.module, &[prim_block_type.into()])
             .unwrap();
@@ -96,9 +98,9 @@ impl<'ctx> CodeGen<'ctx> {
         let accum_ptr = builder.build_alloca(prim_llvm_type, "accum").unwrap();
         // store a neutral value into accum
         let to_store = match agg {
-            Aggregation::Min => prim.max_value(&self.context),
-            Aggregation::Max => prim.min_value(&self.context),
-            Aggregation::Sum => prim.zero(&self.context),
+            Aggregation::Min => prim.max_value(self.context),
+            Aggregation::Max => prim.min_value(self.context),
+            Aggregation::Sum => prim.zero(self.context),
         };
         builder.build_store(accum_ptr, to_store).unwrap();
 
@@ -285,12 +287,14 @@ impl<'ctx> CodeGen<'ctx> {
         let access = self.gen_random_access_for("agg", dt);
 
         let agg_intrinsic = Intrinsic::find(&format!("llvm.{}", agg.llvm_func_suffix(prim)))
-            .expect(&format!(
-                "unable to find intrinsic for suffix {}",
-                agg.llvm_func_suffix(prim)
-            ));
+            .unwrap_or_else(|| {
+                panic!(
+                    "unable to find intrinsic for suffix {}",
+                    agg.llvm_func_suffix(prim)
+                )
+            });
         let agg_f = agg_intrinsic
-            .get_declaration(&self.module, &[dtype.into()])
+            .get_declaration(&self.module, &[dtype])
             .unwrap();
 
         let fn_type = i1_type.fn_type(
