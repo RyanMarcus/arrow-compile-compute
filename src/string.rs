@@ -164,6 +164,108 @@ impl<'ctx> CodeGen<'ctx> {
         function
     }
 
+    /// Adds a function to the current context that takes in a start and end
+    /// string pointer, along with a base buffer pointer, and returns a view.
+    pub(crate) fn add_ptrx2_to_view(&self) -> FunctionValue {
+        let ctx = self.context;
+        let i1_type = ctx.bool_type();
+        let i32_type = ctx.i32_type();
+        let i64_type = ctx.i64_type();
+        let i128_type = ctx.i128_type();
+        let ptr_type = ctx.ptr_type(AddressSpace::default());
+        let str_type = self.string_return_type();
+
+        let memcpy = Intrinsic::find("llvm.memcpy").unwrap();
+        let memcpy_f = memcpy
+            .get_declaration(
+                &self.module,
+                &[ptr_type.into(), ptr_type.into(), i64_type.into()],
+            )
+            .unwrap();
+
+        let func_type = i128_type.fn_type(&[str_type.into(), ptr_type.into()], false);
+        let func = self.module.add_function("ptrx2_to_view", func_type, None);
+
+        let ptrs = func.get_nth_param(0).unwrap().into_struct_value();
+        let base_ptr = func.get_nth_param(1).unwrap().into_pointer_value();
+
+        declare_blocks!(self.context, func, entry, fits, no_fit, exit);
+        let builder = ctx.create_builder();
+        builder.position_at_end(entry);
+        let ptr1 = builder
+            .build_extract_value(ptrs, 0, "ptr1")
+            .unwrap()
+            .into_pointer_value();
+        let ptr2 = builder
+            .build_extract_value(ptrs, 1, "ptr2")
+            .unwrap()
+            .into_pointer_value();
+        let to_return_ptr = builder.build_alloca(i128_type, "to_return_ptr").unwrap();
+        let len_u64 = self.pointer_diff(&builder, ptr1, ptr2);
+        let len = builder
+            .build_int_truncate(len_u64, i32_type, "len_u32")
+            .unwrap();
+        let len_128 = builder
+            .build_int_z_extend(len, i128_type, "len_128")
+            .unwrap();
+        builder.build_store(to_return_ptr, len_128).unwrap();
+        let is_short = builder
+            .build_int_compare(IntPredicate::ULE, len, i32_type.const_int(12, false), "cmp")
+            .unwrap();
+        builder
+            .build_conditional_branch(is_short, fits, no_fit)
+            .unwrap();
+
+        builder.position_at_end(fits);
+        builder
+            .build_call(
+                memcpy_f,
+                &[
+                    self.increment_pointer(
+                        &builder,
+                        to_return_ptr,
+                        4,
+                        i64_type.const_int(1, false),
+                    )
+                    .into(),
+                    ptr1.into(),
+                    len_u64.into(),
+                    i1_type.const_zero().into(),
+                ],
+                "memcpy",
+            )
+            .unwrap();
+        builder.build_unconditional_branch(exit).unwrap();
+
+        builder.position_at_end(no_fit);
+        let prefix = builder.build_load(i32_type, ptr1, "prefix").unwrap();
+        builder
+            .build_store(
+                self.increment_pointer(&builder, to_return_ptr, 4, i64_type.const_int(1, false)),
+                prefix,
+            )
+            .unwrap();
+        let offset = self.pointer_diff(&builder, base_ptr, ptr1);
+        let offset = builder
+            .build_int_truncate(offset, i32_type, "offset")
+            .unwrap();
+        builder
+            .build_store(
+                self.increment_pointer(&builder, to_return_ptr, 4, i64_type.const_int(3, false)),
+                offset,
+            )
+            .unwrap();
+        builder.build_unconditional_branch(exit).unwrap();
+
+        builder.position_at_end(exit);
+        let result = builder
+            .build_load(i128_type, to_return_ptr, "result")
+            .unwrap();
+        builder.build_return(Some(&result)).unwrap();
+
+        func
+    }
+
     fn string_return_type(&self) -> StructType<'ctx> {
         self.context.struct_type(
             &[
@@ -188,19 +290,51 @@ impl<'ctx> CodeGen<'ctx> {
         )
     }
 
+    pub(crate) fn get_string_base_data_ptr<'a>(
+        &'a self,
+        builder: &'a Builder<'a>,
+        iter: PointerValue<'a>,
+    ) -> PointerValue<'a> {
+        let struct_type = self.struct_for_iter_string_primitive();
+        let data_ptr_ptr = builder
+            .build_struct_gep(struct_type, iter, 1, "data_ptr_ptr")
+            .unwrap();
+        builder
+            .build_load(
+                self.context.ptr_type(AddressSpace::default()),
+                data_ptr_ptr,
+                "data_ptr",
+            )
+            .unwrap()
+            .into_pointer_value()
+    }
+
     pub(crate) fn initialize_iter_string_primitive<'a>(
         &'a self,
         builder: &'a Builder<'a>,
-        offset_ptr: PointerValue,
-        data_ptr: PointerValue,
+        arr_ptr: PointerValue,
         len: IntValue,
     ) -> PointerValue<'a>
     where
         'ctx: 'a,
     {
         let i64_type = self.context.i64_type();
+        let ptr_type = self.context.ptr_type(AddressSpace::default());
         let iter_type = self.struct_for_iter_string_primitive();
         let ptr = builder.build_alloca(iter_type, "prim_iter_ptr").unwrap();
+
+        let offset_ptr = builder
+            .build_load(ptr_type, arr_ptr, "offset_ptr")
+            .unwrap()
+            .into_pointer_value();
+        let data_ptr = builder
+            .build_load(
+                ptr_type,
+                self.increment_pointer(builder, arr_ptr, 8, i64_type.const_int(1, false)),
+                "data_ptr",
+            )
+            .unwrap()
+            .into_pointer_value();
 
         let off_ptr_ptr = builder
             .build_struct_gep(iter_type, ptr, 0, "off_ptr_ptr")
@@ -313,7 +447,8 @@ impl<'ctx> CodeGen<'ctx> {
         assert!(
             matches!(prim_width_type, PrimitiveType::I32)
                 || matches!(prim_width_type, PrimitiveType::I64),
-            "Only I32 and I64 widths are supported for string iterators"
+            "Only I32 and I64 widths are supported for string iterators (not {:?})",
+            prim_width_type
         );
 
         let builder = self.context.create_builder();
@@ -513,32 +648,16 @@ impl<'ctx> CodeGen<'ctx> {
         );
 
         builder.position_at_end(entry);
-        let offset_ptr = builder
-            .build_load(
-                ptr_type,
-                function.get_nth_param(0).unwrap().into_pointer_value(),
-                "offset_ptr",
-            )
-            .unwrap()
-            .into_pointer_value();
-        let data_ptr = builder
-            .build_load(
-                ptr_type,
-                self.increment_pointer(
-                    &builder,
-                    function.get_nth_param(0).unwrap().into_pointer_value(),
-                    8,
-                    i64_type.const_int(1, false),
-                ),
-                "data_ptr",
-            )
-            .unwrap()
-            .into_pointer_value();
+
         let null_map_ptr = function.get_nth_param(1).unwrap().into_pointer_value();
         let len = function.get_nth_param(2).unwrap().into_int_value();
         let curr_best_ptr = function.get_nth_param(3).unwrap().into_pointer_value();
 
-        let iter = self.initialize_iter_string_primitive(&builder, offset_ptr, data_ptr, len);
+        let iter = self.initialize_iter_string_primitive(
+            &builder,
+            function.get_nth_param(0).unwrap().into_pointer_value(),
+            len,
+        );
         let nulls = self.initialize_iter_bitmap(&builder, null_map_ptr, len);
 
         let candidate_ptr = builder.build_alloca(str_type, "candidate_ptr").unwrap();
@@ -676,8 +795,6 @@ mod tests {
     #[test]
     fn test_string_len_max() {
         let data = StringArray::from(vec!["®", " "]);
-
-        println!("{:?}", data.offsets());
 
         let ctx = Context::create();
         let cg = CodeGen::new(&ctx);

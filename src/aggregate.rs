@@ -483,7 +483,6 @@ mod tests {
         let mut rng = fastrand::Rng::with_seed(42);
         for &sz in SIZES_TO_TRY {
             let data = (0..sz).map(|_| rng.u32(..)).collect_vec();
-            println!("{:?}", data);
             let data = UInt32Array::from(data);
             let arrow_min = arrow_arith::aggregate::min(&data).unwrap();
 

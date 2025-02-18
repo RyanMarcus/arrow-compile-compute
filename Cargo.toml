@@ -54,3 +54,8 @@ harness = false
 [[bench]]
 name = "bitmap_bench"
 harness = false
+
+
+[[bench]]
+name = "take_bench"
+harness = false

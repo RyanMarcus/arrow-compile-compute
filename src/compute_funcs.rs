@@ -391,6 +391,12 @@ impl<'a> CodeGen<'a> {
         let access_idx = self.gen_random_access_for("get_idx", idx_dt);
         let access_data = self.gen_random_access_for("get_dat", data_dt);
 
+        let convert = if matches!(data_dt, DataType::Utf8 | DataType::LargeUtf8) {
+            Some(self.add_ptrx2_to_view())
+        } else {
+            None
+        };
+
         declare_blocks!(self.context, function, entry, loop_cond, loop_body, exit);
 
         builder.position_at_end(entry);
@@ -431,7 +437,7 @@ impl<'a> CodeGen<'a> {
             .build_int_z_extend_or_bit_cast(data_idx, i64_type, "zext")
             .unwrap();
 
-        let next_data = builder
+        let mut next_data = builder
             .build_call(
                 access_data,
                 &[data_iter.into(), data_idx.into()],
@@ -440,6 +446,17 @@ impl<'a> CodeGen<'a> {
             .unwrap()
             .try_as_basic_value()
             .unwrap_left();
+
+        if let Some(convert) = convert {
+            // transform the pointer pair into a view
+            let base_ptr = self.get_string_base_data_ptr(&builder, data_iter);
+            next_data = builder
+                .build_call(convert, &[next_data.into(), base_ptr.into()], "view")
+                .unwrap()
+                .try_as_basic_value()
+                .unwrap_left();
+        }
+
         let out_loc = self.increment_pointer(&builder, out_ptr, prim_type.width(), curr_idx);
         builder.build_store(out_loc, next_data).unwrap();
         let inc_idx = builder
@@ -474,7 +491,7 @@ mod tests {
     use arrow_array::{
         cast::AsArray,
         types::{Int32Type, Int64Type, UInt64Type},
-        Array, BooleanArray, Int32Array, Int64Array,
+        Array, BooleanArray, Int32Array, Int64Array, StringArray,
     };
     use inkwell::context::Context;
     use itertools::Itertools;
@@ -590,5 +607,47 @@ mod tests {
             .clone();
 
         assert_eq!(arr_taken, result);
+    }
+
+    #[test]
+    fn test_take_str() {
+        let data = StringArray::from(vec!["hello", "world", "rust"]);
+        let indices = Int32Array::from(vec![0, 2]);
+
+        let ctx = Context::create();
+        let codegen = CodeGen::new(&ctx);
+        let compiled_func = codegen
+            .compile_take(indices.data_type(), data.data_type())
+            .expect("Failed to compile take function");
+        let result = compiled_func.call(&data, &indices).unwrap();
+        let result = result.as_string_view().iter().collect_vec();
+        assert_eq!(result, vec![Some("hello"), Some("rust")]);
+    }
+
+    #[test]
+    fn test_take_long_str() {
+        let data = StringArray::from(vec![
+            "hello",
+            "world",
+            "rust",
+            "this is more than twelve characters",
+        ]);
+        let indices = Int32Array::from(vec![0, 2, 3]);
+
+        let ctx = Context::create();
+        let codegen = CodeGen::new(&ctx);
+        let compiled_func = codegen
+            .compile_take(indices.data_type(), data.data_type())
+            .expect("Failed to compile take function");
+        let result = compiled_func.call(&data, &indices).unwrap();
+        let result = result.as_string_view().iter().collect_vec();
+        assert_eq!(
+            result,
+            vec![
+                Some("hello"),
+                Some("rust"),
+                Some("this is more than twelve characters")
+            ]
+        );
     }
 }

@@ -21,7 +21,10 @@ use arrow_array::{
         Date32Type, Date64Type, Float16Type, Float32Type, Float64Type, Int16Type, Int32Type,
         Int64Type, Int8Type, UInt16Type, UInt32Type, UInt64Type, UInt8Type,
     },
-    Array, ArrayRef, BooleanArray, PrimitiveArray, RunArray, StringArray,
+    Array, ArrayRef, BinaryArray, BinaryViewArray, BooleanArray, Date32Array, Date64Array,
+    FixedSizeBinaryArray, Float16Array, Float32Array, Float64Array, Int16Array, Int32Array,
+    Int64Array, Int8Array, LargeBinaryArray, LargeStringArray, NullArray, PrimitiveArray, RunArray,
+    StringArray, StringViewArray, UInt16Array, UInt32Array, UInt64Array, UInt8Array,
 };
 use arrow_buffer::{BooleanBuffer, Buffer, NullBuffer, ScalarBuffer};
 use arrow_schema::{ArrowError, DataType, Field};
@@ -137,6 +140,50 @@ fn buffer_to_primitive(b: Buffer, nulls: Option<NullBuffer>, tar_dt: &DataType) 
     }
 }
 
+pub fn empty_array_for(dt: &DataType) -> ArrayRef {
+    match dt {
+        DataType::Null => Arc::new(NullArray::new(0)),
+        DataType::Boolean => Arc::new(BooleanArray::new_null(0)),
+        DataType::Int8 => Arc::new(Int8Array::new_null(0)),
+        DataType::Int16 => Arc::new(Int16Array::new_null(0)),
+        DataType::Int32 => Arc::new(Int32Array::new_null(0)),
+        DataType::Int64 => Arc::new(Int64Array::new_null(0)),
+        DataType::UInt8 => Arc::new(UInt8Array::new_null(0)),
+        DataType::UInt16 => Arc::new(UInt16Array::new_null(0)),
+        DataType::UInt32 => Arc::new(UInt32Array::new_null(0)),
+        DataType::UInt64 => Arc::new(UInt64Array::new_null(0)),
+        DataType::Float16 => Arc::new(Float16Array::new_null(0)),
+        DataType::Float32 => Arc::new(Float32Array::new_null(0)),
+        DataType::Float64 => Arc::new(Float64Array::new_null(0)),
+        DataType::Timestamp(_time_unit, _) => todo!(),
+        DataType::Date32 => Arc::new(Date32Array::new_null(0)),
+        DataType::Date64 => Arc::new(Date64Array::new_null(0)),
+        DataType::Time32(_time_unit) => todo!(),
+        DataType::Time64(_time_unit) => todo!(),
+        DataType::Duration(_time_unit) => todo!(),
+        DataType::Interval(_interval_unit) => todo!(),
+        DataType::Binary => Arc::new(BinaryArray::new_null(0)),
+        DataType::FixedSizeBinary(s) => Arc::new(FixedSizeBinaryArray::new_null(*s, 0)),
+        DataType::LargeBinary => Arc::new(LargeBinaryArray::new_null(0)),
+        DataType::BinaryView => Arc::new(BinaryViewArray::new_null(0)),
+        DataType::Utf8 => Arc::new(StringArray::new_null(0)),
+        DataType::LargeUtf8 => Arc::new(LargeStringArray::new_null(0)),
+        DataType::Utf8View => Arc::new(StringViewArray::new_null(0)),
+        DataType::List(_field) => todo!(),
+        DataType::ListView(_field) => todo!(),
+        DataType::FixedSizeList(_field, _) => todo!(),
+        DataType::LargeList(_field) => todo!(),
+        DataType::LargeListView(_field) => todo!(),
+        DataType::Struct(_fields) => todo!(),
+        DataType::Union(_union_fields, _union_mode) => todo!(),
+        DataType::Dictionary(_key, _val) => todo!(),
+        DataType::Decimal128(_, _) => todo!(),
+        DataType::Decimal256(_, _) => todo!(),
+        DataType::Map(_field, _) => todo!(),
+        DataType::RunEndEncoded(_field, _field1) => todo!(),
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum PrimitiveType {
     I8,
@@ -147,6 +194,7 @@ enum PrimitiveType {
     U16,
     U32,
     U64,
+    U128,
     F16,
     F32,
     F64,
@@ -159,6 +207,7 @@ impl PrimitiveType {
             PrimitiveType::I16 | PrimitiveType::U16 => 2,
             PrimitiveType::I32 | PrimitiveType::U32 => 4,
             PrimitiveType::I64 | PrimitiveType::U64 => 8,
+            PrimitiveType::U128 => 16,
             PrimitiveType::F16 => 2,
             PrimitiveType::F32 => 4,
             PrimitiveType::F64 => 8,
@@ -171,6 +220,7 @@ impl PrimitiveType {
             PrimitiveType::I16 | PrimitiveType::U16 => ctx.i16_type().into(),
             PrimitiveType::I32 | PrimitiveType::U32 => ctx.i32_type().into(),
             PrimitiveType::I64 | PrimitiveType::U64 => ctx.i64_type().into(),
+            PrimitiveType::U128 => ctx.i128_type().into(),
             PrimitiveType::F16 => ctx.f16_type().into(),
             PrimitiveType::F32 => ctx.f32_type().into(),
             PrimitiveType::F64 => ctx.f64_type().into(),
@@ -183,6 +233,7 @@ impl PrimitiveType {
             PrimitiveType::I16 | PrimitiveType::U16 => ctx.i16_type().vec_type(size),
             PrimitiveType::I32 | PrimitiveType::U32 => ctx.i32_type().vec_type(size),
             PrimitiveType::I64 | PrimitiveType::U64 => ctx.i64_type().vec_type(size),
+            PrimitiveType::U128 => ctx.i128_type().vec_type(size),
             PrimitiveType::F16 => ctx.f16_type().vec_type(size),
             PrimitiveType::F32 => ctx.f32_type().vec_type(size),
             PrimitiveType::F64 => ctx.f64_type().vec_type(size),
@@ -204,6 +255,8 @@ impl PrimitiveType {
             DataType::Float64 => PrimitiveType::F64,
             DataType::Dictionary(_k, v) => PrimitiveType::for_arrow_type(v),
             DataType::RunEndEncoded(_k, v) => PrimitiveType::for_arrow_type(v.data_type()),
+            DataType::Utf8 => PrimitiveType::U128, // string view
+            DataType::LargeUtf8 => PrimitiveType::U128, // string view
             _ => todo!("no prim type for {:?}", dt),
         }
     }
@@ -218,6 +271,7 @@ impl PrimitiveType {
             PrimitiveType::U16 => DataType::UInt16,
             PrimitiveType::U32 => DataType::UInt32,
             PrimitiveType::U64 => DataType::UInt64,
+            PrimitiveType::U128 => DataType::Utf8View,
             PrimitiveType::F16 => DataType::Float16,
             PrimitiveType::F32 => DataType::Float32,
             PrimitiveType::F64 => DataType::Float64,
@@ -229,6 +283,7 @@ impl PrimitiveType {
     /// For example, calling with `width = 8` will give `I64`.
     fn int_with_width(width: usize) -> PrimitiveType {
         match width {
+            16 => PrimitiveType::U128,
             8 => PrimitiveType::I64,
             4 => PrimitiveType::I32,
             2 => PrimitiveType::I16,
@@ -242,9 +297,11 @@ impl PrimitiveType {
             PrimitiveType::I8 | PrimitiveType::I16 | PrimitiveType::I32 | PrimitiveType::I64 => {
                 true
             }
-            PrimitiveType::U8 | PrimitiveType::U16 | PrimitiveType::U32 | PrimitiveType::U64 => {
-                false
-            }
+            PrimitiveType::U8
+            | PrimitiveType::U16
+            | PrimitiveType::U32
+            | PrimitiveType::U64
+            | PrimitiveType::U128 => false,
             PrimitiveType::F16 | PrimitiveType::F32 | PrimitiveType::F64 => true,
         }
     }
@@ -258,7 +315,8 @@ impl PrimitiveType {
             | PrimitiveType::U8
             | PrimitiveType::U16
             | PrimitiveType::U32
-            | PrimitiveType::U64 => true,
+            | PrimitiveType::U64
+            | PrimitiveType::U128 => true,
             PrimitiveType::F16 | PrimitiveType::F32 | PrimitiveType::F64 => false,
         }
     }
@@ -301,12 +359,15 @@ impl PrimitiveType {
                 .into_int_type()
                 .const_int(i8::MAX as u64, true)
                 .as_basic_value_enum(),
-            PrimitiveType::U8 | PrimitiveType::U16 | PrimitiveType::U32 | PrimitiveType::U64 => {
-                self.llvm_type(&ctx)
-                    .into_int_type()
-                    .const_all_ones()
-                    .as_basic_value_enum()
-            }
+            PrimitiveType::U8
+            | PrimitiveType::U16
+            | PrimitiveType::U32
+            | PrimitiveType::U64
+            | PrimitiveType::U128 => self
+                .llvm_type(&ctx)
+                .into_int_type()
+                .const_all_ones()
+                .as_basic_value_enum(),
             PrimitiveType::F16 => self
                 .llvm_type(&ctx)
                 .into_float_type()
@@ -347,12 +408,15 @@ impl PrimitiveType {
                 .into_int_type()
                 .const_int(i64::MIN as u64, true)
                 .as_basic_value_enum(),
-            PrimitiveType::U8 | PrimitiveType::U16 | PrimitiveType::U32 | PrimitiveType::U64 => {
-                self.llvm_type(&ctx)
-                    .into_int_type()
-                    .const_zero()
-                    .as_basic_value_enum()
-            }
+            PrimitiveType::U8
+            | PrimitiveType::U16
+            | PrimitiveType::U32
+            | PrimitiveType::U64
+            | PrimitiveType::U128 => self
+                .llvm_type(&ctx)
+                .into_int_type()
+                .const_zero()
+                .as_basic_value_enum(),
             PrimitiveType::F16 => self
                 .llvm_type(&ctx)
                 .into_float_type()
@@ -557,29 +621,6 @@ fn arr_to_ptr(arr: &dyn Array) -> (Option<Box<PtrHolder>>, *const c_void) {
     }
 }
 
-#[no_mangle]
-pub(crate) extern "C" fn printd(label: i64, x: i32) {
-    println!("msg {}: {}", label, x);
-}
-
-#[no_mangle]
-pub(crate) extern "C" fn printd64(label: i64, x: i64) {
-    println!("msg {}: {}", label, x);
-}
-
-#[no_mangle]
-pub(crate) extern "C" fn printv64(label: i64, x: *const i64) {
-    let arr: &[i64; 64] = unsafe { &*(x as *const [i64; 64]) };
-    println!("msg {}: {:?}", label, arr);
-}
-
-#[used]
-static EXTERNAL_FN: [extern "C" fn(i64, i32); 1] = [printd];
-#[used]
-static EXTERNAL_FN64: [extern "C" fn(i64, i64); 1] = [printd64];
-#[used]
-static EXTERNAL_FNV64: [extern "C" fn(i64, *const i64); 1] = [printv64];
-
 /// A compiled function that owns its own LLVM context. Maps two arrays to an
 /// array of booleans.
 pub struct CompiledBinaryFunc<'ctx> {
@@ -775,12 +816,12 @@ pub struct CompiledTakeFunc<'ctx> {
 impl CompiledTakeFunc<'_> {
     /// Verify that datatypes matches the types this function was compiled for,
     /// then execute the function and return the result.
-    pub fn call(&self, data: &dyn Array, indexes: &dyn Array) -> Result<ArrayRef, ArrowError> {
-        if data.data_type() != &self.data_dt {
+    pub fn call(&self, data_arr: &dyn Array, indexes: &dyn Array) -> Result<ArrayRef, ArrowError> {
+        if data_arr.data_type() != &self.data_dt {
             return Err(ArrowError::ComputeError(format!(
                 "arg 1 had wrong type (expected {:?}, found {:?})",
                 self.data_dt,
-                data.data_type()
+                data_arr.data_type()
             )));
         }
 
@@ -803,14 +844,11 @@ impl CompiledTakeFunc<'_> {
         // handle length 0 arrays, since our kernels assume len > 0 (this is
         // mostly so we can do one iteration of the loop prior to checking the
         // loop condition)
-        if data.is_empty() || indexes.is_empty() {
-            let buf = Buffer::from_vec(Vec::<u128>::with_capacity(0));
-            return Ok(
-                buffer_to_primitive(buf, data.nulls().cloned(), &prim_type.as_arrow_type()).into(),
-            );
+        if data_arr.is_empty() || indexes.is_empty() {
+            return Ok(empty_array_for(data_arr.data_type()));
         }
 
-        let (data, ptr) = arr_to_ptr(data);
+        let (data, ptr) = arr_to_ptr(data_arr);
         let (take, tptr) = arr_to_ptr(indexes);
 
         let mut buf = vec![0_u8; indexes.len() * prim_type.width()];
@@ -826,9 +864,31 @@ impl CompiledTakeFunc<'_> {
 
         std::mem::drop(data);
         std::mem::drop(take);
-        let buf = Buffer::from_vec(buf);
 
-        let unsliced = buffer_to_primitive(buf, None, &prim_type.as_arrow_type());
+        let buf = Buffer::from_vec(buf);
+        let unsliced = match self.data_dt {
+            DataType::Int8
+            | DataType::Int16
+            | DataType::Int32
+            | DataType::Int64
+            | DataType::UInt8
+            | DataType::UInt16
+            | DataType::UInt32
+            | DataType::UInt64
+            | DataType::Float16
+            | DataType::Float32
+            | DataType::Float64 => buffer_to_primitive(buf, None, &prim_type.as_arrow_type()),
+            DataType::Utf8 | DataType::LargeUtf8 => {
+                let len = buf.len() / 16;
+                let data_buf = data_arr.to_data().buffers()[1].clone();
+                //StringViewArray::new_unchecked(views, buffers, nulls)
+                Box::new(
+                    StringViewArray::try_new(ScalarBuffer::new(buf, 0, len), vec![data_buf], None)
+                        .unwrap(),
+                )
+            }
+            _ => todo!(),
+        };
 
         let sliced = unsliced.slice(0, indexes.len());
         Ok(sliced)
@@ -923,11 +983,34 @@ impl CompiledAggFunc<'_> {
     }
 }
 
+#[no_mangle]
+pub(crate) extern "C" fn printd(label: i64, x: i32) {
+    println!("msg {}: {}", label, x);
+}
+
+#[no_mangle]
+pub(crate) extern "C" fn printd64(label: i64, x: i64) {
+    println!("msg {}: {}", label, x);
+}
+
+#[no_mangle]
+pub(crate) extern "C" fn printv64(label: i64, x: *const i64) {
+    let arr: &[i64; 64] = unsafe { &*(x as *const [i64; 64]) };
+    println!("msg {}: {:?}", label, arr);
+}
+
+#[used]
+static EXTERNAL_FN: [extern "C" fn(i64, i32); 1] = [printd];
+#[used]
+static EXTERNAL_FN64: [extern "C" fn(i64, i64); 1] = [printd64];
+#[used]
+static EXTERNAL_FNV64: [extern "C" fn(i64, *const i64); 1] = [printv64];
+
 /// Code generation routines. Used to generate `CompiledFunc`s.
 ///
-/// The `cmp` interface automatically caches compiled functions for reuse, but
-/// this interface does not (i.e., each time you use a function here, the
-/// underlying kernel will be recompiled).
+/// The `arrow_interface` interface automatically caches compiled functions for
+/// reuse, but this interface does not (i.e., each time you use a function here,
+/// the underlying kernel will be recompiled).
 pub struct CodeGen<'ctx> {
     context: &'ctx Context,
     module: Module<'ctx>,
@@ -993,6 +1076,8 @@ impl<'ctx> CodeGen<'ctx> {
         ptr
     }
 
+    /// Returns the difference in bytes between p1 and p2 (e.g., `p2 - p1`) as a
+    /// 64 bit unsigned integer.
     fn pointer_diff<'a>(
         &'a self,
         builder: &'a Builder,
@@ -1121,6 +1206,8 @@ impl<'ctx> CodeGen<'ctx> {
             | DataType::Float64 => {
                 self.gen_random_access_primitive(label, PrimitiveType::for_arrow_type(dt))
             }
+            DataType::Utf8 => self.generate_string_random_access(label, PrimitiveType::I32),
+            DataType::LargeUtf8 => self.generate_string_random_access(label, PrimitiveType::I64),
             _ => todo!(),
         }
     }
@@ -1147,6 +1234,8 @@ impl<'ctx> CodeGen<'ctx> {
             | DataType::Float64 => self.initialize_iter_primitive(builder, ptr, len),
             DataType::Dictionary(_k_dt, _v_dt) => self.initialize_iter_dict(builder, ptr, len),
             DataType::RunEndEncoded(_re_dt, _v_dt) => self.initialize_iter_re(builder, ptr, len),
+            DataType::LargeUtf8 => self.initialize_iter_string_primitive(builder, ptr, len),
+            DataType::Utf8 => self.initialize_iter_string_primitive(builder, ptr, len),
             _ => todo!(),
         }
     }
