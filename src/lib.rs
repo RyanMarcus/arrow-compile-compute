@@ -881,11 +881,13 @@ impl CompiledTakeFunc<'_> {
             DataType::Utf8 | DataType::LargeUtf8 => {
                 let len = buf.len() / 16;
                 let data_buf = data_arr.to_data().buffers()[1].clone();
-                //StringViewArray::new_unchecked(views, buffers, nulls)
-                Box::new(
-                    StringViewArray::try_new(ScalarBuffer::new(buf, 0, len), vec![data_buf], None)
-                        .unwrap(),
-                )
+                Box::new(unsafe {
+                    StringViewArray::new_unchecked(
+                        ScalarBuffer::new(buf, 0, len),
+                        vec![data_buf],
+                        None,
+                    )
+                })
             }
             _ => todo!(),
         };
@@ -1159,7 +1161,7 @@ impl<'ctx> CodeGen<'ctx> {
         }
     }
 
-    fn gen_iter_for(&self, label: &str, dt: &DataType) -> FunctionValue {
+    fn gen_block_iter_for(&self, label: &str, dt: &DataType) -> Option<FunctionValue> {
         match dt {
             DataType::Int8
             | DataType::Int16
@@ -1172,20 +1174,20 @@ impl<'ctx> CodeGen<'ctx> {
             | DataType::Float16
             | DataType::Float32
             | DataType::Float64 => {
-                self.gen_iter_primitive(label, PrimitiveType::for_arrow_type(dt), 64)
+                Some(self.gen_iter_primitive(label, PrimitiveType::for_arrow_type(dt), 64))
             }
-            DataType::Dictionary(k_dt, v_dt) => self.gen_dict_primitive(
+            DataType::Dictionary(k_dt, v_dt) => Some(self.gen_dict_primitive(
                 label,
                 PrimitiveType::for_arrow_type(k_dt),
                 PrimitiveType::for_arrow_type(v_dt),
-            ),
-            DataType::RunEndEncoded(re_dt, v_dt) => self.gen_re_primitive(
+            )),
+            DataType::RunEndEncoded(re_dt, v_dt) => Some(self.gen_re_primitive(
                 label,
                 PrimitiveType::for_arrow_type(re_dt.data_type()),
                 PrimitiveType::for_arrow_type(v_dt.data_type()),
-            ),
-            DataType::Boolean => self.gen_iter_bitmap(label),
-            _ => todo!(),
+            )),
+            DataType::Boolean => Some(self.gen_iter_bitmap(label)),
+            _ => None,
         }
     }
 
@@ -1356,12 +1358,14 @@ impl<'ctx> CodeGen<'ctx> {
         let out_ptr = function.get_nth_param(3).unwrap().into_pointer_value();
 
         let lhs_iter_next = if !lhs_scalar {
-            self.gen_iter_for("left", lhs_dt)
+            self.gen_block_iter_for("left", lhs_dt)
+                .expect("cmp assumes a block iterator")
         } else {
             self.gen_iter_scalar("left", PrimitiveType::for_arrow_type(lhs_dt))
         };
         let rhs_iter_next = if !rhs_scalar {
-            self.gen_iter_for("right", rhs_dt)
+            self.gen_block_iter_for("right", rhs_dt)
+                .expect("cmp assumes a block iterator")
         } else {
             self.gen_iter_scalar("right", PrimitiveType::for_arrow_type(rhs_dt))
         };
@@ -1490,7 +1494,9 @@ impl<'ctx> CodeGen<'ctx> {
         let len = function.get_nth_param(1).unwrap().into_int_value();
         let out_ptr = function.get_nth_param(2).unwrap().into_pointer_value();
 
-        let next = self.gen_iter_for("source", src_dt);
+        let next = self
+            .gen_block_iter_for("source", src_dt)
+            .expect("cast to prim expects a block iterator");
         let entry = self.context.append_basic_block(function, "entry");
         let loop_cond = self.context.append_basic_block(function, "loop_cond");
         let loop_body = self.context.append_basic_block(function, "loop_body");

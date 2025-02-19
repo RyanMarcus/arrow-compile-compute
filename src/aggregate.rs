@@ -47,7 +47,9 @@ impl<'ctx> CodeGen<'ctx> {
         let i1_type = self.context.bool_type();
         let ptr_type = self.context.ptr_type(AddressSpace::default());
 
-        let next = self.gen_iter_for("iter", dt);
+        let next = self
+            .gen_block_iter_for("iter", dt)
+            .expect("ungrouped agg assumes block iterator");
 
         let agg_intrinsic = Intrinsic::find(&format!(
             "llvm.vector.reduce.{}",

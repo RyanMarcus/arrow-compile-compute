@@ -32,7 +32,9 @@ impl<'a> CodeGen<'a> {
         let len = function.get_nth_param(1).unwrap().into_int_value();
         let out_ptr = function.get_nth_param(2).unwrap().into_pointer_value();
 
-        let next = self.gen_iter_for("source", dt);
+        let next = self
+            .gen_block_iter_for("source", dt)
+            .expect("hash assumes a block iterator");
         let entry = self.context.append_basic_block(function, "entry");
         let loop_cond = self.context.append_basic_block(function, "loop_cond");
         let loop_body = self.context.append_basic_block(function, "loop_body");
@@ -244,7 +246,9 @@ impl<'a> CodeGen<'a> {
         let len = function.get_nth_param(2).unwrap().into_int_value();
         let out_ptr = function.get_nth_param(3).unwrap().into_pointer_value();
 
-        let next = self.gen_iter_for("source", dt);
+        let next = self
+            .gen_block_iter_for("source", dt)
+            .expect("filter assumes a block iterator");
         let bm_next = self.gen_iter_primitive("bitmap", PrimitiveType::U8, 8);
 
         let entry = self.context.append_basic_block(function, "entry");
