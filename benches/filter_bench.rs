@@ -1,4 +1,4 @@
-use arrow_array::{cast::AsArray, types::Int32Type, Array, BooleanArray, Int32Array, StringArray};
+use arrow_array::{cast::AsArray, Array, BooleanArray, Int32Array, StringArray};
 use arrow_compile_compute::dictionary_data_type;
 use arrow_schema::DataType;
 use criterion::{criterion_group, criterion_main, Criterion};
