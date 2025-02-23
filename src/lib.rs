@@ -81,7 +81,17 @@ pub fn run_end_data_type(run_type: &DataType, val_type: &DataType) -> DataType {
     DataType::RunEndEncoded(f1, f2)
 }
 
-fn buffer_to_primitive(b: Buffer, nulls: Option<NullBuffer>, tar_dt: &DataType) -> Box<dyn Array> {
+/// Take a buffer of values `b` and an optional original array `orig_data`, and
+/// create an Arrow array of the specified type. The `orig_data` is used when
+/// the `tar_dt` is a string view type. The data in `b` must be compatible with `tar_dt`.
+///
+/// If `nulls` is specified, it is used to mark the null values in the returned array.
+fn buffer_to_array(
+    b: Buffer,
+    nulls: Option<NullBuffer>,
+    orig_data: Option<&dyn Array>,
+    tar_dt: &DataType,
+) -> Box<dyn Array> {
     let len = b.len() / PrimitiveType::for_arrow_type(tar_dt).width();
     match tar_dt {
         DataType::Int8 => Box::new(PrimitiveArray::<Int8Type>::new(
@@ -136,6 +146,33 @@ fn buffer_to_primitive(b: Buffer, nulls: Option<NullBuffer>, tar_dt: &DataType) 
             ScalarBuffer::new(b, 0, len),
             nulls,
         )),
+        DataType::Utf8View => {
+            let len = b.len() / 16;
+            let data_buf = orig_data
+                .expect("need original data to convert to utf8view")
+                .to_data()
+                .buffers()[1]
+                .clone();
+            // check the array if we are in test mode, otherwise use unsafe
+            #[cfg(test)]
+            {
+                Box::new(StringViewArray::new(
+                    ScalarBuffer::new(b, 0, len),
+                    vec![data_buf],
+                    nulls,
+                ))
+            }
+            #[cfg(not(test))]
+            {
+                Box::new(unsafe {
+                    StringViewArray::new_unchecked(
+                        ScalarBuffer::new(b, 0, len),
+                        vec![data_buf],
+                        nulls,
+                    )
+                })
+            }
+        }
         _ => unreachable!("cannot cast buffer to {}", tar_dt),
     }
 }
@@ -257,6 +294,7 @@ impl PrimitiveType {
             DataType::RunEndEncoded(_k, v) => PrimitiveType::for_arrow_type(v.data_type()),
             DataType::Utf8 => PrimitiveType::U128, // string view
             DataType::LargeUtf8 => PrimitiveType::U128, // string view
+            DataType::Utf8View => PrimitiveType::U128, // string view
             _ => todo!("no prim type for {:?}", dt),
         }
     }
@@ -724,7 +762,7 @@ impl CompiledConvertFunc<'_> {
         // loop condition)
         if arr1.is_empty() {
             let buf = Buffer::from_vec(Vec::<u128>::with_capacity(0));
-            return Ok(buffer_to_primitive(buf, arr1.nulls().cloned(), &self.tar_dt).into());
+            return Ok(buffer_to_array(buf, arr1.nulls().cloned(), None, &self.tar_dt).into());
         }
 
         let (data1, ptr1) = arr_to_ptr(arr1);
@@ -740,7 +778,7 @@ impl CompiledConvertFunc<'_> {
         std::mem::drop(data1);
 
         let buf = Buffer::from_vec(buf);
-        let unsliced = buffer_to_primitive(buf, arr1.nulls().cloned(), &self.tar_dt);
+        let unsliced = buffer_to_array(buf, arr1.nulls().cloned(), Some(arr1), &self.tar_dt);
         let sliced = unsliced.slice(0, final_len as usize);
         Ok(sliced)
     }
@@ -751,7 +789,10 @@ impl CompiledConvertFunc<'_> {
 pub struct CompiledFilterFunc<'ctx> {
     _cg: CodeGen<'ctx>,
     src_dt: DataType,
-    f: JitFunction<'ctx, unsafe extern "C" fn(*const c_void, *const c_void, u64, *mut c_void)>,
+    f: JitFunction<
+        'ctx,
+        unsafe extern "C" fn(*const c_void, *const c_void, u64, *mut c_void) -> u64,
+    >,
 }
 
 impl CompiledFilterFunc<'_> {
@@ -766,40 +807,62 @@ impl CompiledFilterFunc<'_> {
             )));
         }
 
-        let prim_type = PrimitiveType::for_arrow_type(&self.src_dt);
+        if arr1.len() != ba.len() {
+            return Err(ArrowError::ComputeError(format!(
+                "filter data and mask must have the same legnth (data {:?}, mask {:?})",
+                arr1.len(),
+                ba.len()
+            )));
+        }
 
-        // handle length 0 arrays, since our kernels assume len > 0 (this is
-        // mostly so we can do one iteration of the loop prior to checking the
-        // loop condition)
+        // handle length 0 arrays, since our kernels assume len > 0
+        let prim_type = PrimitiveType::for_arrow_type(&self.src_dt);
         let true_count = ba.true_count();
         if arr1.is_empty() || true_count == 0 {
             let buf = Buffer::from_vec(Vec::<u128>::with_capacity(0));
-            return Ok(
-                buffer_to_primitive(buf, arr1.nulls().cloned(), &prim_type.as_arrow_type()).into(),
-            );
+            return Ok(buffer_to_array(
+                buf,
+                arr1.nulls().cloned(),
+                Some(arr1),
+                &prim_type.as_arrow_type(),
+            )
+            .into());
         }
 
         let (data, ptr) = arr_to_ptr(arr1);
-        let (bdata, bptr) = arr_to_ptr(ba);
+        let (bdata, bptr) = arr_to_ptr(&ba);
 
         let mut buf = vec![0_u8; true_count * prim_type.width()];
 
-        unsafe {
+        let num_written = unsafe {
             self.f.call(
                 ptr,
                 bptr,
                 arr1.len() as u64,
                 buf.as_mut_ptr() as *mut c_void,
-            );
-        }
+            ) as usize
+        };
 
         std::mem::drop(data);
         std::mem::drop(bdata);
+        assert_eq!(
+            num_written,
+            true_count,
+            "{} were written, but was expecting {} out of {}",
+            num_written,
+            true_count,
+            arr1.len()
+        );
+
         let buf = Buffer::from_vec(buf);
+        let unsliced = buffer_to_array(
+            buf,
+            arr1.nulls().cloned(),
+            Some(arr1),
+            &prim_type.as_arrow_type(),
+        );
 
-        let unsliced = buffer_to_primitive(buf, arr1.nulls().cloned(), &prim_type.as_arrow_type());
-
-        let sliced = unsliced.slice(0, ba.true_count());
+        let sliced = unsliced.slice(0, true_count);
         Ok(sliced)
     }
 }
@@ -866,31 +929,7 @@ impl CompiledTakeFunc<'_> {
         std::mem::drop(take);
 
         let buf = Buffer::from_vec(buf);
-        let unsliced = match self.data_dt {
-            DataType::Int8
-            | DataType::Int16
-            | DataType::Int32
-            | DataType::Int64
-            | DataType::UInt8
-            | DataType::UInt16
-            | DataType::UInt32
-            | DataType::UInt64
-            | DataType::Float16
-            | DataType::Float32
-            | DataType::Float64 => buffer_to_primitive(buf, None, &prim_type.as_arrow_type()),
-            DataType::Utf8 | DataType::LargeUtf8 => {
-                let len = buf.len() / 16;
-                let data_buf = data_arr.to_data().buffers()[1].clone();
-                Box::new(unsafe {
-                    StringViewArray::new_unchecked(
-                        ScalarBuffer::new(buf, 0, len),
-                        vec![data_buf],
-                        None,
-                    )
-                })
-            }
-            _ => todo!(),
-        };
+        let unsliced = buffer_to_array(buf, None, Some(data_arr), &prim_type.as_arrow_type());
 
         let sliced = unsliced.slice(0, indexes.len());
         Ok(sliced)
@@ -979,7 +1018,7 @@ impl CompiledAggFunc<'_> {
         } else {
             let prim_type = PrimitiveType::for_arrow_type(&self.src_dt);
             let buf = Buffer::from_vec(buf);
-            let res = buffer_to_primitive(buf, None, &prim_type.as_arrow_type());
+            let res = buffer_to_array(buf, None, None, &prim_type.as_arrow_type());
             Ok(Some(res))
         }
     }
@@ -1209,6 +1248,7 @@ impl<'ctx> CodeGen<'ctx> {
             }
             DataType::Utf8 => self.generate_string_random_access(label, PrimitiveType::I32),
             DataType::LargeUtf8 => self.generate_string_random_access(label, PrimitiveType::I64),
+            DataType::Dictionary(k, v) => self.gen_random_access_dict(label, k, v),
             _ => todo!(),
         }
     }
@@ -1221,8 +1261,8 @@ impl<'ctx> CodeGen<'ctx> {
         dt: &DataType,
     ) -> PointerValue<'a> {
         match dt {
-            DataType::Boolean
-            | DataType::Int8
+            DataType::Boolean => self.initialize_iter_bitmap(builder, ptr, len),
+            DataType::Int8
             | DataType::Int16
             | DataType::Int32
             | DataType::Int64
@@ -1233,7 +1273,9 @@ impl<'ctx> CodeGen<'ctx> {
             | DataType::Float16
             | DataType::Float32
             | DataType::Float64 => self.initialize_iter_primitive(builder, ptr, len),
-            DataType::Dictionary(_k_dt, _v_dt) => self.initialize_iter_dict(builder, ptr, len),
+            DataType::Dictionary(k_dt, v_dt) => {
+                self.initialize_iter_dict(builder, ptr, k_dt.as_ref(), v_dt.as_ref(), len)
+            }
             DataType::RunEndEncoded(_re_dt, _v_dt) => self.initialize_iter_re(builder, ptr, len),
             DataType::LargeUtf8 => self.initialize_iter_string_primitive(builder, ptr, len),
             DataType::Utf8 => self.initialize_iter_string_primitive(builder, ptr, len),

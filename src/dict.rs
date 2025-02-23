@@ -1,13 +1,14 @@
+use arrow_schema::DataType;
 use inkwell::{
     builder::Builder,
     intrinsics::Intrinsic,
     module::Linkage,
-    types::StructType,
-    values::{FunctionValue, IntValue, PointerValue},
+    types::{BasicType, StructType},
+    values::{BasicValue, FunctionValue, IntValue, PointerValue},
     AddressSpace,
 };
 
-use crate::{CodeGen, PrimitiveType};
+use crate::{declare_blocks, CodeGen, PrimitiveType};
 
 impl<'ctx> CodeGen<'ctx> {
     pub(crate) fn struct_for_iter_dict(&self) -> StructType {
@@ -16,15 +17,14 @@ impl<'ctx> CodeGen<'ctx> {
             .struct_type(&[ptr_type.into(), ptr_type.into()], false)
     }
 
-    pub(crate) fn initialize_iter_dict<'a>(
-        &'a self,
-        builder: &'a Builder<'a>,
+    pub(crate) fn initialize_iter_dict(
+        &self,
+        builder: &Builder<'ctx>,
         ptr: PointerValue,
+        ktype: &DataType,
+        vtype: &DataType,
         len: IntValue,
-    ) -> PointerValue<'a>
-    where
-        'ctx: 'a,
-    {
+    ) -> PointerValue {
         // `ptr` points to two other pointers, the first for the keys and the
         // second for the values
         let ptr_type = self.context.ptr_type(AddressSpace::default());
@@ -41,16 +41,21 @@ impl<'ctx> CodeGen<'ctx> {
 
         let iter_type = self.struct_for_iter_dict();
         let ptr = builder.build_alloca(iter_type, "dict_iter_ptr").unwrap();
-        let prim_iter = self.initialize_iter_primitive(builder, arr_keys, len);
-        let prim_ptr = builder
-            .build_struct_gep(iter_type, ptr, 0, "dict_prim_ptr")
+        let key_iter = self.initialize_iter(builder, arr_keys, len, ktype);
+        let key_ptr = builder
+            .build_struct_gep(iter_type, ptr, 0, "dict_key_ptr")
             .unwrap();
-        builder.build_store(prim_ptr, prim_iter).unwrap();
+        builder.build_store(key_ptr, key_iter).unwrap();
 
-        let arr_vals_ptr = builder
-            .build_struct_gep(iter_type, ptr, 1, "arr_vals_ptr_ptr")
+        assert!(
+            vtype.is_primitive(),
+            "current iteration code assumes values are primitive"
+        );
+        let val_iter = self.initialize_iter(builder, arr_vals, len, vtype);
+        let val_ptr = builder
+            .build_struct_gep(iter_type, ptr, 1, "dict_val_ptr")
             .unwrap();
-        builder.build_store(arr_vals_ptr, arr_vals).unwrap();
+        builder.build_store(val_ptr, val_iter).unwrap();
 
         ptr
     }
@@ -110,11 +115,15 @@ impl<'ctx> CodeGen<'ctx> {
         let ptr = function.get_nth_param(0).unwrap().into_pointer_value();
 
         builder.position_at_end(entry);
-        let values_ptr_ptr = builder
+        let values_iter_ptr_ptr = builder
             .build_struct_gep(iter_type, ptr, 1, "dict_prim_ptr")
             .unwrap();
+        let values_iter_ptr = builder
+            .build_load(ptr_type, values_iter_ptr_ptr, "values_ptr")
+            .unwrap()
+            .into_pointer_value();
         let values_ptr = builder
-            .build_load(ptr_type, values_ptr_ptr, "values_ptr")
+            .build_load(ptr_type, values_iter_ptr, "values_ptr")
             .unwrap()
             .into_pointer_value();
         let values_ptr_int = builder
@@ -208,6 +217,84 @@ impl<'ctx> CodeGen<'ctx> {
             .into_vector_value();
 
         builder.build_return(Some(&gathered_values)).unwrap();
+        function
+    }
+
+    pub(crate) fn gen_random_access_dict(
+        &self,
+        label: &str,
+        ktype: &DataType,
+        vtype: &DataType,
+    ) -> FunctionValue {
+        let key_getter = self.gen_random_access_for(&format!("{}_get_keys", label), ktype);
+        let val_getter = self.gen_random_access_for(&format!("{}_get_values", label), vtype);
+
+        let i64_type = self.context.i64_type();
+        let ptr_type = self.context.ptr_type(AddressSpace::default());
+        let iter_type = self.struct_for_iter_dict();
+        let prim_type = PrimitiveType::for_arrow_type(vtype)
+            .llvm_type(self.context)
+            .as_basic_type_enum();
+
+        let fn_type = prim_type.fn_type(
+            &[
+                ptr_type.into(), // iter struct
+                i64_type.into(), // index
+            ],
+            false,
+        );
+        let builder = self.context.create_builder();
+
+        let function = self.module.add_function(
+            &format!("{}_dict_random_access", label),
+            fn_type,
+            Some(Linkage::Private),
+        );
+
+        declare_blocks!(self.context, function, entry);
+
+        builder.position_at_end(entry);
+        let iter_ptr = function
+            .get_nth_param(0)
+            .unwrap()
+            .as_basic_value_enum()
+            .into_pointer_value();
+        let idx = function
+            .get_nth_param(1)
+            .unwrap()
+            .as_basic_value_enum()
+            .into_int_value();
+
+        let key_iter_ptr_ptr = builder
+            .build_struct_gep(iter_type, iter_ptr, 0, "key_iter_ptr")
+            .unwrap();
+        let value_iter_ptr_ptr = builder
+            .build_struct_gep(iter_type, iter_ptr, 1, "value_iter_ptr")
+            .unwrap();
+        let key_iter_ptr = builder
+            .build_load(ptr_type, key_iter_ptr_ptr, "key_iter_ptr")
+            .unwrap();
+        let value_iter_ptr = builder
+            .build_load(ptr_type, value_iter_ptr_ptr, "value_iter_ptr")
+            .unwrap();
+
+        let key = builder
+            .build_call(key_getter, &[key_iter_ptr.into(), idx.into()], "key")
+            .unwrap()
+            .try_as_basic_value()
+            .unwrap_left()
+            .into_int_value();
+        let key = builder
+            .build_int_z_extend_or_bit_cast(key, i64_type, "key")
+            .unwrap();
+        let val = builder
+            .build_call(val_getter, &[value_iter_ptr.into(), key.into()], "val")
+            .unwrap()
+            .try_as_basic_value()
+            .unwrap_left()
+            .into_int_value();
+
+        builder.build_return(Some(&val)).unwrap();
         function
     }
 }
@@ -381,12 +468,34 @@ mod tests {
     }
 
     #[test]
-    fn test_dict_filter_simple() {
+    fn test_dict_filter_simple_block() {
         let ctx = Context::create();
         let cg = CodeGen::new(&ctx);
         let dict_type = DataType::Dictionary(Box::new(DataType::Int8), Box::new(DataType::Int32));
 
-        let f = cg.compile_filter(&dict_type).unwrap();
+        let f = cg.compile_filter_block(&dict_type).unwrap();
+
+        let data = Int32Array::from(vec![1, 1, 1, 2, 2, 2, 3, 3, 3, 10]);
+        let data = arrow_cast::cast(&data, &dict_type).unwrap();
+
+        let ba = BooleanArray::from(vec![
+            true, false, false, true, false, true, false, false, false, true,
+        ]);
+
+        let true_result = Int32Array::from(vec![1, 2, 2, 10]);
+        let our_filtered: Int32Array = f.call(&data, &ba).unwrap().as_primitive().clone();
+
+        assert_eq!(our_filtered.len(), 4);
+        assert_eq!(true_result, our_filtered);
+    }
+
+    #[test]
+    fn test_dict_filter_simple_random_access() {
+        let ctx = Context::create();
+        let cg = CodeGen::new(&ctx);
+        let dict_type = DataType::Dictionary(Box::new(DataType::Int8), Box::new(DataType::Int32));
+
+        let f = cg.compile_filter_random_access(&dict_type).unwrap();
 
         let data = Int32Array::from(vec![1, 1, 1, 2, 2, 2, 3, 3, 3, 10]);
         let data = arrow_cast::cast(&data, &dict_type).unwrap();

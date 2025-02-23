@@ -207,11 +207,125 @@ impl<'a> CodeGen<'a> {
         })
     }
 
+    pub fn compile_filter_random_access(
+        self,
+        dt: &DataType,
+    ) -> Result<CompiledFilterFunc<'a>, ArrowError> {
+        let builder = self.context.create_builder();
+
+        let i64_type = self.context.i64_type();
+        let ptr_type = self.context.ptr_type(AddressSpace::default());
+        let prim_type = PrimitiveType::for_arrow_type(dt);
+
+        let convert = if matches!(dt, DataType::Utf8 | DataType::LargeUtf8) {
+            Some(self.add_ptrx2_to_view())
+        } else {
+            None
+        };
+
+        let fn_type = i64_type.fn_type(
+            &[
+                ptr_type.into(), // data (source)
+                ptr_type.into(), // bools
+                i64_type.into(), // len
+                ptr_type.into(), // tar
+            ],
+            false,
+        );
+        let function = self.module.add_function("filter", fn_type, None);
+
+        let data_ptr = function.get_nth_param(0).unwrap().into_pointer_value();
+        let filter_ptr = function.get_nth_param(1).unwrap().into_pointer_value();
+        let len = function.get_nth_param(2).unwrap().into_int_value();
+        let out_ptr = function.get_nth_param(3).unwrap().into_pointer_value();
+
+        let access_data = self.gen_random_access_for("data", dt);
+        let next_idx = self.gen_iter_bitmap("idx");
+
+        declare_blocks!(self.context, function, entry, loop_cond, loop_body, exit);
+
+        builder.position_at_end(entry);
+        let data_iter = self.initialize_iter(&builder, data_ptr, len, dt);
+        let filter_iter = self.initialize_iter(&builder, filter_ptr, len, &DataType::Boolean);
+        let filter_idx_ptr = builder.build_alloca(i64_type, "idx_ptr").unwrap();
+        let out_idx_ptr = builder.build_alloca(i64_type, "out_idx_ptr").unwrap();
+        builder
+            .build_store(out_idx_ptr, i64_type.const_zero())
+            .unwrap();
+        builder.build_unconditional_branch(loop_cond).unwrap();
+
+        builder.position_at_end(loop_cond);
+        let had_next = builder
+            .build_call(
+                next_idx,
+                &[filter_iter.into(), filter_idx_ptr.into()],
+                "next_idx",
+            )
+            .unwrap()
+            .try_as_basic_value()
+            .unwrap_left()
+            .into_int_value();
+        builder
+            .build_conditional_branch(had_next, loop_body, exit)
+            .unwrap();
+
+        builder.position_at_end(loop_body);
+        let filter_idx = builder.build_load(i64_type, filter_idx_ptr, "idx").unwrap();
+        let mut itm = builder
+            .build_call(access_data, &[data_iter.into(), filter_idx.into()], "itm")
+            .unwrap()
+            .try_as_basic_value()
+            .unwrap_left();
+        if let Some(convert) = convert {
+            // transform the pointer pair into a view
+            let base_ptr = self.get_string_base_data_ptr(&builder, data_iter);
+            itm = builder
+                .build_call(convert, &[itm.into(), base_ptr.into()], "view")
+                .unwrap()
+                .try_as_basic_value()
+                .unwrap_left();
+        }
+
+        let out_idx = builder
+            .build_load(i64_type, out_idx_ptr, "out_idx")
+            .unwrap()
+            .into_int_value();
+        let inc_out_ptr = self.increment_pointer(&builder, out_ptr, prim_type.width(), out_idx);
+        builder.build_store(inc_out_ptr, itm).unwrap();
+        let inc_out_idx = builder
+            .build_int_add(out_idx, i64_type.const_int(1, false), "inc_out_idx")
+            .unwrap();
+        builder.build_store(out_idx_ptr, inc_out_idx).unwrap();
+        builder.build_unconditional_branch(loop_cond).unwrap();
+
+        builder.position_at_end(exit);
+        let out_idx = builder
+            .build_load(i64_type, out_idx_ptr, "out_idx")
+            .unwrap()
+            .into_int_value();
+        builder.build_return(Some(&out_idx)).unwrap();
+
+        self.optimize()?;
+        self.module
+            .verify()
+            .map_err(|e| ArrowError::ComputeError(format!("Error compiling kernel: {}", e)))?;
+        let ee = self
+            .module
+            .create_jit_execution_engine(OptimizationLevel::Aggressive)
+            .unwrap();
+
+        Ok(CompiledFilterFunc {
+            _cg: self,
+            src_dt: dt.clone(),
+            f: unsafe { ee.get_function("filter").ok().unwrap() },
+        })
+    }
+
     /// Compiles a function to materialize filtered arrays. The compiled
     /// function takes an array of a particular type and boolean array, and
     /// returns a new primitive array containing the values that are true in the
     /// boolean array.
-    pub fn compile_filter(self, dt: &DataType) -> Result<CompiledFilterFunc<'a>, ArrowError> {
+    pub fn compile_filter_block(self, dt: &DataType) -> Result<CompiledFilterFunc<'a>, ArrowError> {
         let builder = self.context.create_builder();
 
         let i64_type = self.context.i64_type();
@@ -230,7 +344,7 @@ impl<'a> CodeGen<'a> {
             .get_declaration(&self.module, &[i64_type.into()])
             .unwrap();
 
-        let fn_type = self.context.void_type().fn_type(
+        let fn_type = i64_type.fn_type(
             &[
                 ptr_type.into(), // src
                 ptr_type.into(), // bool array
@@ -249,6 +363,8 @@ impl<'a> CodeGen<'a> {
         let next = self
             .gen_block_iter_for("source", dt)
             .expect("filter assumes a block iterator");
+        // we treat the boolean array as a u8 array, requesting a block size of
+        // 8, so we get 64 bits per block
         let bm_next = self.gen_iter_primitive("bitmap", PrimitiveType::U8, 8);
 
         let entry = self.context.append_basic_block(function, "entry");
@@ -286,7 +402,8 @@ impl<'a> CodeGen<'a> {
             )
             .unwrap()
             .into_int_value();
-        let bm_iter_ptr = self.initialize_iter(&builder, filter_ptr, bm_len, &DataType::Boolean);
+
+        let bm_iter_ptr = self.initialize_iter(&builder, filter_ptr, bm_len, &DataType::UInt8);
         builder.build_unconditional_branch(loop_body).unwrap();
 
         builder.position_at_end(loop_body);
@@ -336,7 +453,6 @@ impl<'a> CodeGen<'a> {
             .build_int_add(out_idx, num_els, "inc_out_pos")
             .unwrap();
         builder.build_store(out_idx_ptr, inc_out_pos).unwrap();
-
         builder.build_unconditional_branch(loop_cond).unwrap();
 
         builder.position_at_end(loop_cond);
@@ -346,7 +462,11 @@ impl<'a> CodeGen<'a> {
             .unwrap();
 
         builder.position_at_end(end);
-        builder.build_return(None).unwrap();
+        let out_idx = builder
+            .build_load(i64_type, out_idx_ptr, "out_idx")
+            .unwrap()
+            .into_int_value();
+        builder.build_return(Some(&out_idx)).unwrap();
 
         self.optimize()?;
         self.module
@@ -354,7 +474,7 @@ impl<'a> CodeGen<'a> {
             .map_err(|e| ArrowError::ComputeError(format!("Error compiling kernel: {}", e)))?;
         let ee = self
             .module
-            .create_jit_execution_engine(OptimizationLevel::Aggressive)
+            .create_jit_execution_engine(OptimizationLevel::None)
             .unwrap();
 
         Ok(CompiledFilterFunc {
@@ -537,7 +657,7 @@ mod tests {
     }
 
     #[test]
-    fn test_filter_i32() {
+    fn test_filter_i32_block() {
         let mut rng = fastrand::Rng::with_seed(42);
         let data = (0..10_000).map(|_| rng.i32(..)).collect_vec();
         let data = Int32Array::from(data);
@@ -551,7 +671,33 @@ mod tests {
         let ctx = Context::create();
         let codegen = CodeGen::new(&ctx);
         let compiled_func = codegen
-            .compile_filter(data.data_type())
+            .compile_filter_block(data.data_type())
+            .expect("Failed to compile filter function");
+        let result = compiled_func
+            .call(&data, &mask)
+            .unwrap()
+            .as_primitive::<Int32Type>()
+            .clone();
+
+        assert_eq!(arr_filtered, result);
+    }
+
+    #[test]
+    fn test_filter_i32_random_access() {
+        let mut rng = fastrand::Rng::with_seed(42);
+        let data = (0..10_000).map(|_| rng.i32(..)).collect_vec();
+        let data = Int32Array::from(data);
+        let mask: BooleanArray = (0..10_000).map(|_| Some(rng.bool())).collect();
+
+        let arr_filtered = arrow_select::filter::filter(&data, &mask)
+            .unwrap()
+            .as_primitive::<Int32Type>()
+            .clone();
+
+        let ctx = Context::create();
+        let codegen = CodeGen::new(&ctx);
+        let compiled_func = codegen
+            .compile_filter_random_access(data.data_type())
             .expect("Failed to compile filter function");
         let result = compiled_func
             .call(&data, &mask)
@@ -578,7 +724,7 @@ mod tests {
         let ctx = Context::create();
         let codegen = CodeGen::new(&ctx);
         let compiled_func = codegen
-            .compile_filter(data.data_type())
+            .compile_filter_block(data.data_type())
             .expect("Failed to compile filter function");
         let result = compiled_func
             .call(&data, &mask)
@@ -611,6 +757,21 @@ mod tests {
             .clone();
 
         assert_eq!(arr_taken, result);
+    }
+
+    #[test]
+    fn test_filter_str() {
+        let data = StringArray::from(vec!["hello", "world", "rust"]);
+        let indices = BooleanArray::from(vec![true, false, true]);
+
+        let ctx = Context::create();
+        let codegen = CodeGen::new(&ctx);
+        let compiled_func = codegen
+            .compile_filter_random_access(data.data_type())
+            .unwrap();
+        let result = compiled_func.call(&data, &indices).unwrap();
+        let result = result.as_string_view().iter().collect_vec();
+        assert_eq!(result, vec![Some("hello"), Some("rust")]);
     }
 
     #[test]

@@ -177,7 +177,12 @@ fn build_filter(src: &DataType) -> Result<SelfContainedFilterFunc, ArrowError> {
         ctx,
         cf_builder: |ctx| {
             let cg = CodeGen::new(ctx);
-            cg.compile_filter(src)
+            match src {
+                DataType::Utf8 | DataType::LargeUtf8 | DataType::Utf8View => {
+                    cg.compile_filter_random_access(src)
+                }
+                _ => cg.compile_filter_block(src),
+            }
         },
     }
     .try_build()
