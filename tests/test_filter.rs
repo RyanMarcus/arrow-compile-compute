@@ -4,6 +4,26 @@ use arrow_schema::DataType;
 use itertools::Itertools;
 use proptest::proptest;
 
+#[test]
+fn test_filter_i32_block_single() {
+    let data = Int32Array::from(vec![0]);
+
+    for pos_mask in [true, false] {
+        let mask = BooleanArray::from(vec![pos_mask]);
+
+        let arrow_res: Int32Array = arrow_select::filter::filter(&data, &mask)
+            .unwrap()
+            .as_primitive()
+            .clone();
+        let our_res: Int32Array = arrow_compile_compute::compute::filter(&data, &mask)
+            .unwrap()
+            .as_primitive()
+            .clone();
+
+        assert_eq!(arrow_res, our_res);
+    }
+}
+
 proptest! {
     #[test]
     fn test_filter_i32(arr: Vec<(i32, bool)>) {

@@ -842,7 +842,6 @@ impl CompiledFilterFunc<'_> {
                 buf.as_mut_ptr() as *mut c_void,
             ) as usize
         };
-
         std::mem::drop(data);
         std::mem::drop(bdata);
         assert_eq!(
@@ -1025,27 +1024,12 @@ impl CompiledAggFunc<'_> {
 }
 
 #[no_mangle]
-pub(crate) extern "C" fn printd(label: i64, x: i32) {
-    println!("msg {}: {}", label, x);
-}
-
-#[no_mangle]
-pub(crate) extern "C" fn printd64(label: i64, x: i64) {
-    println!("msg {}: {}", label, x);
-}
-
-#[no_mangle]
-pub(crate) extern "C" fn printv64(label: i64, x: *const i64) {
-    let arr: &[i64; 64] = unsafe { &*(x as *const [i64; 64]) };
-    println!("msg {}: {:?}", label, arr);
+pub(crate) extern "C" fn print_u64(x: u64) {
+    println!("{}: {:064b}", x, x);
 }
 
 #[used]
-static EXTERNAL_FN: [extern "C" fn(i64, i32); 1] = [printd];
-#[used]
-static EXTERNAL_FN64: [extern "C" fn(i64, i64); 1] = [printd64];
-#[used]
-static EXTERNAL_FNV64: [extern "C" fn(i64, *const i64); 1] = [printv64];
+static EXTERNAL_FN: [extern "C" fn(u64); 1] = [print_u64];
 
 /// Code generation routines. Used to generate `CompiledFunc`s.
 ///
@@ -1067,6 +1051,7 @@ impl<'ctx> CodeGen<'ctx> {
     /// ```
     pub fn new(ctx: &Context) -> CodeGen {
         let module = ctx.create_module("jit");
+
         CodeGen {
             context: ctx,
             module,

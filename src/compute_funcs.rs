@@ -367,42 +367,19 @@ impl<'a> CodeGen<'a> {
         // 8, so we get 64 bits per block
         let bm_next = self.gen_iter_primitive("bitmap", PrimitiveType::U8, 8);
 
-        let entry = self.context.append_basic_block(function, "entry");
-        let loop_cond = self.context.append_basic_block(function, "loop_cond");
-        let loop_body = self.context.append_basic_block(function, "loop_body");
-        let end = self.context.append_basic_block(function, "end");
+        declare_blocks!(self.context, function, entry, loop_cond, loop_body, end);
 
         builder.position_at_end(entry);
         let out_idx_ptr = builder.build_alloca(i64_type, "out_idx_ptr").unwrap();
         builder
             .build_store(out_idx_ptr, i64_type.const_zero())
             .unwrap();
+        let bm_idx_ptr = builder.build_alloca(i64_type, "bm_idx_ptr").unwrap();
+        builder
+            .build_store(bm_idx_ptr, i64_type.const_zero())
+            .unwrap();
         let iter_ptr = self.initialize_iter(&builder, arr1_ptr, len, dt);
-        let bm_len = builder
-            .build_int_unsigned_div(len, i64_type.const_int(8, false), "div8")
-            .unwrap();
-        let rem = builder
-            .build_int_unsigned_rem(len, i64_type.const_int(8, false), "rem8")
-            .unwrap();
-        let bm_len = builder
-            .build_select(
-                builder
-                    .build_int_compare(
-                        inkwell::IntPredicate::EQ,
-                        rem,
-                        i64_type.const_zero(),
-                        "is_rem",
-                    )
-                    .unwrap(),
-                bm_len,
-                builder
-                    .build_int_add(bm_len, i64_type.const_int(1, false), "p1")
-                    .unwrap(),
-                "bm_len",
-            )
-            .unwrap()
-            .into_int_value();
-
+        let bm_len = self.div_ceil(&builder, len, 8);
         let bm_iter_ptr = self.initialize_iter(&builder, filter_ptr, bm_len, &DataType::UInt8);
         builder.build_unconditional_branch(loop_body).unwrap();
 
@@ -419,8 +396,47 @@ impl<'a> CodeGen<'a> {
             .try_as_basic_value()
             .unwrap_left()
             .into_vector_value();
+        let block_as_u64 = builder
+            .build_bit_cast(u8_block, i64_type, "block_as_u64")
+            .unwrap()
+            .into_int_value();
+
+        let bm_idx = builder
+            .build_load(i64_type, bm_idx_ptr, "bm_idx")
+            .unwrap()
+            .into_int_value();
+        let remaining = builder.build_int_sub(len, bm_idx, "remaining").unwrap();
+        let mask = builder
+            .build_select(
+                builder
+                    .build_int_compare(
+                        IntPredicate::UGT,
+                        remaining,
+                        i64_type.const_int(64, false),
+                        "gt64",
+                    )
+                    .unwrap(),
+                i64_type.const_all_ones(),
+                builder
+                    .build_right_shift(
+                        i64_type.const_all_ones(),
+                        builder
+                            .build_int_sub(i64_type.const_int(64, false), remaining, "diff")
+                            .unwrap(),
+                        false,
+                        "compute_mask",
+                    )
+                    .unwrap(),
+                "mask",
+            )
+            .unwrap()
+            .into_int_value();
+
+        let block_as_u64 = builder
+            .build_and(block_as_u64, mask, "masked_block")
+            .unwrap();
         let bool_block = builder
-            .build_bit_cast(u8_block, bool_block_type, "bool_block")
+            .build_bit_cast(block_as_u64, bool_block_type, "bool_block")
             .unwrap();
 
         let out_idx = builder
@@ -453,6 +469,10 @@ impl<'a> CodeGen<'a> {
             .build_int_add(out_idx, num_els, "inc_out_pos")
             .unwrap();
         builder.build_store(out_idx_ptr, inc_out_pos).unwrap();
+        let inc_bm_idx = builder
+            .build_int_add(bm_idx, i64_type.const_int(64, false), "inc_bm_idx")
+            .unwrap();
+        builder.build_store(bm_idx_ptr, inc_bm_idx).unwrap();
         builder.build_unconditional_branch(loop_cond).unwrap();
 
         builder.position_at_end(loop_cond);
@@ -474,7 +494,7 @@ impl<'a> CodeGen<'a> {
             .map_err(|e| ArrowError::ComputeError(format!("Error compiling kernel: {}", e)))?;
         let ee = self
             .module
-            .create_jit_execution_engine(OptimizationLevel::None)
+            .create_jit_execution_engine(OptimizationLevel::Aggressive)
             .unwrap();
 
         Ok(CompiledFilterFunc {
@@ -675,6 +695,36 @@ mod tests {
             .expect("Failed to compile filter function");
         let result = compiled_func
             .call(&data, &mask)
+            .unwrap()
+            .as_primitive::<Int32Type>()
+            .clone();
+
+        assert_eq!(arr_filtered, result);
+    }
+
+    #[test]
+    fn test_filter_i32_sliced_block() {
+        let mut rng = fastrand::Rng::with_seed(42);
+        let data = (0..10_000).map(|_| rng.i32(..)).collect_vec();
+        let data = Int32Array::from(data);
+        //let mask: BooleanArray = (0..10_000).map(|_| Some(rng.bool())).collect();
+        let mask: BooleanArray = (0..10_000).map(|_| Some(true)).collect();
+
+        let s_data = data.slice(0, 100);
+        let s_mask = mask.slice(0, 100);
+
+        let arr_filtered = arrow_select::filter::filter(&s_data, &s_mask)
+            .unwrap()
+            .as_primitive::<Int32Type>()
+            .clone();
+
+        let ctx = Context::create();
+        let codegen = CodeGen::new(&ctx);
+        let compiled_func = codegen
+            .compile_filter_block(data.data_type())
+            .expect("Failed to compile filter function");
+        let result = compiled_func
+            .call(&s_data, &s_mask)
             .unwrap()
             .as_primitive::<Int32Type>()
             .clone();

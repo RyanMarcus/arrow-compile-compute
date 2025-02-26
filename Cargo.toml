@@ -26,6 +26,7 @@ fastrand = "2.2.0"
 itertools = "0.13.0"
 proptest = "1.5"
 rayon = "1.10"
+chrono = "= 0.4.39"
 
 [profile.release]
 debug = true
