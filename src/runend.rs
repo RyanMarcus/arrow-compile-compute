@@ -141,7 +141,7 @@ impl<'ctx> CodeGen<'ctx> {
         let i64_type = self.context.i64_type();
         let ptr_type = self.context.ptr_type(AddressSpace::default());
         let run_end_type = re_prim_type.llvm_type(self.context);
-        let chunk_type = value_prim_type.llvm_vec_type(self.context, 64);
+        let chunk_type = value_prim_type.llvm_vec_type(self.context, 64).unwrap();
         let iter_type = self.struct_for_iter_re();
 
         let umin = Intrinsic::find("llvm.umin").unwrap();

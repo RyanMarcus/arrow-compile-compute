@@ -46,6 +46,7 @@ mod arrow_interface;
 mod bitmap;
 mod compute_funcs;
 mod dict;
+mod new_iter;
 mod primitive;
 mod runend;
 mod scalar;
@@ -231,7 +232,7 @@ enum PrimitiveType {
     U16,
     U32,
     U64,
-    U128,
+    P64x2,
     F16,
     F32,
     F64,
@@ -244,7 +245,7 @@ impl PrimitiveType {
             PrimitiveType::I16 | PrimitiveType::U16 => 2,
             PrimitiveType::I32 | PrimitiveType::U32 => 4,
             PrimitiveType::I64 | PrimitiveType::U64 => 8,
-            PrimitiveType::U128 => 16,
+            PrimitiveType::P64x2 => 16,
             PrimitiveType::F16 => 2,
             PrimitiveType::F32 => 4,
             PrimitiveType::F64 => 8,
@@ -257,23 +258,31 @@ impl PrimitiveType {
             PrimitiveType::I16 | PrimitiveType::U16 => ctx.i16_type().into(),
             PrimitiveType::I32 | PrimitiveType::U32 => ctx.i32_type().into(),
             PrimitiveType::I64 | PrimitiveType::U64 => ctx.i64_type().into(),
-            PrimitiveType::U128 => ctx.i128_type().into(),
+            PrimitiveType::P64x2 => ctx
+                .struct_type(
+                    &[
+                        ctx.ptr_type(AddressSpace::default()).into(),
+                        ctx.ptr_type(AddressSpace::default()).into(),
+                    ],
+                    false,
+                )
+                .into(),
             PrimitiveType::F16 => ctx.f16_type().into(),
             PrimitiveType::F32 => ctx.f32_type().into(),
             PrimitiveType::F64 => ctx.f64_type().into(),
         }
     }
 
-    fn llvm_vec_type<'a>(&self, ctx: &'a Context, size: u32) -> VectorType<'a> {
+    fn llvm_vec_type<'a>(&self, ctx: &'a Context, size: u32) -> Option<VectorType<'a>> {
         match self {
-            PrimitiveType::I8 | PrimitiveType::U8 => ctx.i8_type().vec_type(size),
-            PrimitiveType::I16 | PrimitiveType::U16 => ctx.i16_type().vec_type(size),
-            PrimitiveType::I32 | PrimitiveType::U32 => ctx.i32_type().vec_type(size),
-            PrimitiveType::I64 | PrimitiveType::U64 => ctx.i64_type().vec_type(size),
-            PrimitiveType::U128 => ctx.i128_type().vec_type(size),
-            PrimitiveType::F16 => ctx.f16_type().vec_type(size),
-            PrimitiveType::F32 => ctx.f32_type().vec_type(size),
-            PrimitiveType::F64 => ctx.f64_type().vec_type(size),
+            PrimitiveType::I8 | PrimitiveType::U8 => Some(ctx.i8_type().vec_type(size)),
+            PrimitiveType::I16 | PrimitiveType::U16 => Some(ctx.i16_type().vec_type(size)),
+            PrimitiveType::I32 | PrimitiveType::U32 => Some(ctx.i32_type().vec_type(size)),
+            PrimitiveType::I64 | PrimitiveType::U64 => Some(ctx.i64_type().vec_type(size)),
+            PrimitiveType::P64x2 => None,
+            PrimitiveType::F16 => Some(ctx.f16_type().vec_type(size)),
+            PrimitiveType::F32 => Some(ctx.f32_type().vec_type(size)),
+            PrimitiveType::F64 => Some(ctx.f64_type().vec_type(size)),
         }
     }
 
@@ -292,9 +301,9 @@ impl PrimitiveType {
             DataType::Float64 => PrimitiveType::F64,
             DataType::Dictionary(_k, v) => PrimitiveType::for_arrow_type(v),
             DataType::RunEndEncoded(_k, v) => PrimitiveType::for_arrow_type(v.data_type()),
-            DataType::Utf8 => PrimitiveType::U128, // string view
-            DataType::LargeUtf8 => PrimitiveType::U128, // string view
-            DataType::Utf8View => PrimitiveType::U128, // string view
+            DataType::Utf8 => PrimitiveType::P64x2, // string view
+            DataType::LargeUtf8 => PrimitiveType::P64x2, // string view
+            DataType::Utf8View => PrimitiveType::P64x2, // string view
             _ => todo!("no prim type for {:?}", dt),
         }
     }
@@ -309,7 +318,7 @@ impl PrimitiveType {
             PrimitiveType::U16 => DataType::UInt16,
             PrimitiveType::U32 => DataType::UInt32,
             PrimitiveType::U64 => DataType::UInt64,
-            PrimitiveType::U128 => DataType::Utf8View,
+            PrimitiveType::P64x2 => DataType::Utf8View,
             PrimitiveType::F16 => DataType::Float16,
             PrimitiveType::F32 => DataType::Float32,
             PrimitiveType::F64 => DataType::Float64,
@@ -321,7 +330,7 @@ impl PrimitiveType {
     /// For example, calling with `width = 8` will give `I64`.
     fn int_with_width(width: usize) -> PrimitiveType {
         match width {
-            16 => PrimitiveType::U128,
+            16 => PrimitiveType::P64x2,
             8 => PrimitiveType::I64,
             4 => PrimitiveType::I32,
             2 => PrimitiveType::I16,
@@ -339,7 +348,7 @@ impl PrimitiveType {
             | PrimitiveType::U16
             | PrimitiveType::U32
             | PrimitiveType::U64
-            | PrimitiveType::U128 => false,
+            | PrimitiveType::P64x2 => false,
             PrimitiveType::F16 | PrimitiveType::F32 | PrimitiveType::F64 => true,
         }
     }
@@ -353,21 +362,28 @@ impl PrimitiveType {
             | PrimitiveType::U8
             | PrimitiveType::U16
             | PrimitiveType::U32
-            | PrimitiveType::U64
-            | PrimitiveType::U128 => true,
-            PrimitiveType::F16 | PrimitiveType::F32 | PrimitiveType::F64 => false,
+            | PrimitiveType::U64 => true,
+            PrimitiveType::P64x2 | PrimitiveType::F16 | PrimitiveType::F32 | PrimitiveType::F64 => {
+                false
+            }
         }
     }
 
     /// Returns the "best" common value to cast both types to in order to
-    /// perform a comparison
-    fn dominant(lhs_prim: PrimitiveType, rhs_prim: PrimitiveType) -> PrimitiveType {
-        if lhs_prim.is_signed() != rhs_prim.is_signed() {
-            PrimitiveType::I64
+    /// perform a comparison. Returns `None` if there is no compatible type.
+    fn dominant(lhs_prim: PrimitiveType, rhs_prim: PrimitiveType) -> Option<PrimitiveType> {
+        if matches!(lhs_prim, PrimitiveType::P64x2) && matches!(rhs_prim, PrimitiveType::P64x2) {
+            Some(PrimitiveType::P64x2)
+        } else if matches!(lhs_prim, PrimitiveType::P64x2)
+            || matches!(rhs_prim, PrimitiveType::P64x2)
+        {
+            None
+        } else if lhs_prim.is_signed() != rhs_prim.is_signed() {
+            Some(PrimitiveType::I64)
         } else if lhs_prim.width() >= rhs_prim.width() {
-            lhs_prim
+            Some(lhs_prim)
         } else {
-            rhs_prim
+            Some(rhs_prim)
         }
     }
 
@@ -375,101 +391,115 @@ impl PrimitiveType {
         self.llvm_type(ctx).const_zero()
     }
 
-    fn max_value<'a>(&self, ctx: &'a Context) -> BasicValueEnum<'a> {
+    fn min_value<'a>(&self, ctx: &'a Context) -> Option<BasicValueEnum<'a>> {
         match self {
-            PrimitiveType::I8 => self
-                .llvm_type(ctx)
-                .into_int_type()
-                .const_int(i8::MAX as u64, true)
-                .as_basic_value_enum(),
-            PrimitiveType::I16 => self
-                .llvm_type(ctx)
-                .into_int_type()
-                .const_int(i16::MAX as u64, true)
-                .as_basic_value_enum(),
-            PrimitiveType::I32 => self
-                .llvm_type(ctx)
-                .into_int_type()
-                .const_int(i32::MAX as u64, true)
-                .as_basic_value_enum(),
-            PrimitiveType::I64 => self
-                .llvm_type(ctx)
-                .into_int_type()
-                .const_int(i64::MAX as u64, true)
-                .as_basic_value_enum(),
-            PrimitiveType::U8
-            | PrimitiveType::U16
-            | PrimitiveType::U32
-            | PrimitiveType::U64
-            | PrimitiveType::U128 => self
-                .llvm_type(ctx)
-                .into_int_type()
-                .const_all_ones()
-                .as_basic_value_enum(),
-            PrimitiveType::F16 => self
-                .llvm_type(ctx)
-                .into_float_type()
-                .const_float(f16::INFINITY.to_f64())
-                .as_basic_value_enum(),
-            PrimitiveType::F32 => self
-                .llvm_type(ctx)
-                .into_float_type()
-                .const_float(f32::INFINITY as f64)
-                .as_basic_value_enum(),
-            PrimitiveType::F64 => self
-                .llvm_type(ctx)
-                .into_float_type()
-                .const_float(f64::INFINITY)
-                .as_basic_value_enum(),
+            PrimitiveType::P64x2 => None,
+            PrimitiveType::I8 => Some(
+                self.llvm_type(ctx)
+                    .into_int_type()
+                    .const_int(i8::MIN as u64, true)
+                    .as_basic_value_enum(),
+            ),
+            PrimitiveType::I16 => Some(
+                self.llvm_type(ctx)
+                    .into_int_type()
+                    .const_int(i16::MIN as u64, true)
+                    .as_basic_value_enum(),
+            ),
+            PrimitiveType::I32 => Some(
+                self.llvm_type(ctx)
+                    .into_int_type()
+                    .const_int(i32::MIN as u64, true)
+                    .as_basic_value_enum(),
+            ),
+            PrimitiveType::I64 => Some(
+                self.llvm_type(ctx)
+                    .into_int_type()
+                    .const_int(i64::MIN as u64, true)
+                    .as_basic_value_enum(),
+            ),
+            PrimitiveType::U8 | PrimitiveType::U16 | PrimitiveType::U32 | PrimitiveType::U64 => {
+                Some(
+                    self.llvm_type(ctx)
+                        .into_int_type()
+                        .const_zero()
+                        .as_basic_value_enum(),
+                )
+            }
+            PrimitiveType::F16 => Some(
+                self.llvm_type(ctx)
+                    .into_float_type()
+                    .const_float(f16::NEG_INFINITY.to_f64())
+                    .as_basic_value_enum(),
+            ),
+            PrimitiveType::F32 => Some(
+                self.llvm_type(ctx)
+                    .into_float_type()
+                    .const_float(f32::NEG_INFINITY as f64)
+                    .as_basic_value_enum(),
+            ),
+            PrimitiveType::F64 => Some(
+                self.llvm_type(ctx)
+                    .into_float_type()
+                    .const_float(f64::NEG_INFINITY)
+                    .as_basic_value_enum(),
+            ),
         }
     }
 
-    fn min_value<'a>(&self, ctx: &'a Context) -> BasicValueEnum<'a> {
+    fn max_value<'a>(&self, ctx: &'a Context) -> Option<BasicValueEnum<'a>> {
         match self {
-            PrimitiveType::I8 => self
-                .llvm_type(ctx)
-                .into_int_type()
-                .const_int(i8::MIN as u64, true)
-                .as_basic_value_enum(),
-            PrimitiveType::I16 => self
-                .llvm_type(ctx)
-                .into_int_type()
-                .const_int(i16::MIN as u64, true)
-                .as_basic_value_enum(),
-            PrimitiveType::I32 => self
-                .llvm_type(ctx)
-                .into_int_type()
-                .const_int(i32::MIN as u64, true)
-                .as_basic_value_enum(),
-            PrimitiveType::I64 => self
-                .llvm_type(ctx)
-                .into_int_type()
-                .const_int(i64::MIN as u64, true)
-                .as_basic_value_enum(),
-            PrimitiveType::U8
-            | PrimitiveType::U16
-            | PrimitiveType::U32
-            | PrimitiveType::U64
-            | PrimitiveType::U128 => self
-                .llvm_type(ctx)
-                .into_int_type()
-                .const_zero()
-                .as_basic_value_enum(),
-            PrimitiveType::F16 => self
-                .llvm_type(ctx)
-                .into_float_type()
-                .const_float(f16::NEG_INFINITY.to_f64())
-                .as_basic_value_enum(),
-            PrimitiveType::F32 => self
-                .llvm_type(ctx)
-                .into_float_type()
-                .const_float(f32::NEG_INFINITY as f64)
-                .as_basic_value_enum(),
-            PrimitiveType::F64 => self
-                .llvm_type(ctx)
-                .into_float_type()
-                .const_float(f64::NEG_INFINITY)
-                .as_basic_value_enum(),
+            PrimitiveType::P64x2 => None,
+            PrimitiveType::I8 => Some(
+                self.llvm_type(ctx)
+                    .into_int_type()
+                    .const_int(i8::MAX as u64, true)
+                    .as_basic_value_enum(),
+            ),
+            PrimitiveType::I16 => Some(
+                self.llvm_type(ctx)
+                    .into_int_type()
+                    .const_int(i16::MAX as u64, true)
+                    .as_basic_value_enum(),
+            ),
+            PrimitiveType::I32 => Some(
+                self.llvm_type(ctx)
+                    .into_int_type()
+                    .const_int(i32::MAX as u64, true)
+                    .as_basic_value_enum(),
+            ),
+            PrimitiveType::I64 => Some(
+                self.llvm_type(ctx)
+                    .into_int_type()
+                    .const_int(i64::MAX as u64, true)
+                    .as_basic_value_enum(),
+            ),
+            PrimitiveType::U8 | PrimitiveType::U16 | PrimitiveType::U32 | PrimitiveType::U64 => {
+                Some(
+                    self.llvm_type(ctx)
+                        .into_int_type()
+                        .const_all_ones()
+                        .as_basic_value_enum(),
+                )
+            }
+            PrimitiveType::F16 => Some(
+                self.llvm_type(ctx)
+                    .into_float_type()
+                    .const_float(f16::INFINITY.to_f64())
+                    .as_basic_value_enum(),
+            ),
+            PrimitiveType::F32 => Some(
+                self.llvm_type(ctx)
+                    .into_float_type()
+                    .const_float(f32::INFINITY as f64)
+                    .as_basic_value_enum(),
+            ),
+            PrimitiveType::F64 => Some(
+                self.llvm_type(ctx)
+                    .into_float_type()
+                    .const_float(f64::INFINITY)
+                    .as_basic_value_enum(),
+            ),
         }
     }
 }
@@ -510,6 +540,10 @@ struct PtrHolder {
     phys_len: u64,
     start_at: u64,
     remaining: u64,
+
+    /// for recursive data types, we need to store the children's information to
+    /// ensure it lives long enough
+    addl_data: Vec<Box<PtrHolder>>,
 }
 
 /// Turns the given array into a pointer and some optional data. The pointer is
@@ -569,15 +603,13 @@ fn arr_to_ptr(arr: &dyn Array) -> (Option<Box<PtrHolder>>, *const c_void) {
             let (key_data, key_ptr) = arr_to_ptr(arr.keys());
             let (val_data, val_ptr) = arr_to_ptr(arr.values());
 
-            // TODO support nested dictionary arrays
-            assert!(key_data.is_none() && val_data.is_none());
-
             let holder = Box::new(PtrHolder {
                 arr1: key_ptr,
                 arr2: val_ptr,
                 phys_len: arr.len() as u64,
                 start_at: 0,
                 remaining: 0,
+                addl_data: [key_data, val_data].into_iter().filter_map(|x| x).collect(),
             });
 
             let ptr = &*holder as *const PtrHolder;
@@ -625,6 +657,7 @@ fn arr_to_ptr(arr: &dyn Array) -> (Option<Box<PtrHolder>>, *const c_void) {
                 phys_len: children[0].len() as u64,
                 start_at: start_at as u64 + 1,
                 remaining: remaining as u64,
+                addl_data: Vec::new(),
             });
             let ptr = (&*holder as *const PtrHolder) as *const c_void;
             (Some(holder), ptr)
@@ -637,6 +670,7 @@ fn arr_to_ptr(arr: &dyn Array) -> (Option<Box<PtrHolder>>, *const c_void) {
                 phys_len: arr.len() as u64,
                 start_at: 0,
                 remaining: 0,
+                addl_data: Vec::new(),
             });
 
             let ptr = (&*holder as *const PtrHolder) as *const c_void;
@@ -650,6 +684,7 @@ fn arr_to_ptr(arr: &dyn Array) -> (Option<Box<PtrHolder>>, *const c_void) {
                 phys_len: arr.len() as u64,
                 start_at: 0,
                 remaining: 0,
+                addl_data: Vec::new(),
             });
 
             let ptr = (&*holder as *const PtrHolder) as *const c_void;
@@ -1215,6 +1250,15 @@ impl<'ctx> CodeGen<'ctx> {
         }
     }
 
+    fn gen_single_iter_for(&self, label: &str, dt: &DataType) -> FunctionValue {
+        match dt {
+            DataType::Boolean => self.gen_iter_bitmap(label),
+            DataType::Utf8 => self.gen_iter_string_primitive(label, PrimitiveType::I32),
+            DataType::LargeUtf8 => self.gen_iter_string_primitive(label, PrimitiveType::I64),
+            _ => todo!("no single iterator for {}", dt),
+        }
+    }
+
     fn gen_random_access_for(&self, label: &str, dt: &DataType) -> FunctionValue {
         match dt {
             DataType::Boolean => todo!(),
@@ -1362,7 +1406,9 @@ impl<'ctx> CodeGen<'ctx> {
     ) -> Result<CompiledBinaryFunc<'ctx>, ArrowError> {
         let lhs_prim = PrimitiveType::for_arrow_type(lhs_dt);
         let rhs_prim = PrimitiveType::for_arrow_type(rhs_dt);
-        let com_prim = PrimitiveType::dominant(lhs_prim, rhs_prim);
+        let com_prim = PrimitiveType::dominant(lhs_prim, rhs_prim).ok_or_else(|| {
+            ArrowError::ComputeError(format!("cannot compare {:?} and {:?}", lhs_dt, rhs_dt))
+        })?;
         let builder = self.context.create_builder();
 
         let i64_type = self.context.i64_type();
@@ -1576,7 +1622,7 @@ impl<'ctx> CodeGen<'ctx> {
         builder.position_at_end(end);
         builder.build_return(Some(&len)).unwrap();
 
-        //self.optimize()?;
+        self.optimize()?;
         self.module
             .verify()
             .map_err(|e| ArrowError::ComputeError(format!("Error compiling kernel: {}", e)))?;

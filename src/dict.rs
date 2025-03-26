@@ -47,10 +47,6 @@ impl<'ctx> CodeGen<'ctx> {
             .unwrap();
         builder.build_store(key_ptr, key_iter).unwrap();
 
-        assert!(
-            vtype.is_primitive(),
-            "current iteration code assumes values are primitive"
-        );
         let val_iter = self.initialize_iter(builder, arr_vals, len, vtype);
         let val_ptr = builder
             .build_struct_gep(iter_type, ptr, 1, "dict_val_ptr")
@@ -88,6 +84,10 @@ impl<'ctx> CodeGen<'ctx> {
         key_prim_type: PrimitiveType,
         value_prim_type: PrimitiveType,
     ) -> FunctionValue {
+        assert!(
+            !matches!(value_prim_type, PrimitiveType::P64x2),
+            "cannot block iterate over string values"
+        );
         let prim_f = self.gen_iter_primitive(&format!("{}_sub", label), key_prim_type, 64);
         let builder = self.context.create_builder();
 
@@ -96,7 +96,7 @@ impl<'ctx> CodeGen<'ctx> {
         let i32_type = self.context.i32_type();
         let ptr_type = self.context.ptr_type(AddressSpace::default());
         let ptr_int_chunk = i64_type.vec_type(64);
-        let chunk_type = value_prim_type.llvm_vec_type(self.context, 64);
+        let chunk_type = value_prim_type.llvm_vec_type(self.context, 64).unwrap();
         let iter_type = self.struct_for_iter_primitive();
 
         let fn_type = chunk_type.fn_type(
@@ -291,8 +291,7 @@ impl<'ctx> CodeGen<'ctx> {
             .build_call(val_getter, &[value_iter_ptr.into(), key.into()], "val")
             .unwrap()
             .try_as_basic_value()
-            .unwrap_left()
-            .into_int_value();
+            .unwrap_left();
 
         builder.build_return(Some(&val)).unwrap();
         function
@@ -302,13 +301,13 @@ impl<'ctx> CodeGen<'ctx> {
 #[cfg(test)]
 mod tests {
 
-    use arrow_array::{cast::AsArray, BooleanArray, Int32Array, Int64Array};
+    use arrow_array::{cast::AsArray, Array, BooleanArray, Int32Array, Int64Array};
     use arrow_ord::cmp;
     use arrow_schema::DataType;
     use inkwell::context::Context;
     use itertools::Itertools;
 
-    use crate::{dictionary_data_type, CodeGen, Predicate};
+    use crate::{aggregate::Aggregation, dictionary_data_type, CodeGen, Predicate};
 
     const SIZES_TO_TRY: &[usize] = &[0, 50, 64, 100, 128, 200, 2048, 2049];
 
@@ -509,5 +508,42 @@ mod tests {
 
         assert_eq!(our_filtered.len(), 4);
         assert_eq!(true_result, our_filtered);
+    }
+
+    //    #[test]
+    fn test_dict_str_min_agg() {
+        let ctx = Context::create();
+        let cg = CodeGen::new(&ctx);
+        let dict_type = DataType::Dictionary(Box::new(DataType::Int8), Box::new(DataType::Utf8));
+
+        let values = vec![
+            Some("zeta"),
+            None,
+            Some("alpha"),
+            Some("beta"),
+            None,
+            Some("gamma"),
+            Some("alpha"),
+            Some("zeta"),
+            None,
+        ];
+        let string_array = arrow_array::StringArray::from(values);
+        let dict_array = arrow_cast::cast(&string_array, &dict_type).unwrap();
+
+        // Compile the min aggregation function for dictionary-encoded string arrays.
+
+        let agg_fn = cg
+            .string_minmax(&dict_type, Aggregation::Min, true)
+            .unwrap();
+
+        let result = agg_fn.call(&dict_array).unwrap().unwrap();
+        let result_array = result
+            .as_any()
+            .downcast_ref::<arrow_array::StringArray>()
+            .unwrap();
+
+        // The expected minimum value, ignoring nulls, is "alpha".
+        assert_eq!(result_array.len(), 1);
+        assert_eq!(result_array.value(0), "alpha");
     }
 }

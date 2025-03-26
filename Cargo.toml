@@ -14,6 +14,7 @@ ouroboros = "0.18"
 half = "2.4.1"
 enum-as-inner = "0.6.1"
 
+
 [dev-dependencies]
 half = "2.4.1"
 arrow-ord = "53.3"

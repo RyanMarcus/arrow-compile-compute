@@ -267,13 +267,9 @@ impl<'ctx> CodeGen<'ctx> {
     }
 
     fn string_return_type(&self) -> StructType<'ctx> {
-        self.context.struct_type(
-            &[
-                self.context.ptr_type(AddressSpace::default()).into(),
-                self.context.ptr_type(AddressSpace::default()).into(),
-            ],
-            false,
-        )
+        (PrimitiveType::P64x2)
+            .llvm_type(self.context)
+            .into_struct_type()
     }
 
     pub(crate) fn struct_for_iter_string_primitive(&self) -> StructType {
@@ -547,7 +543,7 @@ impl<'ctx> CodeGen<'ctx> {
 
     pub(crate) fn string_minmax(
         self,
-        offset_type: PrimitiveType,
+        dt: &DataType,
         agg: Aggregation,
         nullable: bool,
     ) -> Result<CompiledAggFunc<'ctx>, ArrowError> {
@@ -580,11 +576,11 @@ impl<'ctx> CodeGen<'ctx> {
             let str_iter_ptr = next_f.get_nth_param(0).unwrap().into_pointer_value();
             let bit_iter_ptr = next_f.get_nth_param(1).unwrap().into_pointer_value();
             let out_ptr = next_f.get_nth_param(2).unwrap().into_pointer_value();
+
             builder.position_at_end(entry);
             if nullable {
+                let string_getter = self.gen_random_access_for("string_getter", dt);
                 declare_blocks!(self.context, next_f, load_str, exit);
-                let string_getter =
-                    self.generate_string_random_access("string_getter", offset_type);
                 let next_bit = self.gen_iter_bitmap("null_map");
 
                 let idx_ptr = builder.build_alloca(i64_type, "idx_ptr").unwrap();
@@ -613,7 +609,7 @@ impl<'ctx> CodeGen<'ctx> {
                 builder.position_at_end(exit);
                 builder.build_return(Some(&i1_type.const_zero())).unwrap();
             } else {
-                let next_str = self.gen_iter_string_primitive("next_string", offset_type);
+                let next_str = self.gen_single_iter_for("next_string", dt);
                 let res = builder
                     .build_call(next_str, &[str_iter_ptr.into(), out_ptr.into()], "string")
                     .unwrap()
@@ -736,7 +732,8 @@ impl<'ctx> CodeGen<'ctx> {
             .unwrap();
 
         self.module.verify().unwrap();
-        self.optimize()?;
+        self.module.print_to_stderr();
+        //        self.optimize()?;
         let ee = self
             .module
             .create_jit_execution_engine(OptimizationLevel::Aggressive)
@@ -745,11 +742,7 @@ impl<'ctx> CodeGen<'ctx> {
         Ok(CompiledAggFunc {
             _cg: self,
             nullable,
-            src_dt: match offset_type {
-                PrimitiveType::I32 => DataType::Utf8,
-                PrimitiveType::I64 => DataType::LargeUtf8,
-                _ => unreachable!(),
-            },
+            src_dt: dt.clone(),
             f: unsafe { ee.get_function("agg_str").unwrap() },
         })
     }
@@ -758,6 +751,7 @@ impl<'ctx> CodeGen<'ctx> {
 #[cfg(test)]
 mod tests {
     use arrow_array::{Array, StringArray};
+    use arrow_schema::DataType;
     use inkwell::context::Context;
 
     use crate::{aggregate::Aggregation, CodeGen};
@@ -769,7 +763,7 @@ mod tests {
         let ctx = Context::create();
         let cg = CodeGen::new(&ctx);
         let f = cg
-            .string_minmax(crate::PrimitiveType::I32, Aggregation::Min, false)
+            .string_minmax(&DataType::Utf8, Aggregation::Min, false)
             .unwrap();
 
         let expected = StringArray::from(vec!["a"]);
@@ -784,7 +778,7 @@ mod tests {
         let ctx = Context::create();
         let cg = CodeGen::new(&ctx);
         let f = cg
-            .string_minmax(crate::PrimitiveType::I32, Aggregation::Max, false)
+            .string_minmax(&DataType::Utf8, Aggregation::Max, false)
             .unwrap();
 
         let expected = StringArray::from(vec!["this"]);
@@ -799,7 +793,7 @@ mod tests {
         let ctx = Context::create();
         let cg = CodeGen::new(&ctx);
         let f = cg
-            .string_minmax(crate::PrimitiveType::I32, Aggregation::Max, false)
+            .string_minmax(&DataType::Utf8, Aggregation::Max, false)
             .unwrap();
 
         assert!("®" > " ");
@@ -815,7 +809,7 @@ mod tests {
         let ctx = Context::create();
         let cg = CodeGen::new(&ctx);
         let f = cg
-            .string_minmax(crate::PrimitiveType::I32, Aggregation::Min, false)
+            .string_minmax(&DataType::Utf8, Aggregation::Min, false)
             .unwrap();
 
         let expected = StringArray::from(vec!["this"]);
@@ -830,7 +824,7 @@ mod tests {
         let ctx = Context::create();
         let cg = CodeGen::new(&ctx);
         let f = cg
-            .string_minmax(crate::PrimitiveType::I32, Aggregation::Max, false)
+            .string_minmax(&DataType::Utf8, Aggregation::Max, false)
             .unwrap();
 
         let expected = StringArray::from(vec!["thiszz"]);
@@ -845,7 +839,7 @@ mod tests {
         let ctx = Context::create();
         let cg = CodeGen::new(&ctx);
         let f = cg
-            .string_minmax(crate::PrimitiveType::I32, Aggregation::Max, true)
+            .string_minmax(&DataType::Utf8, Aggregation::Max, true)
             .unwrap();
 
         let expected = StringArray::from(vec!["this"]);

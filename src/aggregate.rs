@@ -39,8 +39,8 @@ impl<'ctx> CodeGen<'ctx> {
     ) -> Result<CompiledAggFunc<'ctx>, ArrowError> {
         let prim = PrimitiveType::for_arrow_type(dt);
         let prim_llvm_type = prim.llvm_type(self.context);
-        let pair_type = prim.llvm_vec_type(self.context, 2);
-        let prim_block_type = prim.llvm_vec_type(self.context, 64);
+        let pair_type = prim.llvm_vec_type(self.context, 2).unwrap();
+        let prim_block_type = prim.llvm_vec_type(self.context, 64).unwrap();
 
         let builder = self.context.create_builder();
         let i64_type = self.context.i64_type();
@@ -100,8 +100,8 @@ impl<'ctx> CodeGen<'ctx> {
         let accum_ptr = builder.build_alloca(prim_llvm_type, "accum").unwrap();
         // store a neutral value into accum
         let to_store = match agg {
-            Aggregation::Min => prim.max_value(self.context),
-            Aggregation::Max => prim.min_value(self.context),
+            Aggregation::Min => prim.max_value(self.context).unwrap(),
+            Aggregation::Max => prim.min_value(self.context).unwrap(),
             Aggregation::Sum => prim.zero(self.context),
         };
         builder.build_store(accum_ptr, to_store).unwrap();

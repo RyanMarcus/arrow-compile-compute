@@ -5,7 +5,7 @@ use std::{
 
 use crate::{
     aggregate::Aggregation, CompiledAggFunc, CompiledBinaryFunc, CompiledConvertFunc,
-    CompiledFilterFunc, CompiledTakeFunc, Predicate, PrimitiveType,
+    CompiledFilterFunc, CompiledTakeFunc, Predicate,
 };
 
 use arrow_array::array::{
@@ -211,8 +211,8 @@ fn build_agg(
         cf_builder: |ctx| {
             let cg = CodeGen::new(ctx);
             match src {
-                DataType::Utf8 => cg.string_minmax(PrimitiveType::I32, agg, nullable),
-                DataType::LargeUtf8 => cg.string_minmax(PrimitiveType::I64, agg, nullable),
+                DataType::Utf8 => cg.string_minmax(src, agg, nullable),
+                DataType::LargeUtf8 => cg.string_minmax(src, agg, nullable),
                 _ => {
                     if nullable {
                         cg.compile_ungrouped_agg_with_nulls(src, agg)

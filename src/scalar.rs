@@ -91,7 +91,7 @@ impl<'ctx> CodeGen<'ctx> {
         let i64_type = self.context.i64_type();
         let ptr_type = self.context.ptr_type(AddressSpace::default());
         let dtype = prim_type.llvm_type(self.context);
-        let chunk_type = prim_type.llvm_vec_type(self.context, 64);
+        let chunk_type = prim_type.llvm_vec_type(self.context, 64).unwrap();
         let iter_type = self.struct_for_iter_scalar();
 
         let fn_type = chunk_type.fn_type(
