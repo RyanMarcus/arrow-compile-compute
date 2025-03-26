@@ -9,6 +9,10 @@ use arrow_array::{
     Array, ArrowPrimitiveType, BooleanArray, GenericStringArray, PrimitiveArray, StringArray,
 };
 
+/// Convert an Arrow Array into an IteratorHolder, which contains the C-style
+/// iterator along with all the other C-style iterator needed. For example, a
+/// dictionary array will get a C-style iterator and then two sub-iterators for
+/// the keys and values.
 fn array_to_iter(arr: &dyn Array) -> IteratorHolder {
     match arr.data_type() {
         arrow_schema::DataType::Null => todo!(),
@@ -97,6 +101,8 @@ fn array_to_iter(arr: &dyn Array) -> IteratorHolder {
     }
 }
 
+/// A holder for a C-style iterator. Created by `array_to_iter`, and used by
+/// compiled LLVM functions.
 enum IteratorHolder {
     Primitive(Box<PrimitiveIterator>),
     String(Box<StringIterator>),
@@ -106,6 +112,15 @@ enum IteratorHolder {
     RunEnd(Box<RunEndIterator>, Vec<Box<IteratorHolder>>),
 }
 
+/// An iterator for primitive (densely packed) data.
+///
+/// * `data` is a pointer to the densely packed data buffer
+///
+/// * `pos` is the current position in the iterator, all reads are relative to
+/// this position
+///
+/// * `len` is the length of the data from the start of the `data` pointer
+/// (i.e., not accounting for `pos`)
 #[repr(C)]
 struct PrimitiveIterator {
     data: *const c_void,
@@ -123,6 +138,8 @@ impl<K: ArrowPrimitiveType> From<&PrimitiveArray<K>> for Box<PrimitiveIterator> 
     }
 }
 
+/// An iterator for string data. Contains a pointer to the offset buffer and the
+/// data buffer, along with a `pos` and `len` just like primitive iterators.
 #[repr(C)]
 struct StringIterator {
     offsets: *const i32,
@@ -142,6 +159,7 @@ impl From<&StringArray> for Box<StringIterator> {
     }
 }
 
+/// Same as `StringIterator`, but with 64 bit offsets.
 #[repr(C)]
 struct LargeStringIterator {
     offsets: *const i64,
@@ -161,6 +179,9 @@ impl From<&GenericStringArray<i64>> for Box<LargeStringIterator> {
     }
 }
 
+/// An iterator for bitmap data. Contains a pointer to the bitmap buffer and the
+/// data buffer, along with a `pos` and `len` just like primitive iterators.
+/// Note that each element pointed to by `data` contains 8 items/bits.
 #[repr(C)]
 struct BitmapIterator {
     data: *const u8,
@@ -178,6 +199,9 @@ impl From<&BooleanArray> for Box<BitmapIterator> {
     }
 }
 
+/// An iterator for dictionary data. Contains pointers to the *iterators* for
+/// the underlying keys and values. To access the element at position `i`, you
+/// want to compute `value[key[i]]`.
 #[repr(C)]
 struct DictionaryIterator {
     key_iter: *const c_void,
@@ -186,6 +210,8 @@ struct DictionaryIterator {
     len: u64,
 }
 
+/// An iterator for run-end encoded data. Contains pointers to the *iterators* for
+/// the underlying run ends and values.
 #[repr(C)]
 struct RunEndIterator {
     /// the run ends, which must be i16, i32, or i64
