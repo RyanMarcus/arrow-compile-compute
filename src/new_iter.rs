@@ -1,4 +1,4 @@
-use std::{ffi::c_void, intrinsics::unreachable};
+use std::ffi::c_void;
 
 use arrow_array::{
     cast::AsArray,
