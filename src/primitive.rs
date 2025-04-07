@@ -169,10 +169,6 @@ impl<'ctx> CodeGen<'ctx> {
         builder
             .build_store(partial_chunk_ptr, chunk_type.const_zero())
             .unwrap();
-        let partial_idx_ptr = builder.build_alloca(i64_type, "p_idx").unwrap();
-        builder
-            .build_store(partial_idx_ptr, i64_type.const_zero())
-            .unwrap();
         builder
             .build_unconditional_branch(partial_loop_cond)
             .unwrap();
@@ -190,10 +186,6 @@ impl<'ctx> CodeGen<'ctx> {
             .unwrap();
 
         builder.position_at_end(partial_loop_body);
-        let partial_idx = builder
-            .build_load(i64_type, partial_idx_ptr, "partial_idx")
-            .unwrap()
-            .into_int_value();
         let idx = builder
             .build_load(i64_type, idx_ptr, "idx")
             .unwrap()
@@ -210,14 +202,7 @@ impl<'ctx> CodeGen<'ctx> {
         builder
             .build_store(partial_chunk_ptr, partial_chunk)
             .unwrap();
-        builder
-            .build_store(
-                partial_idx_ptr,
-                builder
-                    .build_int_add(partial_idx, i64_type.const_int(1, false), "new_partial_idx")
-                    .unwrap(),
-            )
-            .unwrap();
+
         builder
             .build_store(
                 idx_ptr,

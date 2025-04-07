@@ -1524,10 +1524,10 @@ impl<'ctx> CodeGen<'ctx> {
         builder.position_at_end(end);
         builder.build_return(None).unwrap();
 
-        self.optimize()?;
         self.module
             .verify()
             .map_err(|e| ArrowError::ComputeError(format!("Error compiling kernel: {}", e)))?;
+        self.optimize()?;
         let ee = self
             .module
             .create_jit_execution_engine(OptimizationLevel::Aggressive)

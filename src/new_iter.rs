@@ -8,6 +8,17 @@ use arrow_array::{
     },
     Array, ArrowPrimitiveType, BooleanArray, GenericStringArray, PrimitiveArray, StringArray,
 };
+use arrow_schema::DataType;
+use inkwell::{
+    builder::Builder,
+    context::{AsContextRef, Context},
+    module::{Linkage, Module},
+    values::FunctionValue,
+    AddressSpace, IntPredicate,
+};
+use repr_offset::ReprOffset;
+
+use crate::{declare_blocks, PrimitiveType};
 
 /// Convert an Arrow Array into an IteratorHolder, which contains the C-style
 /// iterator along with all the other C-style iterator needed. For example, a
@@ -122,6 +133,8 @@ enum IteratorHolder {
 /// * `len` is the length of the data from the start of the `data` pointer
 /// (i.e., not accounting for `pos`)
 #[repr(C)]
+#[derive(ReprOffset)]
+#[roff(usize_offsets)]
 struct PrimitiveIterator {
     data: *const c_void,
     pos: u64,
@@ -138,9 +151,15 @@ impl<K: ArrowPrimitiveType> From<&PrimitiveArray<K>> for Box<PrimitiveIterator> 
     }
 }
 
+impl PrimitiveIterator {
+    fn destructure_llvm(&self, builder: &mut Builder) {}
+}
+
 /// An iterator for string data. Contains a pointer to the offset buffer and the
 /// data buffer, along with a `pos` and `len` just like primitive iterators.
 #[repr(C)]
+#[derive(ReprOffset)]
+#[roff(usize_offsets)]
 struct StringIterator {
     offsets: *const i32,
     data: *const u8,
@@ -161,6 +180,8 @@ impl From<&StringArray> for Box<StringIterator> {
 
 /// Same as `StringIterator`, but with 64 bit offsets.
 #[repr(C)]
+#[derive(ReprOffset)]
+#[roff(usize_offsets)]
 struct LargeStringIterator {
     offsets: *const i64,
     data: *const u8,
@@ -183,6 +204,8 @@ impl From<&GenericStringArray<i64>> for Box<LargeStringIterator> {
 /// data buffer, along with a `pos` and `len` just like primitive iterators.
 /// Note that each element pointed to by `data` contains 8 items/bits.
 #[repr(C)]
+#[derive(ReprOffset)]
+#[roff(usize_offsets)]
 struct BitmapIterator {
     data: *const u8,
     pos: u64,
@@ -201,18 +224,19 @@ impl From<&BooleanArray> for Box<BitmapIterator> {
 
 /// An iterator for dictionary data. Contains pointers to the *iterators* for
 /// the underlying keys and values. To access the element at position `i`, you
-/// want to compute `value[key[i]]`.
+/// want to compute `value[key[i]]`. The `key_iter` is used for tracking current
+/// position and length.
 #[repr(C)]
 struct DictionaryIterator {
     key_iter: *const c_void,
     val_iter: *const c_void,
-    pos: u64,
-    len: u64,
 }
 
 /// An iterator for run-end encoded data. Contains pointers to the *iterators* for
 /// the underlying run ends and values.
 #[repr(C)]
+#[derive(ReprOffset)]
+#[roff(usize_offsets)]
 struct RunEndIterator {
     /// the run ends, which must be i16, i32, or i64
     run_ends: *const c_void,
@@ -221,4 +245,131 @@ struct RunEndIterator {
     val_iter: *const c_void,
     pos: u64,
     len: u64,
+}
+
+macro_rules! increment_pointer {
+    ($ctx: expr, $builder: expr, $ptr: expr, $offset: expr) => {
+        unsafe {
+            $builder
+                .build_gep(
+                    $ctx.i8_type(),
+                    $ptr,
+                    &[$ctx.i64_type().const_int($offset as u64, false)],
+                    "inc_ptr",
+                )
+                .unwrap()
+        }
+    };
+}
+
+/// For any iterator, this function adds code corresponding to a `has_next`
+/// function. This function returns true if the iterator's offset is less than
+/// it's length (there are more items to consume with `next`), and false
+/// otherwise.
+fn generate_has_next<'a>(
+    llvm_mod: &'a Module,
+    label: &str,
+    ih: &IteratorHolder,
+) -> FunctionValue<'a> {
+    let ctx = llvm_mod.get_context();
+    let builder = ctx.create_builder();
+    let bool_type = ctx.bool_type();
+    let ptr_type = ctx.ptr_type(AddressSpace::default());
+    let i64_type = ctx.i64_type();
+
+    let fn_type = bool_type.fn_type(&[ptr_type.into()], false);
+    let has_next = llvm_mod.add_function(
+        &format!("{}_has_next", label),
+        fn_type,
+        Some(Linkage::Private),
+    );
+    let iter_ptr = has_next.get_nth_param(0).unwrap().into_pointer_value();
+    declare_blocks!(ctx, has_next, entry);
+    builder.position_at_end(entry);
+
+    let (pos_offset, len_offset) = match ih {
+        IteratorHolder::Primitive(_) => {
+            (PrimitiveIterator::OFFSET_POS, PrimitiveIterator::OFFSET_LEN)
+        }
+        IteratorHolder::String(_) => (StringIterator::OFFSET_POS, StringIterator::OFFSET_LEN),
+        IteratorHolder::LargeString(_) => (
+            LargeStringIterator::OFFSET_POS,
+            LargeStringIterator::OFFSET_LEN,
+        ),
+        IteratorHolder::Bitmap(_) => (BitmapIterator::OFFSET_POS, BitmapIterator::OFFSET_LEN),
+        IteratorHolder::Dictionary(_, iterator_holders) => {
+            // "forward" this call of has next to a call on the dictionary iterator
+            let sub_has_next = generate_has_next(
+                llvm_mod,
+                &format!("{}_sub_has_next", label),
+                &iterator_holders[0],
+            );
+            let res = builder
+                .build_call(sub_has_next, &[iter_ptr.into()], "sub_res")
+                .unwrap()
+                .try_as_basic_value()
+                .unwrap_left();
+            builder.build_return(Some(&res)).unwrap();
+            return has_next;
+        }
+        IteratorHolder::RunEnd(_, _) => (RunEndIterator::OFFSET_POS, RunEndIterator::OFFSET_LEN),
+    };
+
+    let offset_ptr = increment_pointer!(ctx, builder, iter_ptr, pos_offset);
+    let len_ptr = increment_pointer!(ctx, builder, iter_ptr, len_offset);
+    let offset = builder
+        .build_load(i64_type, offset_ptr, "offset")
+        .unwrap()
+        .into_int_value();
+    let len = builder
+        .build_load(i64_type, len_ptr, "len")
+        .unwrap()
+        .into_int_value();
+    let res = builder
+        .build_int_compare(IntPredicate::ULT, offset, len, "res")
+        .unwrap();
+    builder.build_return(Some(&res)).unwrap();
+
+    return has_next;
+}
+
+/// This adds a `next_block` function to the module for the given iterator. When
+/// called, this `next_block` function will fetch `n` elements from the
+/// iterator, advancing the iterator's offset. The generated function's signature is:
+/// fn next_block(iter: ptr, out: ptr_to_vec_of_size_n) -> bool
+///
+fn generate_next_block<'a, const N: u32>(
+    ctx: &'a Context,
+    llvm_mod: &'a Module<'a>,
+    label: &str,
+    dt: &DataType,
+    ih: &IteratorHolder,
+) -> Option<FunctionValue<'a>> {
+    let build = ctx.create_builder();
+    let ptype = PrimitiveType::for_arrow_type(dt);
+    let vec_type = ptype.llvm_vec_type(&ctx, N)?;
+    let bool_type = ctx.bool_type();
+    let ptr_type = ctx.ptr_type(AddressSpace::default());
+
+    let fn_type = bool_type.fn_type(&[ptr_type.into(), ptr_type.into()], false);
+    let next = llvm_mod.add_function(
+        &format!("{}_next_block_{}", label, N),
+        fn_type,
+        Some(Linkage::Private),
+    );
+
+    match ih {
+        IteratorHolder::Primitive(primitive_iter) => {
+            declare_blocks!(ctx, next, entry, check_rem, none_left, get_next);
+
+            build.position_at_end(entry);
+
+            todo!()
+        }
+        IteratorHolder::String(string_iterator) => todo!(),
+        IteratorHolder::LargeString(large_string_iterator) => todo!(),
+        IteratorHolder::Bitmap(bitmap_iterator) => todo!(),
+        IteratorHolder::Dictionary(dictionary_iterator, iterator_holders) => todo!(),
+        IteratorHolder::RunEnd(run_end_iterator, iterator_holders) => todo!(),
+    };
 }
