@@ -3,11 +3,11 @@ use std::ffi::c_void;
 use arrow_array::{
     cast::AsArray,
     types::{
-        Float16Type, Float32Type, Float64Type, Int16Type, Int32Type, Int64Type, Int8Type,
-        UInt16Type, UInt32Type, UInt64Type, UInt8Type,
+        ArrowDictionaryKeyType, Float16Type, Float32Type, Float64Type, Int16Type, Int32Type,
+        Int64Type, Int8Type, UInt16Type, UInt32Type, UInt64Type, UInt8Type,
     },
-    Array, ArrowPrimitiveType, BooleanArray, Datum, GenericStringArray, PrimitiveArray,
-    StringArray,
+    Array, ArrowPrimitiveType, BooleanArray, Datum, DictionaryArray, GenericStringArray,
+    PrimitiveArray, StringArray,
 };
 use arrow_buffer::{BooleanBuffer, NullBuffer};
 use arrow_schema::DataType;
@@ -23,7 +23,7 @@ use inkwell::{
 use ouroboros::self_referencing;
 use repr_offset::ReprOffset;
 
-use crate::{declare_blocks, PrimitiveType, SelfContainedBinaryFunc};
+use crate::{declare_blocks, PrimitiveType};
 
 macro_rules! increment_pointer {
     ($ctx: expr, $builder: expr, $ptr: expr, $offset: expr) => {
@@ -125,19 +125,14 @@ pub fn array_to_iter(arr: &dyn Array) -> IteratorHolder {
         arrow_schema::DataType::Struct(_fields) => todo!(),
         arrow_schema::DataType::Union(_union_fields, _union_mode) => todo!(),
         arrow_schema::DataType::Dictionary(key_type, _value_type) => match key_type.as_ref() {
-            arrow_schema::DataType::Int8 => {
-                let arr = arr.as_dictionary::<Int8Type>();
-                let _keys = array_to_iter(arr.keys());
-                let _values = array_to_iter(arr.values());
-                todo!()
-            }
-            arrow_schema::DataType::Int16 => todo!(),
-            arrow_schema::DataType::Int32 => todo!(),
-            arrow_schema::DataType::Int64 => todo!(),
-            arrow_schema::DataType::UInt8 => todo!(),
-            arrow_schema::DataType::UInt16 => todo!(),
-            arrow_schema::DataType::UInt32 => todo!(),
-            arrow_schema::DataType::UInt64 => todo!(),
+            arrow_schema::DataType::Int8 => arr.as_dictionary::<Int8Type>().into(),
+            arrow_schema::DataType::Int16 => arr.as_dictionary::<Int16Type>().into(),
+            arrow_schema::DataType::Int32 => arr.as_dictionary::<Int32Type>().into(),
+            arrow_schema::DataType::Int64 => arr.as_dictionary::<Int64Type>().into(),
+            arrow_schema::DataType::UInt8 => arr.as_dictionary::<UInt8Type>().into(),
+            arrow_schema::DataType::UInt16 => arr.as_dictionary::<UInt16Type>().into(),
+            arrow_schema::DataType::UInt32 => arr.as_dictionary::<UInt32Type>().into(),
+            arrow_schema::DataType::UInt64 => arr.as_dictionary::<UInt64Type>().into(),
             _ => unreachable!(),
         },
         arrow_schema::DataType::Decimal128(_, _) => todo!(),
@@ -178,6 +173,19 @@ impl IteratorHolder {
             IteratorHolder::Bitmap(iter) => &mut **iter as *mut _ as *mut c_void,
             IteratorHolder::Dictionary { arr: iter, .. } => &mut **iter as *mut _ as *mut c_void,
             IteratorHolder::RunEnd { arr: iter, .. } => &mut **iter as *mut _ as *mut c_void,
+        }
+    }
+
+    /// Gets a const pointer to the inner iterator, suitable for passing to
+    /// compiled LLVM functions.
+    pub fn get_ptr(&self) -> *const c_void {
+        match self {
+            IteratorHolder::Primitive(iter) => &**iter as *const _ as *const c_void,
+            IteratorHolder::String(iter) => &**iter as *const _ as *const c_void,
+            IteratorHolder::LargeString(iter) => &**iter as *const _ as *const c_void,
+            IteratorHolder::Bitmap(iter) => &**iter as *const _ as *const c_void,
+            IteratorHolder::Dictionary { arr: iter, .. } => &**iter as *const _ as *const c_void,
+            IteratorHolder::RunEnd { arr: iter, .. } => &**iter as *const _ as *const c_void,
         }
     }
 }
@@ -348,6 +356,50 @@ impl From<&BooleanArray> for Box<BitmapIterator> {
 pub struct DictionaryIterator {
     key_iter: *const c_void,
     val_iter: *const c_void,
+}
+
+impl DictionaryIterator {
+    pub fn llvm_key_iter_ptr<'a>(
+        &self,
+        ctx: &'a Context,
+        builder: &'a Builder,
+        ptr: PointerValue<'a>,
+    ) -> PointerValue<'a> {
+        let ptr_ptr = increment_pointer!(ctx, builder, ptr, DictionaryIterator::OFFSET_KEY_ITER);
+        builder
+            .build_load(ctx.ptr_type(AddressSpace::default()), ptr_ptr, "key_iter")
+            .unwrap()
+            .into_pointer_value()
+    }
+
+    pub fn llvm_val_iter_ptr<'a>(
+        &self,
+        ctx: &'a Context,
+        builder: &'a Builder,
+        ptr: PointerValue<'a>,
+    ) -> PointerValue<'a> {
+        let ptr_ptr = increment_pointer!(ctx, builder, ptr, DictionaryIterator::OFFSET_VAL_ITER);
+        builder
+            .build_load(ctx.ptr_type(AddressSpace::default()), ptr_ptr, "val_iter")
+            .unwrap()
+            .into_pointer_value()
+    }
+}
+
+impl<K: ArrowDictionaryKeyType> From<&DictionaryArray<K>> for IteratorHolder {
+    fn from(arr: &DictionaryArray<K>) -> Self {
+        let keys = Box::new(array_to_iter(arr.keys()));
+        let values = Box::new(array_to_iter(arr.values()));
+        let iter = DictionaryIterator {
+            key_iter: keys.get_ptr(),
+            val_iter: values.get_ptr(),
+        };
+        IteratorHolder::Dictionary {
+            arr: Box::new(iter),
+            keys,
+            values,
+        }
+    }
 }
 
 /// An iterator for run-end encoded data. Contains pointers to the *iterators* for
@@ -562,9 +614,61 @@ fn generate_random_access<'a>(
         }
         IteratorHolder::String(_) | IteratorHolder::LargeString(_) => return None,
         IteratorHolder::Bitmap(_bitmap_iterator) => todo!(),
-        IteratorHolder::Dictionary { .. } => {
-            todo!()
-        }
+        IteratorHolder::Dictionary { arr, keys, values } => match dt {
+            DataType::Dictionary(k_dt, v_dt) => {
+                let keys_access = generate_random_access(
+                    ctx,
+                    llvm_mod,
+                    &format!("{}_key_get", label),
+                    k_dt,
+                    keys,
+                )?;
+                let values_access = generate_random_access(
+                    ctx,
+                    llvm_mod,
+                    &format!("{}_value_get", label),
+                    v_dt,
+                    values,
+                )?;
+
+                declare_blocks!(ctx, next, entry);
+
+                build.position_at_end(entry);
+                let key = build
+                    .build_call(
+                        keys_access,
+                        &[
+                            arr.llvm_key_iter_ptr(ctx, &build, iter_ptr).into(),
+                            idx.into(),
+                        ],
+                        "key",
+                    )
+                    .unwrap()
+                    .try_as_basic_value()
+                    .unwrap_left()
+                    .into_int_value();
+                let key_conv = build
+                    .build_int_cast(key, ctx.i64_type(), "key_conv")
+                    .unwrap();
+
+                let value = build
+                    .build_call(
+                        values_access,
+                        &[
+                            arr.llvm_val_iter_ptr(ctx, &build, iter_ptr).into(),
+                            key_conv.into(),
+                        ],
+                        "value",
+                    )
+                    .unwrap()
+                    .try_as_basic_value()
+                    .unwrap_left();
+                build.build_return(Some(&value)).unwrap();
+
+                return Some(next);
+            }
+            _ => unreachable!("dictionary iterator but non-iterator data type ({:?})", dt),
+        },
         IteratorHolder::RunEnd { .. } => todo!(),
     };
 }
@@ -813,9 +917,10 @@ impl ComparisonKernel {
 
 #[cfg(test)]
 mod tests {
-    use std::ffi::c_void;
+    use std::{ffi::c_void, sync::Arc};
 
-    use arrow_array::{Array, Int32Array};
+    use arrow_array::{Array, DictionaryArray, Int32Array, Int8Array};
+    use arrow_schema::DataType;
     use inkwell::{context::Context, OptimizationLevel};
     use itertools::Itertools;
 
@@ -968,6 +1073,84 @@ mod tests {
             assert_eq!(next_func.call(iter.get_mut_ptr(), 2), 2);
             assert_eq!(next_func.call(iter.get_mut_ptr(), 3), 3);
             assert_eq!(next_func.call(iter.get_mut_ptr(), 4), 4);
+        };
+    }
+
+    #[test]
+    fn test_dict_random_access() {
+        let data = Int32Array::from(vec![0, 0, 10, 10, 20, 20, 30, 30, 40, 40]);
+        let data = arrow_cast::cast(
+            &data,
+            &DataType::Dictionary(Box::new(DataType::Int8), Box::new(DataType::Int32)),
+        )
+        .unwrap();
+
+        let mut iter = array_to_iter(&data);
+
+        let ctx = Context::create();
+        let module = ctx.create_module("test_iter");
+        println!("dt: {:?}", data.data_type());
+        let func = generate_random_access(&ctx, &module, "iter_dict_test", data.data_type(), &iter)
+            .unwrap();
+        let fname = func.get_name().to_str().unwrap();
+
+        module.verify().unwrap();
+        let ee = module
+            .create_jit_execution_engine(OptimizationLevel::None)
+            .unwrap();
+
+        let next_func = unsafe {
+            ee.get_function::<unsafe extern "C" fn(*mut c_void, u64) -> i32>(fname)
+                .unwrap()
+        };
+
+        unsafe {
+            assert_eq!(next_func.call(iter.get_mut_ptr(), 0), 0);
+            assert_eq!(next_func.call(iter.get_mut_ptr(), 1), 0);
+            assert_eq!(next_func.call(iter.get_mut_ptr(), 2), 10);
+            assert_eq!(next_func.call(iter.get_mut_ptr(), 3), 10);
+            assert_eq!(next_func.call(iter.get_mut_ptr(), 4), 20);
+            assert_eq!(next_func.call(iter.get_mut_ptr(), 5), 20);
+            assert_eq!(next_func.call(iter.get_mut_ptr(), 6), 30);
+            assert_eq!(next_func.call(iter.get_mut_ptr(), 7), 30);
+            assert_eq!(next_func.call(iter.get_mut_ptr(), 8), 40);
+            assert_eq!(next_func.call(iter.get_mut_ptr(), 9), 40);
+        };
+    }
+
+    #[test]
+    fn test_dict_recur_random_access() {
+        let keys = Int8Array::from(vec![0, 0, 1, 1, 2, 2, 3, 3]);
+        let values = Int32Array::from(vec![0, 10, 20, 30]);
+        let da1 = DictionaryArray::new(keys, Arc::new(values));
+
+        let parent_keys = Int8Array::from(vec![0, 2, 4, 6]);
+        let da2 = DictionaryArray::new(parent_keys, Arc::new(da1));
+
+        let mut iter = array_to_iter(&da2);
+
+        let ctx = Context::create();
+        let module = ctx.create_module("test_iter");
+        println!("dt: {:?}", da2.data_type());
+        let func = generate_random_access(&ctx, &module, "iter_dict_test", da2.data_type(), &iter)
+            .unwrap();
+        let fname = func.get_name().to_str().unwrap();
+
+        module.verify().unwrap();
+        let ee = module
+            .create_jit_execution_engine(OptimizationLevel::None)
+            .unwrap();
+
+        let next_func = unsafe {
+            ee.get_function::<unsafe extern "C" fn(*mut c_void, u64) -> i32>(fname)
+                .unwrap()
+        };
+
+        unsafe {
+            assert_eq!(next_func.call(iter.get_mut_ptr(), 0), 0);
+            assert_eq!(next_func.call(iter.get_mut_ptr(), 1), 10);
+            assert_eq!(next_func.call(iter.get_mut_ptr(), 2), 20);
+            assert_eq!(next_func.call(iter.get_mut_ptr(), 3), 30);
         };
     }
 }
