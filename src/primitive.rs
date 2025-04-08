@@ -197,7 +197,7 @@ impl<'ctx> CodeGen<'ctx> {
             .unwrap()
             .into_vector_value();
         let partial_chunk = builder
-            .build_insert_element(partial_chunk, val, partial_idx, "partial_chunk")
+            .build_insert_element(partial_chunk, val, idx, "partial_chunk")
             .unwrap();
         builder
             .build_store(partial_chunk_ptr, partial_chunk)

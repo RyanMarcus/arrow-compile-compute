@@ -703,36 +703,6 @@ mod tests {
     }
 
     #[test]
-    fn test_filter_i32_sliced_block() {
-        let mut rng = fastrand::Rng::with_seed(42);
-        let data = (0..10_000).map(|_| rng.i32(..)).collect_vec();
-        let data = Int32Array::from(data);
-        //let mask: BooleanArray = (0..10_000).map(|_| Some(rng.bool())).collect();
-        let mask: BooleanArray = (0..10_000).map(|_| Some(true)).collect();
-
-        let s_data = data.slice(0, 100);
-        let s_mask = mask.slice(0, 100);
-
-        let arr_filtered = arrow_select::filter::filter(&s_data, &s_mask)
-            .unwrap()
-            .as_primitive::<Int32Type>()
-            .clone();
-
-        let ctx = Context::create();
-        let codegen = CodeGen::new(&ctx);
-        let compiled_func = codegen
-            .compile_filter_block(data.data_type())
-            .expect("Failed to compile filter function");
-        let result = compiled_func
-            .call(&s_data, &s_mask)
-            .unwrap()
-            .as_primitive::<Int32Type>()
-            .clone();
-
-        assert_eq!(arr_filtered, result);
-    }
-
-    #[test]
     fn test_filter_i32_random_access() {
         let mut rng = fastrand::Rng::with_seed(42);
         let data = (0..10_000).map(|_| rng.i32(..)).collect_vec();

@@ -307,7 +307,7 @@ mod tests {
     use inkwell::context::Context;
     use itertools::Itertools;
 
-    use crate::{aggregate::Aggregation, dictionary_data_type, CodeGen, Predicate};
+    use crate::{dictionary_data_type, CodeGen, Predicate};
 
     const SIZES_TO_TRY: &[usize] = &[0, 50, 64, 100, 128, 200, 2048, 2049];
 
@@ -508,42 +508,5 @@ mod tests {
 
         assert_eq!(our_filtered.len(), 4);
         assert_eq!(true_result, our_filtered);
-    }
-
-    //    #[test]
-    fn test_dict_str_min_agg() {
-        let ctx = Context::create();
-        let cg = CodeGen::new(&ctx);
-        let dict_type = DataType::Dictionary(Box::new(DataType::Int8), Box::new(DataType::Utf8));
-
-        let values = vec![
-            Some("zeta"),
-            None,
-            Some("alpha"),
-            Some("beta"),
-            None,
-            Some("gamma"),
-            Some("alpha"),
-            Some("zeta"),
-            None,
-        ];
-        let string_array = arrow_array::StringArray::from(values);
-        let dict_array = arrow_cast::cast(&string_array, &dict_type).unwrap();
-
-        // Compile the min aggregation function for dictionary-encoded string arrays.
-
-        let agg_fn = cg
-            .string_minmax(&dict_type, Aggregation::Min, true)
-            .unwrap();
-
-        let result = agg_fn.call(&dict_array).unwrap().unwrap();
-        let result_array = result
-            .as_any()
-            .downcast_ref::<arrow_array::StringArray>()
-            .unwrap();
-
-        // The expected minimum value, ignoring nulls, is "alpha".
-        assert_eq!(result_array.len(), 1);
-        assert_eq!(result_array.value(0), "alpha");
     }
 }
