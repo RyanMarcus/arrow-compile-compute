@@ -155,8 +155,16 @@ pub enum IteratorHolder {
     String(Box<StringIterator>),
     LargeString(Box<LargeStringIterator>),
     Bitmap(Box<BitmapIterator>),
-    Dictionary(Box<DictionaryIterator>, Vec<Box<IteratorHolder>>),
-    RunEnd(Box<RunEndIterator>, Vec<Box<IteratorHolder>>),
+    Dictionary {
+        arr: Box<DictionaryIterator>,
+        keys: Box<IteratorHolder>,
+        values: Box<IteratorHolder>,
+    },
+    RunEnd {
+        arr: Box<RunEndIterator>,
+        run_ends: Box<IteratorHolder>,
+        values: Box<IteratorHolder>,
+    },
 }
 
 impl IteratorHolder {
@@ -168,8 +176,8 @@ impl IteratorHolder {
             IteratorHolder::String(iter) => &mut **iter as *mut _ as *mut c_void,
             IteratorHolder::LargeString(iter) => &mut **iter as *mut _ as *mut c_void,
             IteratorHolder::Bitmap(iter) => &mut **iter as *mut _ as *mut c_void,
-            IteratorHolder::Dictionary(iter, _) => &mut **iter as *mut _ as *mut c_void,
-            IteratorHolder::RunEnd(iter, _) => &mut **iter as *mut _ as *mut c_void,
+            IteratorHolder::Dictionary { arr: iter, .. } => &mut **iter as *mut _ as *mut c_void,
+            IteratorHolder::RunEnd { arr: iter, .. } => &mut **iter as *mut _ as *mut c_void,
         }
     }
 }
@@ -428,8 +436,8 @@ fn generate_next_block<'a, const N: u32>(
         }
         IteratorHolder::String(_) | IteratorHolder::LargeString(_) => return None,
         IteratorHolder::Bitmap(_bitmap_iterator) => todo!(),
-        IteratorHolder::Dictionary(_dictionary_iterator, _iterator_holders) => todo!(),
-        IteratorHolder::RunEnd(_run_end_iterator, _iterator_holders) => todo!(),
+        IteratorHolder::Dictionary { .. } => todo!(),
+        IteratorHolder::RunEnd { .. } => todo!(),
     };
 }
 
@@ -500,8 +508,8 @@ fn generate_next<'a>(
         }
         IteratorHolder::String(_) | IteratorHolder::LargeString(_) => return None,
         IteratorHolder::Bitmap(_bitmap_iterator) => todo!(),
-        IteratorHolder::Dictionary(_dictionary_iterator, _iterator_holders) => todo!(),
-        IteratorHolder::RunEnd(_run_end_iterator, _iterator_holders) => todo!(),
+        IteratorHolder::Dictionary { .. } => todo!(),
+        IteratorHolder::RunEnd { .. } => todo!(),
     };
 }
 
@@ -554,8 +562,10 @@ fn generate_random_access<'a>(
         }
         IteratorHolder::String(_) | IteratorHolder::LargeString(_) => return None,
         IteratorHolder::Bitmap(_bitmap_iterator) => todo!(),
-        IteratorHolder::Dictionary(_dictionary_iterator, _iterator_holders) => todo!(),
-        IteratorHolder::RunEnd(_run_end_iterator, _iterator_holders) => todo!(),
+        IteratorHolder::Dictionary { .. } => {
+            todo!()
+        }
+        IteratorHolder::RunEnd { .. } => todo!(),
     };
 }
 
