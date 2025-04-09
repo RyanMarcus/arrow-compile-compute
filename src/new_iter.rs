@@ -188,6 +188,39 @@ impl IteratorHolder {
             IteratorHolder::RunEnd { arr: iter, .. } => &**iter as *const _ as *const c_void,
         }
     }
+
+    /// Sanity check to ensure all pointers in this iterator, and it's children,
+    /// are non-null. Panics otherwise.
+    pub fn assert_non_null(&self) {
+        match self {
+            IteratorHolder::Primitive(iter) => assert!(!iter.data.is_null()),
+            IteratorHolder::String(iter) => {
+                assert!(!iter.data.is_null());
+                assert!(!iter.offsets.is_null());
+            }
+            IteratorHolder::LargeString(iter) => {
+                assert!(!iter.data.is_null());
+                assert!(!iter.offsets.is_null());
+            }
+            IteratorHolder::Bitmap(iter) => assert!(!iter.data.is_null()),
+            IteratorHolder::Dictionary { arr, keys, values } => {
+                assert!(!arr.key_iter.is_null());
+                assert!(!arr.val_iter.is_null());
+                keys.assert_non_null();
+                values.assert_non_null();
+            }
+            IteratorHolder::RunEnd {
+                arr,
+                run_ends,
+                values,
+            } => {
+                assert!(!arr.val_iter.is_null());
+                assert!(!arr.val_iter.is_null());
+                run_ends.assert_non_null();
+                values.assert_non_null();
+            }
+        }
+    }
 }
 
 /// An iterator for primitive (densely packed) data.
@@ -560,7 +593,65 @@ fn generate_next<'a>(
         }
         IteratorHolder::String(_) | IteratorHolder::LargeString(_) => return None,
         IteratorHolder::Bitmap(_bitmap_iterator) => todo!(),
-        IteratorHolder::Dictionary { .. } => todo!(),
+        IteratorHolder::Dictionary { arr, keys, values } => match dt {
+            DataType::Dictionary(k_dt, v_dt) => {
+                let key_next =
+                    generate_next(ctx, llvm_mod, &format!("{}_key", label), k_dt, keys).unwrap();
+                let values_access = generate_random_access(
+                    ctx,
+                    llvm_mod,
+                    &format!("{}_value", label),
+                    v_dt,
+                    values,
+                )
+                .unwrap();
+                declare_blocks!(ctx, next, entry, none_left, fetch);
+
+                build.position_at_end(entry);
+                let key_type = PrimitiveType::for_arrow_type(k_dt).llvm_type(ctx);
+                let key_iter = arr.llvm_key_iter_ptr(ctx, &build, iter_ptr);
+                let val_iter = arr.llvm_val_iter_ptr(ctx, &build, iter_ptr);
+
+                let key_buf = build.build_alloca(key_type, "key_buf").unwrap();
+                let had_next = build
+                    .build_call(key_next, &[key_iter.into(), key_buf.into()], "next_key")
+                    .unwrap()
+                    .try_as_basic_value()
+                    .unwrap_left()
+                    .into_int_value();
+                build
+                    .build_conditional_branch(had_next, fetch, none_left)
+                    .unwrap();
+
+                build.position_at_end(fetch);
+                let next_key = build
+                    .build_int_cast(
+                        build
+                            .build_load(key_type, key_buf, "next_key")
+                            .unwrap()
+                            .into_int_value(),
+                        i64_type,
+                        "casted_key",
+                    )
+                    .unwrap();
+                let value = build
+                    .build_call(values_access, &[val_iter.into(), next_key.into()], "value")
+                    .unwrap()
+                    .try_as_basic_value()
+                    .unwrap_left();
+                build.build_store(out_ptr, value).unwrap();
+                build
+                    .build_return(Some(&bool_type.const_int(1, false)))
+                    .unwrap();
+
+                build.position_at_end(none_left);
+                build
+                    .build_return(Some(&bool_type.const_int(0, false)))
+                    .unwrap();
+                return Some(next);
+            }
+            _ => unreachable!("dict iterator but not dict data type ({:?})", dt),
+        },
         IteratorHolder::RunEnd { .. } => todo!(),
     };
 }
@@ -1151,6 +1242,52 @@ mod tests {
             assert_eq!(next_func.call(iter.get_mut_ptr(), 1), 10);
             assert_eq!(next_func.call(iter.get_mut_ptr(), 2), 20);
             assert_eq!(next_func.call(iter.get_mut_ptr(), 3), 30);
+        };
+    }
+
+    #[test]
+    fn test_dict_iter_nonblock() {
+        let data = Int32Array::from(vec![0, 0, 10, 10, 20, 20]);
+        let data = arrow_cast::cast(
+            &data,
+            &DataType::Dictionary(Box::new(DataType::Int8), Box::new(DataType::Int32)),
+        )
+        .unwrap();
+
+        let mut iter = array_to_iter(&data);
+        iter.assert_non_null();
+
+        let ctx = Context::create();
+        let module = ctx.create_module("test_iter");
+        let func = generate_next(&ctx, &module, "iter_dict_test", data.data_type(), &iter).unwrap();
+        let fname = func.get_name().to_str().unwrap();
+
+        module.verify().unwrap();
+        module.print_to_stderr();
+        let ee = module
+            .create_jit_execution_engine(OptimizationLevel::None)
+            .unwrap();
+
+        let next_func = unsafe {
+            ee.get_function::<unsafe extern "C" fn(*mut c_void, *mut c_void) -> bool>(fname)
+                .unwrap()
+        };
+
+        unsafe {
+            let mut res: i32 = 0;
+            assert!(next_func.call(iter.get_mut_ptr(), &mut res as *mut i32 as *mut c_void));
+            assert_eq!(res, 0);
+            assert!(next_func.call(iter.get_mut_ptr(), &mut res as *mut i32 as *mut c_void));
+            assert_eq!(res, 0);
+            assert!(next_func.call(iter.get_mut_ptr(), &mut res as *mut i32 as *mut c_void));
+            assert_eq!(res, 10);
+            assert!(next_func.call(iter.get_mut_ptr(), &mut res as *mut i32 as *mut c_void));
+            assert_eq!(res, 10);
+            assert!(next_func.call(iter.get_mut_ptr(), &mut res as *mut i32 as *mut c_void));
+            assert_eq!(res, 20);
+            assert!(next_func.call(iter.get_mut_ptr(), &mut res as *mut i32 as *mut c_void));
+            assert_eq!(res, 20);
+            assert!(!next_func.call(iter.get_mut_ptr(), &mut res as *mut i32 as *mut c_void));
         };
     }
 }
