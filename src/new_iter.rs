@@ -927,7 +927,6 @@ fn generate_llvm_cmp_kernel<'a>(
     build.build_return(None).unwrap();
 
     module.verify().unwrap();
-    module.print_to_stderr();
     let ee = module
         .create_jit_execution_engine(OptimizationLevel::None)
         .unwrap();
@@ -1051,7 +1050,6 @@ mod tests {
             generate_next_block::<8>(&ctx, &module, "iter_prim_test", data.data_type(), &iter)
                 .unwrap();
         let fname = func.get_name().to_str().unwrap();
-        func.print_to_stderr();
 
         module.verify().unwrap();
         let ee = module
@@ -1091,7 +1089,6 @@ mod tests {
         let module = ctx.create_module("test_iter");
         let func = generate_next(&ctx, &module, "iter_prim_test", data.data_type(), &iter).unwrap();
         let fname = func.get_name().to_str().unwrap();
-        func.print_to_stderr();
 
         module.verify().unwrap();
         let ee = module
@@ -1180,7 +1177,6 @@ mod tests {
 
         let ctx = Context::create();
         let module = ctx.create_module("test_iter");
-        println!("dt: {:?}", data.data_type());
         let func = generate_random_access(&ctx, &module, "iter_dict_test", data.data_type(), &iter)
             .unwrap();
         let fname = func.get_name().to_str().unwrap();
@@ -1222,7 +1218,6 @@ mod tests {
 
         let ctx = Context::create();
         let module = ctx.create_module("test_iter");
-        println!("dt: {:?}", da2.data_type());
         let func = generate_random_access(&ctx, &module, "iter_dict_test", da2.data_type(), &iter)
             .unwrap();
         let fname = func.get_name().to_str().unwrap();
@@ -1263,7 +1258,6 @@ mod tests {
         let fname = func.get_name().to_str().unwrap();
 
         module.verify().unwrap();
-        module.print_to_stderr();
         let ee = module
             .create_jit_execution_engine(OptimizationLevel::None)
             .unwrap();
@@ -1309,7 +1303,6 @@ mod tests {
         let fname = func.get_name().to_str().unwrap();
 
         module.verify().unwrap();
-        module.print_to_stderr();
         let ee = module
             .create_jit_execution_engine(OptimizationLevel::None)
             .unwrap();
