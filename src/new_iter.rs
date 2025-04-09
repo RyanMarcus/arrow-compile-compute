@@ -1290,4 +1290,46 @@ mod tests {
             assert!(!next_func.call(iter.get_mut_ptr(), &mut res as *mut i32 as *mut c_void));
         };
     }
+
+    #[test]
+    fn test_dict_recur_iter_nonblock() {
+        let keys = Int8Array::from(vec![0, 0, 1, 1, 2, 2, 3, 3]);
+        let values = Int32Array::from(vec![0, 10, 20, 30]);
+        let da1 = DictionaryArray::new(keys, Arc::new(values));
+
+        let parent_keys = Int8Array::from(vec![0, 2, 4, 6]);
+        let da2 = DictionaryArray::new(parent_keys, Arc::new(da1));
+
+        let mut iter = array_to_iter(&da2);
+        iter.assert_non_null();
+
+        let ctx = Context::create();
+        let module = ctx.create_module("test_iter");
+        let func = generate_next(&ctx, &module, "iter_dict_test", da2.data_type(), &iter).unwrap();
+        let fname = func.get_name().to_str().unwrap();
+
+        module.verify().unwrap();
+        module.print_to_stderr();
+        let ee = module
+            .create_jit_execution_engine(OptimizationLevel::None)
+            .unwrap();
+
+        let next_func = unsafe {
+            ee.get_function::<unsafe extern "C" fn(*mut c_void, *mut c_void) -> bool>(fname)
+                .unwrap()
+        };
+
+        unsafe {
+            let mut res: i32 = 0;
+            assert!(next_func.call(iter.get_mut_ptr(), &mut res as *mut i32 as *mut c_void));
+            assert_eq!(res, 0);
+            assert!(next_func.call(iter.get_mut_ptr(), &mut res as *mut i32 as *mut c_void));
+            assert_eq!(res, 10);
+            assert!(next_func.call(iter.get_mut_ptr(), &mut res as *mut i32 as *mut c_void));
+            assert_eq!(res, 20);
+            assert!(next_func.call(iter.get_mut_ptr(), &mut res as *mut i32 as *mut c_void));
+            assert_eq!(res, 30);
+            assert!(!next_func.call(iter.get_mut_ptr(), &mut res as *mut i32 as *mut c_void));
+        };
+    }
 }
