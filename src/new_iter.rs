@@ -554,7 +554,7 @@ use half::f16;
 impl From<f16> for IteratorHolder {
     fn from(val: f16) -> Self {
         IteratorHolder::ScalarPrimitive(Box::new(ScalarPrimitiveIterator::new(
-            val.to_bits() as u64,
+            (val.to_f64()).to_bits() as u64,
             2,
         )))
     }
@@ -563,7 +563,7 @@ impl From<f16> for IteratorHolder {
 impl From<f32> for IteratorHolder {
     fn from(val: f32) -> Self {
         IteratorHolder::ScalarPrimitive(Box::new(ScalarPrimitiveIterator::new(
-            val.to_bits() as u64,
+            (val as f64).to_bits() as u64,
             4,
         )))
     }

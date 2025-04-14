@@ -274,6 +274,13 @@ enum PrimitiveType {
     F64,
 }
 
+#[derive(Copy, Clone, Debug)]
+pub enum ComparisonType {
+    Int { signed: bool },
+    Float,
+    String,
+}
+
 impl PrimitiveType {
     fn width(&self) -> usize {
         match self {
@@ -538,6 +545,19 @@ impl PrimitiveType {
             ),
         }
     }
+
+    fn comparison_type(&self) -> ComparisonType {
+        match self {
+            PrimitiveType::I8 | PrimitiveType::I16 | PrimitiveType::I32 | PrimitiveType::I64 => {
+                ComparisonType::Int { signed: true }
+            }
+            PrimitiveType::U8 | PrimitiveType::U16 | PrimitiveType::U32 | PrimitiveType::U64 => {
+                ComparisonType::Int { signed: false }
+            }
+            PrimitiveType::P64x2 => ComparisonType::String,
+            PrimitiveType::F16 | PrimitiveType::F32 | PrimitiveType::F64 => ComparisonType::Float,
+        }
+    }
 }
 
 #[derive(Copy, Clone, Hash, PartialEq, Eq)]
@@ -565,6 +585,22 @@ impl Predicate {
             (Predicate::Gt, false) => IntPredicate::UGT,
             (Predicate::Gte, true) => IntPredicate::SGE,
             (Predicate::Gte, false) => IntPredicate::UGE,
+        }
+    }
+
+    /// Returns the variant of this predicate that produces the same answer if
+    /// the operands are flipped. For example:
+    ///
+    /// `(A == B) == (B == A)`
+    /// `(A > B) == (B < A)`
+    fn flip(&self) -> Predicate {
+        match self {
+            Predicate::Eq => Predicate::Eq,
+            Predicate::Ne => Predicate::Ne,
+            Predicate::Lt => Predicate::Gt,
+            Predicate::Lte => Predicate::Gte,
+            Predicate::Gt => Predicate::Lt,
+            Predicate::Gte => Predicate::Lte,
         }
     }
 }

@@ -2,13 +2,15 @@ use arrow_array::{BooleanArray, Datum};
 use arrow_buffer::{BooleanBuffer, NullBuffer};
 use arrow_schema::DataType;
 use inkwell::execution_engine::JitFunction;
+use inkwell::module::{Linkage, Module};
+use inkwell::values::FunctionValue;
+use inkwell::OptimizationLevel;
 use inkwell::{context::Context, AddressSpace};
-use inkwell::{IntPredicate, OptimizationLevel};
 use ouroboros::self_referencing;
 use std::ffi::c_void;
 
 use crate::new_iter::{datum_to_iter, generate_next, generate_next_block, IteratorHolder};
-use crate::{declare_blocks, increment_pointer, PrimitiveType};
+use crate::{declare_blocks, increment_pointer, ComparisonType, Predicate, PrimitiveType};
 
 use super::ArrowKernelError;
 
@@ -18,6 +20,7 @@ pub struct ComparisonKernel {
     lhs_data_type: DataType,
     rhs_data_type: DataType,
     rhs_scalar: bool,
+    pred: Predicate,
 
     #[borrows(context)]
     #[covariant]
@@ -25,7 +28,11 @@ pub struct ComparisonKernel {
 }
 
 impl ComparisonKernel {
-    pub fn compile(lhs: &dyn Datum, rhs: &dyn Datum) -> Result<ComparisonKernel, ArrowKernelError> {
+    pub fn compile(
+        lhs: &dyn Datum,
+        rhs: &dyn Datum,
+        pred: Predicate,
+    ) -> Result<ComparisonKernel, ArrowKernelError> {
         let (lhs_arr, lhs_scalar) = lhs.get();
         let (rhs_arr, rhs_scalar) = rhs.get();
 
@@ -36,7 +43,7 @@ impl ComparisonKernel {
         }
 
         if lhs_scalar && !rhs_scalar {
-            return ComparisonKernel::compile(rhs, lhs);
+            return ComparisonKernel::compile(rhs, lhs, pred.flip());
         }
 
         let lhs_iter = datum_to_iter(lhs)?;
@@ -47,7 +54,8 @@ impl ComparisonKernel {
             lhs_data_type: lhs_arr.data_type().clone(),
             rhs_data_type: rhs_arr.data_type().clone(),
             rhs_scalar,
-            func_builder: |ctx| generate_llvm_cmp_kernel(ctx, lhs, &lhs_iter, rhs, &rhs_iter),
+            pred,
+            func_builder: |ctx| generate_llvm_cmp_kernel(ctx, lhs, &lhs_iter, rhs, &rhs_iter, pred),
         }
         .build())
     }
@@ -100,6 +108,7 @@ fn generate_llvm_cmp_kernel<'a>(
     lhs_iter: &IteratorHolder,
     rhs: &dyn Datum,
     rhs_iter: &IteratorHolder,
+    pred: Predicate,
 ) -> JitFunction<'a, unsafe extern "C" fn(*mut c_void, *mut c_void, *mut u64)> {
     let (lhs_arr, _lhs_scalar) = lhs.get();
     let (rhs_arr, _rhs_scalar) = rhs.get();
@@ -117,6 +126,7 @@ fn generate_llvm_cmp_kernel<'a>(
     let rhs_vec = rhs_prim.llvm_vec_type(&ctx, 64).unwrap();
     let lhs_llvm = lhs_prim.llvm_type(&ctx);
     let rhs_llvm = rhs_prim.llvm_type(&ctx);
+    let dom_prim_type = PrimitiveType::dominant(lhs_prim, rhs_prim).unwrap();
 
     let lhs_next_block =
         generate_next_block::<64>(&ctx, &module, "next_lhs_block", lhs_dt, lhs_iter).unwrap();
@@ -182,9 +192,32 @@ fn generate_llvm_cmp_kernel<'a>(
         .build_load(rhs_vec, rhs_vec_buf, "rvec")
         .unwrap()
         .into_vector_value();
-    let res = build
-        .build_int_compare(IntPredicate::ULT, lvec, rvec, "block_cmp_result")
-        .unwrap();
+
+    let res = match dom_prim_type.comparison_type() {
+        ComparisonType::Int { signed } => build
+            .build_int_compare(pred.as_int_pred(signed), lvec, rvec, "block_cmp_result")
+            .unwrap(),
+        ComparisonType::Float => {
+            let convert = add_float_vec_to_int_vec(ctx, &module, 64, dom_prim_type);
+            let lhs = build
+                .build_call(convert, &[lvec.into()], "lhs_converted")
+                .unwrap()
+                .try_as_basic_value()
+                .unwrap_left()
+                .into_vector_value();
+            let rhs = build
+                .build_call(convert, &[rvec.into()], "rhs_converted")
+                .unwrap()
+                .try_as_basic_value()
+                .unwrap_left()
+                .into_vector_value();
+            build
+                .build_int_compare(pred.as_int_pred(true), lhs, rhs, "block_cmp_result")
+                .unwrap()
+        }
+        ComparisonType::String => unreachable!("no block comparison for strings"),
+    };
+
     let res = build.build_bit_cast(res, i64_type, "res_u64").unwrap();
     let out_ptr = build
         .build_load(ptr_type, out_ptr_ptr, "out_ptr")
@@ -218,17 +251,42 @@ fn generate_llvm_cmp_kernel<'a>(
         .unwrap();
 
     build.position_at_end(tail_body);
-    let lv = build
-        .build_load(lhs_llvm, lhs_single_buf, "lv")
-        .unwrap()
-        .into_int_value();
-    let rv = build
-        .build_load(rhs_llvm, rhs_single_buf, "rv")
-        .unwrap()
-        .into_int_value();
-    let res = build
-        .build_int_compare(IntPredicate::ULT, lv, rv, "cmp_single")
-        .unwrap();
+    let lv = build.build_load(lhs_llvm, lhs_single_buf, "lv").unwrap();
+    let rv = build.build_load(rhs_llvm, rhs_single_buf, "rv").unwrap();
+
+    let res = match dom_prim_type.comparison_type() {
+        ComparisonType::Int { signed } => build
+            .build_int_compare(
+                pred.as_int_pred(signed),
+                lv.into_int_value(),
+                rv.into_int_value(),
+                "cmp_single",
+            )
+            .unwrap(),
+        ComparisonType::Float => {
+            let convert = add_float_to_int(ctx, &module, dom_prim_type);
+            let lhs = build
+                .build_call(convert, &[lv.into()], "lhs_converted")
+                .unwrap()
+                .try_as_basic_value()
+                .unwrap_left();
+            let rhs = build
+                .build_call(convert, &[rv.into()], "rhs_converted")
+                .unwrap()
+                .try_as_basic_value()
+                .unwrap_left();
+            build
+                .build_int_compare(
+                    pred.as_int_pred(true),
+                    lhs.into_int_value(),
+                    rhs.into_int_value(),
+                    "cmp_single",
+                )
+                .unwrap()
+        }
+        ComparisonType::String => todo!(),
+    };
+
     let res = build
         .build_int_z_extend_or_bit_cast(res, i64_type, "casted_cmp")
         .unwrap();
@@ -280,18 +338,130 @@ fn generate_llvm_cmp_kernel<'a>(
     }
 }
 
+fn add_float_vec_to_int_vec<'a>(
+    ctx: &'a Context,
+    module: &Module<'a>,
+    v_size: u32,
+    ptype: PrimitiveType,
+) -> FunctionValue<'a> {
+    // apply the following algorithm to get a total float ordering
+    // left ^= (((left >> 63) as u64) >> 1) as i64;
+    // right ^= (((right >> 63) as u64) >> 1) as i64;
+    // left.cmp(right)
+
+    let inp_type = ptype.llvm_vec_type(ctx, v_size).unwrap();
+    let int_type = PrimitiveType::int_with_width(ptype.width())
+        .llvm_type(ctx)
+        .into_int_type();
+    let ret_type = int_type.vec_type(v_size);
+
+    let func_type = ret_type.fn_type(&[inp_type.into()], false);
+    let func = module.add_function("fvec_to_int", func_type, Some(Linkage::Private));
+    let fvec = func.get_nth_param(0).unwrap().into_vector_value();
+
+    declare_blocks!(ctx, func, entry);
+    let builder = ctx.create_builder();
+    builder.position_at_end(entry);
+
+    let vminus1 = builder
+        .build_insert_element(
+            int_type.vec_type(v_size).const_zero(),
+            int_type.const_int(ptype.width() as u64 * 8 - 1, false),
+            int_type.const_zero(),
+            "vminus1",
+        )
+        .unwrap();
+    let vminus1 = builder
+        .build_shuffle_vector(
+            vminus1,
+            int_type.vec_type(v_size).get_undef(),
+            int_type.vec_type(v_size).const_zero(),
+            "vminus1_bcast",
+        )
+        .unwrap();
+    let v1 = builder
+        .build_insert_element(
+            int_type.vec_type(v_size).const_zero(),
+            int_type.const_int(1, false),
+            int_type.const_zero(),
+            "v1",
+        )
+        .unwrap();
+    let v1 = builder
+        .build_shuffle_vector(
+            v1,
+            int_type.vec_type(v_size).get_undef(),
+            int_type.vec_type(v_size).const_zero(),
+            "v1_bcast",
+        )
+        .unwrap();
+
+    let cleft = builder
+        .build_bit_cast(fvec, int_type.vec_type(v_size), "cleft")
+        .unwrap()
+        .into_vector_value();
+    let left = builder
+        .build_right_shift(cleft, vminus1, true, "sleft")
+        .unwrap();
+    let left = builder.build_right_shift(left, v1, false, "sleft").unwrap();
+    let res = builder.build_xor(cleft, left, "left").unwrap();
+    builder.build_return(Some(&res)).unwrap();
+
+    return func;
+}
+
+fn add_float_to_int<'a>(
+    ctx: &'a Context,
+    module: &Module<'a>,
+    ptype: PrimitiveType,
+) -> FunctionValue<'a> {
+    // apply the following algorithm to get a total float ordering
+    // left ^= (((left >> 63) as u64) >> 1) as i64;
+    // right ^= (((right >> 63) as u64) >> 1) as i64;
+    // left.cmp(right)
+
+    let inp_type = ptype.llvm_type(ctx);
+    let int_type = PrimitiveType::int_with_width(ptype.width())
+        .llvm_type(ctx)
+        .into_int_type();
+
+    let func_type = int_type.fn_type(&[inp_type.into()], false);
+    let func = module.add_function("vec_to_int", func_type, Some(Linkage::Private));
+    let float = func.get_nth_param(0).unwrap().into_float_value();
+
+    declare_blocks!(ctx, func, entry);
+    let builder = ctx.create_builder();
+    builder.position_at_end(entry);
+
+    let vminus1 = int_type.const_int(ptype.width() as u64 * 8 - 1, false);
+    let v1 = int_type.const_int(1, false);
+
+    let cleft = builder
+        .build_bit_cast(float, int_type, "cleft")
+        .unwrap()
+        .into_int_value();
+    let left = builder
+        .build_right_shift(cleft, vminus1, true, "sleft")
+        .unwrap();
+    let left = builder.build_right_shift(left, v1, false, "sleft").unwrap();
+    let res = builder.build_xor(cleft, left, "left").unwrap();
+    builder.build_return(Some(&res)).unwrap();
+
+    return func;
+}
+
 #[cfg(test)]
 mod tests {
-    use arrow_array::{BooleanArray, Scalar, UInt32Array};
+    use arrow_array::{BooleanArray, Float32Array, Scalar, UInt32Array};
     use itertools::Itertools;
 
-    use crate::new_kernels::cmp::ComparisonKernel;
+    use crate::{new_kernels::cmp::ComparisonKernel, Predicate};
 
     #[test]
     fn test_num_num_cmp() {
         let a = UInt32Array::from(vec![1, 2, 3]);
         let b = UInt32Array::from(vec![11, 0, 13]);
-        let k = ComparisonKernel::compile(&a, &b).unwrap();
+        let k = ComparisonKernel::compile(&a, &b, Predicate::Lt).unwrap();
         let r = k.call(&a, &b).unwrap();
         assert_eq!(r, BooleanArray::from(vec![true, false, true]))
     }
@@ -300,7 +470,7 @@ mod tests {
     fn test_num_num_block_cmp() {
         let a = UInt32Array::from((0..100).collect_vec());
         let b = UInt32Array::from((1..101).collect_vec());
-        let k = ComparisonKernel::compile(&a, &b).unwrap();
+        let k = ComparisonKernel::compile(&a, &b, Predicate::Lt).unwrap();
         let r = k.call(&a, &b).unwrap();
         assert_eq!(r, BooleanArray::from(vec![true; 100]))
     }
@@ -309,7 +479,27 @@ mod tests {
     fn test_num_num_block_scalar_cmp() {
         let a = UInt32Array::from((0..100).collect_vec());
         let b = Scalar::new(UInt32Array::from(vec![5]));
-        let k = ComparisonKernel::compile(&a, &b).unwrap();
+        let k = ComparisonKernel::compile(&a, &b, Predicate::Lt).unwrap();
+        let r = k.call(&a, &b).unwrap();
+
+        let expected_result = (0..100).map(|i| i < 5).collect::<Vec<bool>>();
+        assert_eq!(r, BooleanArray::from(expected_result));
+    }
+
+    #[test]
+    fn test_num_num_float_cmp() {
+        let a = Float32Array::from((0..100).map(|i| i as f32).collect_vec());
+        let b = Float32Array::from((1..101).map(|i| i as f32).collect_vec());
+        let k = ComparisonKernel::compile(&a, &b, Predicate::Lt).unwrap();
+        let r = k.call(&a, &b).unwrap();
+        assert_eq!(r, BooleanArray::from(vec![true; 100]))
+    }
+
+    #[test]
+    fn test_num_num_float_scalar_cmp() {
+        let a = Float32Array::from((0..100).map(|i| i as f32).collect_vec());
+        let b = Scalar::new(Float32Array::from(vec![5.0]));
+        let k = ComparisonKernel::compile(&a, &b, Predicate::Lt).unwrap();
         let r = k.call(&a, &b).unwrap();
 
         let expected_result = (0..100).map(|i| i < 5).collect::<Vec<bool>>();

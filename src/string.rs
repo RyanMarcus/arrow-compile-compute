@@ -732,7 +732,6 @@ impl<'ctx> CodeGen<'ctx> {
             .unwrap();
 
         self.module.verify().unwrap();
-        self.module.print_to_stderr();
         //        self.optimize()?;
         let ee = self
             .module
