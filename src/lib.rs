@@ -47,6 +47,7 @@ mod bitmap;
 mod compute_funcs;
 mod dict;
 mod new_iter;
+mod new_kernels;
 mod primitive;
 mod runend;
 mod scalar;
@@ -56,6 +57,9 @@ pub use arrow_interface::cast;
 pub use arrow_interface::cmp;
 pub use arrow_interface::compute;
 pub use arrow_interface::SelfContainedBinaryFunc;
+
+pub use new_kernels::ArrowKernelError;
+pub use new_kernels::ComparisonKernel;
 
 /// Declare a set of basic blocks at once
 macro_rules! declare_blocks {
@@ -68,6 +72,38 @@ macro_rules! declare_blocks {
     };
 }
 pub(crate) use declare_blocks;
+
+/// Increments a pointer by a fixed number of bytes or with a stride
+macro_rules! increment_pointer {
+    ($ctx: expr, $builder: expr, $ptr: expr, $offset: expr) => {
+        unsafe {
+            $builder
+                .build_gep(
+                    $ctx.i8_type(),
+                    $ptr,
+                    &[$ctx.i64_type().const_int($offset as u64, false)],
+                    "inc_ptr",
+                )
+                .unwrap()
+        }
+    };
+    ($ctx: expr, $builder: expr, $ptr: expr, $stride: expr, $offset: expr) => {
+        unsafe {
+            let i64_type = $ctx.i64_type();
+            let tmp = $builder
+                .build_int_mul(
+                    i64_type.const_int($stride as u64, false),
+                    $offset,
+                    "strided",
+                )
+                .unwrap();
+            $builder
+                .build_gep($ctx.i8_type(), $ptr, &[tmp], "inc_ptr")
+                .unwrap()
+        }
+    };
+}
+pub(crate) use increment_pointer;
 
 /// Utility function to create the appropriate `DataType` for a dictionary array
 pub fn dictionary_data_type(key_type: DataType, val_type: DataType) -> DataType {
