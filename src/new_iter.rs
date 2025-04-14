@@ -6,8 +6,8 @@ use arrow_array::{
         ArrowDictionaryKeyType, Float16Type, Float32Type, Float64Type, Int16Type, Int32Type,
         Int64Type, Int8Type, UInt16Type, UInt32Type, UInt64Type, UInt8Type,
     },
-    Array, ArrowPrimitiveType, BooleanArray, DictionaryArray, GenericStringArray, PrimitiveArray,
-    StringArray,
+    Array, ArrowPrimitiveType, BooleanArray, Datum, DictionaryArray, GenericStringArray,
+    PrimitiveArray, StringArray,
 };
 use arrow_schema::DataType;
 use inkwell::{
@@ -15,18 +15,18 @@ use inkwell::{
     context::Context,
     module::{Linkage, Module},
     types::BasicType,
-    values::{FunctionValue, IntValue, PointerValue},
+    values::{BasicValue, FunctionValue, IntValue, PointerValue},
     AddressSpace, IntPredicate,
 };
 use repr_offset::ReprOffset;
 
-use crate::{declare_blocks, increment_pointer, PrimitiveType};
+use crate::{declare_blocks, increment_pointer, ArrowKernelError, PrimitiveType};
 
 /// Convert an Arrow Array into an IteratorHolder, which contains the C-style
 /// iterator along with all the other C-style iterator needed. For example, a
 /// dictionary array will get a C-style iterator and then two sub-iterators for
 /// the keys and values.
-pub fn array_to_iter(arr: &dyn Array) -> IteratorHolder {
+fn array_to_iter(arr: &dyn Array) -> IteratorHolder {
     match arr.data_type() {
         arrow_schema::DataType::Null => todo!(),
         arrow_schema::DataType::Boolean => IteratorHolder::Bitmap(arr.as_boolean().into()),
@@ -109,6 +109,62 @@ pub fn array_to_iter(arr: &dyn Array) -> IteratorHolder {
     }
 }
 
+pub fn datum_to_iter(val: &dyn Datum) -> Result<IteratorHolder, ArrowKernelError> {
+    let (d, is_scalar) = val.get();
+    if !is_scalar {
+        Ok(array_to_iter(d))
+    } else {
+        match d.data_type() {
+            DataType::Int8 => Ok(d.as_primitive::<Int8Type>().value(0).into()),
+            DataType::Int16 => Ok(d.as_primitive::<Int16Type>().value(0).into()),
+            DataType::Int32 => Ok(d.as_primitive::<Int32Type>().value(0).into()),
+            DataType::Int64 => Ok(d.as_primitive::<Int64Type>().value(0).into()),
+            DataType::UInt8 => Ok(d.as_primitive::<UInt8Type>().value(0).into()),
+            DataType::UInt16 => Ok(d.as_primitive::<UInt16Type>().value(0).into()),
+            DataType::UInt32 => Ok(d.as_primitive::<UInt32Type>().value(0).into()),
+            DataType::UInt64 => Ok(d.as_primitive::<UInt64Type>().value(0).into()),
+            DataType::Float16 => Ok(d.as_primitive::<Float16Type>().value(0).into()),
+            DataType::Float32 => Ok(d.as_primitive::<Float32Type>().value(0).into()),
+            DataType::Float64 => Ok(d.as_primitive::<Float64Type>().value(0).into()),
+            DataType::Timestamp(_time_unit, _) => todo!(),
+            DataType::Date32 => todo!(),
+            DataType::Date64 => todo!(),
+            DataType::Time32(_time_unit) => todo!(),
+            DataType::Time64(__time_unit) => todo!(),
+            DataType::Duration(_time_unit) => todo!(),
+            DataType::Interval(_interval_unit) => todo!(),
+            DataType::Binary => todo!(),
+            DataType::FixedSizeBinary(_) => todo!(),
+            DataType::LargeBinary => todo!(),
+            DataType::BinaryView => todo!(),
+            DataType::Utf8 => Ok(d
+                .as_string::<i32>()
+                .value(0)
+                .to_owned()
+                .into_boxed_str()
+                .into()),
+            DataType::LargeUtf8 => Ok(d
+                .as_string::<i64>()
+                .value(0)
+                .to_owned()
+                .into_boxed_str()
+                .into()),
+            DataType::Utf8View => todo!(),
+            DataType::List(_field) => todo!(),
+            DataType::ListView(_field) => todo!(),
+            DataType::FixedSizeList(_field, _) => todo!(),
+            DataType::LargeList(_field) => todo!(),
+            DataType::LargeListView(_field) => todo!(),
+            DataType::Struct(_fields) => todo!(),
+            DataType::Union(_union_fields, _union_mode) => todo!(),
+            DataType::Decimal128(_, _) => todo!(),
+            DataType::Decimal256(_, _) => todo!(),
+            DataType::Map(_field, _) => todo!(),
+            _ => Err(ArrowKernelError::UnsupportedScalar(d.data_type().clone())),
+        }
+    }
+}
+
 /// A holder for a C-style iterator. Created by `array_to_iter`, and used by
 /// compiled LLVM functions.
 #[derive(Debug)]
@@ -127,6 +183,8 @@ pub enum IteratorHolder {
         run_ends: Box<IteratorHolder>,
         values: Box<IteratorHolder>,
     },
+    ScalarPrimitive(Box<ScalarPrimitiveIterator>),
+    ScalarString(Box<ScalarStringIterator>),
 }
 
 impl IteratorHolder {
@@ -140,6 +198,8 @@ impl IteratorHolder {
             IteratorHolder::Bitmap(iter) => &mut **iter as *mut _ as *mut c_void,
             IteratorHolder::Dictionary { arr: iter, .. } => &mut **iter as *mut _ as *mut c_void,
             IteratorHolder::RunEnd { arr: iter, .. } => &mut **iter as *mut _ as *mut c_void,
+            IteratorHolder::ScalarPrimitive(iter) => &mut **iter as *mut _ as *mut c_void,
+            IteratorHolder::ScalarString(iter) => &mut **iter as *mut _ as *mut c_void,
         }
     }
 
@@ -153,6 +213,8 @@ impl IteratorHolder {
             IteratorHolder::Bitmap(iter) => &**iter as *const _ as *const c_void,
             IteratorHolder::Dictionary { arr: iter, .. } => &**iter as *const _ as *const c_void,
             IteratorHolder::RunEnd { arr: iter, .. } => &**iter as *const _ as *const c_void,
+            IteratorHolder::ScalarPrimitive(iter) => &**iter as *const _ as *const c_void,
+            IteratorHolder::ScalarString(iter) => &**iter as *const _ as *const c_void,
         }
     }
 
@@ -186,6 +248,8 @@ impl IteratorHolder {
                 run_ends.assert_non_null();
                 values.assert_non_null();
             }
+            IteratorHolder::ScalarPrimitive(_) => {}
+            IteratorHolder::ScalarString(_) => {}
         }
     }
 }
@@ -417,6 +481,114 @@ pub struct RunEndIterator {
     len: u64,
 }
 
+#[derive(Debug)]
+pub struct ScalarPrimitiveIterator {
+    /// the scalar value, packed to the right of a u64
+    val: u64,
+
+    /// the width, in bytes, of the scalar
+    width: u8,
+}
+
+impl ScalarPrimitiveIterator {
+    pub fn new(val: u64, width: u8) -> Self {
+        Self { val, width }
+    }
+}
+
+impl From<i8> for IteratorHolder {
+    fn from(val: i8) -> Self {
+        IteratorHolder::ScalarPrimitive(Box::new(ScalarPrimitiveIterator::new(val as u8 as u64, 1)))
+    }
+}
+
+impl From<i16> for IteratorHolder {
+    fn from(val: i16) -> Self {
+        IteratorHolder::ScalarPrimitive(Box::new(ScalarPrimitiveIterator::new(
+            val as u16 as u64,
+            2,
+        )))
+    }
+}
+
+impl From<i32> for IteratorHolder {
+    fn from(val: i32) -> Self {
+        IteratorHolder::ScalarPrimitive(Box::new(ScalarPrimitiveIterator::new(
+            val as u32 as u64,
+            4,
+        )))
+    }
+}
+
+impl From<i64> for IteratorHolder {
+    fn from(val: i64) -> Self {
+        IteratorHolder::ScalarPrimitive(Box::new(ScalarPrimitiveIterator::new(val as u64, 8)))
+    }
+}
+
+impl From<u8> for IteratorHolder {
+    fn from(val: u8) -> Self {
+        IteratorHolder::ScalarPrimitive(Box::new(ScalarPrimitiveIterator::new(val as u64, 1)))
+    }
+}
+
+impl From<u16> for IteratorHolder {
+    fn from(val: u16) -> Self {
+        IteratorHolder::ScalarPrimitive(Box::new(ScalarPrimitiveIterator::new(val as u64, 2)))
+    }
+}
+
+impl From<u32> for IteratorHolder {
+    fn from(val: u32) -> Self {
+        IteratorHolder::ScalarPrimitive(Box::new(ScalarPrimitiveIterator::new(val as u64, 4)))
+    }
+}
+
+impl From<u64> for IteratorHolder {
+    fn from(val: u64) -> Self {
+        IteratorHolder::ScalarPrimitive(Box::new(ScalarPrimitiveIterator::new(val as u64, 8)))
+    }
+}
+
+use half::f16;
+impl From<f16> for IteratorHolder {
+    fn from(val: f16) -> Self {
+        IteratorHolder::ScalarPrimitive(Box::new(ScalarPrimitiveIterator::new(
+            val.to_bits() as u64,
+            2,
+        )))
+    }
+}
+
+impl From<f32> for IteratorHolder {
+    fn from(val: f32) -> Self {
+        IteratorHolder::ScalarPrimitive(Box::new(ScalarPrimitiveIterator::new(
+            val.to_bits() as u64,
+            4,
+        )))
+    }
+}
+
+impl From<f64> for IteratorHolder {
+    fn from(val: f64) -> Self {
+        IteratorHolder::ScalarPrimitive(Box::new(ScalarPrimitiveIterator::new(
+            val.to_bits() as u64,
+            8,
+        )))
+    }
+}
+
+#[derive(Debug)]
+pub struct ScalarStringIterator {
+    val: Box<str>,
+}
+
+impl From<Box<str>> for IteratorHolder {
+    fn from(val: Box<str>) -> Self {
+        IteratorHolder::ScalarString(Box::new(ScalarStringIterator { val }))
+    }
+}
+
 /// This adds a `next_block` function to the module for the given iterator. When
 /// called, this `next_block` function will fetch `n` elements from the
 /// iterator, advancing the iterator's offset. The generated function's signature is:
@@ -432,6 +604,7 @@ pub fn generate_next_block<'a, const N: u32>(
     let build = ctx.create_builder();
     let ptype = PrimitiveType::for_arrow_type(dt);
     let vec_type = ptype.llvm_vec_type(&ctx, N)?;
+    let llvm_type = ptype.llvm_type(&ctx);
     let bool_type = ctx.bool_type();
     let ptr_type = ctx.ptr_type(AddressSpace::default());
     let i64_type = ctx.i64_type();
@@ -488,9 +661,43 @@ pub fn generate_next_block<'a, const N: u32>(
         }
         IteratorHolder::String(_) | IteratorHolder::LargeString(_) => return None,
         IteratorHolder::Bitmap(_bitmap_iterator) => todo!(),
-
         IteratorHolder::Dictionary { .. } => todo!(),
         IteratorHolder::RunEnd { .. } => todo!(),
+        IteratorHolder::ScalarPrimitive(s) => {
+            assert_eq!(ptype.width(), s.width as usize);
+            declare_blocks!(ctx, next, entry);
+            build.position_at_end(entry);
+            let constant = match dt {
+                DataType::Int8
+                | DataType::Int16
+                | DataType::Int32
+                | DataType::Int64
+                | DataType::UInt8
+                | DataType::UInt16
+                | DataType::UInt32
+                | DataType::UInt64 => llvm_type
+                    .into_int_type()
+                    .const_int(s.val, false)
+                    .as_basic_value_enum(),
+                DataType::Float16 | DataType::Float32 | DataType::Float64 => llvm_type
+                    .into_float_type()
+                    .const_float(f64::from_bits(s.val))
+                    .as_basic_value_enum(),
+                _ => unreachable!(),
+            };
+            let v = build
+                .build_insert_element(vec_type.const_zero(), constant, i64_type.const_zero(), "v")
+                .unwrap();
+            let v = build
+                .build_shuffle_vector(v, vec_type.const_zero(), vec_type.const_zero(), "splatted")
+                .unwrap();
+            build.build_store(out_ptr, v).unwrap();
+            build
+                .build_return(Some(&bool_type.const_int(1, false)))
+                .unwrap();
+            return Some(next);
+        }
+        IteratorHolder::ScalarString(_) => todo!(),
     };
 }
 
@@ -621,6 +828,35 @@ pub fn generate_next<'a>(
             _ => unreachable!("dict iterator but not dict data type ({:?})", dt),
         },
         IteratorHolder::RunEnd { .. } => todo!(),
+        IteratorHolder::ScalarPrimitive(s) => {
+            assert_eq!(ptype.width(), s.width as usize);
+            declare_blocks!(ctx, next, entry);
+            build.position_at_end(entry);
+            let constant = match dt {
+                DataType::Int8
+                | DataType::Int16
+                | DataType::Int32
+                | DataType::Int64
+                | DataType::UInt8
+                | DataType::UInt16
+                | DataType::UInt32
+                | DataType::UInt64 => llvm_type
+                    .into_int_type()
+                    .const_int(s.val, false)
+                    .as_basic_value_enum(),
+                DataType::Float16 | DataType::Float32 | DataType::Float64 => llvm_type
+                    .into_float_type()
+                    .const_float(f64::from_bits(s.val))
+                    .as_basic_value_enum(),
+                _ => unreachable!(),
+            };
+            build.build_store(out_ptr, constant).unwrap();
+            build
+                .build_return(Some(&bool_type.const_int(1, false)))
+                .unwrap();
+            return Some(next);
+        }
+        IteratorHolder::ScalarString(_) => todo!(),
     };
 }
 
@@ -729,6 +965,33 @@ pub fn generate_random_access<'a>(
             _ => unreachable!("dictionary iterator but non-iterator data type ({:?})", dt),
         },
         IteratorHolder::RunEnd { .. } => todo!(),
+        IteratorHolder::ScalarPrimitive(s) => {
+            assert_eq!(ptype.width(), s.width as usize);
+            declare_blocks!(ctx, next, entry);
+            build.position_at_end(entry);
+            let constant = match dt {
+                DataType::Int8
+                | DataType::Int16
+                | DataType::Int32
+                | DataType::Int64
+                | DataType::UInt8
+                | DataType::UInt16
+                | DataType::UInt32
+                | DataType::UInt64 => llvm_type
+                    .into_int_type()
+                    .const_int(s.val, false)
+                    .as_basic_value_enum(),
+                DataType::Float16 | DataType::Float32 | DataType::Float64 => llvm_type
+                    .into_float_type()
+                    .const_float(f64::from_bits(s.val))
+                    .as_basic_value_enum(),
+                _ => unreachable!(),
+            };
+
+            build.build_return(Some(&constant)).unwrap();
+            return Some(next);
+        }
+        IteratorHolder::ScalarString(_) => todo!(),
     };
 }
 
@@ -741,12 +1004,14 @@ pub extern "C" fn debug_u64(v: i64) {
 mod tests {
     use std::{ffi::c_void, sync::Arc};
 
-    use arrow_array::{Array, DictionaryArray, Int32Array, Int8Array};
+    use arrow_array::{Array, DictionaryArray, Int32Array, Int8Array, Scalar};
     use arrow_schema::DataType;
     use inkwell::{context::Context, OptimizationLevel};
     use itertools::Itertools;
 
-    use super::{array_to_iter, generate_next, generate_next_block, generate_random_access};
+    use super::{
+        array_to_iter, datum_to_iter, generate_next, generate_next_block, generate_random_access,
+    };
 
     #[test]
     fn test_primitive_iter_block() {
@@ -1042,5 +1307,73 @@ mod tests {
             assert_eq!(res, 30);
             assert!(!next_func.call(iter.get_mut_ptr(), &mut res as *mut i32 as *mut c_void));
         };
+    }
+
+    #[test]
+    fn test_scalar_int() {
+        let s = Int32Array::from(vec![42]);
+        let s = Scalar::new(s);
+        let mut iter = datum_to_iter(&s).unwrap();
+
+        let ctx = Context::create();
+        let module = ctx.create_module("test_scalar_prim");
+        let func_block =
+            generate_next_block::<4>(&ctx, &module, "iter_prim_test", &DataType::Int32, &iter)
+                .unwrap();
+        let func_next =
+            generate_next(&ctx, &module, "iter_prim_test", &DataType::Int32, &iter).unwrap();
+        let func_access =
+            generate_random_access(&ctx, &module, "iter_prim_test", &DataType::Int32, &iter)
+                .unwrap();
+
+        let fname_block = func_block.get_name().to_str().unwrap();
+        let fname_next = func_next.get_name().to_str().unwrap();
+        let fname_access = func_access.get_name().to_str().unwrap();
+
+        module.verify().unwrap();
+        let ee = module
+            .create_jit_execution_engine(OptimizationLevel::None)
+            .unwrap();
+
+        let next_block_func = unsafe {
+            ee.get_function::<unsafe extern "C" fn(*mut c_void, *mut i32) -> bool>(fname_block)
+                .unwrap()
+        };
+        let next_func = unsafe {
+            ee.get_function::<unsafe extern "C" fn(*mut c_void, *mut i32) -> bool>(fname_next)
+                .unwrap()
+        };
+        let access_func = unsafe {
+            ee.get_function::<unsafe extern "C" fn(*const c_void, u64) -> i32>(fname_access)
+                .unwrap()
+        };
+
+        let mut buf = [0_i32; 4];
+        unsafe {
+            assert_eq!(
+                next_block_func.call(iter.get_mut_ptr(), buf.as_mut_ptr()),
+                true
+            );
+            assert_eq!(buf, [42, 42, 42, 42]);
+            assert_eq!(
+                next_block_func.call(iter.get_mut_ptr(), buf.as_mut_ptr()),
+                true
+            );
+            assert_eq!(buf, [42, 42, 42, 42]);
+        };
+
+        let mut buf = [0_i32; 1];
+        unsafe {
+            assert_eq!(next_func.call(iter.get_mut_ptr(), buf.as_mut_ptr()), true);
+            assert_eq!(buf, [42]);
+            assert_eq!(next_func.call(iter.get_mut_ptr(), buf.as_mut_ptr()), true);
+            assert_eq!(buf, [42]);
+        };
+
+        unsafe {
+            assert_eq!(access_func.call(iter.get_ptr(), 0), 42);
+            assert_eq!(access_func.call(iter.get_ptr(), 100), 42);
+            assert_eq!(access_func.call(iter.get_ptr(), 143500), 42);
+        }
     }
 }

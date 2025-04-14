@@ -7,7 +7,7 @@ use inkwell::{IntPredicate, OptimizationLevel};
 use ouroboros::self_referencing;
 use std::ffi::c_void;
 
-use crate::new_iter::{array_to_iter, generate_next, generate_next_block, IteratorHolder};
+use crate::new_iter::{datum_to_iter, generate_next, generate_next_block, IteratorHolder};
 use crate::{declare_blocks, increment_pointer, PrimitiveType};
 
 use super::ArrowKernelError;
@@ -17,7 +17,6 @@ pub struct ComparisonKernel {
     context: Context,
     lhs_data_type: DataType,
     rhs_data_type: DataType,
-    lhs_scalar: bool,
     rhs_scalar: bool,
 
     #[borrows(context)]
@@ -26,87 +25,105 @@ pub struct ComparisonKernel {
 }
 
 impl ComparisonKernel {
-    pub fn compile(
-        lhs: &DataType,
-        lhs_iter: &IteratorHolder,
-        lhs_scalar: bool,
-        rhs: &DataType,
-        rhs_iter: &IteratorHolder,
-        rhs_scalar: bool,
-    ) -> ComparisonKernel {
-        let ctx = Context::create();
-        ComparisonKernelBuilder {
-            context: ctx,
-            lhs_data_type: lhs.clone(),
-            rhs_data_type: rhs.clone(),
-            lhs_scalar,
-            rhs_scalar,
-            func_builder: |ctx| {
-                generate_llvm_cmp_kernel(ctx, lhs, lhs_iter, lhs_scalar, rhs, rhs_iter, rhs_scalar)
-            },
+    pub fn compile(lhs: &dyn Datum, rhs: &dyn Datum) -> Result<ComparisonKernel, ArrowKernelError> {
+        let (lhs_arr, lhs_scalar) = lhs.get();
+        let (rhs_arr, rhs_scalar) = rhs.get();
+
+        if lhs_scalar && rhs_scalar {
+            return Err(ArrowKernelError::UnsupportedArguments(
+                "scalar-scalar comparison".to_string(),
+            ));
         }
-        .build()
+
+        if lhs_scalar && !rhs_scalar {
+            return ComparisonKernel::compile(rhs, lhs);
+        }
+
+        let lhs_iter = datum_to_iter(lhs)?;
+        let rhs_iter = datum_to_iter(rhs)?;
+        let ctx = Context::create();
+        Ok(ComparisonKernelBuilder {
+            context: ctx,
+            lhs_data_type: lhs_arr.data_type().clone(),
+            rhs_data_type: rhs_arr.data_type().clone(),
+            rhs_scalar,
+            func_builder: |ctx| generate_llvm_cmp_kernel(ctx, lhs, &lhs_iter, rhs, &rhs_iter),
+        }
+        .build())
     }
 
     pub fn call(&self, a: &dyn Datum, b: &dyn Datum) -> Result<BooleanArray, ArrowKernelError> {
-        let (a, a_scalar) = a.get();
-        let (b, b_scalar) = b.get();
+        let (a_arr, a_scalar) = a.get();
+        let (b_arr, b_scalar) = b.get();
+        assert!(
+            !a_scalar,
+            "should swap scalar to 2nd argument (this is a bug)"
+        );
 
-        if (!a_scalar && !b_scalar) && (a.len() != b.len()) {
+        if !b_scalar && (a_arr.len() != b_arr.len()) {
             return Err(ArrowKernelError::SizeMismatch);
         }
 
-        if !self.with_lhs_data_type(|lhs_dt| a.data_type() == lhs_dt) {
+        if !self.with_rhs_scalar(|rhs_scalar| b_scalar == *rhs_scalar) {
             return Err(ArrowKernelError::ArgumentMismatch);
         }
 
-        if !self.with_lhs_data_type(|rhs_dt| b.data_type() == rhs_dt) {
+        if !self.with_lhs_data_type(|lhs_dt| a_arr.data_type() == lhs_dt) {
             return Err(ArrowKernelError::ArgumentMismatch);
         }
 
-        let mut a_iter = array_to_iter(a);
-        let mut b_iter = array_to_iter(b);
-        let mut out = vec![0_u64; a.len().div_ceil(64)];
+        if !self.with_lhs_data_type(|rhs_dt| b_arr.data_type() == rhs_dt) {
+            return Err(ArrowKernelError::ArgumentMismatch);
+        }
+
+        let mut a_iter = datum_to_iter(a)?;
+        let mut b_iter = datum_to_iter(b)?;
+        a_iter.assert_non_null();
+        b_iter.assert_non_null();
+        let mut out = vec![0_u64; a_arr.len().div_ceil(64)];
 
         self.with_func(|func| unsafe {
             func.call(a_iter.get_mut_ptr(), b_iter.get_mut_ptr(), out.as_mut_ptr())
         });
 
-        let buf = BooleanBuffer::new(out.into(), 0, a.len());
+        let buf = BooleanBuffer::new(out.into(), 0, a_arr.len());
         Ok(BooleanArray::new(
             buf,
-            NullBuffer::union(a.nulls(), b.nulls()),
+            NullBuffer::union(a_arr.nulls(), b_arr.nulls()),
         ))
     }
 }
 
 fn generate_llvm_cmp_kernel<'a>(
     ctx: &'a Context,
-    lhs: &DataType,
+    lhs: &dyn Datum,
     lhs_iter: &IteratorHolder,
-    lhs_scalar: bool,
-    rhs: &DataType,
+    rhs: &dyn Datum,
     rhs_iter: &IteratorHolder,
-    rhs_scalar: bool,
 ) -> JitFunction<'a, unsafe extern "C" fn(*mut c_void, *mut c_void, *mut u64)> {
+    let (lhs_arr, _lhs_scalar) = lhs.get();
+    let (rhs_arr, _rhs_scalar) = rhs.get();
+    let lhs_dt = lhs_arr.data_type();
+    let rhs_dt = rhs_arr.data_type();
+
     let module = ctx.create_module("cmp_kernel");
     let build = ctx.create_builder();
     let i64_type = ctx.i64_type();
     let ptr_type = ctx.ptr_type(AddressSpace::default());
     let void_type = ctx.void_type();
-    let lhs_prim = PrimitiveType::for_arrow_type(lhs);
-    let rhs_prim = PrimitiveType::for_arrow_type(rhs);
+    let lhs_prim = PrimitiveType::for_arrow_type(lhs_dt);
+    let rhs_prim = PrimitiveType::for_arrow_type(rhs_dt);
     let lhs_vec = lhs_prim.llvm_vec_type(&ctx, 64).unwrap();
     let rhs_vec = rhs_prim.llvm_vec_type(&ctx, 64).unwrap();
     let lhs_llvm = lhs_prim.llvm_type(&ctx);
     let rhs_llvm = rhs_prim.llvm_type(&ctx);
 
     let lhs_next_block =
-        generate_next_block::<64>(&ctx, &module, "next_lhs_block", lhs, lhs_iter).unwrap();
+        generate_next_block::<64>(&ctx, &module, "next_lhs_block", lhs_dt, lhs_iter).unwrap();
     let rhs_next_block =
-        generate_next_block::<64>(&ctx, &module, "next_rhs_block", rhs, rhs_iter).unwrap();
-    let lhs_next = generate_next(&ctx, &module, "next_lhs", lhs, lhs_iter).unwrap();
-    let rhs_next = generate_next(&ctx, &module, "next_rhs", rhs, rhs_iter).unwrap();
+        generate_next_block::<64>(&ctx, &module, "next_rhs_block", rhs_dt, rhs_iter).unwrap();
+    let lhs_next = generate_next(&ctx, &module, "next_lhs", lhs_dt, lhs_iter).unwrap();
+    let rhs_next = generate_next(&ctx, &module, "next_rhs", rhs_dt, rhs_iter).unwrap();
 
     let fn_type = void_type.fn_type(&[ptr_type.into(), ptr_type.into(), ptr_type.into()], false);
     let cmp = module.add_function("cmp", fn_type, None);
@@ -265,19 +282,16 @@ fn generate_llvm_cmp_kernel<'a>(
 
 #[cfg(test)]
 mod tests {
-    use arrow_array::{Array, BooleanArray, UInt32Array};
+    use arrow_array::{BooleanArray, Scalar, UInt32Array};
     use itertools::Itertools;
 
-    use crate::{new_iter::array_to_iter, new_kernels::cmp::ComparisonKernel};
+    use crate::new_kernels::cmp::ComparisonKernel;
 
     #[test]
     fn test_num_num_cmp() {
         let a = UInt32Array::from(vec![1, 2, 3]);
         let b = UInt32Array::from(vec![11, 0, 13]);
-        let a_iter = array_to_iter(&a);
-        let b_iter = array_to_iter(&b);
-        let k =
-            ComparisonKernel::compile(a.data_type(), &a_iter, false, b.data_type(), &b_iter, false);
+        let k = ComparisonKernel::compile(&a, &b).unwrap();
         let r = k.call(&a, &b).unwrap();
         assert_eq!(r, BooleanArray::from(vec![true, false, true]))
     }
@@ -286,11 +300,19 @@ mod tests {
     fn test_num_num_block_cmp() {
         let a = UInt32Array::from((0..100).collect_vec());
         let b = UInt32Array::from((1..101).collect_vec());
-        let a_iter = array_to_iter(&a);
-        let b_iter = array_to_iter(&b);
-        let k =
-            ComparisonKernel::compile(a.data_type(), &a_iter, false, b.data_type(), &b_iter, false);
+        let k = ComparisonKernel::compile(&a, &b).unwrap();
         let r = k.call(&a, &b).unwrap();
         assert_eq!(r, BooleanArray::from(vec![true; 100]))
+    }
+
+    #[test]
+    fn test_num_num_block_scalar_cmp() {
+        let a = UInt32Array::from((0..100).collect_vec());
+        let b = Scalar::new(UInt32Array::from(vec![5]));
+        let k = ComparisonKernel::compile(&a, &b).unwrap();
+        let r = k.call(&a, &b).unwrap();
+
+        let expected_result = (0..100).map(|i| i < 5).collect::<Vec<bool>>();
+        assert_eq!(r, BooleanArray::from(expected_result));
     }
 }
