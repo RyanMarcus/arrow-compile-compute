@@ -29,8 +29,8 @@ proptest! {
         let arr1 = Float64Array::from(arr);
         let arr2 = Float64Array::new_scalar(sca);
 
-        let our_res = arrow_compile_compute::cmp::eq(&arr1, &arr2).unwrap();
-        let arrow_res = arrow_ord::cmp::eq(&arr1, &arr2).unwrap();
+        let our_res = arrow_compile_compute::cmp::lt(&arr1, &arr2).unwrap();
+        let arrow_res = arrow_ord::cmp::lt(&arr1, &arr2).unwrap();
         assert_eq!(our_res, arrow_res);
     }
 
@@ -39,8 +39,8 @@ proptest! {
         let arr1 = Float32Array::from(arr);
         let arr2 = Float32Array::new_scalar(sca);
 
-        let our_res = arrow_compile_compute::cmp::eq(&arr1, &arr2).unwrap();
-        let arrow_res = arrow_ord::cmp::eq(&arr1, &arr2).unwrap();
+        let our_res = arrow_compile_compute::cmp::lt(&arr1, &arr2).unwrap();
+        let arrow_res = arrow_ord::cmp::lt(&arr1, &arr2).unwrap();
         assert_eq!(our_res, arrow_res);
     }
 

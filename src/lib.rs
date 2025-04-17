@@ -46,6 +46,7 @@ mod arrow_interface;
 mod bitmap;
 mod compute_funcs;
 mod dict;
+mod new_arrow_interface;
 mod new_iter;
 mod new_kernels;
 mod primitive;
@@ -54,9 +55,10 @@ mod scalar;
 mod string;
 
 pub use arrow_interface::cast;
-pub use arrow_interface::cmp;
 pub use arrow_interface::compute;
 pub use arrow_interface::SelfContainedBinaryFunc;
+
+pub use new_arrow_interface::cmp;
 
 pub use new_kernels::ArrowKernelError;
 pub use new_kernels::ComparisonKernel;

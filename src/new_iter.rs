@@ -483,7 +483,9 @@ pub struct RunEndIterator {
     len: u64,
 }
 
-#[derive(Debug)]
+#[repr(C)]
+#[derive(ReprOffset, Debug)]
+#[roff(usize_offsets)]
 pub struct ScalarPrimitiveIterator {
     /// the scalar value, packed to the right of a u64
     val: u64,
@@ -495,6 +497,15 @@ pub struct ScalarPrimitiveIterator {
 impl ScalarPrimitiveIterator {
     pub fn new(val: u64, width: u8) -> Self {
         Self { val, width }
+    }
+
+    pub fn llvm_val_ptr<'a>(
+        &self,
+        ctx: &'a Context,
+        builder: &'a Builder,
+        ptr: PointerValue<'a>,
+    ) -> PointerValue<'a> {
+        increment_pointer!(ctx, builder, ptr, ScalarPrimitiveIterator::OFFSET_VAL)
     }
 }
 
@@ -556,7 +567,7 @@ use half::f16;
 impl From<f16> for IteratorHolder {
     fn from(val: f16) -> Self {
         IteratorHolder::ScalarPrimitive(Box::new(ScalarPrimitiveIterator::new(
-            (val.to_f64()).to_bits() as u64,
+            (val.to_f64()).to_bits(),
             2,
         )))
     }
@@ -565,7 +576,7 @@ impl From<f16> for IteratorHolder {
 impl From<f32> for IteratorHolder {
     fn from(val: f32) -> Self {
         IteratorHolder::ScalarPrimitive(Box::new(ScalarPrimitiveIterator::new(
-            (val as f64).to_bits() as u64,
+            val.to_bits() as u64,
             4,
         )))
     }
@@ -573,10 +584,7 @@ impl From<f32> for IteratorHolder {
 
 impl From<f64> for IteratorHolder {
     fn from(val: f64) -> Self {
-        IteratorHolder::ScalarPrimitive(Box::new(ScalarPrimitiveIterator::new(
-            val.to_bits() as u64,
-            8,
-        )))
+        IteratorHolder::ScalarPrimitive(Box::new(ScalarPrimitiveIterator::new(val.to_bits(), 8)))
     }
 }
 
@@ -594,6 +602,7 @@ impl From<Box<str>> for IteratorHolder {
 /// This adds a `next_block` function to the module for the given iterator. When
 /// called, this `next_block` function will fetch `n` elements from the
 /// iterator, advancing the iterator's offset. The generated function's signature is:
+///
 /// fn next_block(iter: ptr, out: ptr_to_vec_of_size_n) -> bool
 ///
 pub fn generate_next_block<'a, const N: u32>(
@@ -784,26 +793,20 @@ pub fn generate_next_block<'a, const N: u32>(
         IteratorHolder::RunEnd { .. } => todo!(),
         IteratorHolder::ScalarPrimitive(s) => {
             assert_eq!(ptype.width(), s.width as usize);
+            let get_next_single = generate_next(
+                ctx,
+                llvm_mod,
+                &format!("scaler_block_single_next_{}", label),
+                dt,
+                ih,
+            )?;
             declare_blocks!(ctx, next, entry);
             build.position_at_end(entry);
-            let constant = match dt {
-                DataType::Int8
-                | DataType::Int16
-                | DataType::Int32
-                | DataType::Int64
-                | DataType::UInt8
-                | DataType::UInt16
-                | DataType::UInt32
-                | DataType::UInt64 => llvm_type
-                    .into_int_type()
-                    .const_int(s.val, false)
-                    .as_basic_value_enum(),
-                DataType::Float16 | DataType::Float32 | DataType::Float64 => llvm_type
-                    .into_float_type()
-                    .const_float(f64::from_bits(s.val))
-                    .as_basic_value_enum(),
-                _ => unreachable!(),
-            };
+            let val_buf = build.build_alloca(llvm_type, "val_buf").unwrap();
+            build
+                .build_call(get_next_single, &[iter_ptr.into(), val_buf.into()], "get")
+                .unwrap();
+            let constant = build.build_load(llvm_type, val_buf, "constant").unwrap();
             let v = build
                 .build_insert_element(vec_type.const_zero(), constant, i64_type.const_zero(), "v")
                 .unwrap();
@@ -841,7 +844,7 @@ pub fn generate_next<'a>(
 
     let fn_type = bool_type.fn_type(&[ptr_type.into(), ptr_type.into()], false);
     let next = llvm_mod.add_function(
-        &format!("{}_next_block", label),
+        &format!("{}_next", label),
         fn_type,
         Some(
             #[cfg(test)]
@@ -951,6 +954,7 @@ pub fn generate_next<'a>(
             assert_eq!(ptype.width(), s.width as usize);
             declare_blocks!(ctx, next, entry);
             build.position_at_end(entry);
+            let ptr = s.llvm_val_ptr(ctx, &build, iter_ptr);
             let constant = match dt {
                 DataType::Int8
                 | DataType::Int16
@@ -959,14 +963,34 @@ pub fn generate_next<'a>(
                 | DataType::UInt8
                 | DataType::UInt16
                 | DataType::UInt32
-                | DataType::UInt64 => llvm_type
-                    .into_int_type()
-                    .const_int(s.val, false)
-                    .as_basic_value_enum(),
-                DataType::Float16 | DataType::Float32 | DataType::Float64 => llvm_type
-                    .into_float_type()
-                    .const_float(f64::from_bits(s.val))
-                    .as_basic_value_enum(),
+                | DataType::UInt64 => {
+                    let data = build
+                        .build_load(i64_type, ptr, "const_u64")
+                        .unwrap()
+                        .into_int_value();
+                    build
+                        .build_int_cast(data, llvm_type.into_int_type(), "casted")
+                        .unwrap()
+                        .as_basic_value_enum()
+                }
+                DataType::Float16 | DataType::Float32 | DataType::Float64 => {
+                    let data = build
+                        .build_load(i64_type, ptr, "const_u64")
+                        .unwrap()
+                        .into_int_value();
+                    let data = build
+                        .build_int_cast(
+                            data,
+                            PrimitiveType::int_with_width(s.width as usize)
+                                .llvm_type(ctx)
+                                .into_int_type(),
+                            "const_int",
+                        )
+                        .unwrap();
+                    build
+                        .build_bit_cast(data, llvm_type, "const_float")
+                        .unwrap()
+                }
                 _ => unreachable!(),
             };
             build.build_store(out_ptr, constant).unwrap();
@@ -1084,46 +1108,16 @@ pub fn generate_random_access<'a>(
             _ => unreachable!("dictionary iterator but non-iterator data type ({:?})", dt),
         },
         IteratorHolder::RunEnd { .. } => todo!(),
-        IteratorHolder::ScalarPrimitive(s) => {
-            assert_eq!(ptype.width(), s.width as usize);
-            declare_blocks!(ctx, next, entry);
-            build.position_at_end(entry);
-            let constant = match dt {
-                DataType::Int8
-                | DataType::Int16
-                | DataType::Int32
-                | DataType::Int64
-                | DataType::UInt8
-                | DataType::UInt16
-                | DataType::UInt32
-                | DataType::UInt64 => llvm_type
-                    .into_int_type()
-                    .const_int(s.val, false)
-                    .as_basic_value_enum(),
-                DataType::Float16 | DataType::Float32 | DataType::Float64 => llvm_type
-                    .into_float_type()
-                    .const_float(f64::from_bits(s.val))
-                    .as_basic_value_enum(),
-                _ => unreachable!(),
-            };
-
-            build.build_return(Some(&constant)).unwrap();
-            return Some(next);
-        }
+        IteratorHolder::ScalarPrimitive(_s) => todo!(),
         IteratorHolder::ScalarString(_) => todo!(),
     };
-}
-
-#[no_mangle]
-pub extern "C" fn debug_u64(v: i64) {
-    println!("{0} {0:b}", v);
 }
 
 #[cfg(test)]
 mod tests {
     use std::{ffi::c_void, sync::Arc};
 
-    use arrow_array::{Array, DictionaryArray, Int32Array, Int8Array, Scalar};
+    use arrow_array::{Array, DictionaryArray, Float32Array, Int32Array, Int8Array, Scalar};
     use arrow_schema::DataType;
     use inkwell::{context::Context, OptimizationLevel};
     use itertools::Itertools;
@@ -1526,13 +1520,9 @@ mod tests {
                 .unwrap();
         let func_next =
             generate_next(&ctx, &module, "iter_prim_test", &DataType::Int32, &iter).unwrap();
-        let func_access =
-            generate_random_access(&ctx, &module, "iter_prim_test", &DataType::Int32, &iter)
-                .unwrap();
 
         let fname_block = func_block.get_name().to_str().unwrap();
         let fname_next = func_next.get_name().to_str().unwrap();
-        let fname_access = func_access.get_name().to_str().unwrap();
 
         module.verify().unwrap();
         let ee = module
@@ -1545,10 +1535,6 @@ mod tests {
         };
         let next_func = unsafe {
             ee.get_function::<unsafe extern "C" fn(*mut c_void, *mut i32) -> bool>(fname_next)
-                .unwrap()
-        };
-        let access_func = unsafe {
-            ee.get_function::<unsafe extern "C" fn(*const c_void, u64) -> i32>(fname_access)
                 .unwrap()
         };
 
@@ -1573,11 +1559,67 @@ mod tests {
             assert_eq!(next_func.call(iter.get_mut_ptr(), buf.as_mut_ptr()), true);
             assert_eq!(buf, [42]);
         };
+    }
 
+    #[test]
+    fn test_scalar_float() {
+        let f = 42.31894;
+        let s = Float32Array::from(vec![f]);
+        let s = Scalar::new(s);
+        let mut iter = datum_to_iter(&s).unwrap();
+
+        let ctx = Context::create();
+        let module = ctx.create_module("test_scalar_prim");
+        let func_block = generate_next_block::<4>(
+            &ctx,
+            &module,
+            "iter_block_prim_test",
+            &DataType::Float32,
+            &iter,
+        )
+        .unwrap();
+        let func_next =
+            generate_next(&ctx, &module, "iter_prim_test", &DataType::Float32, &iter).unwrap();
+
+        let fname_block = func_block.get_name().to_str().unwrap();
+        let fname_next = func_next.get_name().to_str().unwrap();
+
+        module.verify().unwrap();
+        let ee = module
+            .create_jit_execution_engine(OptimizationLevel::None)
+            .unwrap();
+
+        let next_block_func = unsafe {
+            ee.get_function::<unsafe extern "C" fn(*mut c_void, *mut f32) -> bool>(fname_block)
+                .unwrap()
+        };
+        let next_func = unsafe {
+            ee.get_function::<unsafe extern "C" fn(*mut c_void, *mut f32) -> bool>(fname_next)
+                .unwrap()
+        };
+
+        let mut buf: f32 = 0.0;
         unsafe {
-            assert_eq!(access_func.call(iter.get_ptr(), 0), 42);
-            assert_eq!(access_func.call(iter.get_ptr(), 100), 42);
-            assert_eq!(access_func.call(iter.get_ptr(), 143500), 42);
-        }
+            assert_eq!(next_func.call(iter.get_mut_ptr(), &mut buf), true);
+            assert_eq!(buf, f);
+            assert_eq!(next_func.call(iter.get_mut_ptr(), &mut buf), true);
+            assert_eq!(buf, f);
+        };
+
+        #[repr(align(16))]
+        struct Buf([f32; 4]);
+        let mut buf = Buf([0_f32; 4]);
+        unsafe {
+            assert_eq!(
+                next_block_func.call(iter.get_mut_ptr(), buf.0.as_mut_ptr()),
+                true
+            );
+            assert_eq!(buf.0, [f, f, f, f]);
+            assert_eq!(
+                next_block_func.call(iter.get_mut_ptr(), buf.0.as_mut_ptr()),
+                true
+            );
+            assert_eq!(buf.0, [f, f, f, f]);
+        };
     }
 }

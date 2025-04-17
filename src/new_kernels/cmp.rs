@@ -12,7 +12,7 @@ use std::ffi::c_void;
 use crate::new_iter::{datum_to_iter, generate_next, generate_next_block, IteratorHolder};
 use crate::{declare_blocks, increment_pointer, ComparisonType, Predicate, PrimitiveType};
 
-use super::ArrowKernelError;
+use super::{ArrowKernelError, Kernel};
 
 #[self_referencing]
 pub struct ComparisonKernel {
@@ -27,40 +27,17 @@ pub struct ComparisonKernel {
     func: JitFunction<'this, unsafe extern "C" fn(*mut c_void, *mut c_void, *mut u64)>,
 }
 
-impl ComparisonKernel {
-    pub fn compile(
-        lhs: &dyn Datum,
-        rhs: &dyn Datum,
-        pred: Predicate,
-    ) -> Result<ComparisonKernel, ArrowKernelError> {
-        let (lhs_arr, lhs_scalar) = lhs.get();
-        let (rhs_arr, rhs_scalar) = rhs.get();
+unsafe impl Sync for ComparisonKernel {}
+unsafe impl Send for ComparisonKernel {}
 
-        if lhs_scalar && rhs_scalar {
-            return Err(ArrowKernelError::UnsupportedArguments(
-                "scalar-scalar comparison".to_string(),
-            ));
-        }
+impl Kernel for ComparisonKernel {
+    type Key = (DataType, DataType, bool, Predicate);
+    type Input<'a> = (&'a dyn Datum, &'a dyn Datum);
+    type Params = Predicate;
+    type Output = BooleanArray;
 
-        if lhs_scalar && !rhs_scalar {
-            return ComparisonKernel::compile(rhs, lhs, pred.flip());
-        }
-
-        let lhs_iter = datum_to_iter(lhs)?;
-        let rhs_iter = datum_to_iter(rhs)?;
-        let ctx = Context::create();
-        Ok(ComparisonKernelBuilder {
-            context: ctx,
-            lhs_data_type: lhs_arr.data_type().clone(),
-            rhs_data_type: rhs_arr.data_type().clone(),
-            rhs_scalar,
-            pred,
-            func_builder: |ctx| generate_llvm_cmp_kernel(ctx, lhs, &lhs_iter, rhs, &rhs_iter, pred),
-        }
-        .build())
-    }
-
-    pub fn call(&self, a: &dyn Datum, b: &dyn Datum) -> Result<BooleanArray, ArrowKernelError> {
+    fn call<'a>(&self, inp: Self::Input<'a>) -> Result<Self::Output, ArrowKernelError> {
+        let (a, b) = inp;
         let (a_arr, a_scalar) = a.get();
         let (b_arr, b_scalar) = b.get();
         assert!(
@@ -73,15 +50,25 @@ impl ComparisonKernel {
         }
 
         if !self.with_rhs_scalar(|rhs_scalar| b_scalar == *rhs_scalar) {
-            return Err(ArrowKernelError::ArgumentMismatch);
+            return Err(ArrowKernelError::ArgumentMismatch(format!(
+                "Expected RHS to be scalar"
+            )));
         }
 
         if !self.with_lhs_data_type(|lhs_dt| a_arr.data_type() == lhs_dt) {
-            return Err(ArrowKernelError::ArgumentMismatch);
+            return Err(ArrowKernelError::ArgumentMismatch(format!(
+                "LHS did not match, expected {:?}, found {:?}",
+                self.borrow_lhs_data_type(),
+                a_arr.data_type()
+            )));
         }
 
-        if !self.with_lhs_data_type(|rhs_dt| b_arr.data_type() == rhs_dt) {
-            return Err(ArrowKernelError::ArgumentMismatch);
+        if !self.with_rhs_data_type(|rhs_dt| b_arr.data_type() == rhs_dt) {
+            return Err(ArrowKernelError::ArgumentMismatch(format!(
+                "RHS did not match, expected {:?}, found {:?}",
+                self.borrow_rhs_data_type(),
+                b_arr.data_type()
+            )));
         }
 
         let mut a_iter = datum_to_iter(a)?;
@@ -98,6 +85,57 @@ impl ComparisonKernel {
         Ok(BooleanArray::new(
             buf,
             NullBuffer::union(a_arr.nulls(), b_arr.nulls()),
+        ))
+    }
+
+    fn compile<'a>(inp: &Self::Input<'a>, pred: Predicate) -> Result<Self, ArrowKernelError> {
+        let (lhs, rhs) = *inp;
+        let (lhs_arr, lhs_scalar) = lhs.get();
+        let (rhs_arr, rhs_scalar) = rhs.get();
+
+        if lhs_scalar && rhs_scalar {
+            return Err(ArrowKernelError::UnsupportedArguments(
+                "scalar-scalar comparison".to_string(),
+            ));
+        }
+
+        if lhs_scalar && !rhs_scalar {
+            return ComparisonKernel::compile(&(rhs, lhs), pred.flip());
+        }
+
+        let lhs_iter = datum_to_iter(lhs)?;
+        let rhs_iter = datum_to_iter(rhs)?;
+        let ctx = Context::create();
+        Ok(ComparisonKernelBuilder {
+            context: ctx,
+            lhs_data_type: lhs_arr.data_type().clone(),
+            rhs_data_type: rhs_arr.data_type().clone(),
+            rhs_scalar,
+            pred,
+            func_builder: |ctx| generate_llvm_cmp_kernel(ctx, lhs, &lhs_iter, rhs, &rhs_iter, pred),
+        }
+        .build())
+    }
+
+    fn get_key_for_input<'a>(
+        i: &Self::Input<'a>,
+        p: &Predicate,
+    ) -> Result<Self::Key, ArrowKernelError> {
+        let (lhs, rhs) = *i;
+        if lhs.get().1 {
+            return Self::get_key_for_input(&(rhs, lhs), &p.flip());
+        }
+
+        if lhs.get().1 {
+            return Err(ArrowKernelError::UnsupportedArguments(
+                "scalar-scalar comparison".to_string(),
+            ));
+        }
+        Ok((
+            lhs.get().0.data_type().clone(),
+            rhs.get().0.data_type().clone(),
+            rhs.get().1,
+            p.clone(),
         ))
     }
 }
@@ -275,6 +313,7 @@ fn generate_llvm_cmp_kernel<'a>(
                 .unwrap()
                 .try_as_basic_value()
                 .unwrap_left();
+
             build
                 .build_int_compare(
                     pred.as_int_pred(true),
@@ -426,7 +465,7 @@ fn add_float_to_int<'a>(
         .into_int_type();
 
     let func_type = int_type.fn_type(&[inp_type.into()], false);
-    let func = module.add_function("vec_to_int", func_type, Some(Linkage::Private));
+    let func = module.add_function("float_to_int", func_type, Some(Linkage::Private));
     let float = func.get_nth_param(0).unwrap().into_float_value();
 
     declare_blocks!(ctx, func, entry);
@@ -452,17 +491,22 @@ fn add_float_to_int<'a>(
 
 #[cfg(test)]
 mod tests {
+    use std::cmp::Ordering;
+
     use arrow_array::{BooleanArray, Float32Array, Scalar, UInt32Array};
     use itertools::Itertools;
 
-    use crate::{new_kernels::cmp::ComparisonKernel, Predicate};
+    use crate::{
+        new_kernels::{cmp::ComparisonKernel, Kernel},
+        Predicate,
+    };
 
     #[test]
     fn test_num_num_cmp() {
         let a = UInt32Array::from(vec![1, 2, 3]);
         let b = UInt32Array::from(vec![11, 0, 13]);
-        let k = ComparisonKernel::compile(&a, &b, Predicate::Lt).unwrap();
-        let r = k.call(&a, &b).unwrap();
+        let k = ComparisonKernel::compile(&(&a, &b), Predicate::Lt).unwrap();
+        let r = k.call((&a, &b)).unwrap();
         assert_eq!(r, BooleanArray::from(vec![true, false, true]))
     }
 
@@ -470,8 +514,8 @@ mod tests {
     fn test_num_num_block_cmp() {
         let a = UInt32Array::from((0..100).collect_vec());
         let b = UInt32Array::from((1..101).collect_vec());
-        let k = ComparisonKernel::compile(&a, &b, Predicate::Lt).unwrap();
-        let r = k.call(&a, &b).unwrap();
+        let k = ComparisonKernel::compile(&(&a, &b), Predicate::Lt).unwrap();
+        let r = k.call((&a, &b)).unwrap();
         assert_eq!(r, BooleanArray::from(vec![true; 100]))
     }
 
@@ -479,8 +523,8 @@ mod tests {
     fn test_num_num_block_scalar_cmp() {
         let a = UInt32Array::from((0..100).collect_vec());
         let b = Scalar::new(UInt32Array::from(vec![5]));
-        let k = ComparisonKernel::compile(&a, &b, Predicate::Lt).unwrap();
-        let r = k.call(&a, &b).unwrap();
+        let k = ComparisonKernel::compile(&(&a, &b), Predicate::Lt).unwrap();
+        let r = k.call((&a, &b)).unwrap();
 
         let expected_result = (0..100).map(|i| i < 5).collect::<Vec<bool>>();
         assert_eq!(r, BooleanArray::from(expected_result));
@@ -490,8 +534,8 @@ mod tests {
     fn test_num_num_float_cmp() {
         let a = Float32Array::from((0..100).map(|i| i as f32).collect_vec());
         let b = Float32Array::from((1..101).map(|i| i as f32).collect_vec());
-        let k = ComparisonKernel::compile(&a, &b, Predicate::Lt).unwrap();
-        let r = k.call(&a, &b).unwrap();
+        let k = ComparisonKernel::compile(&(&a, &b), Predicate::Lt).unwrap();
+        let r = k.call((&a, &b)).unwrap();
         assert_eq!(r, BooleanArray::from(vec![true; 100]))
     }
 
@@ -499,10 +543,21 @@ mod tests {
     fn test_num_num_float_scalar_cmp() {
         let a = Float32Array::from((0..100).map(|i| i as f32).collect_vec());
         let b = Scalar::new(Float32Array::from(vec![5.0]));
-        let k = ComparisonKernel::compile(&a, &b, Predicate::Lt).unwrap();
-        let r = k.call(&a, &b).unwrap();
+        let k = ComparisonKernel::compile(&(&a, &b), Predicate::Lt).unwrap();
+        let r = k.call((&a, &b)).unwrap();
 
         let expected_result = (0..100).map(|i| i < 5).collect::<Vec<bool>>();
         assert_eq!(r, BooleanArray::from(expected_result));
+    }
+
+    #[test]
+    fn test_num_num_float_scalar_cmp_convert() {
+        let a = Float32Array::from(vec![-93294.49]);
+        let b = Float32Array::new_scalar(-205150180000.0);
+        let k = ComparisonKernel::compile(&(&a, &b), Predicate::Lt).unwrap();
+        let r = k.call((&a, &b)).unwrap();
+
+        let res = (-93294.49_f32).total_cmp(&-205150180000.0) == Ordering::Less;
+        assert_eq!(r, BooleanArray::from(vec![res]));
     }
 }
