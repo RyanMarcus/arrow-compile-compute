@@ -1320,12 +1320,12 @@ mod tests {
         let ctx = Context::create();
         let module = ctx.create_module("test_iter");
         let func =
-            generate_next_block::<16>(&ctx, &module, "dict_iter_block1", data.data_type(), &iter)
+            generate_next_block::<2>(&ctx, &module, "dict_iter_block1", data.data_type(), &iter)
                 .unwrap();
         let fname = func.get_name().to_str().unwrap();
 
         module.verify().unwrap();
-        module.print_to_stderr();
+
         let ee = module
             .create_jit_execution_engine(OptimizationLevel::None)
             .unwrap();
