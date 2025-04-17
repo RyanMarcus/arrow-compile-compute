@@ -172,7 +172,9 @@ pub enum IteratorHolder {
     Primitive(Box<PrimitiveIterator>),
     String(Box<StringIterator>),
     LargeString(Box<LargeStringIterator>),
-    Bitmap(Box<BitmapIterator>),
+    Bitmap(Box<BitmapIterator>), // all three methods, returns 0 or 1
+    // TODO(paul): SetBitsOfBitmap() -- only single get next, no random access or block
+    // https://lemire.me/blog/2018/02/21/iterating-over-set-bits-quickly/
     Dictionary {
         arr: Box<DictionaryIterator>,
         keys: Box<IteratorHolder>,
@@ -661,106 +663,124 @@ pub fn generate_next_block<'a, const N: u32>(
         }
         IteratorHolder::String(_) | IteratorHolder::LargeString(_) => return None,
         IteratorHolder::Bitmap(_bitmap_iterator) => todo!(),
-        IteratorHolder::Dictionary {arr, keys, values} => match dt {
+        IteratorHolder::Dictionary { arr, keys, values } => match dt {
             DataType::Dictionary(k_dt, v_dt) => {
-                let key_block_next = generate_next_block::<N>(
-                    ctx,
-                    llvm_mod, 
-                    &format!("{}_key", label),
-                    k_dt,
-                    keys
-                ).unwrap();
+                let key_block_next =
+                    generate_next_block::<N>(ctx, llvm_mod, &format!("{}_key", label), k_dt, keys)
+                        .unwrap();
 
                 let value_access = generate_random_access(
                     ctx,
                     llvm_mod,
                     &format!("{}_value", label),
                     v_dt,
-                    values
-                ).unwrap();
+                    values,
+                )
+                .unwrap();
 
-                declare_blocks!(ctx, next, entry, none_left, get_next,
-                    loop_cond_block, loop_body_block, after_loop_block);
+                declare_blocks!(
+                    ctx,
+                    next,
+                    entry,
+                    none_left,
+                    get_next,
+                    loop_cond_block,
+                    loop_body_block,
+                    after_loop_block
+                );
 
                 build.position_at_end(entry);
                 let key_prim_type = PrimitiveType::for_arrow_type(k_dt);
                 let key_iter = arr.llvm_key_iter_ptr(ctx, &build, iter_ptr);
                 let key_vec_type = key_prim_type.llvm_vec_type(ctx, N).unwrap();
                 let key_buf = build.build_alloca(key_vec_type, "key_block").unwrap();
-                let key_block_result = build.build_call(
-                    key_block_next,
-                    &[key_iter.into(), key_buf.into()],
-                    "key_block_result"
-                )
-                .unwrap()
-                .try_as_basic_value()
-                .unwrap_left()
-                .into_int_value();
-                build.build_conditional_branch(key_block_result, get_next, none_left).unwrap();
+                let key_block_result = build
+                    .build_call(
+                        key_block_next,
+                        &[key_iter.into(), key_buf.into()],
+                        "key_block_result",
+                    )
+                    .unwrap()
+                    .try_as_basic_value()
+                    .unwrap_left()
+                    .into_int_value();
+                build
+                    .build_conditional_branch(key_block_result, get_next, none_left)
+                    .unwrap();
 
                 build.position_at_end(none_left);
-                build.build_return(Some(&bool_type.const_int(0, false))).unwrap();
-                
+                build
+                    .build_return(Some(&bool_type.const_int(0, false)))
+                    .unwrap();
+
                 build.position_at_end(get_next);
                 let loop_counter_type = ctx.i64_type();
-                let loop_counter = build.build_alloca(loop_counter_type, "loop_counter").unwrap();
-                build.build_store(loop_counter, loop_counter_type.const_int(0, false)).unwrap();
+                let loop_counter = build
+                    .build_alloca(loop_counter_type, "loop_counter")
+                    .unwrap();
+                build
+                    .build_store(loop_counter, loop_counter_type.const_int(0, false))
+                    .unwrap();
                 build.build_unconditional_branch(loop_cond_block).unwrap();
 
                 build.position_at_end(loop_cond_block);
-                let loop_index = build.build_load(
-                    loop_counter_type,
-                    loop_counter,
-                    "loop_index"
-                ).unwrap()
-                .into_int_value();
-                let loop_cond = build.build_int_compare(
-                    IntPredicate::ULT,
-                    loop_index,
-                    loop_counter_type.const_int(N as u64, false),
-                    "loop_cond"
-                ).unwrap();
-                build.build_conditional_branch(loop_cond, loop_body_block, after_loop_block).unwrap();
-                
+                let loop_index = build
+                    .build_load(loop_counter_type, loop_counter, "loop_index")
+                    .unwrap()
+                    .into_int_value();
+                let loop_cond = build
+                    .build_int_compare(
+                        IntPredicate::ULT,
+                        loop_index,
+                        loop_counter_type.const_int(N as u64, false),
+                        "loop_cond",
+                    )
+                    .unwrap();
+                build
+                    .build_conditional_branch(loop_cond, loop_body_block, after_loop_block)
+                    .unwrap();
+
                 build.position_at_end(loop_body_block);
-                let key_vec = build.build_load(key_vec_type, key_buf, "key_vec").unwrap().into_vector_value();
-                let key_uncast = build.build_extract_element(
-                    key_vec,
-                    loop_index,
-                    "key"
-                ).unwrap()
-                .into_int_value();
-                let key = build.build_int_cast(
-                    key_uncast,
-                    i64_type,
-                    "key_cast"
-                ).unwrap();
+                let key_vec = build
+                    .build_load(key_vec_type, key_buf, "key_vec")
+                    .unwrap()
+                    .into_vector_value();
+                let key_uncast = build
+                    .build_extract_element(key_vec, loop_index, "key")
+                    .unwrap()
+                    .into_int_value();
+                let key = build
+                    .build_int_cast(key_uncast, i64_type, "key_cast")
+                    .unwrap();
                 let val_iter = arr.llvm_val_iter_ptr(ctx, &build, iter_ptr);
-                let value = build.build_call(
-                    value_access,
-                    &[val_iter.into(), key.into()],
-                    "value"
-                ).unwrap()
-                .try_as_basic_value()
-                .unwrap_left();
+                let value = build
+                    .build_call(value_access, &[val_iter.into(), key.into()], "value")
+                    .unwrap()
+                    .try_as_basic_value()
+                    .unwrap_left();
                 let val_prim_type = PrimitiveType::for_arrow_type(v_dt);
-                let elem_ptr = increment_pointer!(ctx, &build, out_ptr, val_prim_type.width(), loop_index);
+                let elem_ptr =
+                    increment_pointer!(ctx, &build, out_ptr, val_prim_type.width(), loop_index);
                 build.build_store(elem_ptr, value).unwrap();
-                let new_index = build.build_int_add(
-                    loop_index,
-                    loop_counter_type.const_int(1, false),
-                    "new_index"
-                ).unwrap();
+                let new_index = build
+                    .build_int_add(
+                        loop_index,
+                        loop_counter_type.const_int(1, false),
+                        "new_index",
+                    )
+                    .unwrap();
                 build.build_store(loop_counter, new_index).unwrap();
                 build.build_unconditional_branch(loop_cond_block).unwrap();
 
                 build.position_at_end(after_loop_block);
-                build.build_return(Some(&bool_type.const_int(1, false))).unwrap();
-                
+                build
+                    .build_return(Some(&bool_type.const_int(1, false)))
+                    .unwrap();
+
                 return Some(next);
             }
             _ => unreachable!("dict iterator but not dict data type ({:?})", dt),
-        }
+        },
         IteratorHolder::RunEnd { .. } => todo!(),
         IteratorHolder::ScalarPrimitive(s) => {
             assert_eq!(ptype.width(), s.width as usize);
@@ -1251,35 +1271,38 @@ mod tests {
         let data = Int32Array::from(vec![10, 20, 30]);
         let data = arrow_cast::cast(
             &data,
-            &DataType::Dictionary(Box::new(DataType::Int8), Box::new(DataType::Int32))   
+            &DataType::Dictionary(Box::new(DataType::Int8), Box::new(DataType::Int32)),
         )
         .unwrap();
-        
+
         let mut iter = array_to_iter(&data);
         iter.assert_non_null();
 
         let ctx = Context::create();
         let module = ctx.create_module("test_iter");
-        let func = generate_next_block::<8>(&ctx, &module, "dict_iter_block1", data.data_type(), &iter).unwrap();
+        let func =
+            generate_next_block::<8>(&ctx, &module, "dict_iter_block1", data.data_type(), &iter)
+                .unwrap();
         let fname = func.get_name().to_str().unwrap();
 
         module.verify().unwrap();
         let ee = module
             .create_jit_execution_engine(OptimizationLevel::None)
             .unwrap();
-        
+
         let next_block_func = unsafe {
             ee.get_function::<unsafe extern "C" fn(*mut c_void, *mut i32) -> bool>(fname)
-              .unwrap()
+                .unwrap()
         };
 
         let mut out_buf = [0_i32; 8];
 
-        let result = unsafe {
-            next_block_func.call(iter.get_mut_ptr(), out_buf.as_mut_ptr())
-        };
+        let result = unsafe { next_block_func.call(iter.get_mut_ptr(), out_buf.as_mut_ptr()) };
 
-        assert!(!result, "expected false since the dict size is less than the block size");
+        assert!(
+            !result,
+            "expected false since the dict size is less than the block size"
+        );
     }
 
     #[test]
@@ -1287,7 +1310,7 @@ mod tests {
         let data = Int32Array::from(vec![10, 20, 30, 40, 50]);
         let data = arrow_cast::cast(
             &data,
-            &DataType::Dictionary(Box::new(DataType::Int8), Box::new(DataType::Int32))   
+            &DataType::Dictionary(Box::new(DataType::Int8), Box::new(DataType::Int32)),
         )
         .unwrap();
 
@@ -1296,17 +1319,20 @@ mod tests {
 
         let ctx = Context::create();
         let module = ctx.create_module("test_iter");
-        let func = generate_next_block::<2>(&ctx, &module, "dict_iter_block1", data.data_type(), &iter).unwrap();
+        let func =
+            generate_next_block::<16>(&ctx, &module, "dict_iter_block1", data.data_type(), &iter)
+                .unwrap();
         let fname = func.get_name().to_str().unwrap();
 
         module.verify().unwrap();
+        module.print_to_stderr();
         let ee = module
             .create_jit_execution_engine(OptimizationLevel::None)
             .unwrap();
-        
+
         let next_block_func = unsafe {
             ee.get_function::<unsafe extern "C" fn(*mut c_void, *mut i32) -> bool>(fname)
-              .unwrap()
+                .unwrap()
         };
 
         let mut out_buf = [0_i32; 2];
