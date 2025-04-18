@@ -4,10 +4,10 @@ use arrow_array::{
     cast::AsArray,
     types::{
         ArrowDictionaryKeyType, Float16Type, Float32Type, Float64Type, Int16Type, Int32Type,
-        Int64Type, Int8Type, UInt16Type, UInt32Type, UInt64Type, UInt8Type,
+        Int64Type, Int8Type, RunEndIndexType, UInt16Type, UInt32Type, UInt64Type, UInt8Type,
     },
     Array, ArrowPrimitiveType, BooleanArray, Datum, DictionaryArray, GenericStringArray,
-    PrimitiveArray, StringArray,
+    PrimitiveArray, RunArray, StringArray,
 };
 use arrow_schema::DataType;
 use inkwell::{
@@ -481,6 +481,26 @@ pub struct RunEndIterator {
     val_iter: *const c_void,
     pos: u64,
     len: u64,
+}
+
+impl<R: RunEndIndexType + ArrowPrimitiveType> From<&RunArray<R>> for IteratorHolder {
+    fn from(arr: &RunArray<R>) -> Self {
+        let re = arr.run_ends().inner().clone();
+        let re: PrimitiveArray<R> = PrimitiveArray::new(re, None);
+        let run_ends = Box::new(array_to_iter(&re));
+        let values = Box::new(array_to_iter(arr.values()));
+        let iter = RunEndIterator {
+            run_ends: run_ends.get_ptr(),
+            val_iter: values.get_ptr(),
+            pos: 0,
+            len: arr.len() as u64,
+        };
+        IteratorHolder::RunEnd {
+            arr: Box::new(iter),
+            run_ends,
+            values,
+        }
+    }
 }
 
 #[repr(C)]
