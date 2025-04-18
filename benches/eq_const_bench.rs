@@ -1,5 +1,5 @@
-use arrow_array::{types::Int64Type, Array, Datum, Float32Array, Int32Array, Int64Array, RunArray};
-use arrow_compile_compute::{CodeGen, Predicate};
+use arrow_array::{types::Int64Type, Array, Float32Array, Int32Array, Int64Array, RunArray};
+use arrow_compile_compute::{CodeGen, ComparisonKernel, Kernel, Predicate};
 use arrow_schema::DataType;
 use criterion::{criterion_group, criterion_main, Criterion};
 use inkwell::context::Context;
@@ -26,66 +26,40 @@ pub fn criterion_benchmark(c: &mut Criterion) {
     let mut rng = fastrand::Rng::with_seed(42);
 
     c.bench_function("compile", |b| {
-        b.iter(|| {
-            let ctx = Context::create();
-            let cg = CodeGen::new(&ctx);
-            cg.primitive_primitive_cmp(
-                &arrow_schema::DataType::Int32,
-                false,
-                &arrow_schema::DataType::Int32,
-                false,
-                Predicate::Eq,
-            )
-            .unwrap();
-        })
+        let arr = Int32Array::from(vec![1, 2, 3]);
+        b.iter(|| ComparisonKernel::compile(&(&arr, &arr), Predicate::Eq).unwrap())
     });
 
     {
         let data1 = Int32Array::from((0..10_000_000).map(|_| rng.i32(0..1000)).collect_vec());
         let data2 = Int32Array::from((0..10_000_000).map(|_| rng.i32(0..1000)).collect_vec());
-        let ctx = Context::create();
-        let cg = CodeGen::new(&ctx);
-        let f = cg
-            .primitive_primitive_cmp(
-                &arrow_schema::DataType::Int32,
-                false,
-                &arrow_schema::DataType::Int32,
-                false,
-                Predicate::Eq,
-            )
-            .unwrap();
+        let k = ComparisonKernel::compile(&(&data1, &data2), Predicate::Eq).unwrap();
 
         let arrow_answer = arrow_ord::cmp::eq(&data1, &data2).unwrap();
-        let llvm_answer = f.call(&data1, &data2).unwrap();
+        let llvm_answer = k.call((&data1, &data2)).unwrap();
         assert_eq!(arrow_answer, llvm_answer);
 
-        c.bench_function("i32/execute arrow", |b| {
+        c.bench_function("cmpi32/execute arrow", |b| {
             b.iter(|| arrow_ord::cmp::eq(&data1, &data2).unwrap())
         });
-        c.bench_function("i32/execute llvm", |b| {
-            b.iter(|| f.call(&data1, &data2));
+        c.bench_function("cmpi32/execute llvm", |b| {
+            b.iter(|| k.call((&data1, &data2)).unwrap());
         });
     }
 
     {
         let data1 = Int32Array::from((0..10_000_000).map(|_| rng.i32(0..1000)).collect_vec());
         let data2 = Int64Array::from((0..10_000_000).map(|_| rng.i64(0..1000)).collect_vec());
-        let ctx = Context::create();
-        let cg = CodeGen::new(&ctx);
-        let f = cg
-            .primitive_primitive_cmp(
-                &arrow_schema::DataType::Int32,
-                false,
-                &arrow_schema::DataType::Int64,
-                false,
-                Predicate::Eq,
-            )
-            .unwrap();
+
+        let comp_kernel = ComparisonKernel::compile(&(&data1, &data2), Predicate::Eq).unwrap();
+        let llvm_answer_kernel = comp_kernel.call((&data1, &data2)).unwrap();
         let arrow_answer =
             arrow_ord::cmp::eq(&arrow_cast::cast(&data1, &DataType::Int64).unwrap(), &data2)
                 .unwrap();
-        let llvm_answer = f.call(&data1, &data2).unwrap();
-        assert_eq!(arrow_answer, llvm_answer);
+        assert_eq!(arrow_answer, llvm_answer_kernel);
+        c.bench_function("cast_eq/execute llvm", |b| {
+            b.iter(|| comp_kernel.call((&data1, &data2)).unwrap())
+        });
 
         c.bench_function("cast_eq/execute arrow", |b| {
             b.iter(|| {
@@ -93,36 +67,46 @@ pub fn criterion_benchmark(c: &mut Criterion) {
                     .unwrap()
             })
         });
-        c.bench_function("cast_eq/execute llvm", |b| {
-            b.iter(|| f.call(&data1, &data2));
+    }
+
+    {
+        let data1 = Int32Array::from((0..10_000_000).map(|_| rng.i32(0..100)).collect_vec());
+        let data2 = Int32Array::from((0..10_000_000).map(|_| rng.i32(0..100)).collect_vec());
+        let dict_type = DataType::Dictionary(Box::new(DataType::Int8), Box::new(DataType::Int32));
+
+        let data1 = arrow_cast::cast(&data1, &dict_type).unwrap();
+        let data2 = arrow_cast::cast(&data2, &dict_type).unwrap();
+
+        let k = ComparisonKernel::compile(&(&data1, &data2), Predicate::Eq).unwrap();
+        let llvm_answer = k.call((&data1, &data2)).unwrap();
+        let arrow_answer = arrow_ord::cmp::eq(&data1, &data2).unwrap();
+        assert_eq!(llvm_answer, arrow_answer);
+
+        c.bench_function("dict_i32/execute arrow", |b| {
+            b.iter(|| arrow_ord::cmp::eq(&data1, &data2).unwrap())
+        });
+        c.bench_function("dict_i32/execute llvm", |b| {
+            b.iter(|| k.call((&data1, &data2)).unwrap());
         });
     }
 
     {
         let data1 = Int32Array::from((0..10_000_000).map(|_| rng.i32(0..100)).collect_vec());
-        let data2 = Int64Array::from((0..10_000_000).map(|_| rng.i64(0..100)).collect_vec());
-        let dict_type = DataType::Dictionary(Box::new(DataType::Int8), Box::new(DataType::Int64));
+        let data2 = Int32Array::from((0..10_000_000).map(|_| rng.i32(0..100)).collect_vec());
+        let dict_type = DataType::Dictionary(Box::new(DataType::Int8), Box::new(DataType::Int32));
 
         let data1 = arrow_cast::cast(&data1, &dict_type).unwrap();
-        let data2 = arrow_cast::cast(&data2, &dict_type).unwrap();
 
-        let ctx = Context::create();
-        let cg = CodeGen::new(&ctx);
-        let f = cg
-            .primitive_primitive_cmp(&dict_type, false, &dict_type, false, Predicate::Eq)
-            .unwrap();
+        let k = ComparisonKernel::compile(&(&data1, &data2), Predicate::Eq).unwrap();
+        let llvm_answer = k.call((&data1, &data2)).unwrap();
         let arrow_answer = arrow_ord::cmp::eq(&data1, &data2).unwrap();
-        let llvm_answer = f.call(&data1, &data2).unwrap();
-        assert_eq!(arrow_answer, llvm_answer);
+        assert_eq!(llvm_answer, arrow_answer);
 
-        c.bench_function("dict_i64/execute arrow", |b| {
-            b.iter(|| {
-                arrow_ord::cmp::eq(&arrow_cast::cast(&data1, &DataType::Int64).unwrap(), &data2)
-                    .unwrap()
-            })
+        c.bench_function("dict_prim_i32/execute arrow", |b| {
+            b.iter(|| arrow_ord::cmp::eq(&data1, &data2).unwrap())
         });
-        c.bench_function("dict_i64/execute llvm", |b| {
-            b.iter(|| f.call(&data1, &data2));
+        c.bench_function("dict_prim_i32/execute llvm", |b| {
+            b.iter(|| k.call((&data1, &data2)).unwrap());
         });
     }
 
@@ -153,23 +137,13 @@ pub fn criterion_benchmark(c: &mut Criterion) {
     }
 
     {
-        let data1 = Int32Array::from((0..1048576).map(|_| rng.i32(0..1000)).collect_vec());
+        let data1 = Int32Array::from((0..10_000_000).map(|_| rng.i32(0..1000)).collect_vec());
         let data2 = Int32Array::new_scalar(50);
-        let data2_u64 = Int64Array::new_scalar(50);
-        let ctx = Context::create();
-        let cg = CodeGen::new(&ctx);
-        let f = cg
-            .primitive_primitive_cmp(
-                &arrow_schema::DataType::Int32,
-                false,
-                &arrow_schema::DataType::Int64,
-                true,
-                Predicate::Gte,
-            )
-            .unwrap();
+
+        let k = ComparisonKernel::compile(&(&data1, &data2), Predicate::Gte).unwrap();
 
         let arrow_answer = arrow_ord::cmp::gt_eq(&data1, &data2).unwrap();
-        let llvm_answer = f.call(&data1, data2_u64.get().0).unwrap();
+        let llvm_answer = k.call((&data1, &data2)).unwrap();
         assert_eq!(arrow_answer, llvm_answer);
 
         c.bench_function("i32scalar/execute arrow", |b| {
@@ -177,34 +151,23 @@ pub fn criterion_benchmark(c: &mut Criterion) {
         });
 
         c.bench_function("i32scalar/execute llvm", |b| {
-            b.iter(|| arrow_compile_compute::cmp::gt_eq(&data1, &data2_u64).unwrap());
+            b.iter(|| k.call((&data1, &data2)).unwrap())
         });
     }
 
     {
         let data1 = Float32Array::from((0..10_000_000).map(|_| rng.f32()).collect_vec());
         let data2 = Float32Array::from((0..10_000_000).map(|_| rng.f32()).collect_vec());
-        let ctx = Context::create();
-        let cg = CodeGen::new(&ctx);
-        let f = cg
-            .primitive_primitive_cmp(
-                &arrow_schema::DataType::Float32,
-                false,
-                &arrow_schema::DataType::Float32,
-                false,
-                Predicate::Lt,
-            )
-            .unwrap();
-
+        let k = ComparisonKernel::compile(&(&data1, &data2), Predicate::Lt).unwrap();
         let arrow_answer = arrow_ord::cmp::lt(&data1, &data2).unwrap();
-        let llvm_answer = f.call(&data1, &data2).unwrap();
+        let llvm_answer = k.call((&data1, &data2)).unwrap();
         assert_eq!(arrow_answer, llvm_answer);
 
-        c.bench_function("f32/execute arrow", |b| {
-            b.iter(|| arrow_ord::cmp::eq(&data1, &data2).unwrap())
+        c.bench_function("f32_lt/execute arrow", |b| {
+            b.iter(|| arrow_ord::cmp::lt(&data1, &data2).unwrap())
         });
-        c.bench_function("f32/execute llvm", |b| {
-            b.iter(|| f.call(&data1, &data2));
+        c.bench_function("f32_lt/execute llvm", |b| {
+            b.iter(|| k.call((&data1, &data2)).unwrap())
         });
     }
 }

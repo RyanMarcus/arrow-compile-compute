@@ -62,6 +62,7 @@ pub use new_arrow_interface::cmp;
 
 pub use new_kernels::ArrowKernelError;
 pub use new_kernels::ComparisonKernel;
+pub use new_kernels::Kernel;
 
 /// Declare a set of basic blocks at once
 macro_rules! declare_blocks {

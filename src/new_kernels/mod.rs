@@ -4,6 +4,12 @@ use std::{collections::HashMap, sync::RwLock};
 
 use arrow_schema::DataType;
 pub use cmp::ComparisonKernel;
+use inkwell::{
+    module::Module,
+    passes::PassBuilderOptions,
+    targets::{CodeModel, RelocMode, Target, TargetMachine},
+    OptimizationLevel,
+};
 
 #[derive(Debug)]
 pub enum ArrowKernelError {
@@ -11,6 +17,7 @@ pub enum ArrowKernelError {
     ArgumentMismatch(String),
     UnsupportedArguments(String),
     UnsupportedScalar(DataType),
+    LLVMError(String),
 }
 
 pub trait Kernel: Sized {
@@ -64,6 +71,28 @@ impl<K: Kernel> KernelCache<K> {
         map.insert(key, kernel);
         result
     }
+}
+
+fn optimize_module(module: &Module) -> Result<(), ArrowKernelError> {
+    Target::initialize_native(&inkwell::targets::InitializationConfig::default()).unwrap();
+    let triple = TargetMachine::get_default_triple();
+    let cpu = TargetMachine::get_host_cpu_name().to_string();
+    let features = TargetMachine::get_host_cpu_features().to_string();
+    let target = Target::from_triple(&triple).unwrap();
+    let machine = target
+        .create_target_machine(
+            &triple,
+            &cpu,
+            &features,
+            OptimizationLevel::Aggressive,
+            RelocMode::Default,
+            CodeModel::Default,
+        )
+        .unwrap();
+
+    module
+        .run_passes("default<O3>", &machine, PassBuilderOptions::create())
+        .map_err(|e| ArrowKernelError::LLVMError(e.to_string()))
 }
 
 #[cfg(test)]

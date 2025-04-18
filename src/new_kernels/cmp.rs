@@ -1,15 +1,17 @@
 use arrow_array::{BooleanArray, Datum};
 use arrow_buffer::{BooleanBuffer, NullBuffer};
 use arrow_schema::DataType;
+use inkwell::builder::Builder;
 use inkwell::execution_engine::JitFunction;
 use inkwell::module::{Linkage, Module};
-use inkwell::values::FunctionValue;
+use inkwell::values::{FunctionValue, VectorValue};
 use inkwell::OptimizationLevel;
 use inkwell::{context::Context, AddressSpace};
 use ouroboros::self_referencing;
 use std::ffi::c_void;
 
 use crate::new_iter::{datum_to_iter, generate_next, generate_next_block, IteratorHolder};
+use crate::new_kernels::optimize_module;
 use crate::{declare_blocks, increment_pointer, ComparisonType, Predicate, PrimitiveType};
 
 use super::{ArrowKernelError, Kernel};
@@ -106,7 +108,7 @@ impl Kernel for ComparisonKernel {
         let lhs_iter = datum_to_iter(lhs)?;
         let rhs_iter = datum_to_iter(rhs)?;
         let ctx = Context::create();
-        Ok(ComparisonKernelBuilder {
+        Ok(ComparisonKernelTryBuilder {
             context: ctx,
             lhs_data_type: lhs_arr.data_type().clone(),
             rhs_data_type: rhs_arr.data_type().clone(),
@@ -114,7 +116,7 @@ impl Kernel for ComparisonKernel {
             pred,
             func_builder: |ctx| generate_llvm_cmp_kernel(ctx, lhs, &lhs_iter, rhs, &rhs_iter, pred),
         }
-        .build())
+        .try_build())?
     }
 
     fn get_key_for_input<'a>(
@@ -140,6 +142,65 @@ impl Kernel for ComparisonKernel {
     }
 }
 
+fn gen_convert_vec<'ctx>(
+    ctx: &'ctx Context,
+    builder: &Builder<'ctx>,
+    v: VectorValue<'ctx>,
+    src: PrimitiveType,
+    dst: PrimitiveType,
+) -> VectorValue<'ctx> {
+    if src == dst {
+        return v;
+    }
+
+    let dst_llvm = dst.llvm_vec_type(ctx, v.get_type().get_size()).unwrap();
+
+    match (src.is_int(), dst.is_int()) {
+        // int to int
+        (true, true) => {
+            if src.width() > dst.width() {
+                builder.build_int_truncate(v, dst_llvm, "trunc").unwrap()
+            } else if src.is_signed() {
+                builder.build_int_s_extend(v, dst_llvm, "sext").unwrap()
+            } else {
+                builder.build_int_z_extend(v, dst_llvm, "zext").unwrap()
+            }
+        }
+        // int to float
+        (true, false) => {
+            if src.is_signed() {
+                builder
+                    .build_signed_int_to_float(v, dst_llvm, "sitf")
+                    .unwrap()
+            } else {
+                builder
+                    .build_signed_int_to_float(v, dst_llvm, "uitf")
+                    .unwrap()
+            }
+        }
+        // float to int
+        (false, true) => {
+            if dst.is_signed() {
+                builder
+                    .build_float_to_signed_int(v, dst_llvm, "ftsi")
+                    .unwrap()
+            } else {
+                builder
+                    .build_float_to_unsigned_int(v, dst_llvm, "ftui")
+                    .unwrap()
+            }
+        }
+        // float to float
+        (false, false) => {
+            if src.width() > dst.width() {
+                builder.build_float_trunc(v, dst_llvm, "ftrun").unwrap()
+            } else {
+                builder.build_float_ext(v, dst_llvm, "fext").unwrap()
+            }
+        }
+    }
+}
+
 fn generate_llvm_cmp_kernel<'a>(
     ctx: &'a Context,
     lhs: &dyn Datum,
@@ -147,7 +208,10 @@ fn generate_llvm_cmp_kernel<'a>(
     rhs: &dyn Datum,
     rhs_iter: &IteratorHolder,
     pred: Predicate,
-) -> JitFunction<'a, unsafe extern "C" fn(*mut c_void, *mut c_void, *mut u64)> {
+) -> Result<
+    JitFunction<'a, unsafe extern "C" fn(*mut c_void, *mut c_void, *mut u64)>,
+    ArrowKernelError,
+> {
     let (lhs_arr, _lhs_scalar) = lhs.get();
     let (rhs_arr, _rhs_scalar) = rhs.get();
     let lhs_dt = lhs_arr.data_type();
@@ -165,6 +229,7 @@ fn generate_llvm_cmp_kernel<'a>(
     let lhs_llvm = lhs_prim.llvm_type(&ctx);
     let rhs_llvm = rhs_prim.llvm_type(&ctx);
     let dom_prim_type = PrimitiveType::dominant(lhs_prim, rhs_prim).unwrap();
+    let dom_llvm = dom_prim_type.llvm_type(&ctx);
 
     let lhs_next_block =
         generate_next_block::<64>(&ctx, &module, "next_lhs_block", lhs_dt, lhs_iter).unwrap();
@@ -231,6 +296,9 @@ fn generate_llvm_cmp_kernel<'a>(
         .unwrap()
         .into_vector_value();
 
+    let lvec = gen_convert_vec(ctx, &build, lvec, lhs_prim, dom_prim_type);
+    let rvec = gen_convert_vec(ctx, &build, rvec, rhs_prim, dom_prim_type);
+
     let res = match dom_prim_type.comparison_type() {
         ComparisonType::Int { signed } => build
             .build_int_compare(pred.as_int_pred(signed), lvec, rvec, "block_cmp_result")
@@ -291,6 +359,19 @@ fn generate_llvm_cmp_kernel<'a>(
     build.position_at_end(tail_body);
     let lv = build.build_load(lhs_llvm, lhs_single_buf, "lv").unwrap();
     let rv = build.build_load(rhs_llvm, rhs_single_buf, "rv").unwrap();
+
+    let lv_v = build
+        .build_bit_cast(lv, lhs_prim.llvm_vec_type(ctx, 1).unwrap(), "lv_v")
+        .unwrap()
+        .into_vector_value();
+    let rv_v = build
+        .build_bit_cast(rv, rhs_prim.llvm_vec_type(ctx, 1).unwrap(), "rv_v")
+        .unwrap()
+        .into_vector_value();
+    let lv_v = gen_convert_vec(ctx, &build, lv_v, lhs_prim, dom_prim_type);
+    let rv_v = gen_convert_vec(ctx, &build, rv_v, rhs_prim, dom_prim_type);
+    let lv = build.build_bit_cast(lv_v, dom_llvm, "lv").unwrap();
+    let rv = build.build_bit_cast(rv_v, dom_llvm, "rv").unwrap();
 
     let res = match dom_prim_type.comparison_type() {
         ComparisonType::Int { signed } => build
@@ -365,16 +446,17 @@ fn generate_llvm_cmp_kernel<'a>(
     build.build_return(None).unwrap();
 
     module.verify().unwrap();
+    optimize_module(&module)?;
     let ee = module
         .create_jit_execution_engine(OptimizationLevel::Aggressive)
         .unwrap();
 
-    unsafe {
+    Ok(unsafe {
         ee.get_function::<unsafe extern "C" fn(*mut c_void, *mut c_void, *mut u64)>(
             cmp.get_name().to_str().unwrap(),
         )
         .unwrap()
-    }
+    })
 }
 
 fn add_float_vec_to_int_vec<'a>(
@@ -493,7 +575,7 @@ fn add_float_to_int<'a>(
 mod tests {
     use std::cmp::Ordering;
 
-    use arrow_array::{BooleanArray, Float32Array, Scalar, UInt32Array};
+    use arrow_array::{BooleanArray, Float32Array, Int32Array, Int64Array, Scalar, UInt32Array};
     use itertools::Itertools;
 
     use crate::{
@@ -559,5 +641,16 @@ mod tests {
 
         let res = (-93294.49_f32).total_cmp(&-205150180000.0) == Ordering::Less;
         assert_eq!(r, BooleanArray::from(vec![res]));
+    }
+
+    #[test]
+    fn test_int32_int64_cmp() {
+        let a = Int32Array::from(vec![1, 2, 3, 4]);
+        let b = Int64Array::from(vec![4, 3, 2, 1]);
+        let k = ComparisonKernel::compile(&(&a, &b), Predicate::Lt).unwrap();
+        let r = k.call((&a, &b)).unwrap();
+
+        let expected_result = vec![true, true, false, false];
+        assert_eq!(r, BooleanArray::from(expected_result));
     }
 }
