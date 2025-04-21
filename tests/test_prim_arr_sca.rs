@@ -64,4 +64,15 @@ proptest! {
         let arrow_res = arrow_ord::cmp::eq(&arr1, &arr2).unwrap();
         assert_eq!(our_res, arrow_res);
     }
+
+    #[test]
+    fn test_dictstr_str_eq(arr: Vec<String>, sca: String) {
+        let arr1 = StringArray::from(arr);
+        let arr1 = arrow_cast::cast(&arr1, &dictionary_data_type(DataType::Int64, DataType::Utf8)).unwrap();
+        let arr2 = StringArray::new_scalar(sca);
+
+        let our_res = arrow_compile_compute::cmp::eq(&arr1, &arr2).unwrap();
+        let arrow_res = arrow_ord::cmp::eq(&arr1, &arr2).unwrap();
+        assert_eq!(our_res, arrow_res);
+    }
 }

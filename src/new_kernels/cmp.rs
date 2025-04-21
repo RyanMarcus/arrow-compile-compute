@@ -935,9 +935,11 @@ mod tests {
     use arrow_array::{
         BooleanArray, Float32Array, Int32Array, Int64Array, Scalar, StringArray, UInt32Array,
     };
+    use arrow_schema::DataType;
     use itertools::Itertools;
 
     use crate::{
+        dictionary_data_type,
         new_kernels::{cmp::ComparisonKernel, Kernel},
         Predicate,
     };
@@ -1045,6 +1047,22 @@ mod tests {
         let r = k.call((&a, &b)).unwrap();
 
         let expected_result = (0..64).map(|i| i == 50).collect_vec();
+        assert_eq!(r, BooleanArray::from(expected_result));
+    }
+
+    #[test]
+    fn test_dict_string_scalar_cmp() {
+        let values = (0..100).map(|i| format!("value{}", i % 4)).collect_vec();
+        let a = StringArray::from(values);
+        let a =
+            arrow_cast::cast(&a, &dictionary_data_type(DataType::Int8, DataType::Utf8)).unwrap();
+
+        let b = Scalar::new(StringArray::from(vec!["value2"]));
+
+        let k = ComparisonKernel::compile(&(&a, &b), Predicate::Eq).unwrap();
+        let r = k.call((&a, &b)).unwrap();
+
+        let expected_result = (0..100).map(|i| i % 4 == 2).collect_vec();
         assert_eq!(r, BooleanArray::from(expected_result));
     }
 }
