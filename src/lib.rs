@@ -76,6 +76,19 @@ macro_rules! declare_blocks {
 }
 pub(crate) use declare_blocks;
 
+macro_rules! pointer_diff {
+    ($ctx: expr, $builder: expr, $ptr1: expr, $ptr2: expr) => {{
+        let as_int1 = $builder
+            .build_ptr_to_int($ptr1, $ctx.i64_type(), "as_int1")
+            .unwrap();
+        let as_int2 = $builder
+            .build_ptr_to_int($ptr2, $ctx.i64_type(), "as_int2")
+            .unwrap();
+        $builder.build_int_sub(as_int2, as_int1, "diff").unwrap()
+    }};
+}
+pub(crate) use pointer_diff;
+
 /// Increments a pointer by a fixed number of bytes or with a stride
 macro_rules! increment_pointer {
     ($ctx: expr, $builder: expr, $ptr: expr, $offset: expr) => {

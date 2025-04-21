@@ -3,16 +3,19 @@ use arrow_buffer::{BooleanBuffer, NullBuffer};
 use arrow_schema::DataType;
 use inkwell::builder::Builder;
 use inkwell::execution_engine::JitFunction;
+use inkwell::intrinsics::Intrinsic;
 use inkwell::module::{Linkage, Module};
 use inkwell::values::{FunctionValue, VectorValue};
-use inkwell::OptimizationLevel;
 use inkwell::{context::Context, AddressSpace};
+use inkwell::{IntPredicate, OptimizationLevel};
 use ouroboros::self_referencing;
 use std::ffi::c_void;
 
 use crate::new_iter::{datum_to_iter, generate_next, generate_next_block, IteratorHolder};
 use crate::new_kernels::optimize_module;
-use crate::{declare_blocks, increment_pointer, ComparisonType, Predicate, PrimitiveType};
+use crate::{
+    declare_blocks, increment_pointer, pointer_diff, ComparisonType, Predicate, PrimitiveType,
+};
 
 use super::{ArrowKernelError, Kernel};
 
@@ -49,6 +52,10 @@ impl Kernel for ComparisonKernel {
 
         if !b_scalar && (a_arr.len() != b_arr.len()) {
             return Err(ArrowKernelError::SizeMismatch);
+        }
+
+        if a_arr.len() == 0 {
+            return Ok(BooleanArray::new_null(0));
         }
 
         if !self.with_rhs_scalar(|rhs_scalar| b_scalar == *rhs_scalar) {
@@ -108,15 +115,23 @@ impl Kernel for ComparisonKernel {
         let lhs_iter = datum_to_iter(lhs)?;
         let rhs_iter = datum_to_iter(rhs)?;
         let ctx = Context::create();
-        Ok(ComparisonKernelTryBuilder {
+        ComparisonKernelTryBuilder {
             context: ctx,
             lhs_data_type: lhs_arr.data_type().clone(),
             rhs_data_type: rhs_arr.data_type().clone(),
             rhs_scalar,
             pred,
-            func_builder: |ctx| generate_llvm_cmp_kernel(ctx, lhs, &lhs_iter, rhs, &rhs_iter, pred),
+            func_builder: |ctx| match generate_block_llvm_cmp_kernel(
+                ctx, lhs, &lhs_iter, rhs, &rhs_iter, pred,
+            ) {
+                Ok(k) => Ok(k),
+                Err(ArrowKernelError::NonVectorizableType(_)) => {
+                    generate_llvm_cmp_kernel(ctx, lhs, &lhs_iter, rhs, &rhs_iter, pred)
+                }
+                Err(e) => Err(e),
+            },
         }
-        .try_build())?
+        .try_build()
     }
 
     fn get_key_for_input(
@@ -224,8 +239,200 @@ fn generate_llvm_cmp_kernel<'a>(
     let void_type = ctx.void_type();
     let lhs_prim = PrimitiveType::for_arrow_type(lhs_dt);
     let rhs_prim = PrimitiveType::for_arrow_type(rhs_dt);
-    let lhs_vec = lhs_prim.llvm_vec_type(ctx, 64).unwrap();
-    let rhs_vec = rhs_prim.llvm_vec_type(ctx, 64).unwrap();
+
+    if lhs_prim != rhs_prim {
+        return Err(ArrowKernelError::ArgumentMismatch(format!(
+            "nonblock cmp cannot do type conversion, saw {:?} and {:?}",
+            lhs_dt, rhs_dt
+        )));
+    }
+
+    let lhs_llvm = lhs_prim.llvm_type(ctx);
+    let rhs_llvm = rhs_prim.llvm_type(ctx);
+
+    let lhs_next = generate_next(ctx, &module, "next_lhs", lhs_dt, lhs_iter).unwrap();
+    let rhs_next = generate_next(ctx, &module, "next_rhs", rhs_dt, rhs_iter).unwrap();
+
+    let fn_type = void_type.fn_type(&[ptr_type.into(), ptr_type.into(), ptr_type.into()], false);
+    let cmp = module.add_function("cmp", fn_type, None);
+    let lhs_ptr = cmp.get_nth_param(0).unwrap();
+    let rhs_ptr = cmp.get_nth_param(1).unwrap();
+    let out_ptr = cmp.get_nth_param(2).unwrap();
+
+    declare_blocks!(
+        ctx,
+        cmp,
+        entry,
+        block_cond,
+        check_buf_full,
+        flush_buffer,
+        block_body,
+        exit
+    );
+
+    build.position_at_end(entry);
+    let out_ptr_ptr = build.build_alloca(ptr_type, "out_ptr_ptr").unwrap();
+    build.build_store(out_ptr_ptr, out_ptr).unwrap();
+
+    let lhs_buf = build.build_alloca(lhs_llvm, "lhs_single_buf").unwrap();
+    let rhs_buf = build.build_alloca(rhs_llvm, "rhs_single_buf").unwrap();
+    let out_buf_ptr = build.build_alloca(i64_type, "out_buf_ptr").unwrap();
+    build
+        .build_store(out_buf_ptr, i64_type.const_zero())
+        .unwrap();
+    let out_buf_idx_ptr = build.build_alloca(i64_type, "tail_buf_idx").unwrap();
+    build
+        .build_store(out_buf_idx_ptr, i64_type.const_zero())
+        .unwrap();
+    build.build_unconditional_branch(block_cond).unwrap();
+
+    build.position_at_end(block_cond);
+    let had_lhs = build
+        .build_call(lhs_next, &[lhs_ptr.into(), lhs_buf.into()], "lhs_next")
+        .unwrap()
+        .try_as_basic_value()
+        .unwrap_left()
+        .into_int_value();
+    build
+        .build_call(rhs_next, &[rhs_ptr.into(), rhs_buf.into()], "rhs_next")
+        .unwrap();
+    build
+        .build_conditional_branch(had_lhs, check_buf_full, exit)
+        .unwrap();
+
+    build.position_at_end(check_buf_full);
+    let buf_pos = build
+        .build_load(i64_type, out_buf_idx_ptr, "out_idx")
+        .unwrap()
+        .into_int_value();
+    let buf_full = build
+        .build_int_compare(
+            IntPredicate::ULT,
+            buf_pos,
+            i64_type.const_int(64, false),
+            "buf_full",
+        )
+        .unwrap();
+    build
+        .build_conditional_branch(buf_full, block_body, flush_buffer)
+        .unwrap();
+
+    build.position_at_end(flush_buffer);
+    let out_ptr = build
+        .build_load(ptr_type, out_ptr_ptr, "out_ptr")
+        .unwrap()
+        .into_pointer_value();
+    let curr_buf = build.build_load(i64_type, out_buf_ptr, "curr_buf").unwrap();
+    build.build_store(out_ptr, curr_buf).unwrap();
+    let next_out_ptr = increment_pointer!(ctx, build, out_ptr, 8);
+    build.build_store(out_ptr_ptr, next_out_ptr).unwrap();
+    build
+        .build_store(out_buf_ptr, i64_type.const_zero())
+        .unwrap();
+    build
+        .build_store(out_buf_idx_ptr, i64_type.const_zero())
+        .unwrap();
+    build.build_unconditional_branch(block_body).unwrap();
+
+    build.position_at_end(block_body);
+    let lv = build.build_load(lhs_llvm, lhs_buf, "lv").unwrap();
+    let rv = build.build_load(rhs_llvm, rhs_buf, "rv").unwrap();
+
+    let res = match lhs_prim.comparison_type() {
+        ComparisonType::Int { .. } => unreachable!("ints should use block compare"),
+        ComparisonType::Float => unreachable!("floats should use block compare"),
+        ComparisonType::String => {
+            let memcmp = add_memcmp(ctx, &module);
+            let res = build
+                .build_call(memcmp, &[lv.into(), rv.into()], "res")
+                .unwrap()
+                .try_as_basic_value()
+                .unwrap_left()
+                .into_int_value();
+            build
+                .build_int_compare(
+                    pred.as_int_pred(true),
+                    res,
+                    i64_type.const_zero(),
+                    "cmp_res",
+                )
+                .unwrap()
+        }
+    };
+
+    let res = build
+        .build_int_z_extend_or_bit_cast(res, i64_type, "casted_cmp")
+        .unwrap();
+
+    let buf_idx = build
+        .build_load(i64_type, out_buf_idx_ptr, "buf_idx")
+        .unwrap()
+        .into_int_value();
+    let res = build.build_left_shift(res, buf_idx, "shifted").unwrap();
+    let curr_buf = build
+        .build_load(i64_type, out_buf_ptr, "curr_buf")
+        .unwrap()
+        .into_int_value();
+    let new_buf = build.build_or(res, curr_buf, "new_buf").unwrap();
+    build.build_store(out_buf_ptr, new_buf).unwrap();
+    let new_buf_idx = build
+        .build_int_add(buf_idx, i64_type.const_int(1, false), "new_tail_buf_idx")
+        .unwrap();
+    build.build_store(out_buf_idx_ptr, new_buf_idx).unwrap();
+    build.build_unconditional_branch(block_cond).unwrap();
+
+    build.position_at_end(exit);
+    let out_ptr = build
+        .build_load(ptr_type, out_ptr_ptr, "out_ptr")
+        .unwrap()
+        .into_pointer_value();
+    let curr_buf = build.build_load(i64_type, out_buf_ptr, "curr_buf").unwrap();
+    build.build_store(out_ptr, curr_buf).unwrap();
+    build.build_return(None).unwrap();
+
+    module.verify().unwrap();
+    //optimize_module(&module)?;
+    let ee = module
+        .create_jit_execution_engine(OptimizationLevel::None)
+        .unwrap();
+
+    Ok(unsafe {
+        ee.get_function::<unsafe extern "C" fn(*mut c_void, *mut c_void, *mut u64)>(
+            cmp.get_name().to_str().unwrap(),
+        )
+        .unwrap()
+    })
+}
+
+fn generate_block_llvm_cmp_kernel<'a>(
+    ctx: &'a Context,
+    lhs: &dyn Datum,
+    lhs_iter: &IteratorHolder,
+    rhs: &dyn Datum,
+    rhs_iter: &IteratorHolder,
+    pred: Predicate,
+) -> Result<
+    JitFunction<'a, unsafe extern "C" fn(*mut c_void, *mut c_void, *mut u64)>,
+    ArrowKernelError,
+> {
+    let (lhs_arr, _lhs_scalar) = lhs.get();
+    let (rhs_arr, _rhs_scalar) = rhs.get();
+    let lhs_dt = lhs_arr.data_type();
+    let rhs_dt = rhs_arr.data_type();
+
+    let module = ctx.create_module("cmp_kernel");
+    let build = ctx.create_builder();
+    let i64_type = ctx.i64_type();
+    let ptr_type = ctx.ptr_type(AddressSpace::default());
+    let void_type = ctx.void_type();
+    let lhs_prim = PrimitiveType::for_arrow_type(lhs_dt);
+    let rhs_prim = PrimitiveType::for_arrow_type(rhs_dt);
+    let lhs_vec = lhs_prim
+        .llvm_vec_type(ctx, 64)
+        .ok_or_else(|| ArrowKernelError::NonVectorizableType(lhs_dt.clone()))?;
+    let rhs_vec = rhs_prim
+        .llvm_vec_type(ctx, 64)
+        .ok_or_else(|| ArrowKernelError::NonVectorizableType(rhs_dt.clone()))?;
     let lhs_llvm = lhs_prim.llvm_type(ctx);
     let rhs_llvm = rhs_prim.llvm_type(ctx);
     let dom_prim_type = PrimitiveType::dominant(lhs_prim, rhs_prim).unwrap();
@@ -571,11 +778,163 @@ fn add_float_to_int<'a>(
     func
 }
 
+fn add_memcmp<'a>(ctx: &'a Context, module: &Module<'a>) -> FunctionValue<'a> {
+    let i64_type = ctx.i64_type();
+    let i8_type = ctx.i8_type();
+    let str_type = PrimitiveType::P64x2.llvm_type(ctx);
+
+    let fn_type = i64_type.fn_type(
+        &[
+            str_type.into(), // first string
+            str_type.into(), // second string
+        ],
+        false,
+    );
+
+    let umin = Intrinsic::find("llvm.umin").unwrap();
+    let umin_f = umin.get_declaration(module, &[i64_type.into()]).unwrap();
+
+    let builder = ctx.create_builder();
+    let function = module.add_function("memcmp", fn_type, None);
+
+    declare_blocks!(
+        ctx,
+        function,
+        entry,
+        for_cond,
+        for_body,
+        early_return,
+        no_diff
+    );
+
+    builder.position_at_end(entry);
+    let ptr1 = function.get_nth_param(0).unwrap().into_struct_value();
+    let ptr2 = function.get_nth_param(1).unwrap().into_struct_value();
+
+    let start_ptr1 = builder
+        .build_extract_value(ptr1, 0, "start_ptr1")
+        .unwrap()
+        .into_pointer_value();
+    let end_ptr1 = builder
+        .build_extract_value(ptr1, 1, "end_ptr1")
+        .unwrap()
+        .into_pointer_value();
+    let start_ptr2 = builder
+        .build_extract_value(ptr2, 0, "start_ptr2")
+        .unwrap()
+        .into_pointer_value();
+    let end_ptr2 = builder
+        .build_extract_value(ptr2, 1, "end_ptr2")
+        .unwrap()
+        .into_pointer_value();
+
+    let len1 = pointer_diff!(ctx, builder, start_ptr1, end_ptr1);
+    let len2 = pointer_diff!(ctx, builder, start_ptr2, end_ptr2);
+
+    let len = builder
+        .build_call(umin_f, &[len1.into(), len2.into()], "len")
+        .unwrap()
+        .try_as_basic_value()
+        .unwrap_left()
+        .into_int_value();
+
+    let index_ptr = builder.build_alloca(i64_type, "index_ptr").unwrap();
+    builder
+        .build_store(index_ptr, i64_type.const_zero())
+        .unwrap();
+
+    builder.build_unconditional_branch(for_cond).unwrap();
+
+    builder.position_at_end(for_cond);
+    let index = builder
+        .build_load(i64_type, index_ptr, "index")
+        .unwrap()
+        .into_int_value();
+    let cmp = builder
+        .build_int_compare(IntPredicate::ULT, index, len, "loop_cmp")
+        .unwrap();
+    builder
+        .build_conditional_branch(cmp, for_body, no_diff)
+        .unwrap();
+
+    builder.position_at_end(for_body);
+    let index = builder
+        .build_load(i64_type, index_ptr, "index")
+        .unwrap()
+        .into_int_value();
+    let elem1_ptr = increment_pointer!(ctx, builder, start_ptr1, 1, index);
+    let elem2_ptr = increment_pointer!(ctx, builder, start_ptr2, 1, index);
+    let elem1 = builder
+        .build_load(i8_type, elem1_ptr, "elem1")
+        .unwrap()
+        .into_int_value();
+    let elem2 = builder
+        .build_load(i8_type, elem2_ptr, "elem2")
+        .unwrap()
+        .into_int_value();
+
+    let elem1 = builder
+        .build_int_z_extend_or_bit_cast(elem1, i64_type, "z_elem1")
+        .unwrap();
+    let elem2 = builder
+        .build_int_z_extend_or_bit_cast(elem2, i64_type, "z_elem2")
+        .unwrap();
+
+    let diff = builder.build_int_sub(elem1, elem2, "sub").unwrap();
+
+    let value_cmp = builder
+        .build_int_compare(IntPredicate::EQ, diff, i64_type.const_zero(), "value_cmp")
+        .unwrap();
+
+    let inc_index = builder
+        .build_int_add(index, i64_type.const_int(1, false), "inc_index")
+        .unwrap();
+    builder.build_store(index_ptr, inc_index).unwrap();
+
+    builder
+        .build_conditional_branch(value_cmp, for_cond, early_return)
+        .unwrap();
+
+    builder.position_at_end(early_return);
+    builder.build_return(Some(&diff)).unwrap();
+
+    builder.position_at_end(no_diff);
+    let eq_len = builder
+        .build_int_compare(IntPredicate::EQ, len1, len2, "is_eq")
+        .unwrap();
+    let arr1_longer = builder
+        .build_int_compare(IntPredicate::UGT, len1, len2, "arr1_longer")
+        .unwrap();
+
+    let res = builder
+        .build_select(
+            eq_len,
+            i64_type.const_zero(),
+            builder
+                .build_select(
+                    arr1_longer,
+                    i64_type.const_int(1, true),
+                    i64_type.const_int(-1_i64 as u64, false),
+                    "diff",
+                )
+                .unwrap()
+                .into_int_value(),
+            "same",
+        )
+        .unwrap()
+        .into_int_value();
+    builder.build_return(Some(&res)).unwrap();
+
+    function
+}
+
 #[cfg(test)]
 mod tests {
     use std::cmp::Ordering;
 
-    use arrow_array::{BooleanArray, Float32Array, Int32Array, Int64Array, Scalar, UInt32Array};
+    use arrow_array::{
+        BooleanArray, Float32Array, Int32Array, Int64Array, Scalar, StringArray, UInt32Array,
+    };
     use itertools::Itertools;
 
     use crate::{
@@ -651,6 +1010,41 @@ mod tests {
         let r = k.call((&a, &b)).unwrap();
 
         let expected_result = vec![true, true, false, false];
+        assert_eq!(r, BooleanArray::from(expected_result));
+    }
+
+    #[test]
+    fn test_string_string_cmp() {
+        let a = StringArray::from(vec!["apple", "banana", "cherry"]);
+        let b = StringArray::from(vec!["banana", "cherry", "apple"]);
+        let k = ComparisonKernel::compile(&(&a, &b), Predicate::Lt).unwrap();
+        let r = k.call((&a, &b)).unwrap();
+
+        let expected_result = vec![true, true, false];
+        assert_eq!(r, BooleanArray::from(expected_result));
+    }
+
+    #[test]
+    fn test_string_scalar_cmp() {
+        let values = (0..100).map(|i| format!("value{}", i)).collect_vec();
+        let a = StringArray::from(values);
+        let b = Scalar::new(StringArray::from(vec!["value50"]));
+        let k = ComparisonKernel::compile(&(&a, &b), Predicate::Eq).unwrap();
+        let r = k.call((&a, &b)).unwrap();
+
+        let expected_result = (0..100).map(|i| i == 50).collect_vec();
+        assert_eq!(r, BooleanArray::from(expected_result));
+    }
+
+    #[test]
+    fn test_string_64_scalar_cmp() {
+        let values = (0..64).map(|i| format!("value{}", i)).collect_vec();
+        let a = StringArray::from(values);
+        let b = Scalar::new(StringArray::from(vec!["value50"]));
+        let k = ComparisonKernel::compile(&(&a, &b), Predicate::Eq).unwrap();
+        let r = k.call((&a, &b)).unwrap();
+
+        let expected_result = (0..64).map(|i| i == 50).collect_vec();
         assert_eq!(r, BooleanArray::from(expected_result));
     }
 }

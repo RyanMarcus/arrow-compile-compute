@@ -18,6 +18,7 @@ pub enum ArrowKernelError {
     UnsupportedArguments(String),
     UnsupportedScalar(DataType),
     LLVMError(String),
+    NonVectorizableType(DataType),
 }
 
 pub trait Kernel: Sized {
