@@ -6,9 +6,11 @@ use arrow_array::{
         ArrowDictionaryKeyType, Float16Type, Float32Type, Float64Type, Int16Type, Int32Type,
         Int64Type, Int8Type, RunEndIndexType, UInt16Type, UInt32Type, UInt64Type, UInt8Type,
     },
-    Array, ArrowPrimitiveType, BooleanArray, Datum, DictionaryArray, GenericStringArray,
-    PrimitiveArray, RunArray, StringArray,
+    Array, ArrowNativeTypeOp, ArrowPrimitiveType, BooleanArray, Datum, DictionaryArray,
+    GenericStringArray, Int16RunArray, Int32RunArray, Int64RunArray, PrimitiveArray, RunArray,
+    StringArray,
 };
+use arrow_buffer::ArrowNativeType;
 use arrow_schema::DataType;
 use inkwell::{
     builder::Builder,
@@ -105,7 +107,12 @@ fn array_to_iter(arr: &dyn Array) -> IteratorHolder {
         arrow_schema::DataType::Decimal128(_, _) => todo!(),
         arrow_schema::DataType::Decimal256(_, _) => todo!(),
         arrow_schema::DataType::Map(_field, _) => todo!(),
-        arrow_schema::DataType::RunEndEncoded(_field, _field1) => todo!(),
+        arrow_schema::DataType::RunEndEncoded(re, _values) => match re.data_type() {
+            DataType::Int16 => arr.as_any().downcast_ref::<Int16RunArray>().unwrap().into(),
+            DataType::Int32 => arr.as_any().downcast_ref::<Int32RunArray>().unwrap().into(),
+            DataType::Int64 => arr.as_any().downcast_ref::<Int64RunArray>().unwrap().into(),
+            _ => unreachable!("invalid run end type"),
+        },
     }
 }
 
@@ -636,8 +643,127 @@ pub struct RunEndIterator {
 
     /// the value iterator, not the raw value array
     val_iter: *const c_void,
+
+    /// the position within the run_ends iterator (not the logical position)
     pos: u64,
+
+    /// the total number of run ends (and values)
     len: u64,
+
+    /// the remaining number of values in the current run
+    remaining: u64,
+}
+
+impl RunEndIterator {
+    pub fn llvm_re_iter_ptr<'a>(
+        &self,
+        ctx: &'a Context,
+        builder: &'a Builder,
+        ptr: PointerValue<'a>,
+    ) -> PointerValue<'a> {
+        let ptr_ptr = increment_pointer!(ctx, builder, ptr, RunEndIterator::OFFSET_RUN_ENDS);
+        builder
+            .build_load(ctx.ptr_type(AddressSpace::default()), ptr_ptr, "run_ends")
+            .unwrap()
+            .into_pointer_value()
+    }
+
+    pub fn llvm_val_iter_ptr<'a>(
+        &self,
+        ctx: &'a Context,
+        builder: &'a Builder,
+        ptr: PointerValue<'a>,
+    ) -> PointerValue<'a> {
+        let ptr_ptr = increment_pointer!(ctx, builder, ptr, RunEndIterator::OFFSET_VAL_ITER);
+        builder
+            .build_load(ctx.ptr_type(AddressSpace::default()), ptr_ptr, "val_iter")
+            .unwrap()
+            .into_pointer_value()
+    }
+
+    pub fn llvm_pos<'a>(
+        &self,
+        ctx: &'a Context,
+        builder: &'a Builder,
+        ptr: PointerValue<'a>,
+    ) -> IntValue<'a> {
+        let ptr = increment_pointer!(ctx, builder, ptr, RunEndIterator::OFFSET_POS);
+        builder
+            .build_load(ctx.i64_type(), ptr, "pos")
+            .unwrap()
+            .into_int_value()
+    }
+
+    pub fn llvm_len<'a>(
+        &self,
+        ctx: &'a Context,
+        builder: &'a Builder,
+        ptr: PointerValue<'a>,
+    ) -> IntValue<'a> {
+        let ptr = increment_pointer!(ctx, builder, ptr, RunEndIterator::OFFSET_LEN);
+        builder
+            .build_load(ctx.i64_type(), ptr, "len")
+            .unwrap()
+            .into_int_value()
+    }
+
+    pub fn llvm_remaining<'a>(
+        &self,
+        ctx: &'a Context,
+        builder: &'a Builder,
+        ptr: PointerValue<'a>,
+    ) -> IntValue<'a> {
+        let ptr = increment_pointer!(ctx, builder, ptr, RunEndIterator::OFFSET_REMAINING);
+        builder
+            .build_load(ctx.i64_type(), ptr, "remaining")
+            .unwrap()
+            .into_int_value()
+    }
+
+    pub fn llvm_inc_pos<'a>(
+        &self,
+        ctx: &'a Context,
+        builder: &'a Builder,
+        ptr: PointerValue<'a>,
+        amt: IntValue<'a>,
+    ) {
+        let ptr = increment_pointer!(ctx, builder, ptr, RunEndIterator::OFFSET_POS);
+        let curr_pos = builder
+            .build_load(ctx.i64_type(), ptr, "curr_pos")
+            .unwrap()
+            .into_int_value();
+        let new_pos = builder.build_int_add(curr_pos, amt, "new_pos").unwrap();
+        builder.build_store(ptr, new_pos).unwrap();
+    }
+
+    pub fn llvm_dec_remaining<'a>(
+        &self,
+        ctx: &'a Context,
+        builder: &'a Builder,
+        ptr: PointerValue<'a>,
+        amt: IntValue<'a>,
+    ) {
+        let remaining_ptr = increment_pointer!(ctx, builder, ptr, RunEndIterator::OFFSET_REMAINING);
+        let remaining_val = builder
+            .build_load(ctx.i64_type(), remaining_ptr, "remaining")
+            .unwrap()
+            .into_int_value();
+        let new_remaining = builder
+            .build_int_sub(remaining_val, amt, "new_remaining")
+            .unwrap();
+        builder.build_store(remaining_ptr, new_remaining).unwrap();
+    }
+
+    pub fn llvm_set_remaining<'a>(
+        &self,
+        ctx: &'a Context,
+        builder: &'a Builder,
+        ptr: PointerValue<'a>,
+        amt: IntValue<'a>,
+    ) {
+        let remaining_ptr = increment_pointer!(ctx, builder, ptr, RunEndIterator::OFFSET_REMAINING);
+        builder.build_store(remaining_ptr, amt).unwrap();
+    }
 }
 
 impl<R: RunEndIndexType + ArrowPrimitiveType> From<&RunArray<R>> for IteratorHolder {
@@ -646,11 +772,22 @@ impl<R: RunEndIndexType + ArrowPrimitiveType> From<&RunArray<R>> for IteratorHol
         let re: PrimitiveArray<R> = PrimitiveArray::new(re, None);
         let run_ends = Box::new(array_to_iter(&re));
         let values = Box::new(array_to_iter(arr.values()));
+
+        let first_pos = re
+            .values()
+            .iter()
+            .enumerate()
+            .find(|(_idx, val)| !val.is_zero())
+            .map(|(idx, _val)| idx)
+            .expect("all run ends in RE array were zero");
+        let first_remaining = re.value(first_pos).as_usize();
+
         let iter = RunEndIterator {
             run_ends: run_ends.get_ptr(),
             val_iter: values.get_ptr(),
-            pos: 0,
-            len: arr.len() as u64,
+            pos: first_pos as u64,
+            len: re.len() as u64,
+            remaining: first_remaining as u64,
         };
         IteratorHolder::RunEnd {
             arr: Box::new(iter),
@@ -1218,7 +1355,123 @@ pub fn generate_next<'a>(
             }
             _ => unreachable!("dict iterator but not dict data type ({:?})", dt),
         },
-        IteratorHolder::RunEnd { .. } => todo!(),
+        IteratorHolder::RunEnd {
+            arr,
+            run_ends,
+            values,
+        } => match dt {
+            DataType::RunEndEncoded(res, data) => {
+                let re_access = generate_random_access(
+                    ctx,
+                    llvm_mod,
+                    &format!("re_access_{}", label),
+                    res.data_type(),
+                    run_ends,
+                )
+                .unwrap();
+                let val_access = generate_random_access(
+                    ctx,
+                    llvm_mod,
+                    &format!("val_access_{}", label),
+                    data.data_type(),
+                    values,
+                )
+                .unwrap();
+
+                declare_blocks!(
+                    ctx,
+                    next,
+                    entry,
+                    check_remaining,
+                    has_remaining,
+                    none_remaining,
+                    load_next_run,
+                    exhausted
+                );
+
+                build.position_at_end(entry);
+                let val_iter_ptr = arr.llvm_val_iter_ptr(ctx, &build, iter_ptr);
+                let re_iter_ptr = arr.llvm_re_iter_ptr(ctx, &build, iter_ptr);
+                build.build_unconditional_branch(check_remaining).unwrap();
+
+                build.position_at_end(check_remaining);
+                let remaining = arr.llvm_remaining(ctx, &build, iter_ptr);
+                let res = build
+                    .build_int_compare(
+                        IntPredicate::UGT,
+                        remaining,
+                        i64_type.const_zero(),
+                        "has_remaining",
+                    )
+                    .unwrap();
+                build
+                    .build_conditional_branch(res, has_remaining, none_remaining)
+                    .unwrap();
+
+                build.position_at_end(has_remaining);
+                // there are values left in the current run
+                let curr_pos = arr.llvm_pos(ctx, &build, iter_ptr);
+                let val = build
+                    .build_call(val_access, &[val_iter_ptr.into(), curr_pos.into()], "value")
+                    .unwrap()
+                    .try_as_basic_value()
+                    .unwrap_left();
+                build.build_store(out_ptr, val).unwrap();
+                arr.llvm_dec_remaining(ctx, &build, iter_ptr, i64_type.const_int(1, false));
+                build
+                    .build_return(Some(&bool_type.const_all_ones()))
+                    .unwrap();
+
+                build.position_at_end(none_remaining);
+                // there are no values left in the current run -- either load a
+                // new run, or return false
+                arr.llvm_inc_pos(ctx, &build, iter_ptr, i64_type.const_int(1, false));
+                let curr_pos = arr.llvm_pos(ctx, &build, iter_ptr);
+                let re_len = arr.llvm_len(ctx, &build, iter_ptr);
+                let have_another_run = build
+                    .build_int_compare(IntPredicate::ULT, curr_pos, re_len, "another_run")
+                    .unwrap();
+                build
+                    .build_conditional_branch(have_another_run, load_next_run, exhausted)
+                    .unwrap();
+
+                build.position_at_end(load_next_run);
+                let curr_pos = arr.llvm_pos(ctx, &build, iter_ptr);
+                let my_end = build
+                    .build_call(re_access, &[re_iter_ptr.into(), curr_pos.into()], "my_end")
+                    .unwrap()
+                    .try_as_basic_value()
+                    .unwrap_left()
+                    .into_int_value();
+                let prev_end = build
+                    .build_call(
+                        re_access,
+                        &[
+                            re_iter_ptr.into(),
+                            build
+                                .build_int_sub(curr_pos, i64_type.const_int(1, false), "prev_pos")
+                                .unwrap()
+                                .into(),
+                        ],
+                        "prev_end",
+                    )
+                    .unwrap()
+                    .try_as_basic_value()
+                    .unwrap_left()
+                    .into_int_value();
+                let new_remaining = build
+                    .build_int_sub(my_end, prev_end, "new_remaining")
+                    .unwrap();
+                arr.llvm_set_remaining(ctx, &build, iter_ptr, new_remaining);
+                build.build_unconditional_branch(check_remaining).unwrap();
+
+                build.position_at_end(exhausted);
+                build.build_return(Some(&bool_type.const_zero())).unwrap();
+
+                return Some(next);
+            }
+            _ => unreachable!("run-end iterator but not run-end data type ({:?})", dt),
+        },
         IteratorHolder::ScalarPrimitive(s) => {
             assert_eq!(ptype.width(), s.width as usize);
             declare_blocks!(ctx, next, entry);
@@ -1512,10 +1765,11 @@ mod tests {
     use std::{ffi::c_void, sync::Arc};
 
     use arrow_array::{
-        Array, Datum, DictionaryArray, Float32Array, Int32Array, Int8Array, LargeStringArray,
-        Scalar, StringArray,
+        Array, Datum, DictionaryArray, Float32Array, Int32Array, Int32RunArray, Int8Array,
+        LargeStringArray, Scalar, StringArray,
     };
-    use arrow_schema::DataType;
+    use arrow_data::ArrayDataBuilder;
+    use arrow_schema::{DataType, Field};
     use inkwell::{context::Context, OptimizationLevel};
     use itertools::Itertools;
 
@@ -2241,5 +2495,91 @@ mod tests {
 
             assert!(!func.call(iter.get_mut_ptr(), &mut b));
         }
+    }
+
+    #[test]
+    fn test_re_iter() {
+        let values = Int32Array::from(vec![10, 20]);
+        let res = Int32Array::from(vec![2, 4]);
+        let ree = Int32RunArray::try_new(&res, &values).unwrap();
+        let mut iter = datum_to_iter(&ree).unwrap();
+
+        let ctx = Context::create();
+        let module = ctx.create_module("test_runend");
+
+        let func = generate_next(&ctx, &module, "runend", ree.data_type(), &iter).unwrap();
+        let fname = func.get_name().to_str().unwrap();
+
+        module.verify().unwrap();
+        let ee = module
+            .create_jit_execution_engine(OptimizationLevel::None)
+            .unwrap();
+        let next_func = unsafe {
+            ee.get_function::<unsafe extern "C" fn(*mut c_void, *mut i32) -> bool>(fname)
+                .unwrap()
+        };
+
+        let mut res = 0;
+        assert!(unsafe { next_func.call(iter.get_mut_ptr(), &mut res as *mut i32) });
+        assert_eq!(res, 10);
+
+        assert!(unsafe { next_func.call(iter.get_mut_ptr(), &mut res as *mut i32) });
+        assert_eq!(res, 10);
+
+        assert!(unsafe { next_func.call(iter.get_mut_ptr(), &mut res as *mut i32) });
+        assert_eq!(res, 20);
+
+        assert!(unsafe { next_func.call(iter.get_mut_ptr(), &mut res as *mut i32) });
+        assert_eq!(res, 20);
+
+        assert!(!unsafe { next_func.call(iter.get_mut_ptr(), &mut res as *mut i32) });
+    }
+
+    #[test]
+    fn test_re_zero_runs_iter() {
+        let ree_array_type = DataType::RunEndEncoded(
+            Arc::new(Field::new("run_ends", DataType::Int32, false)),
+            Arc::new(Field::new("values", DataType::Int32, true)),
+        );
+        let values = Int32Array::from(vec![10, 20, 30, 40, 50]);
+        let res = Int32Array::from(vec![0, 1, 1, 4, 4]);
+        let builder = ArrayDataBuilder::new(ree_array_type)
+            .len(4)
+            .add_child_data(res.to_data())
+            .add_child_data(values.to_data());
+        let array_data = unsafe { builder.build_unchecked() };
+
+        let ree = Int32RunArray::from(array_data);
+        let mut iter = datum_to_iter(&ree).unwrap();
+
+        let ctx = Context::create();
+        let module = ctx.create_module("test_runend");
+
+        let func = generate_next(&ctx, &module, "runend", ree.data_type(), &iter).unwrap();
+        let fname = func.get_name().to_str().unwrap();
+
+        module.verify().unwrap();
+        let ee = module
+            .create_jit_execution_engine(OptimizationLevel::None)
+            .unwrap();
+        let next_func = unsafe {
+            ee.get_function::<unsafe extern "C" fn(*mut c_void, *mut i32) -> bool>(fname)
+                .unwrap()
+        };
+
+        let mut res = 0;
+        assert!(unsafe { next_func.call(iter.get_mut_ptr(), &mut res as *mut i32) });
+        assert_eq!(res, 20);
+
+        assert!(unsafe { next_func.call(iter.get_mut_ptr(), &mut res as *mut i32) });
+        assert_eq!(res, 40);
+
+        assert!(unsafe { next_func.call(iter.get_mut_ptr(), &mut res as *mut i32) });
+        assert_eq!(res, 40);
+
+        assert!(unsafe { next_func.call(iter.get_mut_ptr(), &mut res as *mut i32) });
+        assert_eq!(res, 40);
+
+        assert!(!unsafe { next_func.call(iter.get_mut_ptr(), &mut res as *mut i32) });
     }
 }
