@@ -368,6 +368,84 @@ impl From<&StringArray> for Box<StringIterator> {
     }
 }
 
+impl StringIterator {
+    fn llvm_get_offset_ptr<'a>(
+        &self,
+        ctx: &'a Context,
+        build: &'a Builder,
+        ptr: PointerValue<'a>,
+    ) -> PointerValue<'a> {
+        let offset_ptr_ptr = increment_pointer!(ctx, build, ptr, StringIterator::OFFSET_OFFSETS);
+        build
+            .build_load(
+                ctx.ptr_type(AddressSpace::default()),
+                offset_ptr_ptr,
+                "offset_ptr",
+            )
+            .unwrap()
+            .into_pointer_value()
+    }
+
+    fn llvm_get_data_ptr<'a>(
+        &self,
+        ctx: &'a Context,
+        build: &'a Builder,
+        ptr: PointerValue<'a>,
+    ) -> PointerValue<'a> {
+        let data_ptr_ptr = increment_pointer!(ctx, build, ptr, StringIterator::OFFSET_DATA);
+        build
+            .build_load(
+                ctx.ptr_type(AddressSpace::default()),
+                data_ptr_ptr,
+                "data_ptr",
+            )
+            .unwrap()
+            .into_pointer_value()
+    }
+
+    fn llvm_pos<'a>(
+        &self,
+        ctx: &'a Context,
+        build: &'a Builder,
+        ptr: PointerValue<'a>,
+    ) -> IntValue<'a> {
+        let pos_ptr = increment_pointer!(ctx, build, ptr, StringIterator::OFFSET_POS);
+        build
+            .build_load(ctx.i64_type(), pos_ptr, "pos")
+            .unwrap()
+            .into_int_value()
+    }
+
+    fn llvm_len<'a>(
+        &self,
+        ctx: &'a Context,
+        build: &'a Builder,
+        ptr: PointerValue<'a>,
+    ) -> IntValue<'a> {
+        let len_ptr = increment_pointer!(ctx, build, ptr, StringIterator::OFFSET_LEN);
+        build
+            .build_load(ctx.i64_type(), len_ptr, "len")
+            .unwrap()
+            .into_int_value()
+    }
+
+    fn llvm_increment_pos<'a>(
+        &self,
+        ctx: &'a Context,
+        builder: &'a Builder,
+        ptr: PointerValue<'a>,
+        amt: IntValue<'a>,
+    ) {
+        let pos_ptr = increment_pointer!(ctx, builder, ptr, StringIterator::OFFSET_POS);
+        let pos = builder
+            .build_load(ctx.i64_type(), pos_ptr, "pos")
+            .unwrap()
+            .into_int_value();
+        let new_pos = builder.build_int_add(pos, amt, "new_pos").unwrap();
+        builder.build_store(pos_ptr, new_pos).unwrap();
+    }
+}
+
 /// Same as `StringIterator`, but with 64 bit offsets.
 #[repr(C)]
 #[derive(ReprOffset, Debug)]
@@ -377,6 +455,85 @@ pub struct LargeStringIterator {
     data: *const u8,
     pos: u64,
     len: u64,
+}
+
+impl LargeStringIterator {
+    fn llvm_get_offset_ptr<'a>(
+        &self,
+        ctx: &'a Context,
+        build: &'a Builder,
+        ptr: PointerValue<'a>,
+    ) -> PointerValue<'a> {
+        let offset_ptr_ptr =
+            increment_pointer!(ctx, build, ptr, LargeStringIterator::OFFSET_OFFSETS);
+        build
+            .build_load(
+                ctx.ptr_type(AddressSpace::default()),
+                offset_ptr_ptr,
+                "offset_ptr",
+            )
+            .unwrap()
+            .into_pointer_value()
+    }
+
+    fn llvm_get_data_ptr<'a>(
+        &self,
+        ctx: &'a Context,
+        build: &'a Builder,
+        ptr: PointerValue<'a>,
+    ) -> PointerValue<'a> {
+        let data_ptr_ptr = increment_pointer!(ctx, build, ptr, LargeStringIterator::OFFSET_DATA);
+        build
+            .build_load(
+                ctx.ptr_type(AddressSpace::default()),
+                data_ptr_ptr,
+                "data_ptr",
+            )
+            .unwrap()
+            .into_pointer_value()
+    }
+
+    fn llvm_pos<'a>(
+        &self,
+        ctx: &'a Context,
+        build: &'a Builder,
+        ptr: PointerValue<'a>,
+    ) -> IntValue<'a> {
+        let pos_ptr = increment_pointer!(ctx, build, ptr, LargeStringIterator::OFFSET_POS);
+        build
+            .build_load(ctx.i64_type(), pos_ptr, "pos")
+            .unwrap()
+            .into_int_value()
+    }
+
+    fn llvm_len<'a>(
+        &self,
+        ctx: &'a Context,
+        build: &'a Builder,
+        ptr: PointerValue<'a>,
+    ) -> IntValue<'a> {
+        let len_ptr = increment_pointer!(ctx, build, ptr, LargeStringIterator::OFFSET_LEN);
+        build
+            .build_load(ctx.i64_type(), len_ptr, "len")
+            .unwrap()
+            .into_int_value()
+    }
+
+    fn llvm_increment_pos<'a>(
+        &self,
+        ctx: &'a Context,
+        builder: &'a Builder,
+        ptr: PointerValue<'a>,
+        amt: IntValue<'a>,
+    ) {
+        let pos_ptr = increment_pointer!(ctx, builder, ptr, LargeStringIterator::OFFSET_POS);
+        let pos = builder
+            .build_load(ctx.i64_type(), pos_ptr, "pos")
+            .unwrap()
+            .into_int_value();
+        let new_pos = builder.build_int_add(pos, amt, "new_pos").unwrap();
+        builder.build_store(pos_ptr, new_pos).unwrap();
+    }
 }
 
 impl From<&GenericStringArray<i64>> for Box<LargeStringIterator> {
@@ -931,14 +1088,75 @@ pub fn generate_next<'a>(
 
             return Some(next);
         }
-        IteratorHolder::String(_) | IteratorHolder::LargeString(_) => {
-            let _offset_type = match dt {
-                DataType::Binary | DataType::Utf8 => DataType::Int32,
-                DataType::LargeBinary | DataType::LargeUtf8 => DataType::Int64,
-                _ => unreachable!(),
-            };
+        IteratorHolder::String(iter) => {
+            let access = generate_random_access(ctx, llvm_mod, label, dt, ih).unwrap();
+            declare_blocks!(ctx, next, entry, none_left, get_next);
 
-            todo!()
+            build.position_at_end(entry);
+            let curr_pos = iter.llvm_pos(ctx, &build, iter_ptr);
+            let curr_len = iter.llvm_len(ctx, &build, iter_ptr);
+            let have_more = build
+                .build_int_compare(IntPredicate::ULT, curr_pos, curr_len, "have_enough")
+                .unwrap();
+            build
+                .build_conditional_branch(have_more, get_next, none_left)
+                .unwrap();
+
+            build.position_at_end(none_left);
+            build
+                .build_return(Some(&bool_type.const_int(0, false)))
+                .unwrap();
+
+            build.position_at_end(get_next);
+            // there are at least n elements left, we can load them and increment
+            let result = build
+                .build_call(access, &[iter_ptr.into(), curr_pos.into()], "access_result")
+                .unwrap()
+                .try_as_basic_value()
+                .unwrap_left();
+
+            build.build_store(out_ptr, result).unwrap();
+            iter.llvm_increment_pos(ctx, &build, iter_ptr, i64_type.const_int(1, false));
+            build
+                .build_return(Some(&bool_type.const_int(1, false)))
+                .unwrap();
+
+            return Some(next);
+        }
+        IteratorHolder::LargeString(iter) => {
+            let access = generate_random_access(ctx, llvm_mod, label, dt, ih).unwrap();
+            declare_blocks!(ctx, next, entry, none_left, get_next);
+
+            build.position_at_end(entry);
+            let curr_pos = iter.llvm_pos(ctx, &build, iter_ptr);
+            let curr_len = iter.llvm_len(ctx, &build, iter_ptr);
+            let have_more = build
+                .build_int_compare(IntPredicate::ULT, curr_pos, curr_len, "have_enough")
+                .unwrap();
+            build
+                .build_conditional_branch(have_more, get_next, none_left)
+                .unwrap();
+
+            build.position_at_end(none_left);
+            build
+                .build_return(Some(&bool_type.const_int(0, false)))
+                .unwrap();
+
+            build.position_at_end(get_next);
+            // there are at least n elements left, we can load them and increment
+            let result = build
+                .build_call(access, &[iter_ptr.into(), curr_pos.into()], "access_result")
+                .unwrap()
+                .try_as_basic_value()
+                .unwrap_left();
+
+            build.build_store(out_ptr, result).unwrap();
+            iter.llvm_increment_pos(ctx, &build, iter_ptr, i64_type.const_int(1, false));
+            build
+                .build_return(Some(&bool_type.const_int(1, false)))
+                .unwrap();
+
+            return Some(next);
         }
         IteratorHolder::Bitmap(_bitmap_iterator) => todo!(),
         IteratorHolder::Dictionary { arr, keys, values } => match dt {
@@ -1129,7 +1347,104 @@ pub fn generate_random_access<'a>(
 
             return Some(next);
         }
-        IteratorHolder::String(_) | IteratorHolder::LargeString(_) => return None,
+        IteratorHolder::String(ih) => {
+            let i32_type = ctx.i32_type();
+            let ret_type = PrimitiveType::P64x2.llvm_type(ctx).into_struct_type();
+
+            declare_blocks!(ctx, next, entry);
+
+            build.position_at_end(entry);
+            let offsets = ih.llvm_get_offset_ptr(ctx, &build, iter_ptr);
+            let offset1 = build
+                .build_load(
+                    i32_type,
+                    increment_pointer!(ctx, build, offsets, 4, idx),
+                    "offset1",
+                )
+                .unwrap()
+                .into_int_value();
+            let offset2 = build
+                .build_load(
+                    i32_type,
+                    increment_pointer!(
+                        ctx,
+                        build,
+                        offsets,
+                        4,
+                        build
+                            .build_int_add(idx, i64_type.const_int(1, false), "inc")
+                            .unwrap()
+                    ),
+                    "offset2",
+                )
+                .unwrap()
+                .into_int_value();
+
+            let offset1 = build
+                .build_int_z_extend(offset1, i64_type, "offset1")
+                .unwrap();
+            let offset2 = build
+                .build_int_z_extend(offset2, i64_type, "offset1")
+                .unwrap();
+
+            let data = ih.llvm_get_data_ptr(ctx, &build, iter_ptr);
+            let ptr1 = increment_pointer!(ctx, build, data, 1, offset1);
+            let ptr2 = increment_pointer!(ctx, build, data, 1, offset2);
+            let to_return = ret_type.const_zero();
+            let to_return = build
+                .build_insert_value(to_return, ptr1, 0, "to_return")
+                .unwrap();
+            let to_return = build
+                .build_insert_value(to_return, ptr2, 1, "to_return")
+                .unwrap();
+            build.build_return(Some(&to_return)).unwrap();
+            return Some(next);
+        }
+        IteratorHolder::LargeString(ih) => {
+            let ret_type = PrimitiveType::P64x2.llvm_type(ctx).into_struct_type();
+
+            declare_blocks!(ctx, next, entry);
+
+            build.position_at_end(entry);
+            let offsets = ih.llvm_get_offset_ptr(ctx, &build, iter_ptr);
+            let offset1 = build
+                .build_load(
+                    i64_type,
+                    increment_pointer!(ctx, build, offsets, 8, idx),
+                    "offset1",
+                )
+                .unwrap()
+                .into_int_value();
+            let offset2 = build
+                .build_load(
+                    i64_type,
+                    increment_pointer!(
+                        ctx,
+                        build,
+                        offsets,
+                        8,
+                        build
+                            .build_int_add(idx, i64_type.const_int(1, false), "inc")
+                            .unwrap()
+                    ),
+                    "offset2",
+                )
+                .unwrap()
+                .into_int_value();
+
+            let data = ih.llvm_get_data_ptr(ctx, &build, iter_ptr);
+            let ptr1 = increment_pointer!(ctx, build, data, 1, offset1);
+            let ptr2 = increment_pointer!(ctx, build, data, 1, offset2);
+            let to_return = ret_type.const_zero();
+            let to_return = build
+                .build_insert_value(to_return, ptr1, 0, "to_return")
+                .unwrap();
+            let to_return = build
+                .build_insert_value(to_return, ptr2, 1, "to_return")
+                .unwrap();
+            build.build_return(Some(&to_return)).unwrap();
+            return Some(next);
+        }
         IteratorHolder::Bitmap(_bitmap_iterator) => todo!(),
         IteratorHolder::Dictionary { arr, keys, values } => match dt {
             DataType::Dictionary(k_dt, v_dt) => {
@@ -1772,6 +2087,159 @@ mod tests {
             let slice = std::slice::from_raw_parts(ptr1 as *const u8, len);
             let string = std::str::from_utf8(slice).unwrap();
             assert_eq!(string, "hello");
+        }
+    }
+
+    unsafe fn pointers_to_str(ptrs: u128) -> String {
+        let b = ptrs.to_le_bytes();
+        let ptr1 = u64::from_le_bytes(b[0..8].try_into().unwrap());
+        let ptr2 = u64::from_le_bytes(b[8..16].try_into().unwrap());
+        let len = (ptr2 - ptr1) as usize;
+
+        unsafe {
+            let slice = std::slice::from_raw_parts(ptr1 as *const u8, len);
+            let string = std::str::from_utf8(slice).unwrap();
+            string.to_string()
+        }
+    }
+
+    #[test]
+    fn test_string_random_access() {
+        let data = StringArray::from(vec!["this", "is", "a", "test"]);
+        let mut iter = datum_to_iter(&data).unwrap();
+
+        let ctx = Context::create();
+        let module = ctx.create_module("test_string_random_access");
+        let func_access =
+            generate_random_access(&ctx, &module, "access", data.get().0.data_type(), &iter)
+                .unwrap();
+        let fname = func_access.get_name().to_str().unwrap();
+
+        module.verify().unwrap();
+        let ee = module
+            .create_jit_execution_engine(OptimizationLevel::None)
+            .unwrap();
+
+        let func = unsafe {
+            ee.get_function::<unsafe extern "C" fn(*mut c_void, u64) -> u128>(fname)
+                .unwrap()
+        };
+
+        unsafe {
+            let b = func.call(iter.get_mut_ptr(), 0);
+            assert_eq!(pointers_to_str(b), "this");
+
+            let b = func.call(iter.get_mut_ptr(), 2);
+            assert_eq!(pointers_to_str(b), "a");
+        }
+    }
+
+    #[test]
+    fn test_string_next() {
+        let data = StringArray::from(vec!["this", "is", "a", "test"]);
+        let mut iter = datum_to_iter(&data).unwrap();
+
+        let ctx = Context::create();
+        let module = ctx.create_module("test_string_next");
+        let func_access =
+            generate_next(&ctx, &module, "access", data.get().0.data_type(), &iter).unwrap();
+        let fname = func_access.get_name().to_str().unwrap();
+
+        module.verify().unwrap();
+        let ee = module
+            .create_jit_execution_engine(OptimizationLevel::None)
+            .unwrap();
+
+        let func = unsafe {
+            ee.get_function::<unsafe extern "C" fn(*mut c_void, *mut u128) -> bool>(fname)
+                .unwrap()
+        };
+
+        unsafe {
+            let mut b: u128 = 0;
+            assert!(func.call(iter.get_mut_ptr(), &mut b));
+            assert_eq!(pointers_to_str(b), "this");
+
+            assert!(func.call(iter.get_mut_ptr(), &mut b));
+            assert_eq!(pointers_to_str(b), "is");
+
+            assert!(func.call(iter.get_mut_ptr(), &mut b));
+            assert_eq!(pointers_to_str(b), "a");
+
+            assert!(func.call(iter.get_mut_ptr(), &mut b));
+            assert_eq!(pointers_to_str(b), "test");
+
+            assert!(!func.call(iter.get_mut_ptr(), &mut b));
+        }
+    }
+
+    #[test]
+    fn test_large_string_random_access() {
+        let data = LargeStringArray::from(vec!["this", "is", "a", "test"]);
+        let mut iter = datum_to_iter(&data).unwrap();
+
+        let ctx = Context::create();
+        let module = ctx.create_module("test_string_random_access");
+        let func_access =
+            generate_random_access(&ctx, &module, "access", data.get().0.data_type(), &iter)
+                .unwrap();
+        let fname = func_access.get_name().to_str().unwrap();
+
+        module.verify().unwrap();
+        let ee = module
+            .create_jit_execution_engine(OptimizationLevel::None)
+            .unwrap();
+
+        let func = unsafe {
+            ee.get_function::<unsafe extern "C" fn(*mut c_void, u64) -> u128>(fname)
+                .unwrap()
+        };
+
+        unsafe {
+            let b = func.call(iter.get_mut_ptr(), 0);
+            assert_eq!(pointers_to_str(b), "this");
+
+            let b = func.call(iter.get_mut_ptr(), 2);
+            assert_eq!(pointers_to_str(b), "a");
+        }
+    }
+
+    #[test]
+    fn test_large_string_next() {
+        let data = LargeStringArray::from(vec!["this", "is", "a", "test"]);
+        let mut iter = datum_to_iter(&data).unwrap();
+
+        let ctx = Context::create();
+        let module = ctx.create_module("test_string_next");
+        let func_access =
+            generate_next(&ctx, &module, "access", data.get().0.data_type(), &iter).unwrap();
+        let fname = func_access.get_name().to_str().unwrap();
+
+        module.verify().unwrap();
+        let ee = module
+            .create_jit_execution_engine(OptimizationLevel::None)
+            .unwrap();
+
+        let func = unsafe {
+            ee.get_function::<unsafe extern "C" fn(*mut c_void, *mut u128) -> bool>(fname)
+                .unwrap()
+        };
+
+        unsafe {
+            let mut b: u128 = 0;
+            assert!(func.call(iter.get_mut_ptr(), &mut b));
+            assert_eq!(pointers_to_str(b), "this");
+
+            assert!(func.call(iter.get_mut_ptr(), &mut b));
+            assert_eq!(pointers_to_str(b), "is");
+
+            assert!(func.call(iter.get_mut_ptr(), &mut b));
+            assert_eq!(pointers_to_str(b), "a");
+
+            assert!(func.call(iter.get_mut_ptr(), &mut b));
+            assert_eq!(pointers_to_str(b), "test");
+
+            assert!(!func.call(iter.get_mut_ptr(), &mut b));
         }
     }
 }
