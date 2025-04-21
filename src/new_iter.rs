@@ -261,10 +261,10 @@ impl IteratorHolder {
 /// * `data` is a pointer to the densely packed data buffer
 ///
 /// * `pos` is the current position in the iterator, all reads are relative to
-/// this position
+///   this position
 ///
 /// * `len` is the length of the data from the start of the `data` pointer
-/// (i.e., not accounting for `pos`)
+///   (i.e., not accounting for `pos`)
 #[repr(C)]
 #[derive(ReprOffset, Debug)]
 #[roff(usize_offsets)]
@@ -579,7 +579,7 @@ impl From<u32> for IteratorHolder {
 
 impl From<u64> for IteratorHolder {
     fn from(val: u64) -> Self {
-        IteratorHolder::ScalarPrimitive(Box::new(ScalarPrimitiveIterator::new(val as u64, 8)))
+        IteratorHolder::ScalarPrimitive(Box::new(ScalarPrimitiveIterator::new(val, 8)))
     }
 }
 
@@ -657,8 +657,8 @@ pub fn generate_next_block<'a, const N: u32>(
 ) -> Option<FunctionValue<'a>> {
     let build = ctx.create_builder();
     let ptype = PrimitiveType::for_arrow_type(dt);
-    let vec_type = ptype.llvm_vec_type(&ctx, N)?;
-    let llvm_type = ptype.llvm_type(&ctx);
+    let vec_type = ptype.llvm_vec_type(ctx, N)?;
+    let llvm_type = ptype.llvm_type(ctx);
     let bool_type = ctx.bool_type();
     let ptr_type = ctx.ptr_type(AddressSpace::default());
     let i64_type = ctx.i64_type();

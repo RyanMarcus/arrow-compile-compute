@@ -38,7 +38,7 @@ impl Kernel for ComparisonKernel {
     type Params = Predicate;
     type Output = BooleanArray;
 
-    fn call<'a>(&self, inp: Self::Input<'a>) -> Result<Self::Output, ArrowKernelError> {
+    fn call(&self, inp: Self::Input<'_>) -> Result<Self::Output, ArrowKernelError> {
         let (a, b) = inp;
         let (a_arr, a_scalar) = a.get();
         let (b_arr, b_scalar) = b.get();
@@ -52,9 +52,9 @@ impl Kernel for ComparisonKernel {
         }
 
         if !self.with_rhs_scalar(|rhs_scalar| b_scalar == *rhs_scalar) {
-            return Err(ArrowKernelError::ArgumentMismatch(format!(
-                "Expected RHS to be scalar"
-            )));
+            return Err(ArrowKernelError::ArgumentMismatch(
+                "Expected RHS to be scalar".to_string(),
+            ));
         }
 
         if !self.with_lhs_data_type(|lhs_dt| a_arr.data_type() == lhs_dt) {
@@ -90,7 +90,7 @@ impl Kernel for ComparisonKernel {
         ))
     }
 
-    fn compile<'a>(inp: &Self::Input<'a>, pred: Predicate) -> Result<Self, ArrowKernelError> {
+    fn compile(inp: &Self::Input<'_>, pred: Predicate) -> Result<Self, ArrowKernelError> {
         let (lhs, rhs) = *inp;
         let (lhs_arr, lhs_scalar) = lhs.get();
         let (rhs_arr, rhs_scalar) = rhs.get();
@@ -119,8 +119,8 @@ impl Kernel for ComparisonKernel {
         .try_build())?
     }
 
-    fn get_key_for_input<'a>(
-        i: &Self::Input<'a>,
+    fn get_key_for_input(
+        i: &Self::Input<'_>,
         p: &Predicate,
     ) -> Result<Self::Key, ArrowKernelError> {
         let (lhs, rhs) = *i;
@@ -137,7 +137,7 @@ impl Kernel for ComparisonKernel {
             lhs.get().0.data_type().clone(),
             rhs.get().0.data_type().clone(),
             rhs.get().1,
-            p.clone(),
+            *p,
         ))
     }
 }
@@ -224,19 +224,19 @@ fn generate_llvm_cmp_kernel<'a>(
     let void_type = ctx.void_type();
     let lhs_prim = PrimitiveType::for_arrow_type(lhs_dt);
     let rhs_prim = PrimitiveType::for_arrow_type(rhs_dt);
-    let lhs_vec = lhs_prim.llvm_vec_type(&ctx, 64).unwrap();
-    let rhs_vec = rhs_prim.llvm_vec_type(&ctx, 64).unwrap();
-    let lhs_llvm = lhs_prim.llvm_type(&ctx);
-    let rhs_llvm = rhs_prim.llvm_type(&ctx);
+    let lhs_vec = lhs_prim.llvm_vec_type(ctx, 64).unwrap();
+    let rhs_vec = rhs_prim.llvm_vec_type(ctx, 64).unwrap();
+    let lhs_llvm = lhs_prim.llvm_type(ctx);
+    let rhs_llvm = rhs_prim.llvm_type(ctx);
     let dom_prim_type = PrimitiveType::dominant(lhs_prim, rhs_prim).unwrap();
-    let dom_llvm = dom_prim_type.llvm_type(&ctx);
+    let dom_llvm = dom_prim_type.llvm_type(ctx);
 
     let lhs_next_block =
-        generate_next_block::<64>(&ctx, &module, "next_lhs_block", lhs_dt, lhs_iter).unwrap();
+        generate_next_block::<64>(ctx, &module, "next_lhs_block", lhs_dt, lhs_iter).unwrap();
     let rhs_next_block =
-        generate_next_block::<64>(&ctx, &module, "next_rhs_block", rhs_dt, rhs_iter).unwrap();
-    let lhs_next = generate_next(&ctx, &module, "next_lhs", lhs_dt, lhs_iter).unwrap();
-    let rhs_next = generate_next(&ctx, &module, "next_rhs", rhs_dt, rhs_iter).unwrap();
+        generate_next_block::<64>(ctx, &module, "next_rhs_block", rhs_dt, rhs_iter).unwrap();
+    let lhs_next = generate_next(ctx, &module, "next_lhs", lhs_dt, lhs_iter).unwrap();
+    let rhs_next = generate_next(ctx, &module, "next_rhs", rhs_dt, rhs_iter).unwrap();
 
     let fn_type = void_type.fn_type(&[ptr_type.into(), ptr_type.into(), ptr_type.into()], false);
     let cmp = module.add_function("cmp", fn_type, None);
@@ -528,7 +528,7 @@ fn add_float_vec_to_int_vec<'a>(
     let res = builder.build_xor(cleft, left, "left").unwrap();
     builder.build_return(Some(&res)).unwrap();
 
-    return func;
+    func
 }
 
 fn add_float_to_int<'a>(
@@ -568,7 +568,7 @@ fn add_float_to_int<'a>(
     let res = builder.build_xor(cleft, left, "left").unwrap();
     builder.build_return(Some(&res)).unwrap();
 
-    return func;
+    func
 }
 
 #[cfg(test)]

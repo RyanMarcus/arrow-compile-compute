@@ -28,11 +28,11 @@ pub trait Kernel: Sized {
     type Params;
     type Output;
 
-    fn call<'a>(&self, inp: Self::Input<'a>) -> Result<Self::Output, ArrowKernelError>;
+    fn call(&self, inp: Self::Input<'_>) -> Result<Self::Output, ArrowKernelError>;
 
-    fn compile<'a>(inp: &Self::Input<'a>, params: Self::Params) -> Result<Self, ArrowKernelError>;
-    fn get_key_for_input<'a>(
-        i: &Self::Input<'a>,
+    fn compile(inp: &Self::Input<'_>, params: Self::Params) -> Result<Self, ArrowKernelError>;
+    fn get_key_for_input(
+        i: &Self::Input<'_>,
         p: &Self::Params,
     ) -> Result<Self::Key, ArrowKernelError>;
 }
@@ -47,9 +47,9 @@ impl<K: Kernel> KernelCache<K> {
             map: RwLock::new(HashMap::new()),
         };
     }
-    pub fn get<'a>(
+    pub fn get(
         &self,
-        input: K::Input<'a>,
+        input: K::Input<'_>,
         param: K::Params,
     ) -> Result<K::Output, ArrowKernelError> {
         let key = K::get_key_for_input(&input, &param)?;
