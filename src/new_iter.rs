@@ -608,14 +608,37 @@ impl From<f64> for IteratorHolder {
     }
 }
 
-#[derive(Debug)]
+#[repr(C)]
+#[derive(ReprOffset, Debug)]
+#[roff(usize_offsets)]
 pub struct ScalarStringIterator {
+    ptr1: *const u8,
+    ptr2: *const u8,
     val: Box<str>,
+}
+
+impl ScalarStringIterator {
+    pub fn llvm_val_ptr<'a>(
+        &self,
+        ctx: &'a Context,
+        builder: &'a Builder,
+        ptr: PointerValue<'a>,
+    ) -> (PointerValue<'a>, PointerValue<'a>) {
+        let ptr1 = increment_pointer!(ctx, builder, ptr, ScalarStringIterator::OFFSET_PTR1);
+        let ptr2 = increment_pointer!(ctx, builder, ptr, ScalarStringIterator::OFFSET_PTR2);
+        (ptr1, ptr2)
+    }
 }
 
 impl From<Box<str>> for IteratorHolder {
     fn from(val: Box<str>) -> Self {
-        IteratorHolder::ScalarString(Box::new(ScalarStringIterator { val }))
+        let p1 = val.as_ptr();
+        let p2 = p1.wrapping_add(val.len());
+        IteratorHolder::ScalarString(Box::new(ScalarStringIterator {
+            ptr1: p1,
+            ptr2: p2,
+            val,
+        }))
     }
 }
 
@@ -908,7 +931,15 @@ pub fn generate_next<'a>(
 
             return Some(next);
         }
-        IteratorHolder::String(_) | IteratorHolder::LargeString(_) => return None,
+        IteratorHolder::String(_) | IteratorHolder::LargeString(_) => {
+            let _offset_type = match dt {
+                DataType::Binary | DataType::Utf8 => DataType::Int32,
+                DataType::LargeBinary | DataType::LargeUtf8 => DataType::Int64,
+                _ => unreachable!(),
+            };
+
+            todo!()
+        }
         IteratorHolder::Bitmap(_bitmap_iterator) => todo!(),
         IteratorHolder::Dictionary { arr, keys, values } => match dt {
             DataType::Dictionary(k_dt, v_dt) => {
@@ -1019,7 +1050,35 @@ pub fn generate_next<'a>(
                 .unwrap();
             return Some(next);
         }
-        IteratorHolder::ScalarString(_) => todo!(),
+        IteratorHolder::ScalarString(s) => {
+            let ptr_type = ctx.ptr_type(AddressSpace::default());
+            let ret_type = PrimitiveType::P64x2.llvm_type(ctx).into_struct_type();
+            declare_blocks!(ctx, next, entry);
+            build.position_at_end(entry);
+            let (ptr1, ptr2) = s.llvm_val_ptr(ctx, &build, iter_ptr);
+            let ptr1 = build
+                .build_load(ptr_type, ptr1, "ptr1")
+                .unwrap()
+                .into_pointer_value();
+            let ptr2 = build
+                .build_load(ptr_type, ptr2, "ptr2")
+                .unwrap()
+                .into_pointer_value();
+
+            let to_return = ret_type.const_zero();
+            let to_return = build
+                .build_insert_value(to_return, ptr1, 0, "to_return")
+                .unwrap();
+            let to_return = build
+                .build_insert_value(to_return, ptr2, 1, "to_return")
+                .unwrap();
+            build.build_store(out_ptr, to_return).unwrap();
+            build
+                .build_return(Some(&bool_type.const_int(1, false)))
+                .unwrap();
+
+            return Some(next);
+        }
     };
 }
 
@@ -1137,7 +1196,10 @@ pub fn generate_random_access<'a>(
 mod tests {
     use std::{ffi::c_void, sync::Arc};
 
-    use arrow_array::{Array, DictionaryArray, Float32Array, Int32Array, Int8Array, Scalar};
+    use arrow_array::{
+        Array, Datum, DictionaryArray, Float32Array, Int32Array, Int8Array, LargeStringArray,
+        Scalar, StringArray,
+    };
     use arrow_schema::DataType;
     use inkwell::{context::Context, OptimizationLevel};
     use itertools::Itertools;
@@ -1641,5 +1703,75 @@ mod tests {
             );
             assert_eq!(buf.0, [f, f, f, f]);
         };
+    }
+
+    #[test]
+    fn test_string_scalar() {
+        let s = StringArray::new_scalar("hello");
+        let mut iter = datum_to_iter(&s).unwrap();
+
+        let ctx = Context::create();
+        let module = ctx.create_module("test_scalar_prim");
+        let func_next = generate_next(&ctx, &module, "next", s.get().0.data_type(), &iter).unwrap();
+        let fname_next = func_next.get_name().to_str().unwrap();
+
+        module.verify().unwrap();
+        let ee = module
+            .create_jit_execution_engine(OptimizationLevel::None)
+            .unwrap();
+
+        let next_func = unsafe {
+            ee.get_function::<unsafe extern "C" fn(*mut c_void, *mut u128) -> bool>(fname_next)
+                .unwrap()
+        };
+
+        unsafe {
+            let mut b: u128 = 0;
+            assert!(next_func.call(iter.get_mut_ptr(), &mut b));
+            let b = b.to_le_bytes();
+            let ptr1 = u64::from_le_bytes(b[0..8].try_into().unwrap());
+            let ptr2 = u64::from_le_bytes(b[8..16].try_into().unwrap());
+            let len = (ptr2 - ptr1) as usize;
+            assert_eq!(len, 5);
+
+            let slice = std::slice::from_raw_parts(ptr1 as *const u8, len);
+            let string = std::str::from_utf8(slice).unwrap();
+            assert_eq!(string, "hello");
+        }
+    }
+
+    #[test]
+    fn test_large_string_scalar() {
+        let s = LargeStringArray::new_scalar("hello");
+        let mut iter = datum_to_iter(&s).unwrap();
+
+        let ctx = Context::create();
+        let module = ctx.create_module("test_scalar_prim");
+        let func_next = generate_next(&ctx, &module, "next", s.get().0.data_type(), &iter).unwrap();
+        let fname_next = func_next.get_name().to_str().unwrap();
+
+        module.verify().unwrap();
+        let ee = module
+            .create_jit_execution_engine(OptimizationLevel::None)
+            .unwrap();
+
+        let next_func = unsafe {
+            ee.get_function::<unsafe extern "C" fn(*mut c_void, *mut u128) -> bool>(fname_next)
+                .unwrap()
+        };
+
+        unsafe {
+            let mut b: u128 = 0;
+            assert!(next_func.call(iter.get_mut_ptr(), &mut b));
+            let b = b.to_le_bytes();
+            let ptr1 = u64::from_le_bytes(b[0..8].try_into().unwrap());
+            let ptr2 = u64::from_le_bytes(b[8..16].try_into().unwrap());
+            let len = (ptr2 - ptr1) as usize;
+            assert_eq!(len, 5);
+
+            let slice = std::slice::from_raw_parts(ptr1 as *const u8, len);
+            let string = std::str::from_utf8(slice).unwrap();
+            assert_eq!(string, "hello");
+        }
     }
 }
