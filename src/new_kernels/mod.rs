@@ -62,14 +62,17 @@ impl<K: Kernel> KernelCache<K> {
             }
         }
 
-        let mut map = self.map.write().unwrap();
-        if let Some(kernel) = map.get(&key) {
-            return kernel.call(input);
-        }
-
+        // There is a chance that multiple threads will see that a kernel is
+        // missing, compile it, and then attempt to insert it. This seems
+        // preferable to having to hold a write lock during kernel compilation.
         let kernel = K::compile(&input, param)?;
         let result = kernel.call(input);
-        map.insert(key, kernel);
+
+        {
+            let mut map = self.map.write().unwrap();
+            map.entry(key).or_insert(kernel);
+        }
+
         result
     }
 }
