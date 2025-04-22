@@ -1,18 +1,17 @@
 use arrow_array::{BooleanArray, Datum};
 use arrow_buffer::{BooleanBuffer, NullBuffer};
 use arrow_schema::DataType;
-use inkwell::builder::Builder;
 use inkwell::execution_engine::JitFunction;
 use inkwell::intrinsics::Intrinsic;
 use inkwell::module::{Linkage, Module};
-use inkwell::values::{FunctionValue, VectorValue};
+use inkwell::values::FunctionValue;
 use inkwell::{context::Context, AddressSpace};
 use inkwell::{IntPredicate, OptimizationLevel};
 use ouroboros::self_referencing;
 use std::ffi::c_void;
 
 use crate::new_iter::{datum_to_iter, generate_next, generate_next_block, IteratorHolder};
-use crate::new_kernels::optimize_module;
+use crate::new_kernels::{gen_convert_numeric_vec, optimize_module};
 use crate::{
     declare_blocks, increment_pointer, pointer_diff, ComparisonType, Predicate, PrimitiveType,
 };
@@ -154,65 +153,6 @@ impl Kernel for ComparisonKernel {
             rhs.get().1,
             *p,
         ))
-    }
-}
-
-fn gen_convert_vec<'ctx>(
-    ctx: &'ctx Context,
-    builder: &Builder<'ctx>,
-    v: VectorValue<'ctx>,
-    src: PrimitiveType,
-    dst: PrimitiveType,
-) -> VectorValue<'ctx> {
-    if src == dst {
-        return v;
-    }
-
-    let dst_llvm = dst.llvm_vec_type(ctx, v.get_type().get_size()).unwrap();
-
-    match (src.is_int(), dst.is_int()) {
-        // int to int
-        (true, true) => {
-            if src.width() > dst.width() {
-                builder.build_int_truncate(v, dst_llvm, "trunc").unwrap()
-            } else if src.is_signed() {
-                builder.build_int_s_extend(v, dst_llvm, "sext").unwrap()
-            } else {
-                builder.build_int_z_extend(v, dst_llvm, "zext").unwrap()
-            }
-        }
-        // int to float
-        (true, false) => {
-            if src.is_signed() {
-                builder
-                    .build_signed_int_to_float(v, dst_llvm, "sitf")
-                    .unwrap()
-            } else {
-                builder
-                    .build_signed_int_to_float(v, dst_llvm, "uitf")
-                    .unwrap()
-            }
-        }
-        // float to int
-        (false, true) => {
-            if dst.is_signed() {
-                builder
-                    .build_float_to_signed_int(v, dst_llvm, "ftsi")
-                    .unwrap()
-            } else {
-                builder
-                    .build_float_to_unsigned_int(v, dst_llvm, "ftui")
-                    .unwrap()
-            }
-        }
-        // float to float
-        (false, false) => {
-            if src.width() > dst.width() {
-                builder.build_float_trunc(v, dst_llvm, "ftrun").unwrap()
-            } else {
-                builder.build_float_ext(v, dst_llvm, "fext").unwrap()
-            }
-        }
     }
 }
 
@@ -503,8 +443,8 @@ fn generate_block_llvm_cmp_kernel<'a>(
         .unwrap()
         .into_vector_value();
 
-    let lvec = gen_convert_vec(ctx, &build, lvec, lhs_prim, dom_prim_type);
-    let rvec = gen_convert_vec(ctx, &build, rvec, rhs_prim, dom_prim_type);
+    let lvec = gen_convert_numeric_vec(ctx, &build, lvec, lhs_prim, dom_prim_type);
+    let rvec = gen_convert_numeric_vec(ctx, &build, rvec, rhs_prim, dom_prim_type);
 
     let res = match dom_prim_type.comparison_type() {
         ComparisonType::Int { signed } => build
@@ -575,8 +515,8 @@ fn generate_block_llvm_cmp_kernel<'a>(
         .build_bit_cast(rv, rhs_prim.llvm_vec_type(ctx, 1).unwrap(), "rv_v")
         .unwrap()
         .into_vector_value();
-    let lv_v = gen_convert_vec(ctx, &build, lv_v, lhs_prim, dom_prim_type);
-    let rv_v = gen_convert_vec(ctx, &build, rv_v, rhs_prim, dom_prim_type);
+    let lv_v = gen_convert_numeric_vec(ctx, &build, lv_v, lhs_prim, dom_prim_type);
+    let rv_v = gen_convert_numeric_vec(ctx, &build, rv_v, rhs_prim, dom_prim_type);
     let lv = build.build_bit_cast(lv_v, dom_llvm, "lv").unwrap();
     let rv = build.build_bit_cast(rv_v, dom_llvm, "rv").unwrap();
 

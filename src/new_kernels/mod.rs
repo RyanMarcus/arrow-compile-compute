@@ -5,11 +5,16 @@ use std::{collections::HashMap, sync::RwLock};
 use arrow_schema::DataType;
 pub use cmp::ComparisonKernel;
 use inkwell::{
+    builder::Builder,
+    context::Context,
     module::Module,
     passes::PassBuilderOptions,
     targets::{CodeModel, RelocMode, Target, TargetMachine},
+    values::VectorValue,
     OptimizationLevel,
 };
+
+use crate::PrimitiveType;
 
 #[derive(Debug)]
 pub enum ArrowKernelError {
@@ -97,6 +102,67 @@ fn optimize_module(module: &Module) -> Result<(), ArrowKernelError> {
     module
         .run_passes("default<O3>", &machine, PassBuilderOptions::create())
         .map_err(|e| ArrowKernelError::LLVMError(e.to_string()))
+}
+
+/// Emit code to convert a vector of numeric values to a different numeric type,
+/// (e.g., from i32 to f64).
+fn gen_convert_numeric_vec<'ctx>(
+    ctx: &'ctx Context,
+    builder: &Builder<'ctx>,
+    v: VectorValue<'ctx>,
+    src: PrimitiveType,
+    dst: PrimitiveType,
+) -> VectorValue<'ctx> {
+    if src == dst {
+        return v;
+    }
+
+    let dst_llvm = dst.llvm_vec_type(ctx, v.get_type().get_size()).unwrap();
+
+    match (src.is_int(), dst.is_int()) {
+        // int to int
+        (true, true) => {
+            if src.width() > dst.width() {
+                builder.build_int_truncate(v, dst_llvm, "trunc").unwrap()
+            } else if src.is_signed() {
+                builder.build_int_s_extend(v, dst_llvm, "sext").unwrap()
+            } else {
+                builder.build_int_z_extend(v, dst_llvm, "zext").unwrap()
+            }
+        }
+        // int to float
+        (true, false) => {
+            if src.is_signed() {
+                builder
+                    .build_signed_int_to_float(v, dst_llvm, "sitf")
+                    .unwrap()
+            } else {
+                builder
+                    .build_signed_int_to_float(v, dst_llvm, "uitf")
+                    .unwrap()
+            }
+        }
+        // float to int
+        (false, true) => {
+            if dst.is_signed() {
+                builder
+                    .build_float_to_signed_int(v, dst_llvm, "ftsi")
+                    .unwrap()
+            } else {
+                builder
+                    .build_float_to_unsigned_int(v, dst_llvm, "ftui")
+                    .unwrap()
+            }
+        }
+        // float to float
+        (false, false) => {
+            if src.width() > dst.width() {
+                builder.build_float_trunc(v, dst_llvm, "ftrun").unwrap()
+            } else {
+                builder.build_float_ext(v, dst_llvm, "fext").unwrap()
+            }
+        }
+    }
 }
 
 #[cfg(test)]
