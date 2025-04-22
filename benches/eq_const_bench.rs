@@ -1,4 +1,6 @@
-use arrow_array::{types::Int64Type, Array, Float32Array, Int32Array, Int64Array, RunArray};
+use arrow_array::{
+    types::Int64Type, Array, Float32Array, Int32Array, Int64Array, RunArray, StringArray,
+};
 use arrow_compile_compute::{CodeGen, ComparisonKernel, Kernel, Predicate};
 use arrow_schema::DataType;
 use criterion::{criterion_group, criterion_main, Criterion};
@@ -168,6 +170,29 @@ pub fn criterion_benchmark(c: &mut Criterion) {
         });
         c.bench_function("f32_lt/execute llvm", |b| {
             b.iter(|| k.call((&data1, &data2)).unwrap())
+        });
+    }
+
+    {
+        let random_strings: Vec<String> = (0..1_000_000)
+            .map(|_| {
+                let len = rng.usize(5..15);
+                (0..len).map(|_| (rng.u8(97..123)) as char).collect()
+            })
+            .collect();
+        let scalar = StringArray::new_scalar(random_strings[500_000].clone());
+        let data = StringArray::from(random_strings);
+
+        let k = ComparisonKernel::compile(&(&data, &scalar), Predicate::Lt).unwrap();
+        let arrow_answer = arrow_ord::cmp::lt(&data, &scalar).unwrap();
+        let llvm_answer = k.call((&data, &scalar)).unwrap();
+        assert_eq!(arrow_answer, llvm_answer);
+
+        c.bench_function("strlt/execute arrow", |b| {
+            b.iter(|| arrow_ord::cmp::lt(&data, &scalar).unwrap())
+        });
+        c.bench_function("strlt/execute llvm", |b| {
+            b.iter(|| k.call((&data, &scalar)).unwrap())
         });
     }
 }
