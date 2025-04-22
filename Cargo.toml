@@ -6,10 +6,10 @@ license = "GPL-3.0"
 
 [dependencies]
 inkwell = { version = "0.5.0", features = ["llvm18-0-prefer-static"] }
-arrow-schema = "53.3"
-arrow-buffer = "53.3"
-arrow-data = "53.3"
-arrow-array = "53.3"
+arrow-schema = "55.0"
+arrow-buffer = "55.0"
+arrow-data = "55.0"
+arrow-array = "55.0"
 ouroboros = "0.18"
 half = "2.4.1"
 enum-as-inner = "0.6.1"
@@ -18,17 +18,17 @@ repr_offset = { version = "0.2.2", features = ["derive"] }
 
 [dev-dependencies]
 half = "2.4.1"
-arrow-ord = "53.3"
-arrow-cast = "53.3"
-arrow-select = "53.3"
-arrow-string = "53.3"
-arrow-arith = "53.3"
+arrow-ord = "55.0"
+arrow-cast = "55.0"
+arrow-select = "55.0"
+arrow-string = "55.0"
+arrow-arith = "55.0"
 criterion = "0.5"
 fastrand = "2.2.0"
 itertools = "0.13.0"
 proptest = "1.5"
 rayon = "1.10"
-chrono = "= 0.4.39"
+#chrono = "= 0.4.39"
 
 [profile.release]
 debug = true
