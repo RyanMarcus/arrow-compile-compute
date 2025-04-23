@@ -81,8 +81,6 @@ impl Kernel for ComparisonKernel {
 
         let mut a_iter = datum_to_iter(a)?;
         let mut b_iter = datum_to_iter(b)?;
-        a_iter.assert_non_null();
-        b_iter.assert_non_null();
         let mut out = vec![0_u64; a_arr.len().div_ceil(64)];
 
         self.with_func(|func| unsafe {
