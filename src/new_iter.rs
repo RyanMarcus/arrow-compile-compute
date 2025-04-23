@@ -566,6 +566,64 @@ pub struct BitmapIterator {
     len: u64,
 }
 
+impl BitmapIterator {
+    fn llvm_get_data_ptr<'a>(
+        &self,
+        ctx: &'a Context,
+        build: &'a Builder,
+        ptr: PointerValue<'a>,
+    ) -> PointerValue<'a> {
+        let data_ptr_ptr = increment_pointer!(ctx, build, ptr, BitmapIterator::OFFSET_DATA);
+        build
+            .build_load(ctx.ptr_type(AddressSpace::default()), data_ptr_ptr, "data_ptr")
+            .unwrap()
+            .into_pointer_value()
+
+    }
+
+    fn llvm_pos<'a>(
+        &self,
+        ctx: &'a Context,
+        build: &'a Builder,
+        ptr: PointerValue<'a>,
+    ) -> IntValue<'a> {
+        let pos_ptr = increment_pointer!(ctx, build, ptr, BitmapIterator::OFFSET_POS);
+        build
+            .build_load(ctx.i64_type(), pos_ptr, "pos")
+            .unwrap()
+            .into_int_value()
+    }
+
+    fn llvm_len<'a>(
+        &self,
+        ctx: &'a Context,
+        build: &'a Builder,
+        ptr: PointerValue<'a>,
+    ) -> IntValue<'a> {
+        let len_ptr = increment_pointer!(ctx, build, ptr, BitmapIterator::OFFSET_LEN);
+        build
+            .build_load(ctx.i64_type(), len_ptr, "len")
+            .unwrap()
+            .into_int_value()
+    }
+
+    fn llvm_increment_pos<'a>(
+        &self,
+        ctx: &'a Context,
+        builder: &'a Builder,
+        ptr: PointerValue<'a>,
+        amt: IntValue<'a>,
+    ) {
+        let pos_ptr = increment_pointer!(ctx, builder, ptr, BitmapIterator::OFFSET_POS);
+        let pos = builder
+            .build_load(ctx.i64_type(), pos_ptr, "pos")
+            .unwrap()
+            .into_int_value();
+        let new_pos = builder.build_int_add(pos, amt, "new_pos").unwrap();
+        builder.build_store(pos_ptr, new_pos).unwrap();
+    }
+}
+
 impl From<&BooleanArray> for Box<BitmapIterator> {
     fn from(value: &BooleanArray) -> Self {
         Box::new(BitmapIterator {
@@ -1295,7 +1353,56 @@ pub fn generate_next<'a>(
 
             return Some(next);
         }
-        IteratorHolder::Bitmap(_bitmap_iterator) => todo!(),
+        IteratorHolder::Bitmap(bitmap_iterator) => {
+            declare_blocks!(ctx, next, entry, none_left, get_next);
+
+            build.position_at_end(entry);
+            let curr_pos = bitmap_iterator.llvm_pos(ctx, &build, iter_ptr);
+            let curr_len = bitmap_iterator.llvm_len(ctx, &build, iter_ptr);
+            let have_more = build
+                .build_int_compare(IntPredicate::ULT, curr_pos, curr_len, "have_enough")
+                .unwrap();
+            build
+                .build_conditional_branch(have_more, get_next, none_left)
+                .unwrap();
+
+            build.position_at_end(none_left);
+            build
+                .build_return(Some(&bool_type.const_int(0, false)))
+                .unwrap();
+            
+            build.position_at_end(get_next);
+            let data_ptr = bitmap_iterator.llvm_get_data_ptr(ctx, &build, iter_ptr);
+            let byte_index = build
+                .build_right_shift(curr_pos, i64_type.const_int(3, false), false, "byte_index")
+                .unwrap();
+            let bit_in_byte_i64 = build
+                .build_and(curr_pos, i64_type.const_int(7, false), "bit_in_byte_i64")
+                .unwrap();
+            let bit_in_byte_i8 = build
+                .build_int_truncate(bit_in_byte_i64, ctx.i8_type(), "bit_in_byte_i8")
+                .unwrap();
+            let data_byte_ptr = increment_pointer!(ctx, build, data_ptr, ptype.width(), byte_index);
+            let data_byte_i8 = build
+                .build_load(ctx.i8_type(), data_byte_ptr, "get_data_byte_i8")
+                .unwrap()
+                .into_int_value();
+            let data_byte_shifted_i8 = build
+                .build_right_shift(data_byte_i8, bit_in_byte_i8, false, "data_byte_shifted_i8")
+                .unwrap();
+            let data_bit_i8 = build
+                .build_and(data_byte_shifted_i8, ctx.i8_type().const_int(1, false), "data_bit_i8")
+                .unwrap();
+            build
+                .build_store(out_ptr, data_bit_i8)
+                .unwrap();
+            bitmap_iterator.llvm_increment_pos(ctx, &build, iter_ptr, i64_type.const_int(1, false));
+            build
+                .build_return(Some(&bool_type.const_int(1, false)))
+                .unwrap();
+
+            return Some(next);
+        }
         IteratorHolder::Dictionary { arr, keys, values } => match dt {
             DataType::Dictionary(k_dt, v_dt) => {
                 let key_next =
@@ -1698,7 +1805,35 @@ pub fn generate_random_access<'a>(
             build.build_return(Some(&to_return)).unwrap();
             return Some(next);
         }
-        IteratorHolder::Bitmap(_bitmap_iterator) => todo!(),
+        IteratorHolder::Bitmap(bitmap_iterator) => {
+            declare_blocks!(ctx, next, entry);
+
+            build.position_at_end(entry);
+            let data_ptr = bitmap_iterator.llvm_get_data_ptr(ctx, &build, iter_ptr);
+            let byte_index = build
+                .build_right_shift(idx, i64_type.const_int(3, false), false, "byte_index")
+                .unwrap();
+            let bit_in_byte_i64 = build
+                .build_and(idx, i64_type.const_int(7, false), "bit_in_byte_i64")
+                .unwrap();
+            let bit_in_byte_i8 = build
+                .build_int_truncate(bit_in_byte_i64, ctx.i8_type(), "bit_in_byte_i8")
+                .unwrap();
+            let data_byte_ptr = increment_pointer!(ctx, build, data_ptr, ptype.width(), byte_index);
+            let data_byte_i8 = build
+                .build_load(ctx.i8_type(), data_byte_ptr, "get_data_byte_i8")
+                .unwrap()
+                .into_int_value();
+            let data_byte_shifted_i8 = build
+                .build_right_shift(data_byte_i8, bit_in_byte_i8, false, "data_byte_shifted_i8")
+                .unwrap();
+            let data_bit_i8 = build
+                .build_and(data_byte_shifted_i8, ctx.i8_type().const_int(1, false), "data_bit_i8")
+                .unwrap();
+            build.build_return(Some(&data_bit_i8)).unwrap();
+
+            return Some(next);
+        }
         IteratorHolder::Dictionary { arr, keys, values } => match dt {
             DataType::Dictionary(k_dt, v_dt) => {
                 let keys_access = generate_random_access(
@@ -1908,6 +2043,106 @@ mod tests {
             assert_eq!(next_func.call(iter.get_mut_ptr(), 2), 2);
             assert_eq!(next_func.call(iter.get_mut_ptr(), 3), 3);
             assert_eq!(next_func.call(iter.get_mut_ptr(), 4), 4);
+        };
+    }
+
+    #[test]
+    fn test_bitmap_iter() {
+        use arrow_array::BooleanArray;
+        let data = BooleanArray::from(vec![true, true, false, true, false, false, false, false, true, true, false, true, false]);
+
+        let mut iter = array_to_iter(&data);
+        iter.assert_non_null();
+
+        let ctx = Context::create();
+        let module = ctx.create_module("test_bitmap_iter");
+        let func = generate_next(&ctx, &module, "bitmap_iter", data.data_type(), &iter).unwrap();
+        let fname = func.get_name().to_str().unwrap();
+
+        module.verify().unwrap();
+        let ee = module
+            .create_jit_execution_engine(OptimizationLevel::None)
+            .unwrap();
+
+        let next_func = unsafe {
+            ee.get_function::<unsafe extern "C" fn(*mut c_void, *mut i32) -> bool>(fname)
+            .unwrap()
+        };
+
+        let mut buf: i32 = 0;
+        unsafe {
+            assert_eq!(next_func.call(iter.get_mut_ptr(), &mut buf as *mut i32),true);
+            assert_eq!(buf, 1);
+            assert_eq!(next_func.call(iter.get_mut_ptr(), &mut buf as *mut i32),true);
+            assert_eq!(buf, 1);
+            assert_eq!(next_func.call(iter.get_mut_ptr(), &mut buf as *mut i32),true);
+            assert_eq!(buf, 0);
+            assert_eq!(next_func.call(iter.get_mut_ptr(), &mut buf as *mut i32),true);
+            assert_eq!(buf, 1);
+            assert_eq!(next_func.call(iter.get_mut_ptr(), &mut buf as *mut i32),true);
+            assert_eq!(buf, 0);
+            assert_eq!(next_func.call(iter.get_mut_ptr(), &mut buf as *mut i32),true);
+            assert_eq!(buf, 0);
+            assert_eq!(next_func.call(iter.get_mut_ptr(), &mut buf as *mut i32),true);
+            assert_eq!(buf, 0);
+            assert_eq!(next_func.call(iter.get_mut_ptr(), &mut buf as *mut i32),true);
+            assert_eq!(buf, 0);
+            assert_eq!(next_func.call(iter.get_mut_ptr(), &mut buf as *mut i32),true);
+            assert_eq!(buf, 1);
+            assert_eq!(next_func.call(iter.get_mut_ptr(), &mut buf as *mut i32),true);
+            assert_eq!(buf, 1);
+            assert_eq!(next_func.call(iter.get_mut_ptr(), &mut buf as *mut i32),true);
+            assert_eq!(buf, 0);
+            assert_eq!(next_func.call(iter.get_mut_ptr(), &mut buf as *mut i32),true);
+            assert_eq!(buf, 1);
+            assert_eq!(next_func.call(iter.get_mut_ptr(), &mut buf as *mut i32),true);
+            assert_eq!(buf, 0);
+            assert_eq!(next_func.call(iter.get_mut_ptr(), &mut buf as *mut i32),false);
+        }
+    }
+
+    #[test]
+    fn test_bitmap_random_access() {
+        use arrow_array::BooleanArray;
+        let data = BooleanArray::from(vec![true, true, false, true, false, false, false, false, true, true, false, true, false]);
+
+        let mut iter = array_to_iter(&data);
+        iter.assert_non_null();
+
+        let ctx = Context::create();
+        let module = ctx.create_module("test_bitmap_iter");
+        let func = generate_random_access(&ctx, &module, "bitmap_iter", data.data_type(), &iter).unwrap();
+        let fname = func.get_name().to_str().unwrap();
+
+        module.verify().unwrap();
+        let ee = module
+            .create_jit_execution_engine(OptimizationLevel::None)
+            .unwrap();
+
+        let next_func = unsafe {
+            ee.get_function::<unsafe extern "C" fn(*mut c_void, u64) -> i8>(fname)
+            .unwrap()
+        };
+
+        unsafe {
+            assert_eq!(next_func.call(iter.get_mut_ptr(), 0), 1);
+            assert_eq!(next_func.call(iter.get_mut_ptr(), 1), 1);
+            assert_eq!(next_func.call(iter.get_mut_ptr(), 2), 0);
+            assert_eq!(next_func.call(iter.get_mut_ptr(), 3), 1);
+            assert_eq!(next_func.call(iter.get_mut_ptr(), 4), 0);
+            assert_eq!(next_func.call(iter.get_mut_ptr(), 5), 0);
+            assert_eq!(next_func.call(iter.get_mut_ptr(), 6), 0);
+            assert_eq!(next_func.call(iter.get_mut_ptr(), 7), 0);
+            assert_eq!(next_func.call(iter.get_mut_ptr(), 8), 1);
+            assert_eq!(next_func.call(iter.get_mut_ptr(), 9), 1);
+            assert_eq!(next_func.call(iter.get_mut_ptr(), 10), 0);
+            assert_eq!(next_func.call(iter.get_mut_ptr(), 11), 1);
+            assert_eq!(next_func.call(iter.get_mut_ptr(), 12), 0);
+            assert_eq!(next_func.call(iter.get_mut_ptr(), 3), 1);
+            assert_eq!(next_func.call(iter.get_mut_ptr(), 4), 0);
+            assert_eq!(next_func.call(iter.get_mut_ptr(), 8), 1);
+            assert_eq!(next_func.call(iter.get_mut_ptr(), 9), 1);
+            assert_eq!(next_func.call(iter.get_mut_ptr(), 10), 0);
         };
     }
 

@@ -347,6 +347,7 @@ impl PrimitiveType {
 
     fn for_arrow_type(dt: &DataType) -> Self {
         match dt {
+            DataType::Boolean => PrimitiveType::U8,
             DataType::Int8 => PrimitiveType::I8,
             DataType::Int16 => PrimitiveType::I16,
             DataType::Int32 => PrimitiveType::I32,
