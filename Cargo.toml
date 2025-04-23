@@ -54,10 +54,6 @@ harness = false
 name = "agg_bench"
 harness = false
 
-[[bench]]
-name = "bitmap_bench"
-harness = false
-
 
 [[bench]]
 name = "take_bench"

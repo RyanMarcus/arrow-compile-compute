@@ -54,10 +54,10 @@ mod runend;
 mod scalar;
 mod string;
 
-pub use arrow_interface::cast;
 pub use arrow_interface::compute;
 pub use arrow_interface::SelfContainedBinaryFunc;
 
+pub use new_arrow_interface::cast;
 pub use new_arrow_interface::cmp;
 
 pub use new_kernels::ArrowKernelError;

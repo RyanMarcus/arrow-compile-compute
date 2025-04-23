@@ -96,8 +96,8 @@ impl Kernel for ComparisonKernel {
         ))
     }
 
-    fn compile(inp: &Self::Input<'_>, pred: Predicate) -> Result<Self, ArrowKernelError> {
-        let (lhs, rhs) = *inp;
+    fn compile(inp: Self::Input<'_>, pred: Predicate) -> Result<Self, ArrowKernelError> {
+        let (lhs, rhs) = inp;
         let (lhs_arr, lhs_scalar) = lhs.get();
         let (rhs_arr, rhs_scalar) = rhs.get();
 
@@ -108,7 +108,7 @@ impl Kernel for ComparisonKernel {
         }
 
         if lhs_scalar && !rhs_scalar {
-            return ComparisonKernel::compile(&(rhs, lhs), pred.flip());
+            return ComparisonKernel::compile((rhs, lhs), pred.flip());
         }
 
         let lhs_iter = datum_to_iter(lhs)?;
@@ -888,7 +888,7 @@ mod tests {
     fn test_num_num_cmp() {
         let a = UInt32Array::from(vec![1, 2, 3]);
         let b = UInt32Array::from(vec![11, 0, 13]);
-        let k = ComparisonKernel::compile(&(&a, &b), Predicate::Lt).unwrap();
+        let k = ComparisonKernel::compile((&a, &b), Predicate::Lt).unwrap();
         let r = k.call((&a, &b)).unwrap();
         assert_eq!(r, BooleanArray::from(vec![true, false, true]))
     }
@@ -897,7 +897,7 @@ mod tests {
     fn test_num_num_block_cmp() {
         let a = UInt32Array::from((0..100).collect_vec());
         let b = UInt32Array::from((1..101).collect_vec());
-        let k = ComparisonKernel::compile(&(&a, &b), Predicate::Lt).unwrap();
+        let k = ComparisonKernel::compile((&a, &b), Predicate::Lt).unwrap();
         let r = k.call((&a, &b)).unwrap();
         assert_eq!(r, BooleanArray::from(vec![true; 100]))
     }
@@ -906,7 +906,7 @@ mod tests {
     fn test_num_num_block_scalar_cmp() {
         let a = UInt32Array::from((0..100).collect_vec());
         let b = Scalar::new(UInt32Array::from(vec![5]));
-        let k = ComparisonKernel::compile(&(&a, &b), Predicate::Lt).unwrap();
+        let k = ComparisonKernel::compile((&a, &b), Predicate::Lt).unwrap();
         let r = k.call((&a, &b)).unwrap();
 
         let expected_result = (0..100).map(|i| i < 5).collect::<Vec<bool>>();
@@ -917,7 +917,7 @@ mod tests {
     fn test_num_num_float_cmp() {
         let a = Float32Array::from((0..100).map(|i| i as f32).collect_vec());
         let b = Float32Array::from((1..101).map(|i| i as f32).collect_vec());
-        let k = ComparisonKernel::compile(&(&a, &b), Predicate::Lt).unwrap();
+        let k = ComparisonKernel::compile((&a, &b), Predicate::Lt).unwrap();
         let r = k.call((&a, &b)).unwrap();
         assert_eq!(r, BooleanArray::from(vec![true; 100]))
     }
@@ -926,7 +926,7 @@ mod tests {
     fn test_num_num_float_scalar_cmp() {
         let a = Float32Array::from((0..100).map(|i| i as f32).collect_vec());
         let b = Scalar::new(Float32Array::from(vec![5.0]));
-        let k = ComparisonKernel::compile(&(&a, &b), Predicate::Lt).unwrap();
+        let k = ComparisonKernel::compile((&a, &b), Predicate::Lt).unwrap();
         let r = k.call((&a, &b)).unwrap();
 
         let expected_result = (0..100).map(|i| i < 5).collect::<Vec<bool>>();
@@ -937,7 +937,7 @@ mod tests {
     fn test_num_num_float_scalar_cmp_convert() {
         let a = Float32Array::from(vec![-93294.49]);
         let b = Float32Array::new_scalar(-205150180000.0);
-        let k = ComparisonKernel::compile(&(&a, &b), Predicate::Lt).unwrap();
+        let k = ComparisonKernel::compile((&a, &b), Predicate::Lt).unwrap();
         let r = k.call((&a, &b)).unwrap();
 
         let res = (-93294.49_f32).total_cmp(&-205150180000.0) == Ordering::Less;
@@ -948,7 +948,7 @@ mod tests {
     fn test_int32_int64_cmp() {
         let a = Int32Array::from(vec![1, 2, 3, 4]);
         let b = Int64Array::from(vec![4, 3, 2, 1]);
-        let k = ComparisonKernel::compile(&(&a, &b), Predicate::Lt).unwrap();
+        let k = ComparisonKernel::compile((&a, &b), Predicate::Lt).unwrap();
         let r = k.call((&a, &b)).unwrap();
 
         let expected_result = vec![true, true, false, false];
@@ -959,7 +959,7 @@ mod tests {
     fn test_string_string_cmp() {
         let a = StringArray::from(vec!["apple", "banana", "cherry"]);
         let b = StringArray::from(vec!["banana", "cherry", "apple"]);
-        let k = ComparisonKernel::compile(&(&a, &b), Predicate::Lt).unwrap();
+        let k = ComparisonKernel::compile((&a, &b), Predicate::Lt).unwrap();
         let r = k.call((&a, &b)).unwrap();
 
         let expected_result = vec![true, true, false];
@@ -971,7 +971,7 @@ mod tests {
         let values = (0..100).map(|i| format!("value{}", i)).collect_vec();
         let a = StringArray::from(values);
         let b = Scalar::new(StringArray::from(vec!["value50"]));
-        let k = ComparisonKernel::compile(&(&a, &b), Predicate::Eq).unwrap();
+        let k = ComparisonKernel::compile((&a, &b), Predicate::Eq).unwrap();
         let r = k.call((&a, &b)).unwrap();
 
         let expected_result = (0..100).map(|i| i == 50).collect_vec();
@@ -983,7 +983,7 @@ mod tests {
         let values = (0..64).map(|i| format!("value{}", i)).collect_vec();
         let a = StringArray::from(values);
         let b = Scalar::new(StringArray::from(vec!["value50"]));
-        let k = ComparisonKernel::compile(&(&a, &b), Predicate::Eq).unwrap();
+        let k = ComparisonKernel::compile((&a, &b), Predicate::Eq).unwrap();
         let r = k.call((&a, &b)).unwrap();
 
         let expected_result = (0..64).map(|i| i == 50).collect_vec();
@@ -999,7 +999,7 @@ mod tests {
 
         let b = Scalar::new(StringArray::from(vec!["value2"]));
 
-        let k = ComparisonKernel::compile(&(&a, &b), Predicate::Eq).unwrap();
+        let k = ComparisonKernel::compile((&a, &b), Predicate::Eq).unwrap();
         let r = k.call((&a, &b)).unwrap();
 
         let expected_result = (0..100).map(|i| i % 4 == 2).collect_vec();

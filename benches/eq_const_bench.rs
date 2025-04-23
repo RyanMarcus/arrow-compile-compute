@@ -29,13 +29,13 @@ pub fn criterion_benchmark(c: &mut Criterion) {
 
     c.bench_function("compile", |b| {
         let arr = Int32Array::from(vec![1, 2, 3]);
-        b.iter(|| ComparisonKernel::compile(&(&arr, &arr), Predicate::Eq).unwrap())
+        b.iter(|| ComparisonKernel::compile((&arr, &arr), Predicate::Eq).unwrap())
     });
 
     {
         let data1 = Int32Array::from((0..10_000_000).map(|_| rng.i32(0..1000)).collect_vec());
         let data2 = Int32Array::from((0..10_000_000).map(|_| rng.i32(0..1000)).collect_vec());
-        let k = ComparisonKernel::compile(&(&data1, &data2), Predicate::Eq).unwrap();
+        let k = ComparisonKernel::compile((&data1, &data2), Predicate::Eq).unwrap();
 
         let arrow_answer = arrow_ord::cmp::eq(&data1, &data2).unwrap();
         let llvm_answer = k.call((&data1, &data2)).unwrap();
@@ -53,7 +53,7 @@ pub fn criterion_benchmark(c: &mut Criterion) {
         let data1 = Int32Array::from((0..10_000_000).map(|_| rng.i32(0..1000)).collect_vec());
         let data2 = Int64Array::from((0..10_000_000).map(|_| rng.i64(0..1000)).collect_vec());
 
-        let comp_kernel = ComparisonKernel::compile(&(&data1, &data2), Predicate::Eq).unwrap();
+        let comp_kernel = ComparisonKernel::compile((&data1, &data2), Predicate::Eq).unwrap();
         let llvm_answer_kernel = comp_kernel.call((&data1, &data2)).unwrap();
         let arrow_answer =
             arrow_ord::cmp::eq(&arrow_cast::cast(&data1, &DataType::Int64).unwrap(), &data2)
@@ -79,7 +79,7 @@ pub fn criterion_benchmark(c: &mut Criterion) {
         let data1 = arrow_cast::cast(&data1, &dict_type).unwrap();
         let data2 = arrow_cast::cast(&data2, &dict_type).unwrap();
 
-        let k = ComparisonKernel::compile(&(&data1, &data2), Predicate::Eq).unwrap();
+        let k = ComparisonKernel::compile((&data1, &data2), Predicate::Eq).unwrap();
         let llvm_answer = k.call((&data1, &data2)).unwrap();
         let arrow_answer = arrow_ord::cmp::eq(&data1, &data2).unwrap();
         assert_eq!(llvm_answer, arrow_answer);
@@ -99,7 +99,7 @@ pub fn criterion_benchmark(c: &mut Criterion) {
 
         let data1 = arrow_cast::cast(&data1, &dict_type).unwrap();
 
-        let k = ComparisonKernel::compile(&(&data1, &data2), Predicate::Eq).unwrap();
+        let k = ComparisonKernel::compile((&data1, &data2), Predicate::Eq).unwrap();
         let llvm_answer = k.call((&data1, &data2)).unwrap();
         let arrow_answer = arrow_ord::cmp::eq(&data1, &data2).unwrap();
         assert_eq!(llvm_answer, arrow_answer);
@@ -142,7 +142,7 @@ pub fn criterion_benchmark(c: &mut Criterion) {
         let data1 = Int32Array::from((0..10_000_000).map(|_| rng.i32(0..1000)).collect_vec());
         let data2 = Int32Array::new_scalar(50);
 
-        let k = ComparisonKernel::compile(&(&data1, &data2), Predicate::Gte).unwrap();
+        let k = ComparisonKernel::compile((&data1, &data2), Predicate::Gte).unwrap();
 
         let arrow_answer = arrow_ord::cmp::gt_eq(&data1, &data2).unwrap();
         let llvm_answer = k.call((&data1, &data2)).unwrap();
@@ -160,7 +160,7 @@ pub fn criterion_benchmark(c: &mut Criterion) {
     {
         let data1 = Float32Array::from((0..10_000_000).map(|_| rng.f32()).collect_vec());
         let data2 = Float32Array::from((0..10_000_000).map(|_| rng.f32()).collect_vec());
-        let k = ComparisonKernel::compile(&(&data1, &data2), Predicate::Lt).unwrap();
+        let k = ComparisonKernel::compile((&data1, &data2), Predicate::Lt).unwrap();
         let arrow_answer = arrow_ord::cmp::lt(&data1, &data2).unwrap();
         let llvm_answer = k.call((&data1, &data2)).unwrap();
         assert_eq!(arrow_answer, llvm_answer);
@@ -183,7 +183,7 @@ pub fn criterion_benchmark(c: &mut Criterion) {
         let scalar = StringArray::new_scalar(random_strings[500_000].clone());
         let data = StringArray::from(random_strings);
 
-        let k = ComparisonKernel::compile(&(&data, &scalar), Predicate::Lt).unwrap();
+        let k = ComparisonKernel::compile((&data, &scalar), Predicate::Lt).unwrap();
         let arrow_answer = arrow_ord::cmp::lt(&data, &scalar).unwrap();
         let llvm_answer = k.call((&data, &scalar)).unwrap();
         assert_eq!(arrow_answer, llvm_answer);

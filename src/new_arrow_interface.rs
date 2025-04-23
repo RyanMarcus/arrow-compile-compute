@@ -36,3 +36,21 @@ pub mod cmp {
         CMP_PROGRAM_CACHE.get((lhs, rhs), Predicate::Ne)
     }
 }
+
+pub mod cast {
+    use std::sync::LazyLock;
+
+    use arrow_array::Array;
+    use arrow_array::ArrayRef;
+    use arrow_schema::DataType;
+
+    use crate::new_kernels::CastKernel;
+    use crate::new_kernels::KernelCache;
+    use crate::ArrowKernelError;
+
+    static CAST_PROGRAM_CACHE: LazyLock<KernelCache<CastKernel>> = LazyLock::new(KernelCache::new);
+
+    pub fn cast(lhs: &dyn Array, to_type: &DataType) -> Result<ArrayRef, ArrowKernelError> {
+        CAST_PROGRAM_CACHE.get(lhs, to_type.clone())
+    }
+}

@@ -25,8 +25,8 @@ pub struct SelfContainedBinaryFunc {
     #[not_covariant]
     cf: CompiledBinaryFunc<'this>,
 }
-unsafe impl Send for SelfContainedBinaryFunc {}
 unsafe impl Sync for SelfContainedBinaryFunc {}
+unsafe impl Send for SelfContainedBinaryFunc {}
 
 impl SelfContainedBinaryFunc {
     pub fn build(
@@ -97,29 +97,6 @@ pub struct SelfContainedAggFunc {
 unsafe impl Send for SelfContainedAggFunc {}
 unsafe impl Sync for SelfContainedAggFunc {}
 
-fn build_cast(src: &DataType, tar: &DataType) -> Result<SelfContainedConvertFunc, ArrowError> {
-    let ctx = Context::create();
-    if matches!(src, DataType::Boolean) && matches!(tar, DataType::UInt64) {
-        return SelfContainedConvertFuncTryBuilder {
-            ctx,
-            cf_builder: |ctx| {
-                let cg = CodeGen::new(ctx);
-                cg.compile_bitmap_to_vec()
-            },
-        }
-        .try_build();
-    }
-
-    SelfContainedConvertFuncTryBuilder {
-        ctx,
-        cf_builder: |ctx| {
-            let cg = CodeGen::new(ctx);
-            cg.cast_to_primitive(src, tar)
-        },
-    }
-    .try_build()
-}
-
 fn build_hash(src: &DataType) -> Result<SelfContainedConvertFunc, ArrowError> {
     let ctx = Context::create();
     SelfContainedConvertFuncTryBuilder {
@@ -187,11 +164,9 @@ fn build_agg(
     .try_build()
 }
 
-type CovFuncSig = (DataType, DataType);
 type TakeFuncSig = (DataType, DataType);
 type AggFuncSig = (DataType, bool, Aggregation);
 struct ProgramCache {
-    cov_cache: RwLock<HashMap<CovFuncSig, SelfContainedConvertFunc>>,
     hash_cache: RwLock<HashMap<DataType, SelfContainedConvertFunc>>,
     flt_cache: RwLock<HashMap<DataType, SelfContainedFilterFunc>>,
     tak_cache: RwLock<HashMap<TakeFuncSig, SelfContainedTakeFunc>>,
@@ -201,32 +176,11 @@ struct ProgramCache {
 impl ProgramCache {
     fn new() -> Self {
         ProgramCache {
-            cov_cache: RwLock::default(),
             hash_cache: RwLock::default(),
             flt_cache: RwLock::default(),
             tak_cache: RwLock::default(),
             agg_cache: RwLock::default(),
         }
-    }
-
-    fn cast(&self, arr1: &dyn Array, target_dt: &DataType) -> Result<ArrayRef, ArrowError> {
-        let sig = (arr1.data_type().clone(), target_dt.clone());
-
-        {
-            let lcache = self.cov_cache.read().unwrap();
-            if let Some(f) = lcache.get(&sig) {
-                return f.with_cf(|cf| cf.call(arr1));
-            }
-        }
-
-        // small race here: it is possible that multiple different threads will
-        // see there is no function, then compile it, then store it. This is
-        // fine a price to pay for not holding the lock for all function
-        // compilation.
-        let new_f = build_cast(arr1.data_type(), target_dt)?;
-        let result = new_f.with_cf(|cf| cf.call(arr1));
-        self.cov_cache.write().unwrap().insert(sig, new_f);
-        result
     }
 
     fn hash(&self, arr1: &dyn Array) -> Result<ArrayRef, ArrowError> {
@@ -315,33 +269,6 @@ impl ProgramCache {
         let result = new_f.with_cf(|cf| cf.call(arr1));
         self.agg_cache.write().unwrap().insert(sig, new_f);
         result
-    }
-}
-
-pub mod cast {
-    use arrow_array::{Array, ArrayRef};
-    use arrow_schema::{ArrowError, DataType};
-
-    use super::GLOBAL_PROGRAM_CACHE;
-
-    /// Allows casting from various types to primitive types. For example, you
-    /// can cast from an run-end encoded array to a primitive array:
-    /// ```
-    /// use arrow_array::{Int64Array, Int32Array, PrimitiveArray, RunArray};
-    /// let res = Int32Array::from(vec![5, 6, 10, 11, 12]);
-    /// let val = Int64Array::from(vec![1, 2, 3, 4, 5]);
-    /// let ree_arr = RunArray::try_new(&PrimitiveArray::from(res), &PrimitiveArray::from(val)).unwrap();
-    /// let ree_arr = ree_arr.downcast::<Int64Array>().unwrap();
-    ///
-    /// let result = Int64Array::from_iter(ree_arr).values().to_vec();
-    /// let expected = vec![1, 1, 1, 1, 1, 2, 3, 3, 3, 3, 4, 5];
-    /// assert_eq!(result, expected);
-    /// ```
-    ///
-    /// You can also cast a boolean array to a `UInt64Array`, resulting in the
-    /// indexes of the "on" bits.
-    pub fn cast(arr1: &dyn Array, target: &DataType) -> Result<ArrayRef, ArrowError> {
-        GLOBAL_PROGRAM_CACHE.cast(arr1, target)
     }
 }
 

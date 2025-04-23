@@ -15,6 +15,7 @@ use arrow_schema::DataType;
 use inkwell::{
     builder::Builder,
     context::Context,
+    intrinsics::Intrinsic,
     module::{Linkage, Module},
     types::BasicType,
     values::{BasicValue, FunctionValue, IntValue, PointerValue},
@@ -575,10 +576,13 @@ impl BitmapIterator {
     ) -> PointerValue<'a> {
         let data_ptr_ptr = increment_pointer!(ctx, build, ptr, BitmapIterator::OFFSET_DATA);
         build
-            .build_load(ctx.ptr_type(AddressSpace::default()), data_ptr_ptr, "data_ptr")
+            .build_load(
+                ctx.ptr_type(AddressSpace::default()),
+                data_ptr_ptr,
+                "data_ptr",
+            )
             .unwrap()
             .into_pointer_value()
-
     }
 
     fn llvm_pos<'a>(
@@ -791,6 +795,17 @@ impl RunEndIterator {
             .unwrap()
             .into_int_value();
         let new_pos = builder.build_int_add(curr_pos, amt, "new_pos").unwrap();
+        builder.build_store(ptr, new_pos).unwrap();
+    }
+
+    pub fn llvm_set_pos<'a>(
+        &self,
+        ctx: &'a Context,
+        builder: &'a Builder,
+        ptr: PointerValue<'a>,
+        new_pos: IntValue<'a>,
+    ) {
+        let ptr = increment_pointer!(ctx, builder, ptr, RunEndIterator::OFFSET_POS);
         builder.build_store(ptr, new_pos).unwrap();
     }
 
@@ -1185,7 +1200,256 @@ pub fn generate_next_block<'a, const N: u32>(
             }
             _ => unreachable!("dict iterator but not dict data type ({:?})", dt),
         },
-        IteratorHolder::RunEnd { .. } => todo!(),
+        IteratorHolder::RunEnd {
+            arr,
+            run_ends,
+            values,
+        } => match dt {
+            DataType::RunEndEncoded(re, v) => {
+                let access_ends = generate_random_access(
+                    ctx,
+                    llvm_mod,
+                    "ree_block_ends",
+                    re.data_type(),
+                    run_ends,
+                )?;
+                let access_values = generate_random_access(
+                    ctx,
+                    llvm_mod,
+                    "ree_block_values",
+                    v.data_type(),
+                    values,
+                )?;
+
+                let umin = Intrinsic::find("llvm.umin").unwrap();
+                let umin_f = umin.get_declaration(llvm_mod, &[i64_type.into()]).unwrap();
+                declare_blocks!(
+                    ctx,
+                    next,
+                    entry,
+                    check_for_next,
+                    fetch_next,
+                    not_enough,
+                    loop_cond,
+                    check_vec_full,
+                    fill_vec,
+                    exit
+                );
+
+                build.position_at_end(entry);
+                let orig_pos = arr.llvm_pos(ctx, &build, iter_ptr);
+                let orig_rem = arr.llvm_remaining(ctx, &build, iter_ptr);
+                let ends_iter = arr.llvm_re_iter_ptr(ctx, &build, iter_ptr);
+                let vals_iter = arr.llvm_val_iter_ptr(ctx, &build, iter_ptr);
+                let vbuf = build.build_alloca(vec_type, "vbuf").unwrap();
+                build.build_store(vbuf, vec_type.const_zero()).unwrap();
+                let buf_idx_ptr = build.build_alloca(i64_type, "buf_idx").unwrap();
+                build
+                    .build_store(buf_idx_ptr, i64_type.const_zero())
+                    .unwrap();
+                build.build_unconditional_branch(loop_cond).unwrap();
+
+                build.position_at_end(check_vec_full);
+                let buf_idx = build
+                    .build_load(i64_type, buf_idx_ptr, "buf_idx")
+                    .unwrap()
+                    .into_int_value();
+                let res = build
+                    .build_int_compare(
+                        IntPredicate::ULT,
+                        buf_idx,
+                        i64_type.const_int(N as u64, false),
+                        "vec_full",
+                    )
+                    .unwrap();
+                build
+                    .build_conditional_branch(res, loop_cond, exit)
+                    .unwrap();
+
+                build.position_at_end(loop_cond);
+                let remaining = arr.llvm_remaining(ctx, &build, iter_ptr);
+                let res = build
+                    .build_int_compare(
+                        IntPredicate::UGT,
+                        remaining,
+                        i64_type.const_zero(),
+                        "have_remaining",
+                    )
+                    .unwrap();
+                build
+                    .build_conditional_branch(res, fill_vec, check_for_next)
+                    .unwrap();
+
+                build.position_at_end(check_for_next);
+                arr.llvm_inc_pos(ctx, &build, iter_ptr, i64_type.const_int(1, false));
+                let pos = arr.llvm_pos(ctx, &build, iter_ptr);
+                let len = arr.llvm_len(ctx, &build, iter_ptr);
+                let res = build
+                    .build_int_compare(IntPredicate::ULT, pos, len, "have_next")
+                    .unwrap();
+                build
+                    .build_conditional_branch(res, fetch_next, not_enough)
+                    .unwrap();
+
+                build.position_at_end(not_enough);
+                arr.llvm_set_remaining(ctx, &build, iter_ptr, orig_rem);
+                arr.llvm_set_pos(ctx, &build, iter_ptr, orig_pos);
+                build.build_return(Some(&bool_type.const_zero())).unwrap();
+
+                build.position_at_end(fetch_next);
+                let my_end = build
+                    .build_call(access_ends, &[ends_iter.into(), pos.into()], "my_end")
+                    .unwrap()
+                    .try_as_basic_value()
+                    .unwrap_left()
+                    .into_int_value();
+                let pr_end = build
+                    .build_call(
+                        access_ends,
+                        &[
+                            ends_iter.into(),
+                            build
+                                .build_int_sub(pos, i64_type.const_int(1, false), "minus1")
+                                .unwrap()
+                                .into(),
+                        ],
+                        "pr_end",
+                    )
+                    .unwrap()
+                    .try_as_basic_value()
+                    .unwrap_left()
+                    .into_int_value();
+                let remaining = build.build_int_sub(my_end, pr_end, "remaining").unwrap();
+                arr.llvm_set_remaining(ctx, &build, iter_ptr, remaining);
+                build.build_unconditional_branch(loop_cond).unwrap();
+
+                build.position_at_end(fill_vec);
+                let pos = arr.llvm_pos(ctx, &build, iter_ptr);
+                let curr_val = build
+                    .build_call(access_values, &[vals_iter.into(), pos.into()], "val")
+                    .unwrap()
+                    .try_as_basic_value()
+                    .unwrap_left();
+                let curr_val = build
+                    .build_insert_element(
+                        vec_type.const_zero(),
+                        curr_val,
+                        i64_type.const_zero(),
+                        "curr_val_vec",
+                    )
+                    .unwrap();
+                let curr_val = build
+                    .build_shuffle_vector(
+                        curr_val,
+                        vec_type.get_undef(),
+                        vec_type.const_zero(),
+                        "broadcasted",
+                    )
+                    .unwrap();
+
+                let remaining_values = arr.llvm_remaining(ctx, &build, iter_ptr);
+                let buf_idx = build
+                    .build_load(i64_type, buf_idx_ptr, "buf_idx")
+                    .unwrap()
+                    .into_int_value();
+                let remaining_slots = build
+                    .build_int_sub(
+                        i64_type.const_int(N as u64, false),
+                        buf_idx,
+                        "remaining_slots",
+                    )
+                    .unwrap();
+                let to_fill = build
+                    .build_call(
+                        umin_f,
+                        &[remaining_slots.into(), remaining_values.into()],
+                        "to_fill",
+                    )
+                    .unwrap()
+                    .try_as_basic_value()
+                    .unwrap_left()
+                    .into_int_value();
+
+                // build a mask that 1 in the slots we want to insert value into
+                // ex: suppose block size = 8, to_fill = 2, curr_pos = 3
+                // desired mask: 00011000
+                // formula: ((1 << to_fill) - 1) << curr_pos
+                //
+                let mask = build
+                    .build_left_shift(
+                        build
+                            .build_int_sub(
+                                build
+                                    .build_left_shift(i64_type.const_int(1, false), to_fill, "mask")
+                                    .unwrap(),
+                                i64_type.const_int(1, false),
+                                "mask",
+                            )
+                            .unwrap(),
+                        buf_idx,
+                        "mask",
+                    )
+                    .unwrap();
+                let max_width_cond = build
+                    .build_int_compare(
+                        IntPredicate::EQ,
+                        to_fill,
+                        i64_type.const_int(N as u64, false),
+                        "is_full",
+                    )
+                    .unwrap();
+                let mask = build
+                    .build_select(max_width_cond, i64_type.const_all_ones(), mask, "mask")
+                    .unwrap()
+                    .into_int_value();
+
+                let mask = match N {
+                    8 => build
+                        .build_int_truncate(mask, ctx.i8_type(), "mask")
+                        .unwrap(),
+                    16 => build
+                        .build_int_truncate(mask, ctx.i16_type(), "mask")
+                        .unwrap(),
+                    32 => build
+                        .build_int_truncate(mask, ctx.i32_type(), "mask")
+                        .unwrap(),
+                    64 => mask,
+                    _ => return None,
+                };
+
+                let mask = build
+                    .build_bit_cast(mask, bool_type.vec_type(N), "mask_v")
+                    .unwrap()
+                    .into_vector_value();
+
+                let curr_buf = build
+                    .build_load(vec_type, vbuf, "curr_buf")
+                    .unwrap()
+                    .into_vector_value();
+
+                let new_buf = build
+                    .build_select(mask, curr_val, curr_buf, "new_buf")
+                    .unwrap();
+
+                build.build_store(vbuf, new_buf).unwrap();
+                arr.llvm_dec_remaining(ctx, &build, iter_ptr, to_fill);
+                let new_buf_ptr = build
+                    .build_int_add(buf_idx, to_fill, "new_buf_ptr")
+                    .unwrap();
+                build.build_store(buf_idx_ptr, new_buf_ptr).unwrap();
+                build.build_unconditional_branch(check_vec_full).unwrap();
+
+                build.position_at_end(exit);
+                let result = build.build_load(vec_type, vbuf, "result").unwrap();
+                build.build_store(out_ptr, result).unwrap();
+                build
+                    .build_return(Some(&bool_type.const_all_ones()))
+                    .unwrap();
+
+                return Some(next);
+            }
+            _ => unreachable!("run-end iterator but not run-end data type ({:?})", dt),
+        },
         IteratorHolder::ScalarPrimitive(s) => {
             assert_eq!(ptype.width(), s.width as usize);
             let get_next_single = generate_next(
@@ -1370,7 +1634,7 @@ pub fn generate_next<'a>(
             build
                 .build_return(Some(&bool_type.const_int(0, false)))
                 .unwrap();
-            
+
             build.position_at_end(get_next);
             let data_ptr = bitmap_iterator.llvm_get_data_ptr(ctx, &build, iter_ptr);
             let byte_index = build
@@ -1391,11 +1655,13 @@ pub fn generate_next<'a>(
                 .build_right_shift(data_byte_i8, bit_in_byte_i8, false, "data_byte_shifted_i8")
                 .unwrap();
             let data_bit_i8 = build
-                .build_and(data_byte_shifted_i8, ctx.i8_type().const_int(1, false), "data_bit_i8")
+                .build_and(
+                    data_byte_shifted_i8,
+                    ctx.i8_type().const_int(1, false),
+                    "data_bit_i8",
+                )
                 .unwrap();
-            build
-                .build_store(out_ptr, data_bit_i8)
-                .unwrap();
+            build.build_store(out_ptr, data_bit_i8).unwrap();
             bitmap_iterator.llvm_increment_pos(ctx, &build, iter_ptr, i64_type.const_int(1, false));
             build
                 .build_return(Some(&bool_type.const_int(1, false)))
@@ -1828,7 +2094,11 @@ pub fn generate_random_access<'a>(
                 .build_right_shift(data_byte_i8, bit_in_byte_i8, false, "data_byte_shifted_i8")
                 .unwrap();
             let data_bit_i8 = build
-                .build_and(data_byte_shifted_i8, ctx.i8_type().const_int(1, false), "data_bit_i8")
+                .build_and(
+                    data_byte_shifted_i8,
+                    ctx.i8_type().const_int(1, false),
+                    "data_bit_i8",
+                )
                 .unwrap();
             build.build_return(Some(&data_bit_i8)).unwrap();
 
@@ -1901,7 +2171,7 @@ mod tests {
 
     use arrow_array::{
         Array, Datum, DictionaryArray, Float32Array, Int32Array, Int32RunArray, Int8Array,
-        LargeStringArray, Scalar, StringArray,
+        LargeStringArray, RunArray, Scalar, StringArray,
     };
     use arrow_data::ArrayDataBuilder;
     use arrow_schema::{DataType, Field};
@@ -1911,6 +2181,56 @@ mod tests {
     use super::{
         array_to_iter, datum_to_iter, generate_next, generate_next_block, generate_random_access,
     };
+
+    #[test]
+    fn test_ree_iter_block() {
+        let data = Int32Array::from(vec![1, 2, 3, 4]);
+        let ends = Int32Array::from(vec![4, 8, 17, 18]);
+        let ree = RunArray::try_new(&ends, &data).unwrap();
+
+        let mut iter = datum_to_iter(&ree).unwrap();
+
+        let ctx = Context::create();
+        let module = ctx.create_module("test_iter");
+        let func =
+            generate_next_block::<8>(&ctx, &module, "iter_block_next", ree.data_type(), &iter)
+                .unwrap();
+        let fname = func.get_name().to_str().unwrap();
+
+        let next_func = generate_next(&ctx, &module, "iter_next", ree.data_type(), &iter).unwrap();
+        let next_fname = next_func.get_name().to_str().unwrap();
+
+        module.verify().unwrap();
+        let ee = module
+            .create_jit_execution_engine(OptimizationLevel::None)
+            .unwrap();
+
+        let next_block = unsafe {
+            ee.get_function::<unsafe extern "C" fn(*mut c_void, *mut i32) -> bool>(fname)
+                .unwrap()
+        };
+
+        let next = unsafe {
+            ee.get_function::<unsafe extern "C" fn(*mut c_void, *mut i32) -> bool>(next_fname)
+                .unwrap()
+        };
+
+        let mut buf = [0_i32; 8];
+        let mut sbuf: i32 = 0;
+        unsafe {
+            assert_eq!(next_block.call(iter.get_mut_ptr(), buf.as_mut_ptr()), true);
+            assert_eq!(buf, [1, 1, 1, 1, 2, 2, 2, 2]);
+            assert_eq!(next_block.call(iter.get_mut_ptr(), buf.as_mut_ptr()), true);
+            assert_eq!(buf, [3, 3, 3, 3, 3, 3, 3, 3]);
+            assert_eq!(next_block.call(iter.get_mut_ptr(), buf.as_mut_ptr()), false);
+
+            assert_eq!(next.call(iter.get_mut_ptr(), &mut sbuf), true);
+            assert_eq!(sbuf, 3);
+            assert_eq!(next.call(iter.get_mut_ptr(), &mut sbuf), true);
+            assert_eq!(sbuf, 4);
+            assert_eq!(next.call(iter.get_mut_ptr(), &mut sbuf), false);
+        };
+    }
 
     #[test]
     fn test_primitive_iter_block() {
@@ -2049,7 +2369,9 @@ mod tests {
     #[test]
     fn test_bitmap_iter() {
         use arrow_array::BooleanArray;
-        let data = BooleanArray::from(vec![true, true, false, true, false, false, false, false, true, true, false, true, false]);
+        let data = BooleanArray::from(vec![
+            true, true, false, true, false, false, false, false, true, true, false, true, false,
+        ]);
 
         let mut iter = array_to_iter(&data);
         iter.assert_non_null();
@@ -2066,52 +2388,97 @@ mod tests {
 
         let next_func = unsafe {
             ee.get_function::<unsafe extern "C" fn(*mut c_void, *mut i32) -> bool>(fname)
-            .unwrap()
+                .unwrap()
         };
 
         let mut buf: i32 = 0;
         unsafe {
-            assert_eq!(next_func.call(iter.get_mut_ptr(), &mut buf as *mut i32),true);
+            assert_eq!(
+                next_func.call(iter.get_mut_ptr(), &mut buf as *mut i32),
+                true
+            );
             assert_eq!(buf, 1);
-            assert_eq!(next_func.call(iter.get_mut_ptr(), &mut buf as *mut i32),true);
+            assert_eq!(
+                next_func.call(iter.get_mut_ptr(), &mut buf as *mut i32),
+                true
+            );
             assert_eq!(buf, 1);
-            assert_eq!(next_func.call(iter.get_mut_ptr(), &mut buf as *mut i32),true);
+            assert_eq!(
+                next_func.call(iter.get_mut_ptr(), &mut buf as *mut i32),
+                true
+            );
             assert_eq!(buf, 0);
-            assert_eq!(next_func.call(iter.get_mut_ptr(), &mut buf as *mut i32),true);
+            assert_eq!(
+                next_func.call(iter.get_mut_ptr(), &mut buf as *mut i32),
+                true
+            );
             assert_eq!(buf, 1);
-            assert_eq!(next_func.call(iter.get_mut_ptr(), &mut buf as *mut i32),true);
+            assert_eq!(
+                next_func.call(iter.get_mut_ptr(), &mut buf as *mut i32),
+                true
+            );
             assert_eq!(buf, 0);
-            assert_eq!(next_func.call(iter.get_mut_ptr(), &mut buf as *mut i32),true);
+            assert_eq!(
+                next_func.call(iter.get_mut_ptr(), &mut buf as *mut i32),
+                true
+            );
             assert_eq!(buf, 0);
-            assert_eq!(next_func.call(iter.get_mut_ptr(), &mut buf as *mut i32),true);
+            assert_eq!(
+                next_func.call(iter.get_mut_ptr(), &mut buf as *mut i32),
+                true
+            );
             assert_eq!(buf, 0);
-            assert_eq!(next_func.call(iter.get_mut_ptr(), &mut buf as *mut i32),true);
+            assert_eq!(
+                next_func.call(iter.get_mut_ptr(), &mut buf as *mut i32),
+                true
+            );
             assert_eq!(buf, 0);
-            assert_eq!(next_func.call(iter.get_mut_ptr(), &mut buf as *mut i32),true);
+            assert_eq!(
+                next_func.call(iter.get_mut_ptr(), &mut buf as *mut i32),
+                true
+            );
             assert_eq!(buf, 1);
-            assert_eq!(next_func.call(iter.get_mut_ptr(), &mut buf as *mut i32),true);
+            assert_eq!(
+                next_func.call(iter.get_mut_ptr(), &mut buf as *mut i32),
+                true
+            );
             assert_eq!(buf, 1);
-            assert_eq!(next_func.call(iter.get_mut_ptr(), &mut buf as *mut i32),true);
+            assert_eq!(
+                next_func.call(iter.get_mut_ptr(), &mut buf as *mut i32),
+                true
+            );
             assert_eq!(buf, 0);
-            assert_eq!(next_func.call(iter.get_mut_ptr(), &mut buf as *mut i32),true);
+            assert_eq!(
+                next_func.call(iter.get_mut_ptr(), &mut buf as *mut i32),
+                true
+            );
             assert_eq!(buf, 1);
-            assert_eq!(next_func.call(iter.get_mut_ptr(), &mut buf as *mut i32),true);
+            assert_eq!(
+                next_func.call(iter.get_mut_ptr(), &mut buf as *mut i32),
+                true
+            );
             assert_eq!(buf, 0);
-            assert_eq!(next_func.call(iter.get_mut_ptr(), &mut buf as *mut i32),false);
+            assert_eq!(
+                next_func.call(iter.get_mut_ptr(), &mut buf as *mut i32),
+                false
+            );
         }
     }
 
     #[test]
     fn test_bitmap_random_access() {
         use arrow_array::BooleanArray;
-        let data = BooleanArray::from(vec![true, true, false, true, false, false, false, false, true, true, false, true, false]);
+        let data = BooleanArray::from(vec![
+            true, true, false, true, false, false, false, false, true, true, false, true, false,
+        ]);
 
         let mut iter = array_to_iter(&data);
         iter.assert_non_null();
 
         let ctx = Context::create();
         let module = ctx.create_module("test_bitmap_iter");
-        let func = generate_random_access(&ctx, &module, "bitmap_iter", data.data_type(), &iter).unwrap();
+        let func =
+            generate_random_access(&ctx, &module, "bitmap_iter", data.data_type(), &iter).unwrap();
         let fname = func.get_name().to_str().unwrap();
 
         module.verify().unwrap();
@@ -2121,7 +2488,7 @@ mod tests {
 
         let next_func = unsafe {
             ee.get_function::<unsafe extern "C" fn(*mut c_void, u64) -> i8>(fname)
-            .unwrap()
+                .unwrap()
         };
 
         unsafe {
