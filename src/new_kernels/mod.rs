@@ -1,10 +1,11 @@
 mod cast;
 mod cmp;
+mod ht;
 
 use std::{collections::HashMap, sync::RwLock};
 
 use arrow_schema::DataType;
-pub use cast::CastKernel;
+pub use cast::CastToFlatKernel;
 pub use cmp::ComparisonKernel;
 use inkwell::{
     builder::Builder,
@@ -26,6 +27,7 @@ pub enum ArrowKernelError {
     UnsupportedScalar(DataType),
     LLVMError(String),
     NonVectorizableType(DataType),
+    DictionaryFullError(DataType),
 }
 
 pub trait Kernel: Sized {

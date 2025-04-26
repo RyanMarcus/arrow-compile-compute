@@ -10,14 +10,18 @@ use ouroboros::self_referencing;
 use crate::{
     declare_blocks, empty_array_for, increment_pointer,
     new_iter::{datum_to_iter, generate_next, generate_next_block, IteratorHolder},
-    new_kernels::{gen_convert_numeric_vec, optimize_module},
+    new_kernels::{
+        gen_convert_numeric_vec,
+        ht::{generate_hash_func, generate_lookup_or_insert, TicketTable},
+        optimize_module,
+    },
     PrimitiveType,
 };
 
 use super::{ArrowKernelError, Kernel};
 
 #[self_referencing]
-pub struct CastKernel {
+pub struct CastToFlatKernel {
     context: Context,
     lhs_data_type: DataType,
     tar_data_type: DataType,
@@ -27,10 +31,10 @@ pub struct CastKernel {
     func: JitFunction<'this, unsafe extern "C" fn(*mut c_void, *mut c_void)>,
 }
 
-unsafe impl Sync for CastKernel {}
-unsafe impl Send for CastKernel {}
+unsafe impl Sync for CastToFlatKernel {}
+unsafe impl Send for CastToFlatKernel {}
 
-impl Kernel for CastKernel {
+impl Kernel for CastToFlatKernel {
     type Key = (DataType, DataType);
 
     type Input<'a> = &'a dyn Array;
@@ -87,7 +91,7 @@ impl Kernel for CastKernel {
 
         let ctx = Context::create();
         if out_type.is_primitive() {
-            CastKernelTryBuilder {
+            CastToFlatKernelTryBuilder {
                 context: ctx,
                 lhs_data_type: inp.data_type().clone(),
                 tar_data_type: out_type.clone(),
@@ -229,21 +233,333 @@ pub fn generate_block_cast_to_flat<'a>(
     })
 }
 
+pub fn generate_cast_to_dict<'a>(
+    ctx: &'a Context,
+    lhs: &dyn Array,
+    lhs_iter: &IteratorHolder,
+    dict_key_type: &DataType,
+    dict_val_type: &DataType,
+) -> Result<
+    JitFunction<
+        'a,
+        unsafe extern "C" fn(*mut TicketTable, *mut c_void, *mut c_void, *mut c_void) -> i64,
+    >,
+    ArrowKernelError,
+> {
+    let module = ctx.create_module("cmp_kernel");
+    let build = ctx.create_builder();
+
+    let next = generate_next(ctx, &module, "cast", lhs.data_type(), lhs_iter).unwrap();
+    let ticket = generate_lookup_or_insert(
+        ctx,
+        &module,
+        &TicketTable::new(0, dict_val_type.clone(), dict_key_type.clone()),
+    );
+    let lhs_prim_type = PrimitiveType::for_arrow_type(lhs.data_type());
+    let lhs_type = lhs_prim_type.llvm_type(ctx);
+    let val_prim_type = PrimitiveType::for_arrow_type(dict_val_type);
+    let key_prim_type = PrimitiveType::for_arrow_type(dict_key_type);
+
+    let hash = generate_hash_func(ctx, &module, lhs_prim_type);
+
+    let i8_type = ctx.i8_type();
+    let i64_type = ctx.i64_type();
+    let ptr_type = ctx.ptr_type(AddressSpace::default());
+    let func = module.add_function(
+        "cast",
+        i64_type.fn_type(
+            &[
+                ptr_type.into(),
+                ptr_type.into(),
+                ptr_type.into(),
+                ptr_type.into(),
+            ],
+            false,
+        ),
+        None,
+    );
+
+    declare_blocks!(
+        ctx,
+        func,
+        entry,
+        loop_cond,
+        loop_body,
+        previously_seen_value,
+        new_value,
+        table_full,
+        exit
+    );
+
+    build.position_at_end(entry);
+    let tt_ptr = func.get_nth_param(0).unwrap().into_pointer_value();
+    let iter_ptr = func.get_nth_param(1).unwrap().into_pointer_value();
+    let out_keys = func.get_nth_param(2).unwrap().into_pointer_value();
+    let out_vals = func.get_nth_param(3).unwrap().into_pointer_value();
+    let val_idx_ptr = build.build_alloca(i64_type, "val_idx_ptr").unwrap();
+    let key_idx_ptr = build.build_alloca(i64_type, "key_idx_ptr").unwrap();
+    build
+        .build_store(key_idx_ptr, i64_type.const_zero())
+        .unwrap();
+    build
+        .build_store(val_idx_ptr, i64_type.const_zero())
+        .unwrap();
+    let buf_ptr = build.build_alloca(lhs_type, "buf_ptr").unwrap();
+    let ht_res_ptr = build.build_alloca(i8_type, "ht_res_ptr").unwrap();
+    build.build_unconditional_branch(loop_cond).unwrap();
+
+    build.position_at_end(loop_cond);
+    let had_next = build
+        .build_call(next, &[iter_ptr.into(), buf_ptr.into()], "had_next")
+        .unwrap()
+        .try_as_basic_value()
+        .unwrap_left()
+        .into_int_value();
+    build
+        .build_conditional_branch(had_next, loop_body, exit)
+        .unwrap();
+
+    build.position_at_end(loop_body);
+    let next_val = build.build_load(lhs_type, buf_ptr, "next_val").unwrap();
+    let hashed = build
+        .build_call(hash, &[next_val.into()], "hashed")
+        .unwrap()
+        .try_as_basic_value()
+        .unwrap_left()
+        .into_int_value();
+    let ticket = build
+        .build_call(
+            ticket,
+            &[
+                tt_ptr.into(),
+                next_val.into(),
+                hashed.into(),
+                ht_res_ptr.into(),
+            ],
+            "ticket",
+        )
+        .unwrap()
+        .try_as_basic_value()
+        .unwrap_left()
+        .into_int_value();
+    let status = build
+        .build_load(i8_type, ht_res_ptr, "status")
+        .unwrap()
+        .into_int_value();
+    build
+        .build_switch(
+            status,
+            table_full,
+            &[
+                (i8_type.const_int(0, false), previously_seen_value),
+                (i8_type.const_int(1, false), new_value),
+                (i8_type.const_int(2, false), table_full),
+            ],
+        )
+        .unwrap();
+
+    build.position_at_end(new_value);
+    let cur_val_idx = build
+        .build_load(i64_type, val_idx_ptr, "cur_val_idx")
+        .unwrap()
+        .into_int_value();
+    let next_val_ptr = increment_pointer!(ctx, build, out_vals, val_prim_type.width(), cur_val_idx);
+    // TODO convert types here
+    assert_eq!(lhs_prim_type, val_prim_type);
+    build.build_store(next_val_ptr, next_val).unwrap();
+
+    let next_val_idx = build
+        .build_int_add(cur_val_idx, i64_type.const_int(1, false), "next_val_idx")
+        .unwrap();
+    build.build_store(val_idx_ptr, next_val_idx).unwrap();
+    build
+        .build_unconditional_branch(previously_seen_value)
+        .unwrap();
+
+    build.position_at_end(previously_seen_value);
+    let cur_key_idx = build
+        .build_load(i64_type, key_idx_ptr, "cur_key_idx")
+        .unwrap()
+        .into_int_value();
+
+    let cur_key_ptr = increment_pointer!(ctx, build, out_keys, key_prim_type.width(), cur_key_idx);
+    build.build_store(cur_key_ptr, ticket).unwrap();
+
+    let next_key_idx = build
+        .build_int_add(cur_key_idx, i64_type.const_int(1, false), "next_key_idx")
+        .unwrap();
+    build.build_store(key_idx_ptr, next_key_idx).unwrap();
+    build.build_unconditional_branch(loop_cond).unwrap();
+
+    build.position_at_end(table_full);
+    build
+        .build_return(Some(&i64_type.const_int((-1_i64) as u64, true)))
+        .unwrap();
+
+    build.position_at_end(exit);
+
+    let val_idx = build
+        .build_load(i64_type, val_idx_ptr, "val_idx")
+        .unwrap()
+        .into_int_value();
+    build.build_return(Some(&val_idx)).unwrap();
+
+    module.verify().unwrap();
+    optimize_module(&module)?;
+    let ee = module
+        .create_jit_execution_engine(OptimizationLevel::Aggressive)
+        .unwrap();
+
+    Ok(unsafe { ee.get_function(func.get_name().to_str().unwrap()).unwrap() })
+}
+
+#[self_referencing]
+pub struct CastToDictKernel {
+    context: Context,
+    lhs_data_type: DataType,
+    key_data_type: DataType,
+    val_data_type: DataType,
+
+    #[borrows(context)]
+    #[covariant]
+    func: JitFunction<
+        'this,
+        unsafe extern "C" fn(*mut TicketTable, *mut c_void, *mut c_void, *mut c_void) -> i64,
+    >,
+}
+
+unsafe impl Sync for CastToDictKernel {}
+unsafe impl Send for CastToDictKernel {}
+
+impl Kernel for CastToDictKernel {
+    type Key = (DataType, DataType);
+
+    type Input<'a> = &'a dyn Array;
+
+    type Params = DataType;
+
+    type Output = ArrayRef;
+
+    fn call(&self, inp: Self::Input<'_>) -> Result<Self::Output, ArrowKernelError> {
+        let len = inp.len();
+        let num_values = usize::min(
+            len,
+            match self.borrow_key_data_type() {
+                DataType::Int8 => i8::MAX as usize,
+                DataType::Int16 => i16::MAX as usize,
+                DataType::Int32 => i32::MAX as usize,
+                DataType::Int64 => i64::MAX as usize,
+                _ => unreachable!(),
+            },
+        );
+
+        let key_width = PrimitiveType::for_arrow_type(self.borrow_key_data_type()).width();
+        let val_width = PrimitiveType::for_arrow_type(self.borrow_val_data_type()).width();
+
+        let mut k_data = vec![0_u8; len * key_width];
+        let mut v_data = vec![0_u8; num_values * val_width];
+        let mut tt = TicketTable::new(
+            num_values,
+            self.borrow_val_data_type().clone(),
+            self.borrow_key_data_type().clone(),
+        );
+        let mut iter = datum_to_iter(&inp)?;
+        let result = unsafe {
+            self.borrow_func().call(
+                &mut tt,
+                iter.get_mut_ptr(),
+                k_data.as_mut_ptr() as *mut c_void,
+                v_data.as_mut_ptr() as *mut c_void,
+            )
+        };
+
+        if result < 0 {
+            return Err(ArrowKernelError::DictionaryFullError(
+                self.borrow_key_data_type().clone(),
+            ));
+        }
+        v_data.shrink_to_fit();
+        let num_values = result as usize;
+        let data = unsafe {
+            let values = ArrayDataBuilder::new(
+                PrimitiveType::for_arrow_type(self.borrow_val_data_type()).as_arrow_type(),
+            )
+            .add_buffer(Buffer::from(v_data))
+            .len(num_values)
+            .build_unchecked();
+
+            ArrayDataBuilder::new(DataType::Dictionary(
+                Box::new(self.borrow_key_data_type().clone()),
+                Box::new(self.borrow_val_data_type().clone()),
+            ))
+            .add_buffer(Buffer::from(k_data))
+            .add_child_data(values)
+            .len(len)
+            .build_unchecked()
+        };
+
+        Ok(make_array(data))
+    }
+
+    fn compile(inp: Self::Input<'_>, params: Self::Params) -> Result<Self, ArrowKernelError> {
+        let out_type = &params;
+        assert_ne!(
+            inp.data_type(),
+            out_type,
+            "cannot compile kernel for identical types {:?}",
+            out_type
+        );
+
+        if let DataType::Dictionary(k_dt, v_dt) = out_type {
+            let in_iter = datum_to_iter(&inp)?;
+            let ctx = Context::create();
+            CastToDictKernelTryBuilder {
+                context: ctx,
+                lhs_data_type: inp.data_type().clone(),
+                key_data_type: *k_dt.clone(),
+                val_data_type: *v_dt.clone(),
+                func_builder: |ctx| generate_cast_to_dict(&ctx, inp, &in_iter, k_dt, v_dt),
+            }
+            .try_build()
+        } else {
+            panic!(
+                "cannot compile dict kernel with non-dict target: {:?}",
+                out_type
+            );
+        }
+    }
+
+    fn get_key_for_input(
+        i: &Self::Input<'_>,
+        p: &Self::Params,
+    ) -> Result<Self::Key, ArrowKernelError> {
+        Ok((i.data_type().clone(), p.clone()))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::sync::Arc;
 
-    use arrow_array::{ArrayRef, Int32Array, Int64Array, UInt8Array};
+    use arrow_array::{
+        cast::AsArray,
+        types::{Int32Type, Int8Type},
+        ArrayRef, Int32Array, Int64Array, UInt8Array,
+    };
     use arrow_schema::DataType;
     use itertools::Itertools;
 
-    use crate::{new_kernels::cast::CastKernel, Kernel};
+    use crate::{
+        dictionary_data_type,
+        new_kernels::cast::{CastToDictKernel, CastToFlatKernel},
+        Kernel,
+    };
 
     #[test]
     fn test_i32_to_i64() {
         let data = Int32Array::from(vec![1, 2, 3, 4, 5]);
         let expected: ArrayRef = Arc::new(Int64Array::from(vec![1, 2, 3, 4, 5]));
-        let k = CastKernel::compile(&data, DataType::Int64).unwrap();
+        let k = CastToFlatKernel::compile(&data, DataType::Int64).unwrap();
         let res = k.call(&data).unwrap();
         assert_eq!(&res, &expected);
     }
@@ -252,7 +568,7 @@ mod tests {
     fn test_i32_to_i64_block() {
         let data = Int32Array::from((0..200).collect_vec());
         let expected: ArrayRef = Arc::new(Int64Array::from((0..200).collect_vec()));
-        let k = CastKernel::compile(&data, DataType::Int64).unwrap();
+        let k = CastToFlatKernel::compile(&data, DataType::Int64).unwrap();
         let res = k.call(&data).unwrap();
         assert_eq!(&res, &expected);
     }
@@ -261,8 +577,25 @@ mod tests {
     fn test_i64_to_u8_block() {
         let data = Int64Array::from((0..200).collect_vec());
         let expected: ArrayRef = Arc::new(UInt8Array::from((0..200).collect_vec()));
-        let k = CastKernel::compile(&data, DataType::UInt8).unwrap();
+        let k = CastToFlatKernel::compile(&data, DataType::UInt8).unwrap();
         let res = k.call(&data).unwrap();
         assert_eq!(&res, &expected);
+    }
+
+    #[test]
+    fn test_i32_to_dict() {
+        let data = Int32Array::from(vec![1, 1, 1, 2, 2, 300, 300, 400]);
+        let k =
+            CastToDictKernel::compile(&data, dictionary_data_type(DataType::Int8, DataType::Int32))
+                .unwrap();
+        let res = k.call(&data).unwrap();
+        assert_eq!(res.len(), 8);
+
+        let res = res.as_dictionary::<Int8Type>();
+        assert_eq!(
+            &[1, 2, 300, 400],
+            res.values().as_primitive::<Int32Type>().values()
+        );
+        assert_eq!(&[0, 0, 0, 1, 1, 2, 2, 3], res.keys().values());
     }
 }

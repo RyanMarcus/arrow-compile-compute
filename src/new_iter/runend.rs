@@ -174,8 +174,13 @@ impl<R: RunEndIndexType + ArrowPrimitiveType> From<&RunArray<R>> for IteratorHol
             .enumerate()
             .find(|(_idx, val)| !val.is_zero())
             .map(|(idx, _val)| idx)
-            .expect("all run ends in RE array were zero");
-        let first_remaining = re.value(first_pos).as_usize();
+            .unwrap_or(0);
+
+        let first_remaining = if first_pos < re.len() {
+            re.value(first_pos).as_usize()
+        } else {
+            0
+        };
 
         let iter = RunEndIterator {
             run_ends: run_ends.get_ptr(),

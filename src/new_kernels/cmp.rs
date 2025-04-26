@@ -716,7 +716,7 @@ fn add_float_to_int<'a>(
     func
 }
 
-fn add_memcmp<'a>(ctx: &'a Context, module: &Module<'a>) -> FunctionValue<'a> {
+pub fn add_memcmp<'a>(ctx: &'a Context, module: &Module<'a>) -> FunctionValue<'a> {
     let i64_type = ctx.i64_type();
     let i8_type = ctx.i8_type();
     let str_type = PrimitiveType::P64x2.llvm_type(ctx);
