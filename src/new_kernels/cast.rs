@@ -1,6 +1,6 @@
 use std::ffi::c_void;
 
-use arrow_array::{make_array, Array, ArrayRef};
+use arrow_array::{cast::AsArray, make_array, new_empty_array, Array, ArrayRef};
 use arrow_buffer::Buffer;
 use arrow_data::ArrayDataBuilder;
 use arrow_schema::DataType;
@@ -11,7 +11,7 @@ use crate::{
     declare_blocks, empty_array_for, increment_pointer,
     new_iter::{datum_to_iter, generate_next, generate_next_block, IteratorHolder},
     new_kernels::{
-        gen_convert_numeric_vec,
+        add_ptrx2_to_view, gen_convert_numeric_vec,
         ht::{generate_hash_func, generate_lookup_or_insert, TicketTable},
         optimize_module,
     },
@@ -366,7 +366,24 @@ pub fn generate_cast_to_dict<'a>(
     let next_val_ptr = increment_pointer!(ctx, build, out_vals, val_prim_type.width(), cur_val_idx);
     // TODO convert types here
     assert_eq!(lhs_prim_type, val_prim_type);
-    build.build_store(next_val_ptr, next_val).unwrap();
+    let converted = if let IteratorHolder::String(str_iter) = lhs_iter {
+        let convert = add_ptrx2_to_view(ctx, &module);
+        build
+            .build_call(
+                convert,
+                &[
+                    next_val.into(),
+                    str_iter.llvm_get_data_ptr(ctx, &build, iter_ptr).into(),
+                ],
+                "str_view",
+            )
+            .unwrap()
+            .try_as_basic_value()
+            .unwrap_left()
+    } else {
+        next_val
+    };
+    build.build_store(next_val_ptr, converted).unwrap();
 
     let next_val_idx = build
         .build_int_add(cur_val_idx, i64_type.const_int(1, false), "next_val_idx")
@@ -442,8 +459,16 @@ impl Kernel for CastToDictKernel {
 
     fn call(&self, inp: Self::Input<'_>) -> Result<Self::Output, ArrowKernelError> {
         let len = inp.len();
+
+        if len == 0 {
+            return Ok(new_empty_array(&DataType::Dictionary(
+                Box::new(self.borrow_key_data_type().clone()),
+                Box::new(self.borrow_val_data_type().clone()),
+            )));
+        }
+
         let num_values = usize::min(
-            len,
+            len * 2,
             match self.borrow_key_data_type() {
                 DataType::Int8 => i8::MAX as usize,
                 DataType::Int16 => i16::MAX as usize,
@@ -474,6 +499,7 @@ impl Kernel for CastToDictKernel {
         };
 
         if result < 0 {
+            println!("{} {:?}", result, tt.tickets_data);
             return Err(ArrowKernelError::DictionaryFullError(
                 self.borrow_key_data_type().clone(),
             ));
@@ -485,6 +511,16 @@ impl Kernel for CastToDictKernel {
                 PrimitiveType::for_arrow_type(self.borrow_val_data_type()).as_arrow_type(),
             )
             .add_buffer(Buffer::from(v_data))
+            .add_buffers(
+                inp.as_string_opt::<i32>()
+                    .iter()
+                    .map(|str| str.values().clone()),
+            )
+            .add_buffers(
+                inp.as_string_opt::<i64>()
+                    .iter()
+                    .map(|str| str.values().clone()),
+            )
             .len(num_values)
             .build_unchecked();
 
@@ -544,7 +580,7 @@ mod tests {
     use arrow_array::{
         cast::AsArray,
         types::{Int32Type, Int8Type},
-        ArrayRef, Int32Array, Int64Array, UInt8Array,
+        ArrayRef, Int32Array, Int64Array, StringArray, UInt8Array,
     };
     use arrow_schema::DataType;
     use itertools::Itertools;
@@ -597,5 +633,29 @@ mod tests {
             res.values().as_primitive::<Int32Type>().values()
         );
         assert_eq!(&[0, 0, 0, 1, 1, 2, 2, 3], res.keys().values());
+    }
+
+    #[test]
+    fn test_str_to_dict() {
+        let data = StringArray::from(vec![
+            "this",
+            "this",
+            "is",
+            "a test",
+            "a test",
+            "a string that is longer than 12 chars",
+        ]);
+        let k =
+            CastToDictKernel::compile(&data, dictionary_data_type(DataType::Int8, DataType::Utf8))
+                .unwrap();
+        let res = k.call(&data).unwrap();
+        assert_eq!(res.len(), 6);
+        println!("{:?}", res);
+        let res = res.as_dictionary::<Int8Type>();
+        let strv = res.values().as_string_view();
+        assert_eq!("this", strv.value(0));
+        assert_eq!("is", strv.value(1));
+        assert_eq!("a test", strv.value(2));
+        assert_eq!(&[0, 0, 1, 2, 2, 3], res.keys().values());
     }
 }

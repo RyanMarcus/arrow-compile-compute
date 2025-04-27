@@ -23,7 +23,7 @@ pub struct TicketTable {
 
     last_val: u64,
     keys_data: Box<[u8]>,
-    tickets_data: Box<[u8]>,
+    pub tickets_data: Box<[u8]>,
     key_type: DataType,
     ticket_type: DataType,
 }
@@ -170,14 +170,7 @@ pub fn generate_lookup_or_insert<'a>(
         .build_int_compare(IntPredicate::UGE, pos, table_size, "over_end")
         .unwrap();
     let new_pos = build
-        .build_select(
-            over_end,
-            i64_type.const_zero(),
-            build
-                .build_int_add(pos, i64_type.const_int(1, false), "inc_pos")
-                .unwrap(),
-            "new_pos",
-        )
+        .build_select(over_end, i64_type.const_zero(), pos, "new_pos")
         .unwrap()
         .into_int_value();
     let looped = build

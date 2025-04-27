@@ -44,14 +44,20 @@ pub mod cast {
     use arrow_array::ArrayRef;
     use arrow_schema::DataType;
 
+    use crate::new_kernels::CastToDictKernel;
     use crate::new_kernels::CastToFlatKernel;
     use crate::new_kernels::KernelCache;
     use crate::ArrowKernelError;
 
     static CAST_PROGRAM_CACHE: LazyLock<KernelCache<CastToFlatKernel>> =
         LazyLock::new(KernelCache::new);
+    static CAST_TO_DICT_PROGRAM_CACHE: LazyLock<KernelCache<CastToDictKernel>> =
+        LazyLock::new(KernelCache::new);
 
     pub fn cast(lhs: &dyn Array, to_type: &DataType) -> Result<ArrayRef, ArrowKernelError> {
-        CAST_PROGRAM_CACHE.get(lhs, to_type.clone())
+        match to_type {
+            DataType::Dictionary(..) => CAST_TO_DICT_PROGRAM_CACHE.get(lhs, to_type.clone()),
+            _ => CAST_PROGRAM_CACHE.get(lhs, to_type.clone()),
+        }
     }
 }

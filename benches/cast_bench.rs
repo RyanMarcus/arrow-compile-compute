@@ -1,5 +1,7 @@
 use arrow_array::{
-    cast::AsArray, types::Int64Type, Array, Int32Array, Int64Array, Int8Array, RunArray,
+    cast::AsArray,
+    types::{Int16Type, Int64Type},
+    Array, Int32Array, Int64Array, Int8Array, RunArray, StringArray, UInt64Array,
 };
 use arrow_compile_compute::dictionary_data_type;
 use arrow_schema::DataType;
@@ -109,6 +111,94 @@ pub fn criterion_benchmark(c: &mut Criterion) {
 
         c.bench_function("convert ree i64 to i64/arrow", |b| {
             b.iter(|| Int64Array::from_iter(data.downcast::<Int64Array>().unwrap()))
+        });
+    }
+
+    {
+        let data = (0..10_000_000).map(|_| rng.u64(1880..2026)).collect_vec();
+        let data = UInt64Array::from(data);
+
+        let arrow_dict = arrow_cast::cast(
+            &data,
+            &dictionary_data_type(DataType::Int16, DataType::UInt64),
+        )
+        .unwrap();
+        let our_dict = arrow_compile_compute::cast::cast(
+            &data,
+            &dictionary_data_type(DataType::Int16, DataType::UInt64),
+        )
+        .unwrap();
+
+        let arrow_dict = arrow_dict.as_dictionary::<Int16Type>();
+        let our_dict = our_dict.as_dictionary::<Int16Type>();
+        assert_eq!(arrow_dict, our_dict);
+
+        c.bench_function("convert u64 to dict/llvm", |b| {
+            b.iter(|| {
+                arrow_compile_compute::cast::cast(
+                    &data,
+                    &dictionary_data_type(DataType::Int16, DataType::UInt64),
+                )
+                .unwrap()
+            })
+        });
+
+        c.bench_function("convert u64 to dict/arrow", |b| {
+            b.iter(|| {
+                arrow_cast::cast(
+                    &data,
+                    &dictionary_data_type(DataType::Int16, DataType::UInt64),
+                )
+                .unwrap()
+            })
+        });
+    }
+
+    {
+        let random_strings = (0..1_000_000)
+            .map(|_| {
+                String::from_utf8(
+                    (0..rng.usize(2..20))
+                        .map(|_| rng.alphanumeric() as u8)
+                        .collect_vec(),
+                )
+                .unwrap()
+            })
+            .collect_vec();
+        let data = StringArray::from(random_strings);
+
+        let _arrow_dict = arrow_cast::cast(
+            &data,
+            &dictionary_data_type(DataType::Int32, DataType::Utf8),
+        )
+        .unwrap();
+        let _our_dict = arrow_compile_compute::cast::cast(
+            &data,
+            &dictionary_data_type(DataType::Int32, DataType::Utf8),
+        )
+        .unwrap();
+
+        // we cannot directly compare the arrow and our dictionary, since we
+        // create a string view dictionary and arrow does not. TODO to check this result.
+
+        c.bench_function("convert str to dict/llvm", |b| {
+            b.iter(|| {
+                arrow_compile_compute::cast::cast(
+                    &data,
+                    &dictionary_data_type(DataType::Int32, DataType::Utf8),
+                )
+                .unwrap()
+            })
+        });
+
+        c.bench_function("convert str to dict/arrow", |b| {
+            b.iter(|| {
+                arrow_cast::cast(
+                    &data,
+                    &dictionary_data_type(DataType::Int32, DataType::Utf8),
+                )
+                .unwrap()
+            })
         });
     }
 }
