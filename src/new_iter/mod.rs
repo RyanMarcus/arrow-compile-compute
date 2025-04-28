@@ -20,11 +20,12 @@ use arrow_schema::DataType;
 use bitmap::BitmapIterator;
 use dictionary::DictionaryIterator;
 use inkwell::{
+    builder::Builder,
     context::Context,
     intrinsics::Intrinsic,
     module::{Linkage, Module},
     types::BasicType,
-    values::{BasicValue, FunctionValue},
+    values::{BasicValue, FunctionValue, PointerValue},
     AddressSpace, IntPredicate,
 };
 use primitive::PrimitiveIterator;
@@ -234,6 +235,30 @@ impl IteratorHolder {
             IteratorHolder::RunEnd { arr: iter, .. } => &**iter as *const _ as *const c_void,
             IteratorHolder::ScalarPrimitive(iter) => &**iter as *const _ as *const c_void,
             IteratorHolder::ScalarString(iter) => &**iter as *const _ as *const c_void,
+        }
+    }
+
+    /// If this iterator has a base pointer, generate LLVM code to fetch it. The
+    /// base pointer is a pointer to the start of the data section for an array,
+    /// such as a string array or a binary array.
+    pub fn llvm_get_base_ptr<'a>(
+        &self,
+        ctx: &'a Context,
+        build: &'a Builder,
+        ptr: PointerValue<'a>,
+    ) -> Option<PointerValue<'a>> {
+        match self {
+            IteratorHolder::String(s) => Some(s.llvm_get_data_ptr(ctx, build, ptr)),
+            IteratorHolder::LargeString(s) => Some(s.llvm_get_data_ptr(ctx, build, ptr)),
+            IteratorHolder::Dictionary { arr, values, .. } => {
+                let val_ptr = arr.llvm_val_iter_ptr(ctx, build, ptr);
+                values.llvm_get_base_ptr(ctx, build, val_ptr)
+            }
+            IteratorHolder::RunEnd { arr, values, .. } => {
+                let val_ptr = arr.llvm_val_iter_ptr(ctx, build, ptr);
+                values.llvm_get_base_ptr(ctx, build, val_ptr)
+            }
+            _ => None,
         }
     }
 }

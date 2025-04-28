@@ -1,6 +1,13 @@
 use std::ffi::c_void;
 
-use arrow_array::{cast::AsArray, make_array, new_empty_array, Array, ArrayRef};
+use arrow_array::{
+    cast::AsArray,
+    make_array, new_empty_array,
+    types::{
+        Int16Type, Int32Type, Int64Type, Int8Type, UInt16Type, UInt32Type, UInt64Type, UInt8Type,
+    },
+    Array, ArrayRef, RunArray,
+};
 use arrow_buffer::Buffer;
 use arrow_data::ArrayDataBuilder;
 use arrow_schema::DataType;
@@ -19,6 +26,48 @@ use crate::{
 };
 
 use super::{ArrowKernelError, Kernel};
+
+/// Iterates over an array's string/binary data buffers
+fn iter_buffers<'a>(inp: &'a dyn Array) -> Box<dyn Iterator<Item = &'a Buffer> + 'a> {
+    match inp.data_type() {
+        DataType::Utf8 => Box::new(vec![inp.as_string::<i32>().values()].into_iter()),
+        DataType::LargeUtf8 => Box::new(vec![inp.as_string::<i64>().values()].into_iter()),
+        DataType::Utf8View => Box::new(inp.as_string_view().data_buffers().iter()),
+        DataType::Dictionary(kt, _vt) => match **kt {
+            DataType::UInt8 => iter_buffers(inp.as_dictionary::<UInt8Type>().values()),
+            DataType::UInt16 => iter_buffers(inp.as_dictionary::<UInt16Type>().values()),
+            DataType::UInt32 => iter_buffers(inp.as_dictionary::<UInt32Type>().values()),
+            DataType::UInt64 => iter_buffers(inp.as_dictionary::<UInt64Type>().values()),
+            DataType::Int8 => iter_buffers(inp.as_dictionary::<Int8Type>().values()),
+            DataType::Int16 => iter_buffers(inp.as_dictionary::<Int16Type>().values()),
+            DataType::Int32 => iter_buffers(inp.as_dictionary::<Int32Type>().values()),
+            DataType::Int64 => iter_buffers(inp.as_dictionary::<Int64Type>().values()),
+            _ => unreachable!("invalid dict key type"),
+        },
+        DataType::RunEndEncoded(_re_t, v_t) => match v_t.data_type() {
+            DataType::Int16 => iter_buffers(
+                inp.as_any()
+                    .downcast_ref::<RunArray<Int16Type>>()
+                    .unwrap()
+                    .values(),
+            ),
+            DataType::Int32 => iter_buffers(
+                inp.as_any()
+                    .downcast_ref::<RunArray<Int32Type>>()
+                    .unwrap()
+                    .values(),
+            ),
+            DataType::Int64 => iter_buffers(
+                inp.as_any()
+                    .downcast_ref::<RunArray<Int64Type>>()
+                    .unwrap()
+                    .values(),
+            ),
+            _ => unreachable!("invalid dict key type"),
+        },
+        _ => Box::new(vec![].into_iter()),
+    }
+}
 
 #[self_referencing]
 pub struct CastToFlatKernel {
@@ -57,21 +106,37 @@ impl Kernel for CastToFlatKernel {
         }
 
         let mut inp_iter = datum_to_iter(&inp)?;
-        if self.borrow_tar_data_type().is_primitive() {
-            let out_prim = PrimitiveType::for_arrow_type(self.borrow_tar_data_type());
+        let tar_dt = self.borrow_tar_data_type().clone();
+        if tar_dt.is_primitive() {
+            let out_prim = PrimitiveType::for_arrow_type(&tar_dt);
             let out_size = inp.len() * out_prim.width();
             let mut buf = vec![0u8; out_size];
             let arr_data = unsafe {
                 self.borrow_func()
                     .call(inp_iter.get_mut_ptr(), buf.as_mut_ptr() as *mut c_void);
 
-                ArrayDataBuilder::new(self.borrow_tar_data_type().clone())
+                ArrayDataBuilder::new(tar_dt)
                     .nulls(inp.nulls().cloned())
                     .buffers(vec![Buffer::from(buf)])
                     .len(inp.len())
                     .build_unchecked()
             };
 
+            return Ok(make_array(arr_data));
+        } else if matches!(tar_dt, DataType::Utf8View | DataType::BinaryView) {
+            let out_size = inp.len() * 16;
+            let mut buf = vec![0u8; out_size];
+            let arr_data = unsafe {
+                self.borrow_func()
+                    .call(inp_iter.get_mut_ptr(), buf.as_mut_ptr() as *mut c_void);
+
+                ArrayDataBuilder::new(tar_dt)
+                    .nulls(inp.nulls().cloned())
+                    .buffers(vec![Buffer::from(buf)])
+                    .add_buffers(iter_buffers(inp).cloned())
+                    .len(inp.len())
+                    .build_unchecked()
+            };
             return Ok(make_array(arr_data));
         }
 
@@ -98,6 +163,14 @@ impl Kernel for CastToFlatKernel {
                 func_builder: |ctx| generate_block_cast_to_flat(ctx, inp, &in_iter, out_type),
             }
             .try_build()
+        } else if matches!(out_type, DataType::Utf8View | DataType::BinaryView) {
+            CastToFlatKernelTryBuilder {
+                context: ctx,
+                lhs_data_type: inp.data_type().clone(),
+                tar_data_type: out_type.clone(),
+                func_builder: |ctx| generate_cast_to_view(ctx, inp, &in_iter),
+            }
+            .try_build()
         } else {
             todo!()
         }
@@ -109,6 +182,98 @@ impl Kernel for CastToFlatKernel {
     ) -> Result<Self::Key, ArrowKernelError> {
         Ok((i.data_type().clone(), p.clone()))
     }
+}
+
+pub fn generate_cast_to_view<'a>(
+    ctx: &'a Context,
+    lhs: &dyn Array,
+    lhs_iter: &IteratorHolder,
+) -> Result<JitFunction<'a, unsafe extern "C" fn(*mut c_void, *mut c_void)>, ArrowKernelError> {
+    let i64_type = ctx.i64_type();
+    let ptr_type = ctx.ptr_type(AddressSpace::default());
+    let lhs_prim_type = PrimitiveType::for_arrow_type(lhs.data_type());
+    let lhs_type = lhs_prim_type.llvm_type(ctx);
+    let module = ctx.create_module("cast_kernel");
+
+    let func = module.add_function(
+        "cast_to_view",
+        ctx.void_type()
+            .fn_type(&[ptr_type.into(), ptr_type.into()], false),
+        None,
+    );
+
+    let convert = add_ptrx2_to_view(ctx, &module);
+    let next = generate_next(ctx, &module, "next", lhs.data_type(), lhs_iter).unwrap();
+    let build = ctx.create_builder();
+
+    declare_blocks!(ctx, func, entry, loop_cond, loop_body, exit);
+    build.position_at_end(entry);
+    let iter_ptr = func.get_nth_param(0).unwrap().into_pointer_value();
+    let out_ptr = func.get_nth_param(1).unwrap().into_pointer_value();
+    let out_idx_ptr = build.build_alloca(i64_type, "out_idx_ptr").unwrap();
+    build
+        .build_store(out_idx_ptr, i64_type.const_zero())
+        .unwrap();
+    let buf = build.build_alloca(lhs_type, "buf").unwrap();
+    build.build_unconditional_branch(loop_cond).unwrap();
+
+    build.position_at_end(loop_cond);
+    let res = build
+        .build_call(next, &[iter_ptr.into(), buf.into()], "next")
+        .unwrap()
+        .try_as_basic_value()
+        .unwrap_left()
+        .into_int_value();
+    build
+        .build_conditional_branch(res, loop_body, exit)
+        .unwrap();
+
+    build.position_at_end(loop_body);
+    let val = build
+        .build_load(lhs_type, buf, "val")
+        .unwrap()
+        .into_struct_value();
+    let base_ptr = lhs_iter
+        .llvm_get_base_ptr(ctx, &build, iter_ptr)
+        .ok_or_else(|| {
+            ArrowKernelError::ArgumentMismatch(format!(
+                "unable to get base data pointer for type {:?}",
+                lhs.data_type()
+            ))
+        })?;
+    let val = build
+        .build_call(convert, &[val.into(), base_ptr.into()], "converted")
+        .unwrap()
+        .try_as_basic_value()
+        .unwrap_left();
+    let curr_out_idx = build
+        .build_load(i64_type, out_idx_ptr, "curr_out_idx")
+        .unwrap()
+        .into_int_value();
+    let curr_out_ptr = increment_pointer!(ctx, build, out_ptr, 16, curr_out_idx);
+    build.build_store(curr_out_ptr, val).unwrap();
+
+    let next_out_idx = build
+        .build_int_add(curr_out_idx, i64_type.const_int(1, false), "next_out_idx")
+        .unwrap();
+    build.build_store(out_idx_ptr, next_out_idx).unwrap();
+    build.build_unconditional_branch(loop_cond).unwrap();
+
+    build.position_at_end(exit);
+    build.build_return(None).unwrap();
+
+    module.verify().unwrap();
+    optimize_module(&module)?;
+    let ee = module
+        .create_jit_execution_engine(OptimizationLevel::Aggressive)
+        .unwrap();
+
+    Ok(unsafe {
+        ee.get_function::<unsafe extern "C" fn(*mut c_void, *mut c_void)>(
+            func.get_name().to_str().unwrap(),
+        )
+        .unwrap()
+    })
 }
 
 pub fn generate_block_cast_to_flat<'a>(
@@ -123,7 +288,7 @@ pub fn generate_block_cast_to_flat<'a>(
     let ptr_type = ctx.ptr_type(AddressSpace::default());
 
     let build = ctx.create_builder();
-    let module = ctx.create_module("cmp_kernel");
+    let module = ctx.create_module("cast_kernel");
 
     // assume a 512-bit vector width (will still work for smaller vector widths)
     let vec_type = lhs_prim
@@ -499,7 +664,6 @@ impl Kernel for CastToDictKernel {
         };
 
         if result < 0 {
-            println!("{} {:?}", result, tt.tickets_data);
             return Err(ArrowKernelError::DictionaryFullError(
                 self.borrow_key_data_type().clone(),
             ));
@@ -511,16 +675,7 @@ impl Kernel for CastToDictKernel {
                 PrimitiveType::for_arrow_type(self.borrow_val_data_type()).as_arrow_type(),
             )
             .add_buffer(Buffer::from(v_data))
-            .add_buffers(
-                inp.as_string_opt::<i32>()
-                    .iter()
-                    .map(|str| str.values().clone()),
-            )
-            .add_buffers(
-                inp.as_string_opt::<i64>()
-                    .iter()
-                    .map(|str| str.values().clone()),
-            )
+            .add_buffers(iter_buffers(inp).cloned())
             .len(num_values)
             .build_unchecked();
 
@@ -580,7 +735,7 @@ mod tests {
     use arrow_array::{
         cast::AsArray,
         types::{Int32Type, Int8Type},
-        ArrayRef, Int32Array, Int64Array, StringArray, UInt8Array,
+        Array, ArrayRef, Int32Array, Int64Array, StringArray, UInt8Array,
     };
     use arrow_schema::DataType;
     use itertools::Itertools;
@@ -650,12 +805,34 @@ mod tests {
                 .unwrap();
         let res = k.call(&data).unwrap();
         assert_eq!(res.len(), 6);
-        println!("{:?}", res);
         let res = res.as_dictionary::<Int8Type>();
         let strv = res.values().as_string_view();
         assert_eq!("this", strv.value(0));
         assert_eq!("is", strv.value(1));
         assert_eq!("a test", strv.value(2));
         assert_eq!(&[0, 0, 1, 2, 2, 3], res.keys().values());
+    }
+
+    #[test]
+    fn test_dict_to_str() {
+        let data = StringArray::from(vec![
+            "this",
+            "this",
+            "is",
+            "a test",
+            "a test",
+            "a string that is longer than 12 chars",
+        ]);
+        let ddata =
+            arrow_cast::cast::cast(&data, &dictionary_data_type(DataType::Int8, DataType::Utf8))
+                .unwrap();
+        let k = CastToFlatKernel::compile(&ddata, DataType::Utf8View).unwrap();
+        let res = k.call(&ddata).unwrap();
+        let res = res.as_string_view();
+
+        assert_eq!(res.len(), data.len());
+        for (ours, orig) in res.iter().zip(data.iter()) {
+            assert_eq!(ours, orig);
+        }
     }
 }

@@ -174,7 +174,7 @@ pub fn criterion_benchmark(c: &mut Criterion) {
         .unwrap();
         let _our_dict = arrow_compile_compute::cast::cast(
             &data,
-            &dictionary_data_type(DataType::Int32, DataType::Utf8),
+            &dictionary_data_type(DataType::Int32, DataType::Utf8View),
         )
         .unwrap();
 
@@ -185,7 +185,7 @@ pub fn criterion_benchmark(c: &mut Criterion) {
             b.iter(|| {
                 arrow_compile_compute::cast::cast(
                     &data,
-                    &dictionary_data_type(DataType::Int32, DataType::Utf8),
+                    &dictionary_data_type(DataType::Int32, DataType::Utf8View),
                 )
                 .unwrap()
             })
@@ -199,6 +199,39 @@ pub fn criterion_benchmark(c: &mut Criterion) {
                 )
                 .unwrap()
             })
+        });
+    }
+
+    {
+        let random_strings = (0..1_000_000)
+            .map(|_| {
+                String::from_utf8(
+                    (0..rng.usize(2..20))
+                        .map(|_| rng.alphanumeric() as u8)
+                        .collect_vec(),
+                )
+                .unwrap()
+            })
+            .collect_vec();
+        let orig_data = StringArray::from(random_strings);
+        let data = arrow_cast::cast(
+            &orig_data,
+            &dictionary_data_type(DataType::Int32, DataType::Utf8),
+        )
+        .unwrap();
+
+        let ours = arrow_compile_compute::cast::cast(&data, &DataType::Utf8View).unwrap();
+
+        // we cannot directly compare the arrow and our dictionary, since we
+        // create a string view dictionary and arrow does not. TODO to check this result.
+        assert_eq!(ours.len(), orig_data.len());
+
+        c.bench_function("convert dict to str/llvm", |b| {
+            b.iter(|| arrow_compile_compute::cast::cast(&data, &DataType::Utf8View).unwrap())
+        });
+
+        c.bench_function("convert dict to str/arrow", |b| {
+            b.iter(|| arrow_cast::cast(&data, &DataType::Utf8View).unwrap())
         });
     }
 }
