@@ -30,7 +30,15 @@ use arrow_buffer::{BooleanBuffer, Buffer, NullBuffer, ScalarBuffer};
 use arrow_schema::{ArrowError, DataType, Field};
 use half::f16;
 use inkwell::{
-    builder::Builder, context::Context, execution_engine::JitFunction, intrinsics::Intrinsic, module::Module, passes::PassBuilderOptions, targets::{CodeModel, RelocMode, Target, TargetMachine}, types::{BasicTypeEnum, VectorType}, values::{BasicValue, BasicValueEnum, FunctionValue, IntValue, PointerValue, VectorValue}, AddressSpace, IntPredicate, OptimizationLevel
+    builder::Builder,
+    context::Context,
+    execution_engine::JitFunction,
+    module::Module,
+    passes::PassBuilderOptions,
+    targets::{CodeModel, RelocMode, Target, TargetMachine},
+    types::{BasicTypeEnum, VectorType},
+    values::{BasicValue, BasicValueEnum, FunctionValue, IntValue, PointerValue, VectorValue},
+    AddressSpace, IntPredicate, OptimizationLevel,
 };
 
 mod aggregate;
@@ -1167,13 +1175,6 @@ impl<'ctx> CodeGen<'ctx> {
     /// ```
     pub fn new(ctx: &Context) -> CodeGen {
         let module = ctx.create_module("jit");
-
-        // cttz intrinsic for setbit iterator
-        let cttz_id = Intrinsic::find("llvm.cttz")
-            .expect("llvm.cttz not in Intrinsic list");
-        cttz_id
-            .get_declaration(&module, &[ctx.i8_type().into()])
-            .expect("Couldn't declare llvm.cttz.i8");
 
         CodeGen {
             context: ctx,

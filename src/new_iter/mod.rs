@@ -9,10 +9,12 @@ mod string;
 use std::ffi::c_void;
 
 use arrow_array::{
-    cast::AsArray, types::{
+    cast::AsArray,
+    types::{
         Float16Type, Float32Type, Float64Type, Int16Type, Int32Type, Int64Type, Int8Type,
         UInt16Type, UInt32Type, UInt64Type, UInt8Type,
-    }, Array, BooleanArray, Datum, GenericStringArray, Int16RunArray, Int32RunArray, Int64RunArray
+    },
+    Array, BooleanArray, Datum, GenericStringArray, Int16RunArray, Int32RunArray, Int64RunArray,
 };
 
 use arrow_schema::DataType;
@@ -194,7 +196,7 @@ pub enum IteratorHolder {
     Primitive(Box<PrimitiveIterator>),
     String(Box<StringIterator>),
     LargeString(Box<LargeStringIterator>),
-    Bitmap(Box<BitmapIterator>), 
+    Bitmap(Box<BitmapIterator>),
     SetBit(Box<SetBitIterator>),
     Dictionary {
         arr: Box<DictionaryIterator>,
@@ -911,18 +913,39 @@ pub fn generate_next<'a>(
             return Some(next);
         }
         IteratorHolder::SetBit(setbit_iterator) => {
-            declare_blocks!(ctx, next, entry, while_loop, get_next_byte_loop, none_left, get_next, use_byte);
-            
+            declare_blocks!(
+                ctx,
+                next,
+                entry,
+                while_loop,
+                get_next_byte_loop,
+                none_left,
+                get_next,
+                use_byte
+            );
+
+            let cttz_id = Intrinsic::find("llvm.cttz").expect("llvm.cttz not in Intrinsic list");
+            cttz_id
+                .get_declaration(&llvm_mod, &[ctx.i8_type().into()])
+                .expect("Couldn't declare llvm.cttz.i8");
+
+            let cttz_i8 = llvm_mod
+                .get_function("llvm.cttz.i8")
+                .expect("llvm.cttz.i8 should have been declared in the CodeGen constructor");
+
             build.position_at_end(entry);
-            build
-                .build_unconditional_branch(while_loop)
-                .unwrap();
+            build.build_unconditional_branch(while_loop).unwrap();
 
             build.position_at_end(while_loop);
             let curr_pos = setbit_iterator.llvm_get_pos(ctx, &build, iter_ptr);
             let curr_byte = setbit_iterator.llvm_get_byte(ctx, &build, iter_ptr);
             let cmp_to_zero = build
-                .build_int_compare(IntPredicate::EQ, curr_byte, ctx.i8_type().const_int(0, false), "cmp_byte_to_zero")
+                .build_int_compare(
+                    IntPredicate::EQ,
+                    curr_byte,
+                    ctx.i8_type().const_int(0, false),
+                    "cmp_byte_to_zero",
+                )
                 .unwrap();
             build
                 .build_conditional_branch(cmp_to_zero, get_next_byte_loop, use_byte)
@@ -934,7 +957,12 @@ pub fn generate_next<'a>(
                 .build_int_add(bit_len, i64_type.const_int(7, false), "round_up")
                 .unwrap();
             let bytes_len = build
-                .build_right_shift(bytes_len, i64_type.const_int(3, false), false, "divide_by_8")
+                .build_right_shift(
+                    bytes_len,
+                    i64_type.const_int(3, false),
+                    false,
+                    "divide_by_8",
+                )
                 .unwrap();
             let cmp_pos_to_len = build
                 .build_int_compare(IntPredicate::EQ, curr_pos, bytes_len, "cmp_pos_to_len")
@@ -951,20 +979,17 @@ pub fn generate_next<'a>(
             build.position_at_end(get_next);
             setbit_iterator.llvm_load_byte_at_pos(ctx, &build, iter_ptr);
             setbit_iterator.llvm_increment_pos(ctx, &build, iter_ptr, i64_type.const_int(1, false));
-            build
-                .build_unconditional_branch(while_loop)
-                .unwrap();
+            build.build_unconditional_branch(while_loop).unwrap();
 
             build.position_at_end(use_byte);
-            let cttz_i8 = llvm_mod
-                .get_function("llvm.cttz.i8")
-                .expect("llvm.cttz.i8 should have been declared in the CodeGen constructor");
+
             let is_zero_undef = ctx.bool_type().const_int(0, false);
             let tz_i8 = build
                 .build_call(
                     cttz_i8,
                     &[curr_byte.into(), is_zero_undef.into()],
-                    "cttz_i8")
+                    "cttz_i8",
+                )
                 .unwrap()
                 .try_as_basic_value()
                 .left()
@@ -983,14 +1008,12 @@ pub fn generate_next<'a>(
             let setbit_position = build
                 .build_int_add(setbit_position, tz_i64, "add_tz")
                 .unwrap();
-            build
-                .build_store(out_ptr, setbit_position)
-                .unwrap();
+            build.build_store(out_ptr, setbit_position).unwrap();
             build
                 .build_return(Some(&bool_type.const_int(1, false)))
                 .unwrap();
 
-            return Some(next)
+            return Some(next);
         }
         IteratorHolder::Dictionary { arr, keys, values } => match dt {
             DataType::Dictionary(k_dt, v_dt) => {
@@ -1427,7 +1450,9 @@ pub fn generate_random_access<'a>(
 
             return Some(next);
         }
-        IteratorHolder::SetBit(_) => {unimplemented!("No random access iterator for setbit!")}
+        IteratorHolder::SetBit(_) => {
+            unimplemented!("No random access iterator for setbit!")
+        }
         IteratorHolder::Dictionary { arr, keys, values } => match dt {
             DataType::Dictionary(k_dt, v_dt) => {
                 let keys_access = generate_random_access(
