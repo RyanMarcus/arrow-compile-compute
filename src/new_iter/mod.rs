@@ -3,17 +3,16 @@ mod dictionary;
 mod primitive;
 mod runend;
 mod scalar;
+mod setbit;
 mod string;
 
 use std::ffi::c_void;
 
 use arrow_array::{
-    cast::AsArray,
-    types::{
+    cast::AsArray, types::{
         Float16Type, Float32Type, Float64Type, Int16Type, Int32Type, Int64Type, Int8Type,
         UInt16Type, UInt32Type, UInt64Type, UInt8Type,
-    },
-    Array, Datum, GenericStringArray, Int16RunArray, Int32RunArray, Int64RunArray,
+    }, Array, BooleanArray, Datum, GenericStringArray, Int16RunArray, Int32RunArray, Int64RunArray
 };
 
 use arrow_schema::DataType;
@@ -31,9 +30,14 @@ use inkwell::{
 use primitive::PrimitiveIterator;
 use runend::RunEndIterator;
 use scalar::{ScalarPrimitiveIterator, ScalarStringIterator};
+use setbit::SetBitIterator;
 use string::{LargeStringIterator, StringIterator};
 
 use crate::{declare_blocks, increment_pointer, ArrowKernelError, PrimitiveType};
+
+pub fn array_to_setbit_iter(arr: &BooleanArray) -> IteratorHolder {
+    IteratorHolder::SetBit((arr).into())
+}
 
 /// Convert an Arrow Array into an IteratorHolder, which contains the C-style
 /// iterator along with all the other C-style iterator needed. For example, a
@@ -190,9 +194,8 @@ pub enum IteratorHolder {
     Primitive(Box<PrimitiveIterator>),
     String(Box<StringIterator>),
     LargeString(Box<LargeStringIterator>),
-    Bitmap(Box<BitmapIterator>), // all three methods, returns 0 or 1
-    // TODO(paul): SetBitsOfBitmap() -- only single get next, no random access or block
-    // https://lemire.me/blog/2018/02/21/iterating-over-set-bits-quickly/
+    Bitmap(Box<BitmapIterator>), 
+    SetBit(Box<SetBitIterator>),
     Dictionary {
         arr: Box<DictionaryIterator>,
         keys: Box<IteratorHolder>,
@@ -216,6 +219,7 @@ impl IteratorHolder {
             IteratorHolder::String(iter) => &mut **iter as *mut _ as *mut c_void,
             IteratorHolder::LargeString(iter) => &mut **iter as *mut _ as *mut c_void,
             IteratorHolder::Bitmap(iter) => &mut **iter as *mut _ as *mut c_void,
+            IteratorHolder::SetBit(iter) => &mut **iter as *mut _ as *mut c_void,
             IteratorHolder::Dictionary { arr: iter, .. } => &mut **iter as *mut _ as *mut c_void,
             IteratorHolder::RunEnd { arr: iter, .. } => &mut **iter as *mut _ as *mut c_void,
             IteratorHolder::ScalarPrimitive(iter) => &mut **iter as *mut _ as *mut c_void,
@@ -231,6 +235,7 @@ impl IteratorHolder {
             IteratorHolder::String(iter) => &**iter as *const _ as *const c_void,
             IteratorHolder::LargeString(iter) => &**iter as *const _ as *const c_void,
             IteratorHolder::Bitmap(iter) => &**iter as *const _ as *const c_void,
+            IteratorHolder::SetBit(iter) => &**iter as *const _ as *const c_void,
             IteratorHolder::Dictionary { arr: iter, .. } => &**iter as *const _ as *const c_void,
             IteratorHolder::RunEnd { arr: iter, .. } => &**iter as *const _ as *const c_void,
             IteratorHolder::ScalarPrimitive(iter) => &**iter as *const _ as *const c_void,
@@ -336,6 +341,7 @@ pub fn generate_next_block<'a, const N: u32>(
         }
         IteratorHolder::String(_) | IteratorHolder::LargeString(_) => return None,
         IteratorHolder::Bitmap(_bitmap_iterator) => todo!(),
+        IteratorHolder::SetBit(_) => unimplemented!("No block iterator for setbit!"),
         IteratorHolder::Dictionary { arr, keys, values } => match dt {
             DataType::Dictionary(k_dt, v_dt) => {
                 let key_block_next =
@@ -923,6 +929,82 @@ pub fn generate_next<'a>(
 
             return Some(next);
         }
+        IteratorHolder::SetBit(setbit_iterator) => {
+            declare_blocks!(ctx, next, entry, while_loop, get_next_byte_loop, none_left, get_next, use_byte);
+            
+            build.position_at_end(entry);
+            build
+                .build_unconditional_branch(while_loop)
+                .unwrap();
+
+            build.position_at_end(while_loop);
+            let curr_pos = setbit_iterator.llvm_get_pos(ctx, &build, iter_ptr);
+            let curr_byte = setbit_iterator.llvm_get_byte(ctx, &build, iter_ptr);
+            let cmp_to_zero = build
+                .build_int_compare(IntPredicate::EQ, curr_byte, ctx.i8_type().const_int(0, false), "cmp_byte_to_zero")
+                .unwrap();
+            build
+                .build_conditional_branch(cmp_to_zero, get_next_byte_loop, use_byte)
+                .unwrap();
+
+            build.position_at_end(get_next_byte_loop);
+            let len = setbit_iterator.llvm_get_len(ctx, &build, iter_ptr);
+            let cmp_pos_to_len = build
+                .build_int_compare(IntPredicate::EQ, curr_pos, len, "cmp_pos_to_len")
+                .unwrap();
+            build
+                .build_conditional_branch(cmp_pos_to_len, none_left, get_next)
+                .unwrap();
+
+            build.position_at_end(none_left);
+            build
+                .build_return(Some(&bool_type.const_int(0, false)))
+                .unwrap();
+
+            build.position_at_end(get_next);
+            setbit_iterator.llvm_load_byte_at_pos(ctx, &build, iter_ptr);
+            setbit_iterator.llvm_increment_pos(ctx, &build, iter_ptr, i64_type.const_int(1, false));
+            build
+                .build_unconditional_branch(while_loop)
+                .unwrap();
+
+            build.position_at_end(use_byte);
+            let cttz_i8 = llvm_mod
+                .get_function("llvm.cttz.i8")
+                .expect("llvm.cttz.i8 should have been declared in the CodeGen constructor");
+            let is_zero_undef = ctx.bool_type().const_int(0, false);
+            let tz_i8 = build
+                .build_call(
+                    cttz_i8,
+                    &[curr_byte.into(), is_zero_undef.into()],
+                    "cttz_i8")
+                .unwrap()
+                .try_as_basic_value()
+                .left()
+                .expect("cttz should return a value")
+                .into_int_value();
+            let tz_i64 = build
+                .build_int_z_extend(tz_i8, i64_type, "extend_tz")
+                .unwrap();
+            setbit_iterator.llvm_clear_trailing_bit(ctx, &build, iter_ptr);
+            let setbit_position = build
+                .build_int_nuw_sub(curr_pos, i64_type.const_int(1, false), "pos_minus_one")
+                .unwrap();
+            let setbit_position = build
+                .build_int_mul(setbit_position, i64_type.const_int(8, false), "pos_mul_8")
+                .unwrap();
+            let setbit_position = build
+                .build_int_add(setbit_position, tz_i64, "add_tz")
+                .unwrap();
+            build
+                .build_store(out_ptr, setbit_position)
+                .unwrap();
+            build
+                .build_return(Some(&bool_type.const_int(1, false)))
+                .unwrap();
+
+            return Some(next)
+        }
         IteratorHolder::Dictionary { arr, keys, values } => match dt {
             DataType::Dictionary(k_dt, v_dt) => {
                 let key_next =
@@ -1358,6 +1440,7 @@ pub fn generate_random_access<'a>(
 
             return Some(next);
         }
+        IteratorHolder::SetBit(_) => {unimplemented!("No random access iterator for setbit!")}
         IteratorHolder::Dictionary { arr, keys, values } => match dt {
             DataType::Dictionary(k_dt, v_dt) => {
                 let keys_access = generate_random_access(
