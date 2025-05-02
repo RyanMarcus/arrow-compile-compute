@@ -123,14 +123,7 @@ impl SetBitIterator {
         build: &'a Builder,
         ptr: PointerValue<'a>
     ) {
-        let data_ptr_ptr = increment_pointer!(ctx, build, ptr, SetBitIterator::OFFSET_DATA);
-        let data_ptr = build
-            .build_load(
-                ctx.ptr_type(AddressSpace::default()),
-                data_ptr_ptr,
-                "load_data_ptr")
-            .unwrap()
-            .into_pointer_value();
+        let data_ptr = self.llvm_get_data_ptr(ctx, build, ptr);
         let curr_pos = self.llvm_get_pos(ctx, build, ptr);
         let byte_in_data_ptr = unsafe {
             build.build_gep(
