@@ -878,6 +878,7 @@ pub fn generate_next<'a>(
             return Some(next);
         }
         IteratorHolder::Bitmap(bitmap_iterator) => {
+            let access = generate_random_access(ctx, llvm_mod, label, dt, ih).unwrap();
             declare_blocks!(ctx, next, entry, none_left, get_next);
 
             build.position_at_end(entry);
@@ -896,32 +897,12 @@ pub fn generate_next<'a>(
                 .unwrap();
 
             build.position_at_end(get_next);
-            let data_ptr = bitmap_iterator.llvm_get_data_ptr(ctx, &build, iter_ptr);
-            let byte_index = build
-                .build_right_shift(curr_pos, i64_type.const_int(3, false), false, "byte_index")
-                .unwrap();
-            let bit_in_byte_i64 = build
-                .build_and(curr_pos, i64_type.const_int(7, false), "bit_in_byte_i64")
-                .unwrap();
-            let bit_in_byte_i8 = build
-                .build_int_truncate(bit_in_byte_i64, ctx.i8_type(), "bit_in_byte_i8")
-                .unwrap();
-            let data_byte_ptr = increment_pointer!(ctx, build, data_ptr, ptype.width(), byte_index);
-            let data_byte_i8 = build
-                .build_load(ctx.i8_type(), data_byte_ptr, "get_data_byte_i8")
+            let result = build
+                .build_call(access, &[iter_ptr.into(), curr_pos.into()], "access_result")
                 .unwrap()
-                .into_int_value();
-            let data_byte_shifted_i8 = build
-                .build_right_shift(data_byte_i8, bit_in_byte_i8, false, "data_byte_shifted_i8")
-                .unwrap();
-            let data_bit_i8 = build
-                .build_and(
-                    data_byte_shifted_i8,
-                    ctx.i8_type().const_int(1, false),
-                    "data_bit_i8",
-                )
-                .unwrap();
-            build.build_store(out_ptr, data_bit_i8).unwrap();
+                .try_as_basic_value()
+                .unwrap_left();
+            build.build_store(out_ptr, result).unwrap();
             bitmap_iterator.llvm_increment_pos(ctx, &build, iter_ptr, i64_type.const_int(1, false));
             build
                 .build_return(Some(&bool_type.const_int(1, false)))
