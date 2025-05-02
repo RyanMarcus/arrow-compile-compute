@@ -929,9 +929,15 @@ pub fn generate_next<'a>(
                 .unwrap();
 
             build.position_at_end(get_next_byte_loop);
-            let len = setbit_iterator.llvm_get_len(ctx, &build, iter_ptr);
+            let bit_len = setbit_iterator.llvm_get_len(ctx, &build, iter_ptr);
+            let bytes_len = build
+                .build_int_add(bit_len, i64_type.const_int(7, false), "round_up")
+                .unwrap();
+            let bytes_len = build
+                .build_right_shift(bytes_len, i64_type.const_int(3, false), false, "divide_by_8")
+                .unwrap();
             let cmp_pos_to_len = build
-                .build_int_compare(IntPredicate::EQ, curr_pos, len, "cmp_pos_to_len")
+                .build_int_compare(IntPredicate::EQ, curr_pos, bytes_len, "cmp_pos_to_len")
                 .unwrap();
             build
                 .build_conditional_branch(cmp_pos_to_len, none_left, get_next)

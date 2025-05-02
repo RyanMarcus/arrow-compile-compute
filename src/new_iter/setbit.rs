@@ -228,6 +228,14 @@ mod tests {
                 next_func.call(iter.get_mut_ptr(), &mut buf as *mut u64),
                 false
             );
+            assert_eq!(
+                next_func.call(iter.get_mut_ptr(), &mut buf as *mut u64),
+                false
+            );
+            assert_eq!(
+                next_func.call(iter.get_mut_ptr(), &mut buf as *mut u64),
+                false
+            );
         }
     }
 
