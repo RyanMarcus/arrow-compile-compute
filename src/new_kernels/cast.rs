@@ -143,7 +143,7 @@ impl Kernel for CastToFlatKernel {
         todo!()
     }
 
-    fn compile(inp: Self::Input<'_>, params: Self::Params) -> Result<Self, ArrowKernelError> {
+    fn compile(inp: &Self::Input<'_>, params: Self::Params) -> Result<Self, ArrowKernelError> {
         let in_type = inp.data_type();
         let out_type = &params;
         assert_ne!(
@@ -152,7 +152,7 @@ impl Kernel for CastToFlatKernel {
             in_type
         );
 
-        let in_iter = datum_to_iter(&inp)?;
+        let in_iter = datum_to_iter(inp)?;
 
         let ctx = Context::create();
         if out_type.is_primitive() {
@@ -160,7 +160,7 @@ impl Kernel for CastToFlatKernel {
                 context: ctx,
                 lhs_data_type: inp.data_type().clone(),
                 tar_data_type: out_type.clone(),
-                func_builder: |ctx| generate_block_cast_to_flat(ctx, inp, &in_iter, out_type),
+                func_builder: |ctx| generate_block_cast_to_flat(ctx, *inp, &in_iter, out_type),
             }
             .try_build()
         } else if matches!(out_type, DataType::Utf8View | DataType::BinaryView) {
@@ -168,7 +168,7 @@ impl Kernel for CastToFlatKernel {
                 context: ctx,
                 lhs_data_type: inp.data_type().clone(),
                 tar_data_type: out_type.clone(),
-                func_builder: |ctx| generate_cast_to_view(ctx, inp, &in_iter),
+                func_builder: |ctx| generate_cast_to_view(ctx, *inp, &in_iter),
             }
             .try_build()
         } else {
@@ -692,7 +692,7 @@ impl Kernel for CastToDictKernel {
         Ok(make_array(data))
     }
 
-    fn compile(inp: Self::Input<'_>, params: Self::Params) -> Result<Self, ArrowKernelError> {
+    fn compile(inp: &Self::Input<'_>, params: Self::Params) -> Result<Self, ArrowKernelError> {
         let out_type = &params;
         assert_ne!(
             inp.data_type(),
@@ -702,14 +702,14 @@ impl Kernel for CastToDictKernel {
         );
 
         if let DataType::Dictionary(k_dt, v_dt) = out_type {
-            let in_iter = datum_to_iter(&inp)?;
+            let in_iter = datum_to_iter(inp)?;
             let ctx = Context::create();
             CastToDictKernelTryBuilder {
                 context: ctx,
                 lhs_data_type: inp.data_type().clone(),
                 key_data_type: *k_dt.clone(),
                 val_data_type: *v_dt.clone(),
-                func_builder: |ctx| generate_cast_to_dict(&ctx, inp, &in_iter, k_dt, v_dt),
+                func_builder: |ctx| generate_cast_to_dict(&ctx, *inp, &in_iter, k_dt, v_dt),
             }
             .try_build()
         } else {
@@ -750,7 +750,7 @@ mod tests {
     fn test_i32_to_i64() {
         let data = Int32Array::from(vec![1, 2, 3, 4, 5]);
         let expected: ArrayRef = Arc::new(Int64Array::from(vec![1, 2, 3, 4, 5]));
-        let k = CastToFlatKernel::compile(&data, DataType::Int64).unwrap();
+        let k = CastToFlatKernel::compile(&(&data as &dyn Array), DataType::Int64).unwrap();
         let res = k.call(&data).unwrap();
         assert_eq!(&res, &expected);
     }
@@ -759,7 +759,7 @@ mod tests {
     fn test_i32_to_i64_block() {
         let data = Int32Array::from((0..200).collect_vec());
         let expected: ArrayRef = Arc::new(Int64Array::from((0..200).collect_vec()));
-        let k = CastToFlatKernel::compile(&data, DataType::Int64).unwrap();
+        let k = CastToFlatKernel::compile(&(&data as &dyn Array), DataType::Int64).unwrap();
         let res = k.call(&data).unwrap();
         assert_eq!(&res, &expected);
     }
@@ -768,7 +768,7 @@ mod tests {
     fn test_i64_to_u8_block() {
         let data = Int64Array::from((0..200).collect_vec());
         let expected: ArrayRef = Arc::new(UInt8Array::from((0..200).collect_vec()));
-        let k = CastToFlatKernel::compile(&data, DataType::UInt8).unwrap();
+        let k = CastToFlatKernel::compile(&(&data as &dyn Array), DataType::UInt8).unwrap();
         let res = k.call(&data).unwrap();
         assert_eq!(&res, &expected);
     }
@@ -776,9 +776,11 @@ mod tests {
     #[test]
     fn test_i32_to_dict() {
         let data = Int32Array::from(vec![1, 1, 1, 2, 2, 300, 300, 400]);
-        let k =
-            CastToDictKernel::compile(&data, dictionary_data_type(DataType::Int8, DataType::Int32))
-                .unwrap();
+        let k = CastToDictKernel::compile(
+            &(&data as &dyn Array),
+            dictionary_data_type(DataType::Int8, DataType::Int32),
+        )
+        .unwrap();
         let res = k.call(&data).unwrap();
         assert_eq!(res.len(), 8);
 
@@ -800,9 +802,11 @@ mod tests {
             "a test",
             "a string that is longer than 12 chars",
         ]);
-        let k =
-            CastToDictKernel::compile(&data, dictionary_data_type(DataType::Int8, DataType::Utf8))
-                .unwrap();
+        let k = CastToDictKernel::compile(
+            &(&data as &dyn Array),
+            dictionary_data_type(DataType::Int8, DataType::Utf8),
+        )
+        .unwrap();
         let res = k.call(&data).unwrap();
         assert_eq!(res.len(), 6);
         let res = res.as_dictionary::<Int8Type>();
@@ -826,7 +830,7 @@ mod tests {
         let ddata =
             arrow_cast::cast::cast(&data, &dictionary_data_type(DataType::Int8, DataType::Utf8))
                 .unwrap();
-        let k = CastToFlatKernel::compile(&ddata, DataType::Utf8View).unwrap();
+        let k = CastToFlatKernel::compile(&(&ddata as &dyn Array), DataType::Utf8View).unwrap();
         let res = k.call(&ddata).unwrap();
         let res = res.as_string_view();
 

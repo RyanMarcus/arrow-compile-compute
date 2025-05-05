@@ -1,7 +1,7 @@
+//mod apply;
 mod cast;
 mod cmp;
 mod ht;
-
 use std::{collections::HashMap, sync::RwLock};
 
 use arrow_schema::DataType;
@@ -34,7 +34,7 @@ pub enum ArrowKernelError {
 
 pub trait Kernel: Sized {
     type Key: std::hash::Hash + std::cmp::Eq;
-    type Input<'a>: Copy
+    type Input<'a>
     where
         Self: 'a;
     type Params;
@@ -42,7 +42,7 @@ pub trait Kernel: Sized {
 
     fn call(&self, inp: Self::Input<'_>) -> Result<Self::Output, ArrowKernelError>;
 
-    fn compile(inp: Self::Input<'_>, params: Self::Params) -> Result<Self, ArrowKernelError>;
+    fn compile(inp: &Self::Input<'_>, params: Self::Params) -> Result<Self, ArrowKernelError>;
     fn get_key_for_input(
         i: &Self::Input<'_>,
         p: &Self::Params,
@@ -76,7 +76,7 @@ impl<K: Kernel> KernelCache<K> {
         // There is a chance that multiple threads will see that a kernel is
         // missing, compile it, and then attempt to insert it. This seems
         // preferable to having to hold a write lock during kernel compilation.
-        let kernel = K::compile(input, param)?;
+        let kernel = K::compile(&input, param)?;
         let result = kernel.call(input);
 
         {

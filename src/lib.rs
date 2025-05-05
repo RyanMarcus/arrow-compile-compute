@@ -274,7 +274,7 @@ pub fn empty_array_for(dt: &DataType) -> ArrayRef {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 enum PrimitiveType {
     I8,
     I16,

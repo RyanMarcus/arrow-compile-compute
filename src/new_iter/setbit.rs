@@ -38,6 +38,7 @@ impl SetBitIterator {
         ptr: PointerValue<'a>,
     ) -> PointerValue<'a> {
         let data_ptr_ptr = increment_pointer!(ctx, build, ptr, SetBitIterator::OFFSET_DATA);
+
         build
             .build_load(
                 ctx.ptr_type(AddressSpace::default()),
