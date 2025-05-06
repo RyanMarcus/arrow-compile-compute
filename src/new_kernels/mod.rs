@@ -1,10 +1,13 @@
-//mod apply;
+mod apply;
 mod cast;
 mod cmp;
-mod dsl;
 mod ht;
 use std::{collections::HashMap, sync::RwLock};
 
+pub use apply::FloatFuncCache;
+pub use apply::IntFuncCache;
+pub use apply::StrFuncCache;
+pub use apply::UIntFuncCache;
 use arrow_schema::DataType;
 pub use cast::CastToDictKernel;
 pub use cast::CastToFlatKernel;

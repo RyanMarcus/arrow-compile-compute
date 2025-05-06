@@ -61,3 +61,32 @@ pub mod cast {
         }
     }
 }
+
+pub mod apply {
+    use std::sync::LazyLock;
+
+    use arrow_array::Array;
+
+    use crate::{
+        new_kernels::{FloatFuncCache, IntFuncCache, StrFuncCache, UIntFuncCache},
+        ArrowKernelError,
+    };
+
+    static FLOAT_FUNC_CACHE: LazyLock<FloatFuncCache> = LazyLock::new(FloatFuncCache::default);
+    static INT_FUNC_CACHE: LazyLock<IntFuncCache> = LazyLock::new(IntFuncCache::default);
+    static UINT_FUNC_CACHE: LazyLock<UIntFuncCache> = LazyLock::new(UIntFuncCache::default);
+    static STRING_FUNC_CACHE: LazyLock<StrFuncCache> = LazyLock::new(StrFuncCache::default);
+
+    pub fn apply_f64<F: FnMut(f64)>(data: &dyn Array, func: F) -> Result<(), ArrowKernelError> {
+        FLOAT_FUNC_CACHE.call(data, func)
+    }
+    pub fn apply_i64<F: FnMut(i64)>(data: &dyn Array, func: F) -> Result<(), ArrowKernelError> {
+        INT_FUNC_CACHE.call(data, func)
+    }
+    pub fn apply_u64<F: FnMut(u64)>(data: &dyn Array, func: F) -> Result<(), ArrowKernelError> {
+        UINT_FUNC_CACHE.call(data, func)
+    }
+    pub fn apply_str<F: FnMut(&[u8])>(data: &dyn Array, func: F) -> Result<(), ArrowKernelError> {
+        STRING_FUNC_CACHE.call(data, func)
+    }
+}
