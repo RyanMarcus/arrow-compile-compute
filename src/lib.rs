@@ -577,7 +577,7 @@ impl PrimitiveType {
     }
 }
 
-#[derive(Copy, Clone, Hash, PartialEq, Eq)]
+#[derive(Copy, Clone, Hash, PartialEq, Eq, Debug)]
 /// Represents different logical predicates that can be used for function
 /// compilation. Signedness is automatically determined.
 pub enum Predicate {

@@ -604,7 +604,7 @@ fn generate_block_llvm_cmp_kernel<'a>(
     })
 }
 
-fn add_float_vec_to_int_vec<'a>(
+pub fn add_float_vec_to_int_vec<'a>(
     ctx: &'a Context,
     module: &Module<'a>,
     v_size: u32,
