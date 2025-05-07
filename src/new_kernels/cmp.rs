@@ -4,7 +4,8 @@ use arrow_schema::DataType;
 use inkwell::execution_engine::JitFunction;
 use inkwell::intrinsics::Intrinsic;
 use inkwell::module::{Linkage, Module};
-use inkwell::values::FunctionValue;
+
+use inkwell::values::{BasicValue, FunctionValue};
 use inkwell::{context::Context, AddressSpace};
 use inkwell::{IntPredicate, OptimizationLevel};
 use ouroboros::self_referencing;
@@ -12,6 +13,7 @@ use std::ffi::c_void;
 
 use crate::new_iter::{datum_to_iter, generate_next, generate_next_block, IteratorHolder};
 use crate::new_kernels::{gen_convert_numeric_vec, optimize_module};
+use crate::writers::{ArrayWriter, BooleanWriter};
 use crate::{
     declare_blocks, increment_pointer, pointer_diff, ComparisonType, Predicate, PrimitiveType,
 };
@@ -195,33 +197,14 @@ fn generate_llvm_cmp_kernel<'a>(
     let cmp = module.add_function("cmp", fn_type, None);
     let lhs_ptr = cmp.get_nth_param(0).unwrap();
     let rhs_ptr = cmp.get_nth_param(1).unwrap();
-    let out_ptr = cmp.get_nth_param(2).unwrap();
+    let out_ptr = cmp.get_nth_param(2).unwrap().into_pointer_value();
 
-    declare_blocks!(
-        ctx,
-        cmp,
-        entry,
-        block_cond,
-        check_buf_full,
-        flush_buffer,
-        block_body,
-        exit
-    );
+    declare_blocks!(ctx, cmp, entry, block_cond, block_body, exit);
 
     build.position_at_end(entry);
-    let out_ptr_ptr = build.build_alloca(ptr_type, "out_ptr_ptr").unwrap();
-    build.build_store(out_ptr_ptr, out_ptr).unwrap();
-
     let lhs_buf = build.build_alloca(lhs_llvm, "lhs_single_buf").unwrap();
     let rhs_buf = build.build_alloca(rhs_llvm, "rhs_single_buf").unwrap();
-    let out_buf_ptr = build.build_alloca(i64_type, "out_buf_ptr").unwrap();
-    build
-        .build_store(out_buf_ptr, i64_type.const_zero())
-        .unwrap();
-    let out_buf_idx_ptr = build.build_alloca(i64_type, "tail_buf_idx").unwrap();
-    build
-        .build_store(out_buf_idx_ptr, i64_type.const_zero())
-        .unwrap();
+    let bool_writer = BooleanWriter::allocate_boolean_writer(ctx, &module, &build, out_ptr);
     build.build_unconditional_branch(block_cond).unwrap();
 
     build.position_at_end(block_cond);
@@ -235,42 +218,8 @@ fn generate_llvm_cmp_kernel<'a>(
         .build_call(rhs_next, &[rhs_ptr.into(), rhs_buf.into()], "rhs_next")
         .unwrap();
     build
-        .build_conditional_branch(had_lhs, check_buf_full, exit)
+        .build_conditional_branch(had_lhs, block_body, exit)
         .unwrap();
-
-    build.position_at_end(check_buf_full);
-    let buf_pos = build
-        .build_load(i64_type, out_buf_idx_ptr, "out_idx")
-        .unwrap()
-        .into_int_value();
-    let buf_full = build
-        .build_int_compare(
-            IntPredicate::ULT,
-            buf_pos,
-            i64_type.const_int(64, false),
-            "buf_full",
-        )
-        .unwrap();
-    build
-        .build_conditional_branch(buf_full, block_body, flush_buffer)
-        .unwrap();
-
-    build.position_at_end(flush_buffer);
-    let out_ptr = build
-        .build_load(ptr_type, out_ptr_ptr, "out_ptr")
-        .unwrap()
-        .into_pointer_value();
-    let curr_buf = build.build_load(i64_type, out_buf_ptr, "curr_buf").unwrap();
-    build.build_store(out_ptr, curr_buf).unwrap();
-    let next_out_ptr = increment_pointer!(ctx, build, out_ptr, 8);
-    build.build_store(out_ptr_ptr, next_out_ptr).unwrap();
-    build
-        .build_store(out_buf_ptr, i64_type.const_zero())
-        .unwrap();
-    build
-        .build_store(out_buf_idx_ptr, i64_type.const_zero())
-        .unwrap();
-    build.build_unconditional_branch(block_body).unwrap();
 
     build.position_at_end(block_body);
     let lv = build.build_load(lhs_llvm, lhs_buf, "lv").unwrap();
@@ -297,35 +246,11 @@ fn generate_llvm_cmp_kernel<'a>(
                 .unwrap()
         }
     };
-
-    let res = build
-        .build_int_z_extend_or_bit_cast(res, i64_type, "casted_cmp")
-        .unwrap();
-
-    let buf_idx = build
-        .build_load(i64_type, out_buf_idx_ptr, "buf_idx")
-        .unwrap()
-        .into_int_value();
-    let res = build.build_left_shift(res, buf_idx, "shifted").unwrap();
-    let curr_buf = build
-        .build_load(i64_type, out_buf_ptr, "curr_buf")
-        .unwrap()
-        .into_int_value();
-    let new_buf = build.build_or(res, curr_buf, "new_buf").unwrap();
-    build.build_store(out_buf_ptr, new_buf).unwrap();
-    let new_buf_idx = build
-        .build_int_add(buf_idx, i64_type.const_int(1, false), "new_tail_buf_idx")
-        .unwrap();
-    build.build_store(out_buf_idx_ptr, new_buf_idx).unwrap();
+    bool_writer.ingest(ctx, &build, res.as_basic_value_enum());
     build.build_unconditional_branch(block_cond).unwrap();
 
     build.position_at_end(exit);
-    let out_ptr = build
-        .build_load(ptr_type, out_ptr_ptr, "out_ptr")
-        .unwrap()
-        .into_pointer_value();
-    let curr_buf = build.build_load(i64_type, out_buf_ptr, "curr_buf").unwrap();
-    build.build_store(out_ptr, curr_buf).unwrap();
+    bool_writer.flush(ctx, &build);
     build.build_return(None).unwrap();
 
     module.verify().unwrap();
@@ -717,6 +642,10 @@ fn add_float_to_int<'a>(
 }
 
 pub fn add_memcmp<'a>(ctx: &'a Context, module: &Module<'a>) -> FunctionValue<'a> {
+    if let Some(func) = module.get_function("memcmp") {
+        return func;
+    }
+
     let i64_type = ctx.i64_type();
     let i8_type = ctx.i8_type();
     let str_type = PrimitiveType::P64x2.llvm_type(ctx);
@@ -733,7 +662,7 @@ pub fn add_memcmp<'a>(ctx: &'a Context, module: &Module<'a>) -> FunctionValue<'a
     let umin_f = umin.get_declaration(module, &[i64_type.into()]).unwrap();
 
     let builder = ctx.create_builder();
-    let function = module.add_function("memcmp", fn_type, None);
+    let function = module.add_function("memcmp", fn_type, Some(Linkage::Private));
 
     declare_blocks!(
         ctx,

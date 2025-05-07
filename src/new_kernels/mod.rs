@@ -1,6 +1,7 @@
 mod apply;
 mod cast;
 mod cmp;
+pub mod dsl;
 mod ht;
 use std::{collections::HashMap, sync::RwLock};
 
@@ -12,6 +13,7 @@ use arrow_schema::DataType;
 pub use cast::CastToDictKernel;
 pub use cast::CastToFlatKernel;
 pub use cmp::ComparisonKernel;
+
 use inkwell::{
     builder::Builder,
     context::Context,

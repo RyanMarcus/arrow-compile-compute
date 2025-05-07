@@ -53,6 +53,7 @@ mod primitive;
 mod runend;
 mod scalar;
 mod string;
+mod writers;
 
 pub use arrow_interface::compute;
 pub use arrow_interface::SelfContainedBinaryFunc;
@@ -61,6 +62,7 @@ pub use new_arrow_interface::apply;
 pub use new_arrow_interface::cast;
 pub use new_arrow_interface::cmp;
 
+pub use new_kernels::dsl;
 pub use new_kernels::ArrowKernelError;
 pub use new_kernels::ComparisonKernel;
 pub use new_kernels::Kernel;
