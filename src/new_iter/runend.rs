@@ -7,7 +7,7 @@ use arrow_buffer::ArrowNativeType;
 use inkwell::{
     builder::Builder,
     context::Context,
-    values::{IntValue, PointerValue},
+    values::{BasicValue, IntValue, PointerValue},
     AddressSpace,
 };
 use repr_offset::ReprOffset;
@@ -46,10 +46,15 @@ impl RunEndIterator {
         ptr: PointerValue<'a>,
     ) -> PointerValue<'a> {
         let ptr_ptr = increment_pointer!(ctx, builder, ptr, RunEndIterator::OFFSET_RUN_ENDS);
-        builder
+        let ptr = builder
             .build_load(ctx.ptr_type(AddressSpace::default()), ptr_ptr, "run_ends")
             .unwrap()
-            .into_pointer_value()
+            .into_pointer_value();
+        ptr.as_instruction_value()
+            .unwrap()
+            .set_metadata(ctx.metadata_node(&[]), ctx.get_kind_id("invariant.load"))
+            .unwrap();
+        ptr
     }
 
     pub fn llvm_val_iter_ptr<'a>(
@@ -59,10 +64,15 @@ impl RunEndIterator {
         ptr: PointerValue<'a>,
     ) -> PointerValue<'a> {
         let ptr_ptr = increment_pointer!(ctx, builder, ptr, RunEndIterator::OFFSET_VAL_ITER);
-        builder
+        let ptr = builder
             .build_load(ctx.ptr_type(AddressSpace::default()), ptr_ptr, "val_iter")
             .unwrap()
-            .into_pointer_value()
+            .into_pointer_value();
+        ptr.as_instruction_value()
+            .unwrap()
+            .set_metadata(ctx.metadata_node(&[]), ctx.get_kind_id("invariant.load"))
+            .unwrap();
+        ptr
     }
 
     pub fn llvm_pos<'a>(
@@ -85,10 +95,15 @@ impl RunEndIterator {
         ptr: PointerValue<'a>,
     ) -> IntValue<'a> {
         let ptr = increment_pointer!(ctx, builder, ptr, RunEndIterator::OFFSET_LEN);
-        builder
+        let len = builder
             .build_load(ctx.i64_type(), ptr, "len")
             .unwrap()
-            .into_int_value()
+            .into_int_value();
+        len.as_instruction_value()
+            .unwrap()
+            .set_metadata(ctx.metadata_node(&[]), ctx.get_kind_id("invariant.load"))
+            .unwrap();
+        len
     }
 
     pub fn llvm_remaining<'a>(

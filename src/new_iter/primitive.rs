@@ -4,7 +4,7 @@ use arrow_array::{Array, ArrowPrimitiveType, PrimitiveArray};
 use inkwell::{
     builder::Builder,
     context::Context,
-    values::{IntValue, PointerValue},
+    values::{BasicValue, IntValue, PointerValue},
     AddressSpace,
 };
 use repr_offset::ReprOffset;
@@ -47,10 +47,15 @@ impl PrimitiveIterator {
         ptr: PointerValue<'a>,
     ) -> IntValue<'a> {
         let len_ptr = increment_pointer!(ctx, builder, ptr, PrimitiveIterator::OFFSET_LEN);
-        builder
+        let len = builder
             .build_load(ctx.i64_type(), len_ptr, "len")
             .unwrap()
-            .into_int_value()
+            .into_int_value();
+        len.as_instruction_value()
+            .unwrap()
+            .set_metadata(ctx.metadata_node(&[]), ctx.get_kind_id("invariant.load"))
+            .unwrap();
+        len
     }
 
     pub fn llvm_pos<'a>(
@@ -73,14 +78,19 @@ impl PrimitiveIterator {
         ptr: PointerValue<'a>,
     ) -> PointerValue<'a> {
         let data_ptr_ptr = increment_pointer!(ctx, builder, ptr, PrimitiveIterator::OFFSET_DATA);
-        builder
+        let ptr = builder
             .build_load(
                 ctx.ptr_type(AddressSpace::default()),
                 data_ptr_ptr,
                 "data_ptr",
             )
             .unwrap()
-            .into_pointer_value()
+            .into_pointer_value();
+        ptr.as_instruction_value()
+            .unwrap()
+            .set_metadata(ctx.metadata_node(&[]), ctx.get_kind_id("invariant.load"))
+            .unwrap();
+        ptr
     }
 
     pub fn llvm_increment_pos<'a>(

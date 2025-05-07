@@ -313,6 +313,7 @@ pub fn generate_next_block<'a, const N: u32>(
             build.position_at_end(entry);
             let curr_pos = primitive_iter.llvm_pos(ctx, &build, iter_ptr);
             let curr_len = primitive_iter.llvm_len(ctx, &build, iter_ptr);
+
             let remaining = build
                 .build_int_sub(curr_len, curr_pos, "remaining")
                 .unwrap();
@@ -728,6 +729,11 @@ pub fn generate_next_block<'a, const N: u32>(
                 .build_call(get_next_single, &[iter_ptr.into(), val_buf.into()], "get")
                 .unwrap();
             let constant = build.build_load(llvm_type, val_buf, "constant").unwrap();
+            constant
+                .as_instruction_value()
+                .unwrap()
+                .set_metadata(ctx.metadata_node(&[]), ctx.get_kind_id("invariant.load"))
+                .unwrap();
             let v = build
                 .build_insert_element(vec_type.const_zero(), constant, i64_type.const_zero(), "v")
                 .unwrap();
@@ -1209,6 +1215,10 @@ pub fn generate_next<'a>(
                         .build_load(i64_type, ptr, "const_u64")
                         .unwrap()
                         .into_int_value();
+                    data.as_instruction_value()
+                        .unwrap()
+                        .set_metadata(ctx.metadata_node(&[]), ctx.get_kind_id("invariant.load"))
+                        .unwrap();
                     build
                         .build_int_cast(data, llvm_type.into_int_type(), "casted")
                         .unwrap()
@@ -1219,6 +1229,10 @@ pub fn generate_next<'a>(
                         .build_load(i64_type, ptr, "const_u64")
                         .unwrap()
                         .into_int_value();
+                    data.as_instruction_value()
+                        .unwrap()
+                        .set_metadata(ctx.metadata_node(&[]), ctx.get_kind_id("invariant.load"))
+                        .unwrap();
                     let data = build
                         .build_int_cast(
                             data,
@@ -1250,10 +1264,18 @@ pub fn generate_next<'a>(
                 .build_load(ptr_type, ptr1, "ptr1")
                 .unwrap()
                 .into_pointer_value();
+            ptr1.as_instruction_value()
+                .unwrap()
+                .set_metadata(ctx.metadata_node(&[]), ctx.get_kind_id("invariant.load"))
+                .unwrap();
             let ptr2 = build
                 .build_load(ptr_type, ptr2, "ptr2")
                 .unwrap()
                 .into_pointer_value();
+            ptr2.as_instruction_value()
+                .unwrap()
+                .set_metadata(ctx.metadata_node(&[]), ctx.get_kind_id("invariant.load"))
+                .unwrap();
 
             let to_return = ret_type.const_zero();
             let to_return = build
