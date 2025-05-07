@@ -108,10 +108,6 @@ impl<'a> KernelIterator<'a> {
         }
     }
 
-    pub fn filter<F: Fn(&[KernelExpression<'a>]) -> bool>(self, f: F) -> KernelIterator<'a> {
-        todo!()
-    }
-
     pub fn collect(mut self, ty: KernelOutputType) -> Result<KernelOutput<'a>, DSLError> {
         if self.data.len() != 1 {
             Err(DSLError::InvalidKernelOutputLength(self.data.len()))
