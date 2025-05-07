@@ -108,6 +108,10 @@ impl<'a> KernelIterator<'a> {
         }
     }
 
+    pub fn filter<F: Fn(&[KernelExpression<'a>]) -> bool>(self, f: F) -> KernelIterator<'a> {
+        todo!()
+    }
+
     pub fn collect(mut self, ty: KernelOutputType) -> Result<KernelOutput<'a>, DSLError> {
         if self.data.len() != 1 {
             Err(DSLError::InvalidKernelOutputLength(self.data.len()))
@@ -128,11 +132,11 @@ pub enum KernelExpression<'a> {
     ),
     And(Box<KernelExpression<'a>>, Box<KernelExpression<'a>>),
     Or(Box<KernelExpression<'a>>, Box<KernelExpression<'a>>),
-    Select(
-        Box<KernelExpression<'a>>,
-        Box<KernelExpression<'a>>,
-        Box<KernelExpression<'a>>,
-    ),
+    Select {
+        cond: Box<KernelExpression<'a>>,
+        v1: Box<KernelExpression<'a>>,
+        v2: Box<KernelExpression<'a>>,
+    },
 }
 
 impl<'a> KernelExpression<'a> {
@@ -162,11 +166,11 @@ impl<'a> KernelExpression<'a> {
         a: &KernelExpression<'a>,
         b: &KernelExpression<'a>,
     ) -> KernelExpression<'a> {
-        KernelExpression::Select(
-            Box::new(self.clone()),
-            Box::new(a.clone()),
-            Box::new(b.clone()),
-        )
+        KernelExpression::Select {
+            cond: Box::new(self.clone()),
+            v1: Box::new(a.clone()),
+            v2: Box::new(b.clone()),
+        }
     }
 
     fn descend<F: FnMut(&Self)>(&self, f: &mut F) {
@@ -191,11 +195,11 @@ impl<'a> KernelExpression<'a> {
                 lhs.descend(f);
                 rhs.descend(f);
             }
-            KernelExpression::Select(a, b, c) => {
+            KernelExpression::Select { cond, v1, v2 } => {
                 f(self);
-                a.descend(f);
-                b.descend(f);
-                c.descend(f);
+                cond.descend(f);
+                v1.descend(f);
+                v2.descend(f);
             }
         }
     }
@@ -215,7 +219,7 @@ impl<'a> KernelExpression<'a> {
         match self {
             KernelExpression::Item(kernel_input) => kernel_input.data_type(),
             KernelExpression::Truncate(..) => DataType::Binary,
-            KernelExpression::Select(_cond, lhs, _rhs) => lhs.get_type(),
+            KernelExpression::Select { v1, .. } => v1.get_type(),
             KernelExpression::Cmp(..) | KernelExpression::And(..) | KernelExpression::Or(..) => {
                 DataType::Boolean
             }
@@ -347,7 +351,7 @@ impl<'a> KernelExpression<'a> {
                     .into_int_value();
                 Ok(build.build_or(lhs_v, rhs_v, "or").unwrap().into())
             }
-            KernelExpression::Select(cond, a, b) => {
+            KernelExpression::Select { cond, v1, v2 } => {
                 if cond.get_type() != DataType::Boolean {
                     return Err(DSLError::BooleanExpected(format!(
                         "first parameter to select should be a boolean, found {:?}",
@@ -357,14 +361,14 @@ impl<'a> KernelExpression<'a> {
                 let cond_v = cond
                     .compile(ctx, llvm_mod, build, bufs, llvm_types)?
                     .into_int_value();
-                let a_v = a.compile(ctx, llvm_mod, build, bufs, llvm_types)?;
-                let b_v = b.compile(ctx, llvm_mod, build, bufs, llvm_types)?;
+                let a_v = v1.compile(ctx, llvm_mod, build, bufs, llvm_types)?;
+                let b_v = v2.compile(ctx, llvm_mod, build, bufs, llvm_types)?;
 
                 if a_v.get_type() != b_v.get_type() {
                     return Err(DSLError::TypeMismatch(format!(
                         "select operands must have the same type (saw {} and {})",
-                        a.get_type(),
-                        b.get_type()
+                        v1.get_type(),
+                        v2.get_type()
                     )));
                 }
 
