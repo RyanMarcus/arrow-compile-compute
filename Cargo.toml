@@ -48,14 +48,5 @@ name = "parallel_bench"
 harness = false
 
 [[bench]]
-name = "filter_bench"
-harness = false
-
-[[bench]]
-name = "agg_bench"
-harness = false
-
-
-[[bench]]
-name = "take_bench"
+name = "dsl_bench"
 harness = false

@@ -1,5 +1,6 @@
 use std::ffi::c_void;
 
+use crate::increment_pointer;
 use arrow_array::{Array, ArrowPrimitiveType, PrimitiveArray};
 use inkwell::{
     builder::Builder,
@@ -8,8 +9,6 @@ use inkwell::{
     AddressSpace,
 };
 use repr_offset::ReprOffset;
-
-use crate::increment_pointer;
 
 /// An iterator for primitive (densely packed) data.
 ///
