@@ -535,7 +535,6 @@ mod tests {
         let module = ctx.create_module("test");
         let func = generate_lookup_or_insert(&ctx, &module, &tt);
 
-        module.print_to_stderr();
         module.verify().unwrap();
         let ee = module
             .create_jit_execution_engine(OptimizationLevel::None)
@@ -568,7 +567,6 @@ mod tests {
         let module = ctx.create_module("test");
         let func = generate_lookup_or_insert(&ctx, &module, &tt);
 
-        module.print_to_stderr();
         module.verify().unwrap();
         let ee = module
             .create_jit_execution_engine(OptimizationLevel::None)
@@ -624,7 +622,6 @@ mod tests {
         let module = ctx.create_module("test");
         let func = generate_lookup_or_insert(&ctx, &module, &tt);
 
-        module.print_to_stderr();
         module.verify().unwrap();
         let ee = module
             .create_jit_execution_engine(OptimizationLevel::None)
@@ -712,7 +709,6 @@ mod tests {
         let func = generate_hash_func(&ctx, &module, PrimitiveType::F32);
         let fname = func.get_name().to_str().unwrap();
 
-        module.print_to_stderr();
         module.verify().unwrap();
         let ee = module
             .create_jit_execution_engine(OptimizationLevel::None)
@@ -752,7 +748,6 @@ mod tests {
         let long_str1 = "this is a much longer string";
         let long_str2 = "this is a similar longer string";
 
-        module.print_to_stderr();
         module.verify().unwrap();
         let ee = module
             .create_jit_execution_engine(OptimizationLevel::None)

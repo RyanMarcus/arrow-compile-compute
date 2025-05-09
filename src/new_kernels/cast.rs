@@ -735,7 +735,7 @@ mod tests {
     use arrow_array::{
         cast::AsArray,
         types::{Int32Type, Int8Type},
-        Array, ArrayRef, Int32Array, Int64Array, StringArray, UInt8Array,
+        Array, ArrayRef, DictionaryArray, Int32Array, Int64Array, StringArray, UInt8Array,
     };
     use arrow_schema::DataType;
     use itertools::Itertools;
@@ -790,6 +790,20 @@ mod tests {
             res.values().as_primitive::<Int32Type>().values()
         );
         assert_eq!(&[0, 0, 0, 1, 1, 2, 2, 3], res.keys().values());
+    }
+
+    #[test]
+    fn test_dict_to_i32() {
+        let keys = UInt8Array::from(vec![0, 0, 0, 1, 1, 1, 2, 2, 2, 3, 4, 4, 5, 5]);
+        let values = Int32Array::from(vec![-100, -200, -300, -400, -500, -600]);
+        let da = DictionaryArray::new(keys, Arc::new(values));
+        let k = CastToFlatKernel::compile(&(&da as &dyn Array), DataType::Int32).unwrap();
+
+        let res = k.call(&da).unwrap();
+        assert_eq!(
+            res.as_primitive::<Int32Type>().values(),
+            &[-100, -100, -100, -200, -200, -200, -300, -300, -300, -400, -500, -500, -600, -600]
+        );
     }
 
     #[test]

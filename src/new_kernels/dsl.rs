@@ -800,7 +800,6 @@ fn build_kernel<'a>(
         .into_int_value();
     builder.build_return(Some(&produced)).unwrap();
 
-    llvm_mod.print_to_stderr();
     llvm_mod.verify().unwrap();
     optimize_module(&llvm_mod).unwrap();
     let ee = llvm_mod
