@@ -1,10 +1,7 @@
-use arrow_array::{
-    types::Int64Type, Array, Float32Array, Int32Array, Int64Array, RunArray, StringArray,
-};
-use arrow_compile_compute::{CodeGen, ComparisonKernel, Kernel, Predicate};
+use arrow_array::{types::Int64Type, Float32Array, Int32Array, Int64Array, RunArray, StringArray};
+use arrow_compile_compute::{ComparisonKernel, Kernel, Predicate};
 use arrow_schema::DataType;
 use criterion::{criterion_group, criterion_main, Criterion};
-use inkwell::context::Context;
 use itertools::Itertools;
 
 fn generate_random_ree_array(num_run_ends: usize) -> RunArray<Int64Type> {
@@ -113,32 +110,6 @@ pub fn criterion_benchmark(c: &mut Criterion) {
     }
 
     {
-        let ree_data = generate_random_ree_array(100_000);
-        let pri_data = Int64Array::from((0..ree_data.len()).map(|_| rng.i64(-5..5)).collect_vec());
-
-        let ctx = Context::create();
-        let cg = CodeGen::new(&ctx);
-        let f = cg
-            .primitive_primitive_cmp(
-                &pri_data.data_type(),
-                false,
-                &ree_data.data_type(),
-                false,
-                Predicate::Eq,
-            )
-            .unwrap();
-
-        let ree_as_prim = Int64Array::from_iter(ree_data.downcast::<Int64Array>().unwrap());
-        let arrow_answer = arrow_ord::cmp::eq(&ree_as_prim, &pri_data).unwrap();
-        let llvm_answer = f.call(&pri_data, &ree_data).unwrap();
-        assert_eq!(arrow_answer, llvm_answer);
-
-        c.bench_function("ree_i64/execute llvm", |b| {
-            b.iter(|| f.call(&pri_data, &ree_data));
-        });
-    }
-
-    {
         let data1 = Int32Array::from((0..10_000_000).map(|_| rng.i32(0..1000)).collect_vec());
         let data2 = Int32Array::new_scalar(50);
 
@@ -193,6 +164,17 @@ pub fn criterion_benchmark(c: &mut Criterion) {
         });
         c.bench_function("strlt/execute llvm", |b| {
             b.iter(|| k.call((&data, &scalar)).unwrap())
+        });
+    }
+
+    {
+        let arr = generate_random_ree_array(100_000);
+        let sca = Int64Array::new_scalar(0);
+
+        let k = ComparisonKernel::compile(&(&arr, &sca), Predicate::Eq).unwrap();
+
+        c.bench_function("ree_eq/execute llvm", |b| {
+            b.iter(|| k.call((&arr, &sca)).unwrap())
         });
     }
 }
