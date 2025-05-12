@@ -78,15 +78,67 @@ pub mod apply {
     static UINT_FUNC_CACHE: LazyLock<UIntFuncCache> = LazyLock::new(UIntFuncCache::default);
     static STRING_FUNC_CACHE: LazyLock<StrFuncCache> = LazyLock::new(StrFuncCache::default);
 
+    /// Iterate over data casted to `f64`. Works over any data type that can be
+    /// casted to an `f64` (e.g., a dictionary-encoded array of `i32`s.)
+    ///
+    /// ```
+    /// use arrow_array::Int32Array;
+    /// use arrow_compile_compute::apply::apply_f64;
+    ///
+    /// let data = Int32Array::from(vec![1, 2, 3]);
+    /// let mut res = 0.0;
+    /// apply_f64(&data, |i| res += i / 2.0);
+    /// assert_eq!(res, 3.0);
+    /// ```
     pub fn apply_f64<F: FnMut(f64)>(data: &dyn Array, func: F) -> Result<(), ArrowKernelError> {
         FLOAT_FUNC_CACHE.call(data, func)
     }
+
+    /// Iterate over data casted to `i64`. Works over any data type that can be
+    /// casted to an `i64` (e.g., a dictionary-encoded array of `i32`s.)
+    ///
+    /// ```
+    /// use arrow_array::Int32Array;
+    /// use arrow_compile_compute::apply::apply_i64;
+    ///
+    /// let data = Int32Array::from(vec![1, 2, 3]);
+    /// let mut res = 0;
+    /// apply_i64(&data, |i| res += i);
+    /// assert_eq!(res, 6);
+    /// ```
     pub fn apply_i64<F: FnMut(i64)>(data: &dyn Array, func: F) -> Result<(), ArrowKernelError> {
         INT_FUNC_CACHE.call(data, func)
     }
+
+    /// Iterate over data casted to `u64`. Works over any data type that can be
+    /// casted to an `u64` (e.g., a dictionary-encoded array of `u32`s.)
+    ///
+    /// ```
+    /// use arrow_array::UInt32Array;
+    /// use arrow_compile_compute::apply::apply_u64;
+    ///
+    /// let data = UInt32Array::from(vec![1, 2, 3]);
+    /// let mut res = 0;
+    /// apply_u64(&data, |i| res += i);
+    /// assert_eq!(res, 6);
+    /// ```
     pub fn apply_u64<F: FnMut(u64)>(data: &dyn Array, func: F) -> Result<(), ArrowKernelError> {
         UINT_FUNC_CACHE.call(data, func)
     }
+
+    /// Iterate over data casted to a byte slice. Works over any data type that
+    /// can be casted to a byte slice (e.g., a dictionary-encoded array of
+    /// strings).
+    ///
+    /// ```
+    /// use arrow_array::StringArray;
+    /// use arrow_compile_compute::apply::apply_str;
+    ///
+    /// let data = StringArray::from(vec!["hello ", "world"]);
+    /// let mut res = Vec::new();
+    /// apply_str(&data, |i| res.extend_from_slice(i));
+    /// assert_eq!(std::str::from_utf8(&res).unwrap(), "hello world");
+    /// ```
     pub fn apply_str<F: FnMut(&[u8])>(data: &dyn Array, func: F) -> Result<(), ArrowKernelError> {
         STRING_FUNC_CACHE.call(data, func)
     }
