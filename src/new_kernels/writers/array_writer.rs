@@ -1,4 +1,3 @@
-use crate::writers::ArrayWriter as ArrayWriterTrait;
 use crate::{declare_blocks, increment_pointer, PrimitiveType};
 use inkwell::{
     builder::Builder,
@@ -7,6 +6,8 @@ use inkwell::{
     values::{BasicValueEnum, FunctionValue, PointerValue},
     AddressSpace,
 };
+
+use super::ArrayWriter;
 
 /// Writer for primitive arrays (ints and floats).
 pub struct PrimitiveArrayWriter<'a> {
@@ -62,7 +63,7 @@ impl<'a> PrimitiveArrayWriter<'a> {
     }
 }
 
-impl<'a> ArrayWriterTrait<'a> for PrimitiveArrayWriter<'a> {
+impl<'a> ArrayWriter<'a> for PrimitiveArrayWriter<'a> {
     fn ingest(&self, _ctx: &'a Context, build: &Builder<'a>, val: BasicValueEnum<'a>) {
         build
             .build_call(
@@ -81,7 +82,7 @@ impl<'a> ArrayWriterTrait<'a> for PrimitiveArrayWriter<'a> {
 #[cfg(test)]
 mod tests {
     use super::PrimitiveArrayWriter;
-    use crate::{declare_blocks, writers::ArrayWriter, PrimitiveType};
+    use crate::{declare_blocks, new_kernels::writers::ArrayWriter, PrimitiveType};
     use inkwell::{context::Context, values::BasicValue, AddressSpace, OptimizationLevel};
     use std::ffi::c_void;
 

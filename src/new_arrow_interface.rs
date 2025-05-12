@@ -63,6 +63,7 @@ pub mod cast {
 }
 
 pub mod apply {
+
     use std::sync::LazyLock;
 
     use arrow_array::Array;
@@ -88,5 +89,22 @@ pub mod apply {
     }
     pub fn apply_str<F: FnMut(&[u8])>(data: &dyn Array, func: F) -> Result<(), ArrowKernelError> {
         STRING_FUNC_CACHE.call(data, func)
+    }
+}
+
+pub mod select {
+    use std::sync::LazyLock;
+
+    use arrow_array::{Array, ArrayRef};
+
+    use crate::{
+        new_kernels::{KernelCache, TakeKernel},
+        ArrowKernelError,
+    };
+
+    static TAKE_PROGRAM_CACHE: LazyLock<KernelCache<TakeKernel>> = LazyLock::new(KernelCache::new);
+
+    pub fn take(data: &dyn Array, idxes: &dyn Array) -> Result<ArrayRef, ArrowKernelError> {
+        TAKE_PROGRAM_CACHE.get((data, idxes), ())
     }
 }

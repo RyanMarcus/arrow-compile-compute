@@ -14,7 +14,7 @@ proptest! {
             .collect::<Vec<i32>>());
 
         let expected = Int32Array::from(results);
-        let actual: Int32Array = arrow_compile_compute::compute::take(&data, &indexes).unwrap().as_primitive().clone();
+        let actual: Int32Array = arrow_compile_compute::select::take(&data, &indexes).unwrap().as_primitive().clone();
         assert_eq!(expected, actual);
     }
 
@@ -28,7 +28,7 @@ proptest! {
             .collect::<Vec<i32>>());
 
         let expected = Int32Array::from(results);
-        let actual: Int32Array = arrow_compile_compute::compute::take(&data, &indexes).unwrap().as_primitive().clone();
+        let actual: Int32Array = arrow_compile_compute::select::take(&data, &indexes).unwrap().as_primitive().clone();
         assert_eq!(expected, actual);
     }
 
@@ -42,7 +42,7 @@ proptest! {
             .collect::<Vec<i32>>());
 
         let expected = Int32Array::from(results);
-        let actual: Int32Array = arrow_compile_compute::compute::take(&data, &indexes).unwrap().as_primitive().clone();
+        let actual: Int32Array = arrow_compile_compute::select::take(&data, &indexes).unwrap().as_primitive().clone();
         assert_eq!(expected, actual);
     }
 
@@ -56,7 +56,7 @@ proptest! {
             .collect::<Vec<i32>>());
 
         let expected = Int32Array::from(results);
-        let actual: Int32Array = arrow_compile_compute::compute::take(&data, &indexes).unwrap().as_primitive().clone();
+        let actual: Int32Array = arrow_compile_compute::select::take(&data, &indexes).unwrap().as_primitive().clone();
         assert_eq!(expected, actual);
     }
 
@@ -70,11 +70,11 @@ proptest! {
             .collect::<Vec<String>>();
 
         let expected = StringArray::from(results);
-        let actual = arrow_compile_compute::compute::take(&data, &indexes).unwrap();
+        let actual = arrow_compile_compute::select::take(&data, &indexes).unwrap();
         if expected.is_empty() {
             assert!(actual.is_empty());
         } else {
-            let actual = actual.as_string_view().clone();
+            let actual = actual.as_string::<i32>().clone();
 
             assert_eq!(expected.len(), actual.len());
             for (expected, actual) in expected.iter().zip(actual.iter()) {

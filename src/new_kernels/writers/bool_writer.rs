@@ -222,7 +222,7 @@ mod tests {
     use inkwell::{context::Context, values::BasicValue, AddressSpace, OptimizationLevel};
     use itertools::Itertools;
 
-    use crate::{declare_blocks, writers::ArrayWriter};
+    use crate::{declare_blocks, new_kernels::writers::ArrayWriter};
 
     use super::BooleanWriter;
 

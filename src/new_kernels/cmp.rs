@@ -12,8 +12,8 @@ use ouroboros::self_referencing;
 use std::ffi::c_void;
 
 use crate::new_iter::{datum_to_iter, generate_next, generate_next_block, IteratorHolder};
+use crate::new_kernels::writers::{ArrayWriter, BooleanWriter};
 use crate::new_kernels::{gen_convert_numeric_vec, optimize_module};
-use crate::writers::{ArrayWriter, BooleanWriter};
 use crate::{
     declare_blocks, increment_pointer, pointer_diff, ComparisonType, Predicate, PrimitiveType,
 };

@@ -3,6 +3,9 @@ mod cast;
 mod cmp;
 pub mod dsl;
 mod ht;
+mod llvm_utils;
+mod take;
+mod writers;
 use std::{collections::HashMap, sync::RwLock};
 
 pub use apply::FloatFuncCache;
@@ -13,7 +16,11 @@ use arrow_schema::DataType;
 pub use cast::CastToDictKernel;
 pub use cast::CastToFlatKernel;
 pub use cmp::ComparisonKernel;
+use inkwell::execution_engine::ExecutionEngine;
+use llvm_utils::str_writer_append_bytes;
+pub use take::TakeKernel;
 
+use dsl::DSLError;
 use inkwell::{
     builder::Builder,
     context::Context,
@@ -36,6 +43,7 @@ pub enum ArrowKernelError {
     LLVMError(String),
     NonVectorizableType(DataType),
     DictionaryFullError(DataType),
+    DSLError(DSLError),
 }
 
 pub trait Kernel: Sized {
@@ -92,6 +100,14 @@ impl<K: Kernel> KernelCache<K> {
 
         result
     }
+}
+
+fn link_req_helpers(module: &Module, ee: &ExecutionEngine) -> Result<(), ArrowKernelError> {
+    if let Some(func) = module.get_function("str_writer_append_bytes") {
+        ee.add_global_mapping(&func, str_writer_append_bytes as usize);
+    }
+
+    Ok(())
 }
 
 fn optimize_module(module: &Module) -> Result<(), ArrowKernelError> {

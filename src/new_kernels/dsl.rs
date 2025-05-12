@@ -27,13 +27,13 @@ use crate::{
     new_iter::{datum_to_iter, generate_next, generate_random_access, IteratorHolder},
     new_kernels::{
         cmp::{add_float_vec_to_int_vec, add_memcmp},
-        gen_convert_numeric_vec, optimize_module,
+        gen_convert_numeric_vec, link_req_helpers, optimize_module,
+        writers::{ArrayWriter, BooleanWriter, PrimitiveArrayWriter},
     },
-    writers::{ArrayWriter, BooleanWriter, PrimitiveArrayWriter},
     ComparisonType, Predicate, PrimitiveType,
 };
 
-use super::ArrowKernelError;
+use super::{writers::StringArrayWriter, ArrowKernelError};
 
 #[derive(Debug)]
 pub enum DSLError {
@@ -91,12 +91,51 @@ impl<'a> KernelInput<'a> {
     }
 }
 
-#[derive(Debug, Copy, Clone)]
+#[derive(Debug, Copy, Clone, PartialEq, Eq)]
 pub enum KernelOutputType {
     Array,
+    String,
     Boolean,
     Dictionary,
     RunEnd,
+}
+
+impl KernelOutputType {
+    /// Determines if this output type can collect the passed data type. For
+    /// example, the `Boolean` output type can only collect expressions that
+    /// result in booleans.
+    fn can_collect(&self, dt: &DataType) -> Result<(), DSLError> {
+        match self {
+            KernelOutputType::Array => {
+                if PrimitiveType::for_arrow_type(dt) == PrimitiveType::P64x2 {
+                    return Err(DSLError::TypeMismatch(format!(
+                        "array output type can only collect primitives, but expression has type {}",
+                        dt
+                    )));
+                }
+            }
+            KernelOutputType::String => {
+                if PrimitiveType::for_arrow_type(dt) != PrimitiveType::P64x2 {
+                    return Err(DSLError::TypeMismatch(format!(
+                        "cannot collect type {} into string",
+                        dt
+                    )));
+                }
+            }
+            KernelOutputType::Boolean => {
+                if dt != &DataType::Boolean {
+                    return Err(DSLError::TypeMismatch(format!(
+                        "cannot collect type {} into boolean",
+                        dt
+                    )));
+                }
+            }
+            KernelOutputType::Dictionary => todo!(),
+            KernelOutputType::RunEnd => todo!(),
+        };
+
+        Ok(())
+    }
 }
 
 pub type KernelOutput<'a> = (KernelOutputType, KernelExpression<'a>);
@@ -584,7 +623,7 @@ impl DSLKernel {
         match self.borrow_output_strategy() {
             KernelOutputType::Array => {
                 let width = PrimitiveType::for_arrow_type(self.borrow_out_type()).width();
-                let mut out_buf = vec![0_u8; max_len * width];
+                let mut out_buf = vec![0_u64; (max_len * width).div_ceil(8)];
                 ptrs.push(out_buf.as_mut_ptr() as *mut c_void);
                 let mut kp = KernelParameters::new(ptrs);
 
@@ -600,6 +639,20 @@ impl DSLKernel {
                     )
                 };
                 Ok(res.slice(0, num_results as usize))
+            }
+            KernelOutputType::String => {
+                let mut offset_buf = vec![0_i32; max_len + 1];
+                let mut data_buf: Vec<u8> = Vec::new();
+                ptrs.push(offset_buf.as_mut_ptr() as *mut c_void);
+                ptrs.push(&mut data_buf as *mut Vec<u8> as *mut c_void);
+                let mut kp = KernelParameters::new(ptrs);
+
+                let num_results = unsafe { self.borrow_func().call(kp.get_mut_ptr()) } as usize;
+
+                let res = unsafe {
+                    StringArrayWriter::array_from_buffers(num_results, offset_buf, data_buf)
+                };
+                Ok(Arc::new(res))
             }
             KernelOutputType::Boolean => {
                 let mut out_buf = vec![0_u8; max_len.div_ceil(8)];
@@ -631,6 +684,7 @@ fn build_kernel<'a>(
 
     let addl_parameters = match out_strategy {
         KernelOutputType::Array => 1,
+        KernelOutputType::String => 2,
         KernelOutputType::Boolean => 1,
         KernelOutputType::RunEnd => 2,
         KernelOutputType::Dictionary => 3,
@@ -639,6 +693,8 @@ fn build_kernel<'a>(
     let func = llvm_mod.add_function("kernel", func_type, None);
 
     let out_type = expr.get_type();
+    out_strategy.can_collect(&out_type)?;
+
     let out_prim_type = PrimitiveType::for_arrow_type(&out_type);
 
     let next_funcs: HashMap<usize, FunctionValue> = expr
@@ -708,6 +764,14 @@ fn build_kernel<'a>(
             &builder,
             out_ptrs[0],
             out_prim_type,
+        )) as Box<dyn ArrayWriter>,
+        KernelOutputType::String => Box::new(StringArrayWriter::allocate_string_writer(
+            ctx,
+            &llvm_mod,
+            &builder,
+            out_ptrs[0],
+            PrimitiveType::I32,
+            out_ptrs[1],
         )) as Box<dyn ArrayWriter>,
         KernelOutputType::Boolean => Box::new(BooleanWriter::allocate_boolean_writer(
             &ctx,
@@ -805,6 +869,7 @@ fn build_kernel<'a>(
     let ee = llvm_mod
         .create_jit_execution_engine(OptimizationLevel::Aggressive)
         .unwrap();
+    link_req_helpers(&llvm_mod, &ee).unwrap();
 
     Ok(unsafe {
         ee.get_function::<unsafe extern "C" fn(*mut c_void) -> u64>(
@@ -818,8 +883,10 @@ fn build_kernel<'a>(
 mod test {
 
     use arrow_array::{cast::AsArray, types::Int32Type, BooleanArray, Int32Array, StringArray};
+    use arrow_schema::DataType;
+    use itertools::Itertools;
 
-    use crate::new_kernels::dsl::DSLKernel;
+    use crate::{dictionary_data_type, new_kernels::dsl::DSLKernel};
 
     use super::KernelOutputType;
 
@@ -931,5 +998,30 @@ mod test {
             res.as_primitive::<Int32Type>(),
             &Int32Array::from(vec![20, 10, 20, 50, 40, 50])
         );
+    }
+
+    #[test]
+    fn test_dsl_string_flatten() {
+        let odata = vec!["this", "this", "is", "a", "a", "test"];
+        let data = StringArray::from(odata.clone());
+        let data = arrow_cast::cast(
+            &data,
+            &dictionary_data_type(DataType::UInt8, DataType::Utf8),
+        )
+        .unwrap();
+
+        let k = DSLKernel::compile(&[&data], |ctx| {
+            let inp = ctx.get_input(0)?;
+            inp.into_iter().collect(KernelOutputType::String)
+        })
+        .unwrap();
+
+        let res = k.call(&[&data]).unwrap();
+        let res = res
+            .as_string::<i32>()
+            .iter()
+            .map(|x| x.unwrap())
+            .collect_vec();
+        assert_eq!(res, odata);
     }
 }
