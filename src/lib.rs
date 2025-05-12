@@ -26,8 +26,6 @@ pub use arrow_interface::select;
 
 pub use new_kernels::dsl;
 pub use new_kernels::ArrowKernelError;
-pub use new_kernels::ComparisonKernel;
-pub use new_kernels::Kernel;
 
 /// Declare a set of basic blocks at once
 macro_rules! declare_blocks {
@@ -160,7 +158,7 @@ enum PrimitiveType {
 }
 
 #[derive(Copy, Clone, Debug)]
-pub enum ComparisonType {
+enum ComparisonType {
     Int { signed: bool },
     Float,
     String,

@@ -6,7 +6,7 @@ use crate::{
     ArrowKernelError, PrimitiveType,
 };
 
-use super::Kernel;
+use crate::new_kernels::Kernel;
 
 pub struct TakeKernel(DSLKernel);
 unsafe impl Sync for TakeKernel {}
@@ -67,7 +67,7 @@ mod tests {
     use arrow_array::{cast::AsArray, types::Int32Type, Int32Array, StringArray, UInt8Array};
     use itertools::Itertools;
 
-    use crate::Kernel;
+    use crate::new_kernels::Kernel;
 
     use super::TakeKernel;
 

@@ -742,8 +742,10 @@ mod tests {
 
     use crate::{
         dictionary_data_type,
-        new_kernels::cast::{CastToDictKernel, CastToFlatKernel},
-        Kernel,
+        new_kernels::{
+            cast::{CastToDictKernel, CastToFlatKernel},
+            Kernel,
+        },
     };
 
     #[test]

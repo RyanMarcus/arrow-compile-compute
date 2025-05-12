@@ -4,9 +4,9 @@ pub mod cmp {
     use arrow_array::BooleanArray;
     use arrow_array::Datum;
 
+    use crate::new_kernels::ComparisonKernel;
     use crate::new_kernels::KernelCache;
     use crate::ArrowKernelError;
-    use crate::ComparisonKernel;
     use crate::Predicate;
 
     static CMP_PROGRAM_CACHE: LazyLock<KernelCache<ComparisonKernel>> =
@@ -62,6 +62,27 @@ pub mod cast {
     }
 }
 
+/// Run closures over Arrow arrays.
+///
+/// Iterating over an Arrow [`arrow_array::Array`] requires handling each
+/// possible data type and data layout (e.g., a dictionary encoded array of
+/// 32-bit signed integers). These functions abstract over encoding and
+/// width-extend types.
+///
+/// **In general, you should prefer using a compute kernel instead of these
+/// functions**, such as [`cmp::lt`]. The functions here have
+/// function call overhead, while the other kernels do not.
+///
+/// Printing out all even numbers from an array:
+/// ```
+/// use arrow_array::Int32Array;
+/// use arrow_compile_compute::apply::apply_i64;
+///
+/// let arr = Int32Array::from(vec![1, 2, 3, 4, 5]);
+/// apply_i64(&arr, |i| if i % 2 == 0 {
+///     println!("{}", i);
+/// });
+/// ```
 pub mod apply {
 
     use std::sync::LazyLock;
@@ -78,8 +99,10 @@ pub mod apply {
     static UINT_FUNC_CACHE: LazyLock<UIntFuncCache> = LazyLock::new(UIntFuncCache::default);
     static STRING_FUNC_CACHE: LazyLock<StrFuncCache> = LazyLock::new(StrFuncCache::default);
 
-    /// Iterate over data casted to `f64`. Works over any data type that can be
-    /// casted to an `f64` (e.g., a dictionary-encoded array of `i32`s.)
+    /// Iterate over data casted to `f64`.
+    ///
+    /// Works over any data type that can be casted to an `f64` (e.g., a
+    /// dictionary-encoded array of `i32`s.)
     ///
     /// ```
     /// use arrow_array::Int32Array;
@@ -94,8 +117,10 @@ pub mod apply {
         FLOAT_FUNC_CACHE.call(data, func)
     }
 
-    /// Iterate over data casted to `i64`. Works over any data type that can be
-    /// casted to an `i64` (e.g., a dictionary-encoded array of `i32`s.)
+    /// Iterate over data casted to `i64`.
+    ///
+    /// Works over any data type that can be casted to an `i64` (e.g., a
+    /// dictionary-encoded array of `i32`s.)
     ///
     /// ```
     /// use arrow_array::Int32Array;
@@ -110,8 +135,10 @@ pub mod apply {
         INT_FUNC_CACHE.call(data, func)
     }
 
-    /// Iterate over data casted to `u64`. Works over any data type that can be
-    /// casted to an `u64` (e.g., a dictionary-encoded array of `u32`s.)
+    /// Iterate over data casted to `u64`.
+    ///
+    /// Works over any data type that can be casted to an `u64` (e.g., a
+    /// dictionary-encoded array of `u32`s.)
     ///
     /// ```
     /// use arrow_array::UInt32Array;
@@ -126,9 +153,10 @@ pub mod apply {
         UINT_FUNC_CACHE.call(data, func)
     }
 
-    /// Iterate over data casted to a byte slice. Works over any data type that
-    /// can be casted to a byte slice (e.g., a dictionary-encoded array of
-    /// strings).
+    /// Iterate over data casted to a byte slice.
+    ///
+    /// Works over any data type that can be casted to a byte slice (e.g., a
+    /// dictionary-encoded array of strings).
     ///
     /// ```
     /// use arrow_array::StringArray;
