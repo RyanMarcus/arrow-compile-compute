@@ -101,7 +101,7 @@ impl Kernel for CastToFlatKernel {
             )));
         }
 
-        if inp.len() == 0 {
+        if inp.is_empty() {
             return Ok(empty_array_for(self.borrow_tar_data_type()));
         }
 
@@ -709,7 +709,7 @@ impl Kernel for CastToDictKernel {
                 lhs_data_type: inp.data_type().clone(),
                 key_data_type: *k_dt.clone(),
                 val_data_type: *v_dt.clone(),
-                func_builder: |ctx| generate_cast_to_dict(&ctx, *inp, &in_iter, k_dt, v_dt),
+                func_builder: |ctx| generate_cast_to_dict(ctx, *inp, &in_iter, k_dt, v_dt),
             }
             .try_build()
         } else {

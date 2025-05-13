@@ -1,4 +1,4 @@
-use std::{collections::HashMap, ffi::c_void, sync::RwLock, u64};
+use std::{collections::HashMap, ffi::c_void, sync::RwLock};
 
 use arrow_array::Array;
 use arrow_schema::DataType;
@@ -147,7 +147,7 @@ impl<T: ApplyType> RustFuncKernel<T> {
         RustFuncKernelTryBuilder {
             context: Context::create(),
             inp_data_type: inp.data_type().clone(),
-            pd: std::marker::PhantomData::default(),
+            pd: std::marker::PhantomData,
             func_builder: |ctx| {
                 generate_call(ctx, inp.data_type(), &ih, T::primitive_type(), BLOCK_SIZE)
             },

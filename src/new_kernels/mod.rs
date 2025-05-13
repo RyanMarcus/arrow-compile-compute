@@ -69,9 +69,9 @@ pub struct KernelCache<K: Kernel> {
 
 impl<K: Kernel> KernelCache<K> {
     pub fn new() -> Self {
-        return KernelCache {
+        KernelCache {
             map: RwLock::new(HashMap::new()),
-        };
+        }
     }
     pub fn get(
         &self,
@@ -207,7 +207,7 @@ pub fn add_ptrx2_to_view<'a>(ctx: &'a Context, llvm_mod: &Module<'a>) -> Functio
     let memcpy = Intrinsic::find("llvm.memcpy").unwrap();
     let memcpy_f = memcpy
         .get_declaration(
-            &llvm_mod,
+            llvm_mod,
             &[ptr_type.into(), ptr_type.into(), i64_type.into()],
         )
         .unwrap();

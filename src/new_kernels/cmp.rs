@@ -55,7 +55,7 @@ impl Kernel for ComparisonKernel {
             return Err(ArrowKernelError::SizeMismatch);
         }
 
-        if a_arr.len() == 0 {
+        if a_arr.is_empty() {
             return Ok(BooleanArray::new_null(0));
         }
 
@@ -97,7 +97,7 @@ impl Kernel for ComparisonKernel {
     }
 
     fn compile(inp: &Self::Input<'_>, pred: Predicate) -> Result<Self, ArrowKernelError> {
-        let (lhs, rhs) = inp.clone();
+        let (lhs, rhs) = *inp;
         let (lhs_arr, lhs_scalar) = lhs.get();
         let (rhs_arr, rhs_scalar) = rhs.get();
 

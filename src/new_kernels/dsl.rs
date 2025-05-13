@@ -58,7 +58,7 @@ enum KernelInputType {
     SetBit,
 }
 
-impl<'a> Debug for KernelInput<'a> {
+impl Debug for KernelInput<'_> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             KernelInput::Datum(index, datum) => {
@@ -72,6 +72,7 @@ impl<'a> Debug for KernelInput<'a> {
 }
 
 impl<'a> KernelInput<'a> {
+    #[allow(clippy::should_implement_trait)]
     pub fn into_iter(self) -> KernelIterator<'a> {
         KernelIterator {
             data: vec![KernelExpression::Item(self)],
@@ -298,22 +299,20 @@ impl<'a> KernelExpression<'a> {
 
     fn iterated_indexes(&self) -> Vec<(KernelInputType, usize)> {
         let mut h = BTreeSet::new();
-        self.descend(&mut |e| match e {
-            KernelExpression::Item(kernel_input) => {
+        self.descend(&mut |e| {
+            if let KernelExpression::Item(kernel_input) = e {
                 h.insert((kernel_input.input_type(), kernel_input.index()));
             }
-            _ => {}
         });
         h.into_iter().collect()
     }
 
     fn accessed_indexes(&self) -> Vec<usize> {
         let mut h = BTreeSet::new();
-        self.descend(&mut |e| match e {
-            KernelExpression::At { iter, .. } => {
+        self.descend(&mut |e| {
+            if let KernelExpression::At { iter, .. } = e {
                 h.insert(iter.index());
             }
-            _ => {}
         });
         h.into_iter().collect()
     }
@@ -339,7 +338,6 @@ impl<'a> KernelExpression<'a> {
         accessors: &HashMap<usize, FunctionValue<'b>>,
         iter_ptrs: &[PointerValue<'b>],
         iter_llvm_types: &HashMap<usize, BasicTypeEnum<'b>>,
-        all_llvm_types: &[BasicTypeEnum<'b>],
     ) -> Result<BasicValueEnum<'b>, DSLError> {
         match self {
             KernelExpression::Item(kernel_input) => {
@@ -357,7 +355,6 @@ impl<'a> KernelExpression<'a> {
                     accessors,
                     iter_ptrs,
                     iter_llvm_types,
-                    all_llvm_types,
                 )?;
                 let rhs_v = rhs.compile(
                     ctx,
@@ -367,7 +364,6 @@ impl<'a> KernelExpression<'a> {
                     accessors,
                     iter_ptrs,
                     iter_llvm_types,
-                    all_llvm_types,
                 )?;
 
                 let lhs_ptype = PrimitiveType::for_arrow_type(&lhs.get_type());
@@ -468,7 +464,6 @@ impl<'a> KernelExpression<'a> {
                         accessors,
                         iter_ptrs,
                         iter_llvm_types,
-                        all_llvm_types,
                     )?
                     .into_int_value();
                 let rhs_v = rhs
@@ -480,7 +475,6 @@ impl<'a> KernelExpression<'a> {
                         accessors,
                         iter_ptrs,
                         iter_llvm_types,
-                        all_llvm_types,
                     )?
                     .into_int_value();
                 Ok(build.build_and(lhs_v, rhs_v, "and").unwrap().into())
@@ -495,7 +489,6 @@ impl<'a> KernelExpression<'a> {
                         accessors,
                         iter_ptrs,
                         iter_llvm_types,
-                        all_llvm_types,
                     )?
                     .into_int_value();
                 let rhs_v = rhs
@@ -507,7 +500,6 @@ impl<'a> KernelExpression<'a> {
                         accessors,
                         iter_ptrs,
                         iter_llvm_types,
-                        all_llvm_types,
                     )?
                     .into_int_value();
                 Ok(build.build_or(lhs_v, rhs_v, "or").unwrap().into())
@@ -528,7 +520,6 @@ impl<'a> KernelExpression<'a> {
                         accessors,
                         iter_ptrs,
                         iter_llvm_types,
-                        all_llvm_types,
                     )?
                     .into_int_value();
                 let a_v = v1.compile(
@@ -539,7 +530,6 @@ impl<'a> KernelExpression<'a> {
                     accessors,
                     iter_ptrs,
                     iter_llvm_types,
-                    all_llvm_types,
                 )?;
                 let b_v = v2.compile(
                     ctx,
@@ -549,7 +539,6 @@ impl<'a> KernelExpression<'a> {
                     accessors,
                     iter_ptrs,
                     iter_llvm_types,
-                    all_llvm_types,
                 )?;
 
                 if a_v.get_type() != b_v.get_type() {
@@ -581,7 +570,6 @@ impl<'a> KernelExpression<'a> {
                         accessors,
                         iter_ptrs,
                         iter_llvm_types,
-                        all_llvm_types,
                     )?
                     .into_int_value();
                 let idx = build
@@ -606,7 +594,7 @@ impl<'a> KernelContext<'a> {
         self.inputs
             .get(idx)
             .cloned()
-            .ok_or_else(|| DSLError::InvalidInputIndex(idx))
+            .ok_or(DSLError::InvalidInputIndex(idx))
     }
 }
 
@@ -792,7 +780,7 @@ impl DSLKernel {
                 let num_results = unsafe { self.borrow_func().1.call(kp.get_mut_ptr()) };
 
                 let out_buf = BooleanBuffer::new(out_buf.into(), 0, num_results as usize);
-                let res = BooleanArray::new(out_buf.into(), None);
+                let res = BooleanArray::new(out_buf, None);
                 Ok(Arc::new(res) as ArrayRef)
             }
             KernelOutputType::Dictionary => todo!(),
@@ -865,7 +853,7 @@ fn build_kernel<'a>(
             (
                 *idx,
                 generate_random_access(
-                    &ctx,
+                    ctx,
                     &llvm_mod,
                     &format!("get{}", idx),
                     inputs[*idx].get().0.data_type(),
@@ -885,13 +873,8 @@ fn build_kernel<'a>(
             }
             KernelInputType::SetBit => PrimitiveType::U64,
         };
-        iter_llvm_types.insert(*idx, ptype.llvm_type(&ctx));
+        iter_llvm_types.insert(*idx, ptype.llvm_type(ctx));
     }
-
-    let all_llvm_types = inputs
-        .iter()
-        .map(|i| PrimitiveType::for_arrow_type(i.get().0.data_type()).llvm_type(ctx))
-        .collect_vec();
 
     declare_blocks!(ctx, func, entry, loop_cond, loop_body, exit);
     builder.position_at_end(entry);
@@ -920,7 +903,7 @@ fn build_kernel<'a>(
             out_ptrs[1],
         )) as Box<dyn ArrayWriter>,
         KernelOutputType::Boolean => Box::new(BooleanWriter::allocate_boolean_writer(
-            &ctx,
+            ctx,
             &llvm_mod,
             &builder,
             out_ptrs[0],
@@ -982,16 +965,15 @@ fn build_kernel<'a>(
 
     builder.position_at_end(loop_body);
     let result = expr.compile(
-        &ctx,
+        ctx,
         &llvm_mod,
         &builder,
         &bufs,
         &get_funcs,
         &iter_ptrs,
         &iter_llvm_types,
-        &all_llvm_types,
     )?;
-    writer.ingest(&ctx, &builder, result);
+    writer.ingest(ctx, &builder, result);
     let curr_produced = builder
         .build_load(i64_type, produced_ptr, "curr_produced")
         .unwrap()
@@ -1003,14 +985,13 @@ fn build_kernel<'a>(
     builder.build_unconditional_branch(loop_cond).unwrap();
 
     builder.position_at_end(exit);
-    writer.flush(&ctx, &builder);
+    writer.flush(ctx, &builder);
     let produced = builder
         .build_load(i64_type, produced_ptr, "produced")
         .unwrap()
         .into_int_value();
     builder.build_return(Some(&produced)).unwrap();
 
-    llvm_mod.print_to_stderr();
     llvm_mod.verify().unwrap();
     optimize_module(&llvm_mod).unwrap();
     let ee = llvm_mod
@@ -1036,7 +1017,7 @@ fn build_kernel<'a>(
             inputs.len()
         )));
     }
-    let access_map = access_map.into_iter().map(|(_k, v)| v).collect_vec();
+    let access_map = access_map.into_values().collect_vec();
 
     Ok((access_map, unsafe {
         ee.get_function::<unsafe extern "C" fn(*mut c_void) -> u64>(

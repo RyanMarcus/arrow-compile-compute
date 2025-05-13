@@ -340,9 +340,9 @@ pub fn generate_next_block<'a, const N: u32>(
                 .build_return(Some(&bool_type.const_int(1, false)))
                 .unwrap();
 
-            return Some(next);
+            Some(next)
         }
-        IteratorHolder::String(_) | IteratorHolder::LargeString(_) => return None,
+        IteratorHolder::String(_) | IteratorHolder::LargeString(_) => None,
         IteratorHolder::Bitmap(_bitmap_iterator) => todo!(),
         IteratorHolder::SetBit(_) => unimplemented!("No block iterator for setbit!"),
         IteratorHolder::Dictionary { arr, keys, values } => match dt {
@@ -459,7 +459,7 @@ pub fn generate_next_block<'a, const N: u32>(
                     .build_return(Some(&bool_type.const_int(1, false)))
                     .unwrap();
 
-                return Some(next);
+                Some(next)
             }
             _ => unreachable!("dict iterator but not dict data type ({:?})", dt),
         },
@@ -709,7 +709,7 @@ pub fn generate_next_block<'a, const N: u32>(
                     .build_return(Some(&bool_type.const_all_ones()))
                     .unwrap();
 
-                return Some(next);
+                Some(next)
             }
             _ => unreachable!("run-end iterator but not run-end data type ({:?})", dt),
         },
@@ -744,10 +744,10 @@ pub fn generate_next_block<'a, const N: u32>(
             build
                 .build_return(Some(&bool_type.const_int(1, false)))
                 .unwrap();
-            return Some(next);
+            Some(next)
         }
         IteratorHolder::ScalarString(_) => todo!(),
-    };
+    }
 }
 
 /// This adds a `next` function to the module for the given iterator. When
@@ -813,7 +813,7 @@ pub fn generate_next<'a>(
                 .build_return(Some(&bool_type.const_int(1, false)))
                 .unwrap();
 
-            return Some(next);
+            Some(next)
         }
         IteratorHolder::String(iter) => {
             let access = generate_random_access(ctx, llvm_mod, label, dt, ih).unwrap();
@@ -848,7 +848,7 @@ pub fn generate_next<'a>(
                 .build_return(Some(&bool_type.const_int(1, false)))
                 .unwrap();
 
-            return Some(next);
+            Some(next)
         }
         IteratorHolder::LargeString(iter) => {
             let access = generate_random_access(ctx, llvm_mod, label, dt, ih).unwrap();
@@ -883,7 +883,7 @@ pub fn generate_next<'a>(
                 .build_return(Some(&bool_type.const_int(1, false)))
                 .unwrap();
 
-            return Some(next);
+            Some(next)
         }
         IteratorHolder::Bitmap(bitmap_iterator) => {
             let access = generate_random_access(ctx, llvm_mod, label, dt, ih).unwrap();
@@ -916,7 +916,7 @@ pub fn generate_next<'a>(
                 .build_return(Some(&bool_type.const_int(1, false)))
                 .unwrap();
 
-            return Some(next);
+            Some(next)
         }
         IteratorHolder::SetBit(setbit_iterator) => {
             declare_blocks!(
@@ -932,7 +932,7 @@ pub fn generate_next<'a>(
 
             let cttz_id = Intrinsic::find("llvm.cttz").expect("llvm.cttz not in Intrinsic list");
             cttz_id
-                .get_declaration(&llvm_mod, &[ctx.i8_type().into()])
+                .get_declaration(llvm_mod, &[ctx.i8_type().into()])
                 .expect("Couldn't declare llvm.cttz.i8");
 
             let cttz_i8 = llvm_mod
@@ -1019,7 +1019,7 @@ pub fn generate_next<'a>(
                 .build_return(Some(&bool_type.const_int(1, false)))
                 .unwrap();
 
-            return Some(next);
+            Some(next)
         }
         IteratorHolder::Dictionary { arr, keys, values } => match dt {
             DataType::Dictionary(k_dt, v_dt) => {
@@ -1076,7 +1076,7 @@ pub fn generate_next<'a>(
                 build
                     .build_return(Some(&bool_type.const_int(0, false)))
                     .unwrap();
-                return Some(next);
+                Some(next)
             }
             _ => unreachable!("dict iterator but not dict data type ({:?})", dt),
         },
@@ -1193,7 +1193,7 @@ pub fn generate_next<'a>(
                 build.position_at_end(exhausted);
                 build.build_return(Some(&bool_type.const_zero())).unwrap();
 
-                return Some(next);
+                Some(next)
             }
             _ => unreachable!("run-end iterator but not run-end data type ({:?})", dt),
         },
@@ -1252,7 +1252,7 @@ pub fn generate_next<'a>(
             build
                 .build_return(Some(&bool_type.const_int(1, false)))
                 .unwrap();
-            return Some(next);
+            Some(next)
         }
         IteratorHolder::ScalarString(s) => {
             let ptr_type = ctx.ptr_type(AddressSpace::default());
@@ -1289,9 +1289,9 @@ pub fn generate_next<'a>(
                 .build_return(Some(&bool_type.const_int(1, false)))
                 .unwrap();
 
-            return Some(next);
+            Some(next)
         }
-    };
+    }
 }
 
 /// This adds an `access` function to the module for the given iterator. When
@@ -1339,7 +1339,7 @@ pub fn generate_random_access<'a>(
             let out = build.build_load(llvm_type, data_ptr, "elem").unwrap();
             build.build_return(Some(&out)).unwrap();
 
-            return Some(next);
+            Some(next)
         }
         IteratorHolder::String(ih) => {
             let i32_type = ctx.i32_type();
@@ -1392,7 +1392,7 @@ pub fn generate_random_access<'a>(
                 .build_insert_value(to_return, ptr2, 1, "to_return")
                 .unwrap();
             build.build_return(Some(&to_return)).unwrap();
-            return Some(next);
+            Some(next)
         }
         IteratorHolder::LargeString(ih) => {
             let ret_type = PrimitiveType::P64x2.llvm_type(ctx).into_struct_type();
@@ -1437,7 +1437,7 @@ pub fn generate_random_access<'a>(
                 .build_insert_value(to_return, ptr2, 1, "to_return")
                 .unwrap();
             build.build_return(Some(&to_return)).unwrap();
-            return Some(next);
+            Some(next)
         }
         IteratorHolder::Bitmap(bitmap_iterator) => {
             declare_blocks!(ctx, next, entry);
@@ -1470,7 +1470,7 @@ pub fn generate_random_access<'a>(
                 .unwrap();
             build.build_return(Some(&data_bit_i8)).unwrap();
 
-            return Some(next);
+            Some(next)
         }
         IteratorHolder::SetBit(_) => {
             unimplemented!("No random access iterator for setbit!")
@@ -1526,12 +1526,12 @@ pub fn generate_random_access<'a>(
                     .unwrap_left();
                 build.build_return(Some(&value)).unwrap();
 
-                return Some(next);
+                Some(next)
             }
             _ => unreachable!("dictionary iterator but non-iterator data type ({:?})", dt),
         },
         IteratorHolder::RunEnd { .. } => todo!(),
         IteratorHolder::ScalarPrimitive(_s) => todo!(),
         IteratorHolder::ScalarString(_) => todo!(),
-    };
+    }
 }

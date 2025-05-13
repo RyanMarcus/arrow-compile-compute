@@ -50,7 +50,7 @@ impl Kernel for TakeKernel {
                     .map(|i| vec![arr.at(&i[0])])
                     .collect(out_type)
             })
-            .map_err(|e| ArrowKernelError::DSLError(e))?,
+            .map_err(ArrowKernelError::DSLError)?,
         ))
     }
 
