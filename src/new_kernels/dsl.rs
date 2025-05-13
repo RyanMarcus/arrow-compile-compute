@@ -1,11 +1,11 @@
 use std::{
-    collections::{BTreeSet, HashMap},
+    collections::{BTreeMap, BTreeSet, HashMap},
     ffi::c_void,
     fmt::Debug,
     sync::Arc,
 };
 
-use arrow_array::{make_array, ArrayRef, BooleanArray, Datum};
+use arrow_array::{cast::AsArray, make_array, ArrayRef, BooleanArray, Datum};
 use arrow_buffer::{BooleanBuffer, Buffer};
 use arrow_data::ArrayDataBuilder;
 use arrow_schema::DataType;
@@ -24,7 +24,9 @@ use repr_offset::ReprOffset;
 
 use crate::{
     declare_blocks, increment_pointer,
-    new_iter::{datum_to_iter, generate_next, generate_random_access, IteratorHolder},
+    new_iter::{
+        array_to_setbit_iter, datum_to_iter, generate_next, generate_random_access, IteratorHolder,
+    },
     new_kernels::{
         cmp::{add_float_vec_to_int_vec, add_memcmp},
         gen_convert_numeric_vec, link_req_helpers, optimize_module,
@@ -41,12 +43,19 @@ pub enum DSLError {
     InvalidKernelOutputLength(usize),
     TypeMismatch(String),
     BooleanExpected(String),
+    UnusedInput(String),
 }
 
 #[derive(Clone)]
 pub enum KernelInput<'a> {
     Datum(usize, &'a dyn Datum),
     SetBits(usize, &'a BooleanArray),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
+enum KernelInputType {
+    Standard,
+    SetBit,
 }
 
 impl<'a> Debug for KernelInput<'a> {
@@ -76,10 +85,37 @@ impl<'a> KernelInput<'a> {
         }
     }
 
+    pub fn into_set_bits(self) -> Result<KernelInput<'a>, DSLError> {
+        match self {
+            KernelInput::Datum(idx, datum) => {
+                if datum.get().1 {
+                    Err(DSLError::BooleanExpected(
+                        "cannot convert scalar to set bit iterator".to_string(),
+                    ))
+                } else if let Some(bool) = datum.get().0.as_boolean_opt() {
+                    Ok(KernelInput::SetBits(idx, bool))
+                } else {
+                    Err(DSLError::BooleanExpected(format!(
+                        "cannot convert {} to set bit iterator",
+                        datum.get().0.data_type()
+                    )))
+                }
+            }
+            KernelInput::SetBits(..) => Ok(self),
+        }
+    }
+
     fn index(&self) -> usize {
         match self {
             KernelInput::Datum(index, _) => *index,
             KernelInput::SetBits(index, _) => *index,
+        }
+    }
+
+    fn input_type(&self) -> KernelInputType {
+        match self {
+            KernelInput::Datum(_, _) => KernelInputType::Standard,
+            KernelInput::SetBits(_, _) => KernelInputType::SetBit,
         }
     }
 
@@ -260,11 +296,11 @@ impl<'a> KernelExpression<'a> {
         }
     }
 
-    fn iterated_indexes(&self) -> Vec<usize> {
+    fn iterated_indexes(&self) -> Vec<(KernelInputType, usize)> {
         let mut h = BTreeSet::new();
         self.descend(&mut |e| match e {
             KernelExpression::Item(kernel_input) => {
-                h.insert(kernel_input.index());
+                h.insert((kernel_input.input_type(), kernel_input.index()));
             }
             _ => {}
         });
@@ -302,20 +338,37 @@ impl<'a> KernelExpression<'a> {
         bufs: &HashMap<usize, PointerValue<'b>>,
         accessors: &HashMap<usize, FunctionValue<'b>>,
         iter_ptrs: &[PointerValue<'b>],
-        llvm_types: &[BasicTypeEnum<'b>],
+        iter_llvm_types: &HashMap<usize, BasicTypeEnum<'b>>,
+        all_llvm_types: &[BasicTypeEnum<'b>],
     ) -> Result<BasicValueEnum<'b>, DSLError> {
         match self {
             KernelExpression::Item(kernel_input) => {
                 let buf = bufs[&kernel_input.index()];
-                let llvm_type = llvm_types[kernel_input.index()];
+                let llvm_type = iter_llvm_types[&kernel_input.index()];
                 Ok(build.build_load(llvm_type, buf, "load").unwrap())
             }
             KernelExpression::Truncate(_kernel_expression, _) => todo!(),
             KernelExpression::Cmp(predicate, lhs, rhs) => {
-                let lhs_v =
-                    lhs.compile(ctx, llvm_mod, build, bufs, accessors, iter_ptrs, llvm_types)?;
-                let rhs_v =
-                    rhs.compile(ctx, llvm_mod, build, bufs, accessors, iter_ptrs, llvm_types)?;
+                let lhs_v = lhs.compile(
+                    ctx,
+                    llvm_mod,
+                    build,
+                    bufs,
+                    accessors,
+                    iter_ptrs,
+                    iter_llvm_types,
+                    all_llvm_types,
+                )?;
+                let rhs_v = rhs.compile(
+                    ctx,
+                    llvm_mod,
+                    build,
+                    bufs,
+                    accessors,
+                    iter_ptrs,
+                    iter_llvm_types,
+                    all_llvm_types,
+                )?;
 
                 let lhs_ptype = PrimitiveType::for_arrow_type(&lhs.get_type());
                 let rhs_ptype = PrimitiveType::for_arrow_type(&rhs.get_type());
@@ -407,19 +460,55 @@ impl<'a> KernelExpression<'a> {
             }
             KernelExpression::And(lhs, rhs) => {
                 let lhs_v = lhs
-                    .compile(ctx, llvm_mod, build, bufs, accessors, iter_ptrs, llvm_types)?
+                    .compile(
+                        ctx,
+                        llvm_mod,
+                        build,
+                        bufs,
+                        accessors,
+                        iter_ptrs,
+                        iter_llvm_types,
+                        all_llvm_types,
+                    )?
                     .into_int_value();
                 let rhs_v = rhs
-                    .compile(ctx, llvm_mod, build, bufs, accessors, iter_ptrs, llvm_types)?
+                    .compile(
+                        ctx,
+                        llvm_mod,
+                        build,
+                        bufs,
+                        accessors,
+                        iter_ptrs,
+                        iter_llvm_types,
+                        all_llvm_types,
+                    )?
                     .into_int_value();
                 Ok(build.build_and(lhs_v, rhs_v, "and").unwrap().into())
             }
             KernelExpression::Or(lhs, rhs) => {
                 let lhs_v = lhs
-                    .compile(ctx, llvm_mod, build, bufs, accessors, iter_ptrs, llvm_types)?
+                    .compile(
+                        ctx,
+                        llvm_mod,
+                        build,
+                        bufs,
+                        accessors,
+                        iter_ptrs,
+                        iter_llvm_types,
+                        all_llvm_types,
+                    )?
                     .into_int_value();
                 let rhs_v = rhs
-                    .compile(ctx, llvm_mod, build, bufs, accessors, iter_ptrs, llvm_types)?
+                    .compile(
+                        ctx,
+                        llvm_mod,
+                        build,
+                        bufs,
+                        accessors,
+                        iter_ptrs,
+                        iter_llvm_types,
+                        all_llvm_types,
+                    )?
                     .into_int_value();
                 Ok(build.build_or(lhs_v, rhs_v, "or").unwrap().into())
             }
@@ -431,12 +520,37 @@ impl<'a> KernelExpression<'a> {
                     )));
                 }
                 let cond_v = cond
-                    .compile(ctx, llvm_mod, build, bufs, accessors, iter_ptrs, llvm_types)?
+                    .compile(
+                        ctx,
+                        llvm_mod,
+                        build,
+                        bufs,
+                        accessors,
+                        iter_ptrs,
+                        iter_llvm_types,
+                        all_llvm_types,
+                    )?
                     .into_int_value();
-                let a_v =
-                    v1.compile(ctx, llvm_mod, build, bufs, accessors, iter_ptrs, llvm_types)?;
-                let b_v =
-                    v2.compile(ctx, llvm_mod, build, bufs, accessors, iter_ptrs, llvm_types)?;
+                let a_v = v1.compile(
+                    ctx,
+                    llvm_mod,
+                    build,
+                    bufs,
+                    accessors,
+                    iter_ptrs,
+                    iter_llvm_types,
+                    all_llvm_types,
+                )?;
+                let b_v = v2.compile(
+                    ctx,
+                    llvm_mod,
+                    build,
+                    bufs,
+                    accessors,
+                    iter_ptrs,
+                    iter_llvm_types,
+                    all_llvm_types,
+                )?;
 
                 if a_v.get_type() != b_v.get_type() {
                     return Err(DSLError::TypeMismatch(format!(
@@ -459,7 +573,16 @@ impl<'a> KernelExpression<'a> {
                     )));
                 }
                 let idx = idx
-                    .compile(ctx, llvm_mod, build, bufs, accessors, iter_ptrs, llvm_types)?
+                    .compile(
+                        ctx,
+                        llvm_mod,
+                        build,
+                        bufs,
+                        accessors,
+                        iter_ptrs,
+                        iter_llvm_types,
+                        all_llvm_types,
+                    )?
                     .into_int_value();
                 let idx = build
                     .build_int_z_extend_or_bit_cast(idx, ctx.i64_type(), "zext")
@@ -539,7 +662,10 @@ pub struct DSLKernel {
 
     #[borrows(context)]
     #[covariant]
-    func: JitFunction<'this, unsafe extern "C" fn(*mut c_void) -> u64>,
+    func: (
+        Vec<KernelInputType>,
+        JitFunction<'this, unsafe extern "C" fn(*mut c_void) -> u64>,
+    ),
 }
 
 impl DSLKernel {
@@ -615,7 +741,11 @@ impl DSLKernel {
 
         let mut ihs: Vec<IteratorHolder> = inputs
             .iter()
-            .map(|&input| datum_to_iter(input))
+            .zip(self.borrow_func().0.iter())
+            .map(|(&input, ty)| match ty {
+                KernelInputType::Standard => datum_to_iter(input),
+                KernelInputType::SetBit => array_to_setbit_iter(input.get().0.as_boolean()),
+            })
             .try_collect()?;
         let mut ptrs = Vec::new();
         ptrs.extend(ihs.iter_mut().map(|ih| ih.get_mut_ptr()));
@@ -627,7 +757,7 @@ impl DSLKernel {
                 ptrs.push(out_buf.as_mut_ptr() as *mut c_void);
                 let mut kp = KernelParameters::new(ptrs);
 
-                let num_results = unsafe { self.borrow_func().call(kp.get_mut_ptr()) };
+                let num_results = unsafe { self.borrow_func().1.call(kp.get_mut_ptr()) };
 
                 let res = unsafe {
                     make_array(
@@ -647,7 +777,7 @@ impl DSLKernel {
                 ptrs.push(&mut data_buf as *mut Vec<u8> as *mut c_void);
                 let mut kp = KernelParameters::new(ptrs);
 
-                let num_results = unsafe { self.borrow_func().call(kp.get_mut_ptr()) } as usize;
+                let num_results = unsafe { self.borrow_func().1.call(kp.get_mut_ptr()) } as usize;
 
                 let res = unsafe {
                     StringArrayWriter::array_from_buffers(num_results, offset_buf, data_buf)
@@ -659,7 +789,7 @@ impl DSLKernel {
                 ptrs.push(out_buf.as_mut_ptr() as *mut c_void);
                 let mut kp = KernelParameters::new(ptrs);
 
-                let num_results = unsafe { self.borrow_func().call(kp.get_mut_ptr()) };
+                let num_results = unsafe { self.borrow_func().1.call(kp.get_mut_ptr()) };
 
                 let out_buf = BooleanBuffer::new(out_buf.into(), 0, num_results as usize);
                 let res = BooleanArray::new(out_buf.into(), None);
@@ -676,7 +806,13 @@ fn build_kernel<'a>(
     inputs: &[&dyn Datum],
     expr: KernelExpression,
     out_strategy: KernelOutputType,
-) -> Result<JitFunction<'a, unsafe extern "C" fn(*mut c_void) -> u64>, DSLError> {
+) -> Result<
+    (
+        Vec<KernelInputType>,
+        JitFunction<'a, unsafe extern "C" fn(*mut c_void) -> u64>,
+    ),
+    DSLError,
+> {
     let llvm_mod = ctx.create_module("kernel");
     let builder = ctx.create_builder();
     let i64_type = ctx.i64_type();
@@ -700,12 +836,17 @@ fn build_kernel<'a>(
     let next_funcs: HashMap<usize, FunctionValue> = expr
         .iterated_indexes()
         .iter()
-        .map(|idx| {
-            let ih = datum_to_iter(inputs[*idx]).unwrap();
+        .map(|(ty, idx)| {
+            let ih = match ty {
+                KernelInputType::Standard => datum_to_iter(inputs[*idx]).unwrap(),
+                KernelInputType::SetBit => {
+                    array_to_setbit_iter(inputs[*idx].get().0.as_boolean()).unwrap()
+                }
+            };
             (
                 *idx,
                 generate_next(
-                    &ctx,
+                    ctx,
                     &llvm_mod,
                     &format!("next{}", idx),
                     inputs[*idx].get().0.data_type(),
@@ -736,10 +877,15 @@ fn build_kernel<'a>(
         .collect();
 
     let indexes_to_iter = expr.iterated_indexes();
-    let mut iter_llvm_types = Vec::new();
-    for idx in indexes_to_iter.iter() {
-        let ptype = PrimitiveType::for_arrow_type(inputs[*idx].get().0.data_type());
-        iter_llvm_types.push(ptype.llvm_type(&ctx));
+    let mut iter_llvm_types = HashMap::new();
+    for (ty, idx) in indexes_to_iter.iter() {
+        let ptype = match ty {
+            KernelInputType::Standard => {
+                PrimitiveType::for_arrow_type(inputs[*idx].get().0.data_type())
+            }
+            KernelInputType::SetBit => PrimitiveType::U64,
+        };
+        iter_llvm_types.insert(*idx, ptype.llvm_type(&ctx));
     }
 
     let all_llvm_types = inputs
@@ -785,12 +931,11 @@ fn build_kernel<'a>(
 
     let bufs: HashMap<usize, PointerValue> = indexes_to_iter
         .iter()
-        .zip(iter_llvm_types.iter())
-        .map(|(idx, llvm_type)| {
+        .map(|(_ty, idx)| {
             (
                 *idx,
                 builder
-                    .build_alloca(*llvm_type, &format!("buf{}", idx))
+                    .build_alloca(iter_llvm_types[idx], &format!("buf{}", idx))
                     .unwrap(),
             )
         })
@@ -808,7 +953,7 @@ fn build_kernel<'a>(
     // call next on each of the iterators that we care about (note the
     // difference between the index of the iterator we care about and the index
     // of the parameter value)
-    for param_idx in indexes_to_iter.iter() {
+    for (_ty, param_idx) in indexes_to_iter.iter() {
         let buf = bufs[param_idx];
         let next_func = next_funcs[param_idx];
         let iter_ptr = iter_ptrs[*param_idx];
@@ -843,6 +988,7 @@ fn build_kernel<'a>(
         &bufs,
         &get_funcs,
         &iter_ptrs,
+        &iter_llvm_types,
         &all_llvm_types,
     )?;
     writer.ingest(&ctx, &builder, result);
@@ -864,6 +1010,7 @@ fn build_kernel<'a>(
         .into_int_value();
     builder.build_return(Some(&produced)).unwrap();
 
+    llvm_mod.print_to_stderr();
     llvm_mod.verify().unwrap();
     optimize_module(&llvm_mod).unwrap();
     let ee = llvm_mod
@@ -871,18 +1018,42 @@ fn build_kernel<'a>(
         .unwrap();
     link_req_helpers(&llvm_mod, &ee).unwrap();
 
-    Ok(unsafe {
+    // build an access map for the caller -- for accessed indexes, assume
+    // standard, but override that if we use the set bit iterator in the
+    // expression
+    let mut access_map = BTreeMap::new();
+    for idx in expr.accessed_indexes() {
+        access_map.insert(idx, KernelInputType::Standard);
+    }
+    for (ty, idx) in expr.iterated_indexes() {
+        access_map.insert(idx, ty);
+    }
+
+    if access_map.len() != inputs.len() {
+        return Err(DSLError::UnusedInput(format!(
+            "{} inputs were used, but {} inputs were provided",
+            access_map.len(),
+            inputs.len()
+        )));
+    }
+    let access_map = access_map.into_iter().map(|(_k, v)| v).collect_vec();
+
+    Ok((access_map, unsafe {
         ee.get_function::<unsafe extern "C" fn(*mut c_void) -> u64>(
             func.get_name().to_str().unwrap(),
         )
         .unwrap()
-    })
+    }))
 }
 
 #[cfg(test)]
 mod test {
 
-    use arrow_array::{cast::AsArray, types::Int32Type, BooleanArray, Int32Array, StringArray};
+    use arrow_array::{
+        cast::AsArray,
+        types::{Int32Type, UInt64Type},
+        BooleanArray, Int32Array, StringArray,
+    };
     use arrow_schema::DataType;
     use itertools::Itertools;
 
@@ -1023,5 +1194,22 @@ mod test {
             .map(|x| x.unwrap())
             .collect_vec();
         assert_eq!(res, odata);
+    }
+
+    #[test]
+    fn test_kernel_set_bit_iter() {
+        let data = BooleanArray::from(vec![true, true, false, true, false, true]);
+        let k = DSLKernel::compile(&[&data], |ctx| {
+            let inp = ctx.get_input(0)?.into_set_bits()?;
+            inp.into_iter().collect(KernelOutputType::Array)
+        })
+        .unwrap();
+        let res = k.call(&[&data]).unwrap();
+        let res = res
+            .as_primitive::<UInt64Type>()
+            .iter()
+            .map(|x| x.unwrap())
+            .collect_vec();
+        assert_eq!(res, vec![0, 1, 3, 5]);
     }
 }

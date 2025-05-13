@@ -37,8 +37,8 @@ use string::{LargeStringIterator, StringIterator};
 
 use crate::{declare_blocks, increment_pointer, ArrowKernelError, PrimitiveType};
 
-pub fn array_to_setbit_iter(arr: &BooleanArray) -> IteratorHolder {
-    IteratorHolder::SetBit((arr).into())
+pub fn array_to_setbit_iter(arr: &BooleanArray) -> Result<IteratorHolder, ArrowKernelError> {
+    Ok(IteratorHolder::SetBit((arr).into()))
 }
 
 /// Convert an Arrow Array into an IteratorHolder, which contains the C-style

@@ -157,7 +157,7 @@ mod tests {
             true, true, false, true, false, false, false, false, true, true,
         ]);
 
-        let mut iter = array_to_setbit_iter(&data);
+        let mut iter = array_to_setbit_iter(&data).unwrap();
 
         let ctx = Context::create();
         let module = ctx.create_module("setbit_test");
