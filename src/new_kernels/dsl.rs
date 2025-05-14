@@ -1037,6 +1037,7 @@ fn build_kernel<'a>(
         .into_int_value();
     builder.build_return(Some(&produced)).unwrap();
 
+    llvm_mod.print_to_stderr();
     llvm_mod.verify().unwrap();
     optimize_module(&llvm_mod).unwrap();
     let ee = llvm_mod
@@ -1237,5 +1238,27 @@ mod test {
             .map(|x| x.unwrap())
             .collect_vec();
         assert_eq!(res, vec![0, 1, 3, 5]);
+    }
+
+    #[test]
+    fn test_kernel_set_bit_idx() {
+        let filter = BooleanArray::from(vec![true, true, false, true, false, true]);
+        let data = Int32Array::from(vec![10, 20, 30, 40, 50, 60]);
+        let k = DSLKernel::compile(&[&filter, &data], |ctx| {
+            let filter = ctx.get_input(0)?.into_set_bits()?;
+            let data = ctx.get_input(1)?;
+            filter
+                .into_iter()
+                .map(|i| vec![data.at(&i[0])])
+                .collect(KernelOutputType::Array)
+        })
+        .unwrap();
+        let res = k.call(&[&filter, &data]).unwrap();
+        let res = res
+            .as_primitive::<Int32Type>()
+            .iter()
+            .map(|x| x.unwrap())
+            .collect_vec();
+        assert_eq!(res, vec![10, 20, 40, 60]);
     }
 }
