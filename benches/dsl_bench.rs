@@ -47,11 +47,11 @@ pub fn criterion_benchmark(c: &mut Criterion) {
             our_res.as_primitive::<Int32Type>()
         );
 
-        c.bench_function("idx max/llvm", |b| {
+        c.bench_function("dsl idx max/llvm", |b| {
             b.iter(|| k.call(&[&data1, &data2, &idxes]).unwrap())
         });
 
-        c.bench_function("idx max/arrow", |b| {
+        c.bench_function("dsl idx max/arrow", |b| {
             b.iter(|| arrow_compute(&data1, &data2, &idxes))
         });
     }

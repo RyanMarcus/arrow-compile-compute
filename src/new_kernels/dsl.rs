@@ -10,10 +10,11 @@ use arrow_buffer::{BooleanBuffer, Buffer};
 use arrow_data::ArrayDataBuilder;
 use arrow_schema::DataType;
 use inkwell::{
+    attributes::Attribute,
     builder::Builder,
     context::Context,
     execution_engine::JitFunction,
-    module::Module,
+    module::{Linkage, Module},
     types::BasicTypeEnum,
     values::{BasicValue, BasicValueEnum, FunctionValue, PointerValue},
     AddressSpace, OptimizationLevel,
@@ -813,9 +814,44 @@ fn build_kernel<'a>(
         KernelOutputType::RunEnd => 2,
         KernelOutputType::Dictionary => 3,
     };
+    let num_total_inputs = inputs.len() + addl_parameters;
     let func_type = i64_type.fn_type(&[ptr_type.into()], false);
-    let func = llvm_mod.add_function("kernel", func_type, None);
+    let func_outer = llvm_mod.add_function("kernel", func_type, None);
+    let func_inner = llvm_mod.add_function(
+        "inner_kernel",
+        i64_type.fn_type(
+            &(0..num_total_inputs).map(|_| ptr_type.into()).collect_vec(),
+            false,
+        ),
+        Some(Linkage::Private),
+    );
 
+    // add `noalias` to each parameter
+    let noalias_kind_id = Attribute::get_named_enum_kind_id("noalias");
+    for i in 0..num_total_inputs {
+        let attr = ctx.create_enum_attribute(noalias_kind_id, 0);
+        func_inner.add_attribute(inkwell::attributes::AttributeLoc::Param(i as u32), attr);
+    }
+
+    //
+    // Outer function
+    //
+    declare_blocks!(ctx, func_outer, entry);
+    builder.position_at_end(entry);
+    let param_ptr = func_outer.get_nth_param(0).unwrap().into_pointer_value();
+    let ptr_params = (0..num_total_inputs)
+        .map(|idx| KernelParameters::llvm_get(ctx, &builder, param_ptr, idx).into())
+        .collect_vec();
+    let num_produced = builder
+        .build_call(func_inner, &ptr_params, "num_produced")
+        .unwrap()
+        .try_as_basic_value()
+        .unwrap_left();
+    builder.build_return(Some(&num_produced)).unwrap();
+
+    //
+    // Inner function
+    //
     let out_type = expr.get_type();
     out_strategy.can_collect(&out_type)?;
 
@@ -876,14 +912,23 @@ fn build_kernel<'a>(
         iter_llvm_types.insert(*idx, ptype.llvm_type(ctx));
     }
 
-    declare_blocks!(ctx, func, entry, loop_cond, loop_body, exit);
+    declare_blocks!(ctx, func_inner, entry, loop_cond, loop_body, exit);
     builder.position_at_end(entry);
-    let param_ptr = func.get_nth_param(0).unwrap().into_pointer_value();
     let iter_ptrs = (0..inputs.len())
-        .map(|i| KernelParameters::llvm_get(ctx, &builder, param_ptr, i))
+        .map(|i| {
+            func_inner
+                .get_nth_param(i as u32)
+                .unwrap()
+                .into_pointer_value()
+        })
         .collect_vec();
     let out_ptrs = (inputs.len()..inputs.len() + addl_parameters)
-        .map(|i| KernelParameters::llvm_get(ctx, &builder, param_ptr, i))
+        .map(|i| {
+            func_inner
+                .get_nth_param(i as u32)
+                .unwrap()
+                .into_pointer_value()
+        })
         .collect_vec();
 
     let writer = match out_strategy {
@@ -1021,7 +1066,7 @@ fn build_kernel<'a>(
 
     Ok((access_map, unsafe {
         ee.get_function::<unsafe extern "C" fn(*mut c_void) -> u64>(
-            func.get_name().to_str().unwrap(),
+            func_outer.get_name().to_str().unwrap(),
         )
         .unwrap()
     }))
