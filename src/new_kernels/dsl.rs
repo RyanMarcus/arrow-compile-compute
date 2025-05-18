@@ -214,19 +214,19 @@ pub enum KernelExpression<'a> {
     },
 }
 
-impl<'a> From<u64> for KernelExpression<'a> {
+impl From<u64> for KernelExpression<'_> {
     fn from(value: u64) -> Self {
         KernelExpression::IntConst(value, false)
     }
 }
 
-impl<'a> From<i64> for KernelExpression<'a> {
+impl From<i64> for KernelExpression<'_> {
     fn from(value: i64) -> Self {
         KernelExpression::IntConst(u64::from_le_bytes(value.to_le_bytes()), true)
     }
 }
 
-impl<'a> From<i32> for KernelExpression<'a> {
+impl From<i32> for KernelExpression<'_> {
     fn from(value: i32) -> Self {
         (value as i64).into()
     }
@@ -773,7 +773,7 @@ impl<'a> SealedKernelProgram<'a> {
             strategy,
             out_type,
         };
-        res.strategy().can_collect(&res.out_type())?;
+        res.strategy().can_collect(res.out_type())?;
 
         Ok(res)
     }
@@ -1006,10 +1006,10 @@ impl DSLKernel {
     }
 }
 
-fn build_kernel<'a, 'b>(
+fn build_kernel<'a>(
     ctx: &'a Context,
     inputs: &[&dyn Datum],
-    program: SealedKernelProgram<'b>,
+    program: SealedKernelProgram<'_>,
 ) -> Result<
     (
         Vec<KernelInputType>,
@@ -1062,7 +1062,7 @@ fn build_kernel<'a, 'b>(
     // Inner function
     //
     let out_type = program.out_type();
-    let out_prim_type = PrimitiveType::for_arrow_type(&out_type);
+    let out_prim_type = PrimitiveType::for_arrow_type(out_type);
 
     let indexes_to_iter = program.iterated_indexes();
     if indexes_to_iter.is_empty() {

@@ -121,7 +121,7 @@ fn set_noalias_params(func: &FunctionValue) {
     let noalias_kind_id = Attribute::get_named_enum_kind_id("noalias");
     for i in 0..func.count_params() {
         let attr = context.create_enum_attribute(noalias_kind_id, 0);
-        func.add_attribute(AttributeLoc::Param(i as u32), attr);
+        func.add_attribute(AttributeLoc::Param(i), attr);
     }
 }
 
