@@ -7,14 +7,15 @@ use arrow_buffer::ArrowNativeType;
 use inkwell::{
     builder::Builder,
     context::Context,
-    values::{BasicValue, IntValue, PointerValue},
-    AddressSpace,
+    module::Module,
+    values::{BasicValue, FunctionValue, IntValue, PointerValue},
+    AddressSpace, IntPredicate,
 };
 use repr_offset::ReprOffset;
 
-use crate::increment_pointer;
+use crate::{declare_blocks, increment_pointer, PrimitiveType};
 
-use super::{array_to_iter, IteratorHolder};
+use super::{array_to_iter, primitive::PrimitiveIterator, IteratorHolder};
 
 /// An iterator for run-end encoded data. Contains pointers to the *iterators* for
 /// the underlying run ends and values.
@@ -212,16 +213,146 @@ impl<R: RunEndIndexType + ArrowPrimitiveType> From<&RunArray<R>> for IteratorHol
     }
 }
 
+/// Adds a function that uses binary search to find the position of an index in
+/// a run array
+pub fn add_bsearch<'a>(
+    ctx: &'a Context,
+    llvm_mod: &Module<'a>,
+    re_iter: &PrimitiveIterator,
+    ty: PrimitiveType,
+) -> FunctionValue<'a> {
+    let fname = format!("bsearch_w{}", ty.width());
+    if let Some(func) = llvm_mod.get_function(&fname) {
+        return func;
+    }
+
+    let i64_t = ctx.i64_type();
+    let ptr_t = ctx.ptr_type(AddressSpace::default());
+    let run_t = ty.llvm_type(ctx).into_int_type();
+
+    let func_t = i64_t.fn_type(&[ptr_t.into(), run_t.into()], false);
+    let func = llvm_mod.add_function(&fname, func_t, None); // Some(Linkage::Private)
+
+    declare_blocks!(ctx, func, entry, loop_cond, loop_body, exit);
+    let b = ctx.create_builder();
+    b.position_at_end(entry);
+    let iter_ptr = func.get_nth_param(0).unwrap().into_pointer_value();
+    let target_val = func.get_nth_param(1).unwrap().into_int_value();
+    let lo_ptr_ptr = b.build_alloca(ptr_t, "low_ptr_ptr").unwrap();
+    let hi_ptr_ptr = b.build_alloca(ptr_t, "hi_ptr_ptr").unwrap();
+
+    b.build_store(lo_ptr_ptr, re_iter.llvm_data(ctx, &b, iter_ptr))
+        .unwrap();
+    b.build_store(
+        hi_ptr_ptr,
+        increment_pointer!(
+            ctx,
+            b,
+            re_iter.llvm_data(ctx, &b, iter_ptr),
+            ty.width(),
+            re_iter.llvm_len(ctx, &b, iter_ptr)
+        ),
+    )
+    .unwrap();
+    b.build_unconditional_branch(loop_cond).unwrap();
+
+    b.position_at_end(loop_cond);
+    let lo_ptr = b
+        .build_load(ptr_t, lo_ptr_ptr, "lo_ptr")
+        .unwrap()
+        .into_pointer_value();
+    let hi_ptr = b
+        .build_load(ptr_t, hi_ptr_ptr, "hi_ptr")
+        .unwrap()
+        .into_pointer_value();
+    let cond = b
+        .build_int_compare(IntPredicate::ULT, lo_ptr, hi_ptr, "cond")
+        .unwrap();
+    b.build_conditional_branch(cond, loop_body, exit).unwrap();
+
+    b.position_at_end(loop_body);
+    let lo_ptr = b
+        .build_load(ptr_t, lo_ptr_ptr, "lo_ptr")
+        .unwrap()
+        .into_pointer_value();
+    let hi_ptr = b
+        .build_load(ptr_t, hi_ptr_ptr, "hi_ptr")
+        .unwrap()
+        .into_pointer_value();
+    let diff = b.build_ptr_diff(run_t, hi_ptr, lo_ptr, "diff").unwrap();
+    let dist_to_mid = b
+        .build_int_signed_div(diff, i64_t.const_int(2, false), "dist_to_mid")
+        .unwrap();
+    let mid_ptr = increment_pointer!(ctx, b, lo_ptr, ty.width(), dist_to_mid);
+    let mid_val = b
+        .build_load(run_t, mid_ptr, "mid_val")
+        .unwrap()
+        .into_int_value();
+
+    let gt_tar = b
+        .build_int_compare(IntPredicate::SGT, mid_val, target_val, "gt_tar")
+        .unwrap();
+    let new_lo_ptr = b
+        .build_select(
+            gt_tar,
+            lo_ptr,
+            increment_pointer!(ctx, &b, mid_ptr, ty.width()),
+            "new_lo_ptr",
+        )
+        .unwrap();
+    let new_hi_ptr = b
+        .build_select(gt_tar, mid_ptr, hi_ptr, "new_hi_ptr")
+        .unwrap();
+    b.build_store(lo_ptr_ptr, new_lo_ptr).unwrap();
+    b.build_store(hi_ptr_ptr, new_hi_ptr).unwrap();
+    b.build_unconditional_branch(loop_cond).unwrap();
+
+    b.position_at_end(exit);
+    let hi_ptr = b
+        .build_load(ptr_t, hi_ptr_ptr, "lo_ptr")
+        .unwrap()
+        .into_pointer_value();
+    let idx = b
+        .build_ptr_diff(run_t, hi_ptr, re_iter.llvm_data(ctx, &b, iter_ptr), "idx")
+        .unwrap();
+    let val = b.build_load(run_t, hi_ptr, "val").unwrap().into_int_value();
+    let eq_val = b
+        .build_int_compare(IntPredicate::EQ, val, target_val, "eq_target")
+        .unwrap();
+    let idx = b
+        .build_select(
+            eq_val,
+            b.build_int_add(idx, i64_t.const_int(1, true), "inc_idx")
+                .unwrap(),
+            idx,
+            "idx",
+        )
+        .unwrap();
+    b.build_return(Some(&idx)).unwrap();
+
+    func
+}
+
 #[cfg(test)]
 mod tests {
     use std::{ffi::c_void, sync::Arc};
 
-    use arrow_array::{Array, Int32Array, Int32RunArray, RunArray};
+    use arrow_array::{
+        cast::AsArray, types::Int32Type, Array, Int32Array, Int32RunArray, RunArray,
+    };
     use arrow_data::ArrayDataBuilder;
     use arrow_schema::{DataType, Field};
     use inkwell::{context::Context, OptimizationLevel};
 
-    use crate::new_iter::{datum_to_iter, generate_next, generate_next_block};
+    use crate::{
+        new_iter::{
+            array_to_iter, datum_to_iter, generate_next, generate_next_block,
+            generate_random_access, IteratorHolder,
+        },
+        PrimitiveType,
+    };
+
+    use super::add_bsearch;
 
     #[test]
     fn test_ree_iter_block() {
@@ -357,5 +488,76 @@ mod tests {
         assert_eq!(res, 40);
 
         assert!(!unsafe { next_func.call(iter.get_mut_ptr(), &mut res as *mut i32) });
+    }
+
+    #[test]
+    fn test_re_random_access() {
+        let values = Int32Array::from(vec![10, 20, 30, 40]);
+        let res = Int32Array::from(vec![2, 4, 5, 10]);
+        let ree = Int32RunArray::try_new(&res, &values).unwrap();
+        let mut iter = datum_to_iter(&ree).unwrap();
+
+        let ctx = Context::create();
+        let module = ctx.create_module("test_runend");
+
+        let func = generate_random_access(&ctx, &module, "access", ree.data_type(), &iter).unwrap();
+        let fname = func.get_name().to_str().unwrap();
+
+        module.print_to_stderr();
+        module.verify().unwrap();
+        let ee = module
+            .create_jit_execution_engine(OptimizationLevel::None)
+            .unwrap();
+        let access_func = unsafe {
+            ee.get_function::<unsafe extern "C" fn(*mut c_void, u64) -> i32>(fname)
+                .unwrap()
+        };
+
+        for idx in 0..ree.len() {
+            let p_idx = ree.get_physical_index(idx);
+            let val = ree.values().as_primitive::<Int32Type>().value(p_idx);
+            assert_eq!(
+                val,
+                unsafe { access_func.call(iter.get_mut_ptr(), idx as u64) },
+                "mismatch at idx {} (p_idx = {})",
+                idx,
+                p_idx
+            );
+        }
+    }
+
+    #[test]
+    fn test_bsearch_i32() {
+        let runs = Int32Array::from(vec![1, 10, 20, 23, 24, 24, 30]);
+        let ih = array_to_iter(&runs);
+        if let IteratorHolder::Primitive(iter) = &ih {
+            let ctx = Context::create();
+            let module = ctx.create_module("test_runend");
+            let func = add_bsearch(&ctx, &module, &iter, PrimitiveType::I32);
+            let fname = func.get_name().to_str().unwrap();
+
+            module.verify().unwrap();
+            let ee = module
+                .create_jit_execution_engine(OptimizationLevel::None)
+                .unwrap();
+            let bsearch = unsafe {
+                ee.get_function::<unsafe extern "C" fn(*const c_void, i32) -> i64>(fname)
+                    .unwrap()
+            };
+
+            unsafe {
+                assert_eq!(bsearch.call(ih.get_ptr(), 0), 0);
+                assert_eq!(bsearch.call(ih.get_ptr(), 1), 1);
+                assert_eq!(bsearch.call(ih.get_ptr(), 5), 1);
+                assert_eq!(bsearch.call(ih.get_ptr(), 10), 2);
+                assert_eq!(bsearch.call(ih.get_ptr(), 11), 2);
+                assert_eq!(bsearch.call(ih.get_ptr(), 20), 3);
+                assert_eq!(bsearch.call(ih.get_ptr(), 24), 6);
+                assert_eq!(bsearch.call(ih.get_ptr(), 25), 6);
+                assert_eq!(bsearch.call(ih.get_ptr(), 29), 6);
+            }
+        } else {
+            panic!("non-primitive iterator for primitive array");
+        }
     }
 }

@@ -30,7 +30,7 @@ use inkwell::{
     AddressSpace, IntPredicate,
 };
 use primitive::PrimitiveIterator;
-use runend::RunEndIterator;
+use runend::{add_bsearch, RunEndIterator};
 use scalar::{ScalarPrimitiveIterator, ScalarStringIterator};
 use setbit::SetBitIterator;
 use string::{LargeStringIterator, StringIterator};
@@ -226,6 +226,13 @@ impl IteratorHolder {
             IteratorHolder::RunEnd { arr: iter, .. } => &mut **iter as *mut _ as *mut c_void,
             IteratorHolder::ScalarPrimitive(iter) => &mut **iter as *mut _ as *mut c_void,
             IteratorHolder::ScalarString(iter) => &mut **iter as *mut _ as *mut c_void,
+        }
+    }
+
+    pub fn as_primitive(&self) -> &PrimitiveIterator {
+        match self {
+            IteratorHolder::Primitive(iter) => iter,
+            _ => panic!("as_primitive called on non-primitive iterator holder"),
         }
     }
 
@@ -1316,7 +1323,7 @@ pub fn generate_random_access<'a>(
     let i64_type = ctx.i64_type();
 
     let fn_type = llvm_type.fn_type(&[ptr_type.into(), i64_type.into()], false);
-    let next = llvm_mod.add_function(
+    let access_f = llvm_mod.add_function(
         &format!("{}_access", label),
         fn_type,
         Some(
@@ -1326,12 +1333,12 @@ pub fn generate_random_access<'a>(
             Linkage::Private,
         ),
     );
-    let iter_ptr = next.get_nth_param(0).unwrap().into_pointer_value();
-    let idx = next.get_nth_param(1).unwrap().into_int_value();
+    let iter_ptr = access_f.get_nth_param(0).unwrap().into_pointer_value();
+    let idx = access_f.get_nth_param(1).unwrap().into_int_value();
 
     match ih {
         IteratorHolder::Primitive(primitive_iter) => {
-            declare_blocks!(ctx, next, entry);
+            declare_blocks!(ctx, access_f, entry);
 
             build.position_at_end(entry);
             let data_ptr = primitive_iter.llvm_data(ctx, &build, iter_ptr);
@@ -1339,13 +1346,13 @@ pub fn generate_random_access<'a>(
             let out = build.build_load(llvm_type, data_ptr, "elem").unwrap();
             build.build_return(Some(&out)).unwrap();
 
-            Some(next)
+            Some(access_f)
         }
         IteratorHolder::String(ih) => {
             let i32_type = ctx.i32_type();
             let ret_type = PrimitiveType::P64x2.llvm_type(ctx).into_struct_type();
 
-            declare_blocks!(ctx, next, entry);
+            declare_blocks!(ctx, access_f, entry);
 
             build.position_at_end(entry);
             let offsets = ih.llvm_get_offset_ptr(ctx, &build, iter_ptr);
@@ -1392,12 +1399,12 @@ pub fn generate_random_access<'a>(
                 .build_insert_value(to_return, ptr2, 1, "to_return")
                 .unwrap();
             build.build_return(Some(&to_return)).unwrap();
-            Some(next)
+            Some(access_f)
         }
         IteratorHolder::LargeString(ih) => {
             let ret_type = PrimitiveType::P64x2.llvm_type(ctx).into_struct_type();
 
-            declare_blocks!(ctx, next, entry);
+            declare_blocks!(ctx, access_f, entry);
 
             build.position_at_end(entry);
             let offsets = ih.llvm_get_offset_ptr(ctx, &build, iter_ptr);
@@ -1437,10 +1444,10 @@ pub fn generate_random_access<'a>(
                 .build_insert_value(to_return, ptr2, 1, "to_return")
                 .unwrap();
             build.build_return(Some(&to_return)).unwrap();
-            Some(next)
+            Some(access_f)
         }
         IteratorHolder::Bitmap(bitmap_iterator) => {
-            declare_blocks!(ctx, next, entry);
+            declare_blocks!(ctx, access_f, entry);
 
             build.position_at_end(entry);
             let data_ptr = bitmap_iterator.llvm_get_data_ptr(ctx, &build, iter_ptr);
@@ -1470,11 +1477,9 @@ pub fn generate_random_access<'a>(
                 .unwrap();
             build.build_return(Some(&data_bit_i8)).unwrap();
 
-            Some(next)
+            Some(access_f)
         }
-        IteratorHolder::SetBit(_) => {
-            unimplemented!("No random access iterator for setbit!")
-        }
+        IteratorHolder::SetBit(_) => None,
         IteratorHolder::Dictionary { arr, keys, values } => match dt {
             DataType::Dictionary(k_dt, v_dt) => {
                 let keys_access = generate_random_access(
@@ -1492,7 +1497,7 @@ pub fn generate_random_access<'a>(
                     values,
                 )?;
 
-                declare_blocks!(ctx, next, entry);
+                declare_blocks!(ctx, access_f, entry);
 
                 build.position_at_end(entry);
                 let key = build
@@ -1526,11 +1531,63 @@ pub fn generate_random_access<'a>(
                     .unwrap_left();
                 build.build_return(Some(&value)).unwrap();
 
-                Some(next)
+                Some(access_f)
             }
             _ => unreachable!("dictionary iterator but non-iterator data type ({:?})", dt),
         },
-        IteratorHolder::RunEnd { .. } => todo!(),
+        IteratorHolder::RunEnd {
+            arr,
+            run_ends,
+            values,
+        } => match dt {
+            DataType::RunEndEncoded(r_dt, v_dt) => {
+                let runs_prim_type = PrimitiveType::for_arrow_type(r_dt.data_type());
+                let runs_t = runs_prim_type.llvm_type(ctx).into_int_type();
+                let bsearch = add_bsearch(ctx, llvm_mod, run_ends.as_primitive(), runs_prim_type);
+                let value_access = generate_random_access(
+                    ctx,
+                    llvm_mod,
+                    &format!("{}_val_get", label),
+                    v_dt.data_type(),
+                    values,
+                )?;
+
+                declare_blocks!(ctx, access_f, entry);
+                build.position_at_end(entry);
+                let idx = build
+                    .build_int_truncate_or_bit_cast(idx, runs_t, "casted_idx")
+                    .unwrap();
+
+                let v_idx = build
+                    .build_call(
+                        bsearch,
+                        &[
+                            arr.llvm_re_iter_ptr(ctx, &build, iter_ptr).into(),
+                            idx.into(),
+                        ],
+                        "v_idx",
+                    )
+                    .unwrap()
+                    .try_as_basic_value()
+                    .unwrap_left()
+                    .into_int_value();
+                let v = build
+                    .build_call(
+                        value_access,
+                        &[
+                            arr.llvm_val_iter_ptr(ctx, &build, iter_ptr).into(),
+                            v_idx.into(),
+                        ],
+                        "v",
+                    )
+                    .unwrap()
+                    .try_as_basic_value()
+                    .unwrap_left();
+                build.build_return(Some(&v)).unwrap();
+                Some(access_f)
+            }
+            _ => unreachable!("run-end iterator but non-iterator data type ({:?})", dt),
+        },
         IteratorHolder::ScalarPrimitive(_s) => todo!(),
         IteratorHolder::ScalarString(_) => todo!(),
     }

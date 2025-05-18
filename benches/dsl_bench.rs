@@ -34,7 +34,7 @@ pub fn criterion_benchmark(c: &mut Criterion) {
             let dat2 = ctx.get_input(1)?;
             let idxs = ctx.get_input(2)?;
 
-            idxs.into_iter()
+            ctx.iter_over(vec![idxs])
                 .map(|i| vec![dat1.at(&i[0]), dat2.at(&i[0])])
                 .map(|i| vec![i[0].gt(&i[1]).select(&i[0], &i[1])])
                 .collect(KernelOutputType::Array)

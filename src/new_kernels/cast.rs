@@ -639,7 +639,12 @@ impl Kernel for CastToDictKernel {
                 DataType::Int16 => i16::MAX as usize,
                 DataType::Int32 => i32::MAX as usize,
                 DataType::Int64 => i64::MAX as usize,
-                _ => unreachable!(),
+                _ => {
+                    return Err(ArrowKernelError::UnsupportedArguments(format!(
+                        "dictionary key type should be a signed int, got {}",
+                        self.borrow_key_data_type()
+                    )))
+                }
             },
         );
 

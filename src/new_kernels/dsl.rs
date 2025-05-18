@@ -10,7 +10,6 @@ use arrow_buffer::{BooleanBuffer, Buffer};
 use arrow_data::ArrayDataBuilder;
 use arrow_schema::DataType;
 use inkwell::{
-    attributes::Attribute,
     builder::Builder,
     context::Context,
     execution_engine::JitFunction,
@@ -30,7 +29,7 @@ use crate::{
     },
     new_kernels::{
         cmp::{add_float_vec_to_int_vec, add_memcmp},
-        gen_convert_numeric_vec, link_req_helpers, optimize_module,
+        gen_convert_numeric_vec, link_req_helpers, optimize_module, set_noalias_params,
         writers::{ArrayWriter, BooleanWriter, PrimitiveArrayWriter},
     },
     ComparisonType, Predicate, PrimitiveType,
@@ -45,6 +44,7 @@ pub enum DSLError {
     TypeMismatch(String),
     BooleanExpected(String),
     UnusedInput(String),
+    NoIteration,
 }
 
 #[derive(Clone)]
@@ -73,11 +73,8 @@ impl Debug for KernelInput<'_> {
 }
 
 impl<'a> KernelInput<'a> {
-    #[allow(clippy::should_implement_trait)]
-    pub fn into_iter(self) -> KernelIterator<'a> {
-        KernelIterator {
-            data: vec![KernelExpression::Item(self)],
-        }
+    fn as_expr(&self) -> KernelExpression<'a> {
+        KernelExpression::Item(self.clone())
     }
 
     fn data_type(&self) -> DataType {
@@ -176,39 +173,26 @@ impl KernelOutputType {
     }
 }
 
+fn base_type(dt: &DataType) -> DataType {
+    match dt {
+        DataType::Binary
+        | DataType::LargeBinary
+        | DataType::BinaryView
+        | DataType::Utf8
+        | DataType::LargeUtf8
+        | DataType::Utf8View => DataType::Utf8,
+        DataType::Dictionary(_k, v) => *v.clone(),
+        DataType::RunEndEncoded(_re, v) => v.data_type().clone(),
+        _ => dt.clone(),
+    }
+}
+
 pub type KernelOutput<'a> = (KernelOutputType, KernelExpression<'a>);
-
-pub struct KernelIterator<'a> {
-    data: Vec<KernelExpression<'a>>,
-}
-
-impl<'a> KernelIterator<'a> {
-    pub fn zip(mut self, other: KernelIterator<'a>) -> KernelIterator<'a> {
-        self.data.extend(other.data);
-        self
-    }
-
-    pub fn map<F: Fn(&[KernelExpression<'a>]) -> Vec<KernelExpression<'a>>>(
-        self,
-        f: F,
-    ) -> KernelIterator<'a> {
-        KernelIterator {
-            data: f(&self.data),
-        }
-    }
-
-    pub fn collect(mut self, ty: KernelOutputType) -> Result<KernelOutput<'a>, DSLError> {
-        if self.data.len() != 1 {
-            Err(DSLError::InvalidKernelOutputLength(self.data.len()))
-        } else {
-            Ok((ty, self.data.pop().unwrap()))
-        }
-    }
-}
 
 #[derive(Clone, Debug)]
 pub enum KernelExpression<'a> {
     Item(KernelInput<'a>),
+    IntConst(u64, bool),
     Truncate(Box<KernelExpression<'a>>, usize),
     Cmp(
         Predicate,
@@ -217,6 +201,7 @@ pub enum KernelExpression<'a> {
     ),
     And(Box<KernelExpression<'a>>, Box<KernelExpression<'a>>),
     Or(Box<KernelExpression<'a>>, Box<KernelExpression<'a>>),
+    Not(Box<KernelExpression<'a>>),
 
     Select {
         cond: Box<KernelExpression<'a>>,
@@ -227,6 +212,24 @@ pub enum KernelExpression<'a> {
         iter: Box<KernelInput<'a>>,
         idx: Box<KernelExpression<'a>>,
     },
+}
+
+impl<'a> From<u64> for KernelExpression<'a> {
+    fn from(value: u64) -> Self {
+        KernelExpression::IntConst(value, false)
+    }
+}
+
+impl<'a> From<i64> for KernelExpression<'a> {
+    fn from(value: i64) -> Self {
+        KernelExpression::IntConst(u64::from_le_bytes(value.to_le_bytes()), true)
+    }
+}
+
+impl<'a> From<i32> for KernelExpression<'a> {
+    fn from(value: i32) -> Self {
+        (value as i64).into()
+    }
 }
 
 impl<'a> KernelExpression<'a> {
@@ -247,6 +250,9 @@ impl<'a> KernelExpression<'a> {
     }
     pub fn and(&self, other: &KernelExpression<'a>) -> KernelExpression<'a> {
         KernelExpression::And(Box::new(self.clone()), Box::new(other.clone()))
+    }
+    pub fn not(&self) -> KernelExpression<'a> {
+        KernelExpression::Not(Box::new(self.clone()))
     }
     pub fn truncate(&self, size: usize) -> KernelExpression<'a> {
         KernelExpression::Truncate(Box::new(self.clone()), size)
@@ -285,6 +291,10 @@ impl<'a> KernelExpression<'a> {
                 lhs.descend(f);
                 rhs.descend(f);
             }
+            KernelExpression::Not(c) => {
+                f(self);
+                c.descend(f);
+            }
             KernelExpression::Select { cond, v1, v2 } => {
                 f(self);
                 cond.descend(f);
@@ -295,6 +305,7 @@ impl<'a> KernelExpression<'a> {
                 f(self);
                 idx.descend(f);
             }
+            KernelExpression::IntConst(..) => f(self),
         }
     }
 
@@ -320,13 +331,15 @@ impl<'a> KernelExpression<'a> {
 
     fn get_type(&self) -> DataType {
         match self {
-            KernelExpression::Item(kernel_input) => kernel_input.data_type(),
+            KernelExpression::Item(kernel_input) => base_type(&kernel_input.data_type()),
             KernelExpression::Truncate(..) => DataType::Binary,
             KernelExpression::Select { v1, .. } => v1.get_type(),
-            KernelExpression::Cmp(..) | KernelExpression::And(..) | KernelExpression::Or(..) => {
-                DataType::Boolean
-            }
-            KernelExpression::At { iter, .. } => iter.data_type(),
+            KernelExpression::Cmp(..)
+            | KernelExpression::And(..)
+            | KernelExpression::Or(..)
+            | KernelExpression::Not(..) => DataType::Boolean,
+            KernelExpression::IntConst(..) => DataType::UInt64,
+            KernelExpression::At { iter, .. } => base_type(&iter.data_type()),
         }
     }
 
@@ -505,6 +518,20 @@ impl<'a> KernelExpression<'a> {
                     .into_int_value();
                 Ok(build.build_or(lhs_v, rhs_v, "or").unwrap().into())
             }
+            KernelExpression::Not(e) => {
+                let e = e
+                    .compile(
+                        ctx,
+                        llvm_mod,
+                        build,
+                        bufs,
+                        accessors,
+                        iter_ptrs,
+                        iter_llvm_types,
+                    )?
+                    .into_int_value();
+                Ok(build.build_not(e, "not").unwrap().into())
+            }
             KernelExpression::Select { cond, v1, v2 } => {
                 if cond.get_type() != DataType::Boolean {
                     return Err(DSLError::BooleanExpected(format!(
@@ -582,6 +609,7 @@ impl<'a> KernelExpression<'a> {
                     .try_as_basic_value()
                     .unwrap_left())
             }
+            KernelExpression::IntConst(v, s) => Ok(ctx.i64_type().const_int(*v, *s).into()),
         }
     }
 }
@@ -596,6 +624,193 @@ impl<'a> KernelContext<'a> {
             .get(idx)
             .cloned()
             .ok_or(DSLError::InvalidInputIndex(idx))
+    }
+
+    pub fn iter_over(&self, inputs: Vec<KernelInput<'a>>) -> BaseKernelProgram<'a> {
+        BaseKernelProgram { inputs }
+    }
+}
+
+pub struct BaseKernelProgram<'a> {
+    inputs: Vec<KernelInput<'a>>,
+}
+impl<'a> BaseKernelProgram<'a> {
+    pub fn map<F: Fn(&[KernelExpression<'a>]) -> Vec<KernelExpression<'a>>>(
+        self,
+        f: F,
+    ) -> MappedKernelProgram<'a> {
+        let exprs = self.inputs.iter().map(|inp| inp.as_expr()).collect_vec();
+        MappedKernelProgram {
+            inputs: self.inputs,
+            expr: f(&exprs),
+        }
+    }
+
+    pub fn filter<F: Fn(&[KernelExpression<'a>]) -> KernelExpression<'a>>(
+        self,
+        f: F,
+    ) -> FilteredKernelProgram<'a> {
+        let exprs = self.inputs.iter().map(|inp| inp.as_expr()).collect_vec();
+        FilteredKernelProgram {
+            inputs: self.inputs,
+            cond: f(&exprs),
+        }
+    }
+
+    pub fn collect(self, strategy: KernelOutputType) -> Result<SealedKernelProgram<'a>, DSLError> {
+        SealedKernelProgram::try_new(self.inputs, None, None, strategy)
+    }
+}
+
+pub struct FilteredKernelProgram<'a> {
+    inputs: Vec<KernelInput<'a>>,
+    cond: KernelExpression<'a>,
+}
+
+impl<'a> FilteredKernelProgram<'a> {
+    pub fn map<F: Fn(&[KernelExpression<'a>]) -> Vec<KernelExpression<'a>>>(
+        self,
+        f: F,
+    ) -> FilterMappedKernelProgram<'a> {
+        let exprs = self.inputs.iter().map(|inp| inp.as_expr()).collect_vec();
+        FilterMappedKernelProgram {
+            inputs: self.inputs,
+            cond: self.cond,
+            expr: f(&exprs),
+        }
+    }
+
+    pub fn collect(self, strategy: KernelOutputType) -> Result<SealedKernelProgram<'a>, DSLError> {
+        SealedKernelProgram::try_new(self.inputs, Some(self.cond), None, strategy)
+    }
+}
+
+pub struct MappedKernelProgram<'a> {
+    inputs: Vec<KernelInput<'a>>,
+    expr: Vec<KernelExpression<'a>>,
+}
+
+impl<'a> MappedKernelProgram<'a> {
+    pub fn map<F: Fn(&[KernelExpression<'a>]) -> Vec<KernelExpression<'a>>>(
+        self,
+        f: F,
+    ) -> MappedKernelProgram<'a> {
+        MappedKernelProgram {
+            inputs: self.inputs,
+            expr: f(&self.expr),
+        }
+    }
+
+    pub fn collect(self, strategy: KernelOutputType) -> Result<SealedKernelProgram<'a>, DSLError> {
+        SealedKernelProgram::try_new(self.inputs, None, Some(self.expr), strategy)
+    }
+}
+
+pub struct FilterMappedKernelProgram<'a> {
+    inputs: Vec<KernelInput<'a>>,
+    cond: KernelExpression<'a>,
+    expr: Vec<KernelExpression<'a>>,
+}
+
+impl<'a> FilterMappedKernelProgram<'a> {
+    pub fn map<F: Fn(&[KernelExpression<'a>]) -> Vec<KernelExpression<'a>>>(
+        self,
+        f: F,
+    ) -> FilterMappedKernelProgram<'a> {
+        FilterMappedKernelProgram {
+            inputs: self.inputs,
+            cond: self.cond,
+            expr: f(&self.expr),
+        }
+    }
+
+    pub fn collect(self, strategy: KernelOutputType) -> Result<SealedKernelProgram<'a>, DSLError> {
+        SealedKernelProgram::try_new(self.inputs, Some(self.cond), Some(self.expr), strategy)
+    }
+}
+
+pub struct SealedKernelProgram<'a> {
+    _inputs: Vec<KernelInput<'a>>,
+    cond: Option<KernelExpression<'a>>,
+    expr: KernelExpression<'a>,
+    strategy: KernelOutputType,
+    out_type: DataType,
+}
+
+impl<'a> SealedKernelProgram<'a> {
+    pub fn try_new(
+        inputs: Vec<KernelInput<'a>>,
+        cond: Option<KernelExpression<'a>>,
+        expr: Option<Vec<KernelExpression<'a>>>,
+        strategy: KernelOutputType,
+    ) -> Result<Self, DSLError> {
+        let expr = if let Some(mut expr) = expr {
+            if expr.len() != 1 {
+                return Err(DSLError::InvalidKernelOutputLength(expr.len()));
+            }
+            expr.pop().unwrap()
+        } else {
+            if inputs.len() != 1 {
+                return Err(DSLError::InvalidKernelOutputLength(inputs.len()));
+            }
+            inputs[0].as_expr()
+        };
+
+        if let Some(cond) = &cond {
+            if cond.get_type() != DataType::Boolean {
+                return Err(DSLError::BooleanExpected(format!(
+                    "filter should have a boolean type, found {}",
+                    cond.get_type()
+                )));
+            }
+        }
+
+        let out_type = expr.get_type();
+        let res = Self {
+            _inputs: inputs,
+            cond,
+            expr,
+            strategy,
+            out_type,
+        };
+        res.strategy().can_collect(&res.out_type())?;
+
+        Ok(res)
+    }
+
+    pub fn out_type(&self) -> &DataType {
+        &self.out_type
+    }
+
+    pub fn strategy(&self) -> KernelOutputType {
+        self.strategy
+    }
+
+    fn iterated_indexes(&self) -> Vec<(KernelInputType, usize)> {
+        let mut set = BTreeSet::new();
+        if let Some(cond) = &self.cond {
+            set.extend(cond.iterated_indexes());
+        }
+        set.extend(self.expr.iterated_indexes());
+        set.into_iter().collect()
+    }
+
+    pub fn accessed_indexes(&self) -> Vec<usize> {
+        let mut set = BTreeSet::new();
+        if let Some(cond) = &self.cond {
+            set.extend(cond.accessed_indexes());
+        }
+        set.extend(self.expr.accessed_indexes());
+
+        set.into_iter().collect()
+    }
+
+    pub fn expr(&self) -> &KernelExpression<'a> {
+        &self.expr
+    }
+
+    pub fn filter(&self) -> Option<&KernelExpression<'a>> {
+        self.cond.as_ref()
     }
 }
 
@@ -658,7 +873,7 @@ pub struct DSLKernel {
 }
 
 impl DSLKernel {
-    pub fn compile<F: Fn(KernelContext) -> Result<KernelOutput, DSLError>>(
+    pub fn compile<F: Fn(KernelContext) -> Result<SealedKernelProgram, DSLError>>(
         inputs: &[&dyn Datum],
         f: F,
     ) -> Result<DSLKernel, DSLError> {
@@ -676,16 +891,17 @@ impl DSLKernel {
                 .map(|(idx, itm)| KernelInput::Datum(idx, *itm))
                 .collect(),
         };
-        let (out_strategy, expr) = f(context)?;
-        let out_type = expr.get_type();
+        let program = f(context)?;
+        let out_type = program.out_type().clone();
+        let output_strategy = program.strategy();
 
         DSLKernelTryBuilder {
             context: ctx,
             input_types,
             is_scalar,
             out_type,
-            output_strategy: out_strategy,
-            func_builder: |ctx| build_kernel(ctx, inputs, expr, out_strategy),
+            output_strategy,
+            func_builder: |ctx| build_kernel(ctx, inputs, program),
         }
         .try_build()
     }
@@ -790,11 +1006,10 @@ impl DSLKernel {
     }
 }
 
-fn build_kernel<'a>(
+fn build_kernel<'a, 'b>(
     ctx: &'a Context,
     inputs: &[&dyn Datum],
-    expr: KernelExpression,
-    out_strategy: KernelOutputType,
+    program: SealedKernelProgram<'b>,
 ) -> Result<
     (
         Vec<KernelInputType>,
@@ -807,7 +1022,7 @@ fn build_kernel<'a>(
     let i64_type = ctx.i64_type();
     let ptr_type = ctx.ptr_type(AddressSpace::default());
 
-    let addl_parameters = match out_strategy {
+    let addl_parameters = match program.strategy() {
         KernelOutputType::Array => 1,
         KernelOutputType::String => 2,
         KernelOutputType::Boolean => 1,
@@ -825,13 +1040,7 @@ fn build_kernel<'a>(
         ),
         Some(Linkage::Private),
     );
-
-    // add `noalias` to each parameter
-    let noalias_kind_id = Attribute::get_named_enum_kind_id("noalias");
-    for i in 0..num_total_inputs {
-        let attr = ctx.create_enum_attribute(noalias_kind_id, 0);
-        func_inner.add_attribute(inkwell::attributes::AttributeLoc::Param(i as u32), attr);
-    }
+    set_noalias_params(&func_inner);
 
     //
     // Outer function
@@ -852,13 +1061,25 @@ fn build_kernel<'a>(
     //
     // Inner function
     //
-    let out_type = expr.get_type();
-    out_strategy.can_collect(&out_type)?;
-
+    let out_type = program.out_type();
     let out_prim_type = PrimitiveType::for_arrow_type(&out_type);
 
-    let next_funcs: HashMap<usize, FunctionValue> = expr
-        .iterated_indexes()
+    let indexes_to_iter = program.iterated_indexes();
+    if indexes_to_iter.is_empty() {
+        return Err(DSLError::NoIteration);
+    }
+
+    let mut iter_llvm_types = HashMap::new();
+    for (ty, idx) in indexes_to_iter.iter() {
+        let ptype = match ty {
+            KernelInputType::Standard => {
+                PrimitiveType::for_arrow_type(inputs[*idx].get().0.data_type())
+            }
+            KernelInputType::SetBit => PrimitiveType::U64,
+        };
+        iter_llvm_types.insert(*idx, ptype.llvm_type(ctx));
+    }
+    let next_funcs: HashMap<usize, FunctionValue> = indexes_to_iter
         .iter()
         .map(|(ty, idx)| {
             let ih = match ty {
@@ -881,7 +1102,7 @@ fn build_kernel<'a>(
         })
         .collect();
 
-    let get_funcs: HashMap<usize, FunctionValue> = expr
+    let get_funcs: HashMap<usize, FunctionValue> = program
         .accessed_indexes()
         .iter()
         .map(|idx| {
@@ -900,19 +1121,15 @@ fn build_kernel<'a>(
         })
         .collect();
 
-    let indexes_to_iter = expr.iterated_indexes();
-    let mut iter_llvm_types = HashMap::new();
-    for (ty, idx) in indexes_to_iter.iter() {
-        let ptype = match ty {
-            KernelInputType::Standard => {
-                PrimitiveType::for_arrow_type(inputs[*idx].get().0.data_type())
-            }
-            KernelInputType::SetBit => PrimitiveType::U64,
-        };
-        iter_llvm_types.insert(*idx, ptype.llvm_type(ctx));
-    }
-
-    declare_blocks!(ctx, func_inner, entry, loop_cond, loop_body, exit);
+    declare_blocks!(
+        ctx,
+        func_inner,
+        entry,
+        loop_cond,
+        filter_check,
+        loop_body,
+        exit
+    );
     builder.position_at_end(entry);
     let iter_ptrs = (0..inputs.len())
         .map(|i| {
@@ -931,7 +1148,7 @@ fn build_kernel<'a>(
         })
         .collect_vec();
 
-    let writer = match out_strategy {
+    let writer = match program.strategy() {
         KernelOutputType::Array => Box::new(PrimitiveArrayWriter::allocate_array_writer(
             ctx,
             &llvm_mod,
@@ -1005,11 +1222,32 @@ fn build_kernel<'a>(
         accum = builder.build_and(accum, val, "accum").unwrap();
     }
     builder
-        .build_conditional_branch(accum, loop_body, exit)
+        .build_conditional_branch(accum, filter_check, exit)
         .unwrap();
 
+    builder.position_at_end(filter_check);
+    match program.filter() {
+        Some(cond) => {
+            let result = cond.compile(
+                ctx,
+                &llvm_mod,
+                &builder,
+                &bufs,
+                &get_funcs,
+                &iter_ptrs,
+                &iter_llvm_types,
+            )?;
+            builder
+                .build_conditional_branch(result.into_int_value(), loop_body, loop_cond)
+                .unwrap();
+        }
+        None => {
+            builder.build_unconditional_branch(loop_body).unwrap();
+        }
+    }
+
     builder.position_at_end(loop_body);
-    let result = expr.compile(
+    let result = program.expr().compile(
         ctx,
         &llvm_mod,
         &builder,
@@ -1037,7 +1275,6 @@ fn build_kernel<'a>(
         .into_int_value();
     builder.build_return(Some(&produced)).unwrap();
 
-    llvm_mod.print_to_stderr();
     llvm_mod.verify().unwrap();
     optimize_module(&llvm_mod).unwrap();
     let ee = llvm_mod
@@ -1049,10 +1286,10 @@ fn build_kernel<'a>(
     // standard, but override that if we use the set bit iterator in the
     // expression
     let mut access_map = BTreeMap::new();
-    for idx in expr.accessed_indexes() {
+    for idx in program.accessed_indexes() {
         access_map.insert(idx, KernelInputType::Standard);
     }
-    for (ty, idx) in expr.iterated_indexes() {
+    for (ty, idx) in indexes_to_iter {
         access_map.insert(idx, ty);
     }
 
@@ -1099,9 +1336,7 @@ mod test {
             let scalar1 = ctx.get_input(1)?;
             let scalar2 = ctx.get_input(2)?;
 
-            data.into_iter()
-                .zip(scalar1.into_iter())
-                .zip(scalar2.into_iter())
+            ctx.iter_over(vec![data, scalar1, scalar2])
                 .map(|i| vec![i[0].gt(&i[1]), i[0].lt(&i[2])])
                 .map(|i| vec![i[0].and(&i[1])])
                 .collect(KernelOutputType::Boolean)
@@ -1128,9 +1363,7 @@ mod test {
             let scalar1 = ctx.get_input(1)?;
             let scalar2 = ctx.get_input(2)?;
 
-            data.into_iter()
-                .zip(scalar1.into_iter())
-                .zip(scalar2.into_iter())
+            ctx.iter_over(vec![data, scalar1, scalar2])
                 .map(|i| vec![i[0].gt(&i[1]), i[0].lt(&i[2])])
                 .map(|i| vec![i[0].and(&i[1])])
                 .collect(KernelOutputType::Boolean)
@@ -1155,8 +1388,7 @@ mod test {
             let lhs = ctx.get_input(0)?;
             let rhs = ctx.get_input(1)?;
 
-            lhs.into_iter()
-                .zip(rhs.into_iter())
+            ctx.iter_over(vec![lhs, rhs])
                 .map(|i| vec![i[0].gt(&i[1]).select(&i[0], &i[1])])
                 .collect(KernelOutputType::Array)
         })
@@ -1182,8 +1414,7 @@ mod test {
             let rhs = ctx.get_input(1)?;
             let dat = ctx.get_input(2)?;
 
-            lhs.into_iter()
-                .zip(rhs.into_iter())
+            ctx.iter_over(vec![lhs, rhs])
                 .map(|i| vec![dat.at(&i[0]), dat.at(&i[1])])
                 .map(|i| vec![i[0].gt(&i[1]).select(&i[0], &i[1])])
                 .collect(KernelOutputType::Array)
@@ -1210,7 +1441,7 @@ mod test {
 
         let k = DSLKernel::compile(&[&data], |ctx| {
             let inp = ctx.get_input(0)?;
-            inp.into_iter().collect(KernelOutputType::String)
+            ctx.iter_over(vec![inp]).collect(KernelOutputType::String)
         })
         .unwrap();
 
@@ -1228,7 +1459,7 @@ mod test {
         let data = BooleanArray::from(vec![true, true, false, true, false, true]);
         let k = DSLKernel::compile(&[&data], |ctx| {
             let inp = ctx.get_input(0)?.into_set_bits()?;
-            inp.into_iter().collect(KernelOutputType::Array)
+            ctx.iter_over(vec![inp]).collect(KernelOutputType::Array)
         })
         .unwrap();
         let res = k.call(&[&data]).unwrap();
@@ -1247,8 +1478,7 @@ mod test {
         let k = DSLKernel::compile(&[&filter, &data], |ctx| {
             let filter = ctx.get_input(0)?.into_set_bits()?;
             let data = ctx.get_input(1)?;
-            filter
-                .into_iter()
+            ctx.iter_over(vec![filter])
                 .map(|i| vec![data.at(&i[0])])
                 .collect(KernelOutputType::Array)
         })
@@ -1260,5 +1490,21 @@ mod test {
             .map(|x| x.unwrap())
             .collect_vec();
         assert_eq!(res, vec![10, 20, 40, 60]);
+    }
+
+    #[test]
+    fn test_kernel_filter_lt() {
+        let data = Int32Array::from(vec![1, 2, 3, 4, 5, 6, 7, 8]);
+        let scalar1 = Int32Array::new_scalar(5);
+        let k = DSLKernel::compile(&[&data, &scalar1], |ctx| {
+            ctx.iter_over(vec![ctx.get_input(0)?, ctx.get_input(1)?])
+                .filter(|v| v[0].lt(&v[1]))
+                .map(|v| vec![v[0].clone()])
+                .collect(KernelOutputType::Array)
+        })
+        .unwrap();
+        let res = k.call(&[&data, &scalar1]).unwrap();
+        let res = res.as_primitive::<Int32Type>();
+        assert_eq!(res.values(), &[1, 2, 3, 4]);
     }
 }

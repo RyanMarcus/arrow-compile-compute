@@ -1,6 +1,8 @@
 use arrow_array::{
     cast::AsArray, Array, Int32Array, Int64Array, StringArray, UInt32Array, UInt64Array,
 };
+use arrow_compile_compute::dictionary_data_type;
+use arrow_schema::DataType;
 use proptest::proptest;
 
 proptest! {
@@ -71,6 +73,31 @@ proptest! {
 
         let expected = StringArray::from(results);
         let actual = arrow_compile_compute::select::take(&data, &indexes).unwrap();
+        if expected.is_empty() {
+            assert!(actual.is_empty());
+        } else {
+            let actual = actual.as_string::<i32>().clone();
+
+            assert_eq!(expected.len(), actual.len());
+            for (expected, actual) in expected.iter().zip(actual.iter()) {
+                assert_eq!(expected, actual);
+            }
+        }
+    }
+
+    #[test]
+    fn test_take_str_dict_with_i32(arr: Vec<(String, bool)>) {
+        let data = StringArray::from(arr.iter().map(|(value, _)| value.clone()).collect::<Vec<String>>());
+        let indexes = Int32Array::from(arr.iter().enumerate()
+            .filter_map(|(i, (_, valid))| if *valid { Some(i as i32) } else { None })
+            .collect::<Vec<i32>>());
+        let results = arr.iter().filter_map(|(value, valid)| if *valid { Some(value.clone()) } else { None })
+            .collect::<Vec<String>>();
+
+        let dict = arrow_cast::cast::cast(&data, &dictionary_data_type(DataType::Int32, DataType::Utf8)).unwrap();
+
+        let expected = StringArray::from(results);
+        let actual = arrow_compile_compute::select::take(&dict, &indexes).unwrap();
         if expected.is_empty() {
             assert!(actual.is_empty());
         } else {

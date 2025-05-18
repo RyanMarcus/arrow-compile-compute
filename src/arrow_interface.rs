@@ -1,3 +1,32 @@
+/// Array-array and array-scalar comparison functions.
+///
+/// These functions can compare any array types (e.g., compare a dictionary
+/// array and a run-end encoded array). Comparisons between arrays of different
+/// base types (e.g., `Int32` and `Int64`) will perform the comparison after
+/// casting to a dominant type.
+///
+/// Just like [the default `arrow`
+/// kernels](https://docs.rs/arrow/latest/arrow/compute/kernels/cmp/index.html),
+/// these functions use `Datum` to represent scalar or array types, and IEEE 754
+/// floating point order.
+///
+/// ```
+/// use arrow_array::{Int32Array, Int8Array, DictionaryArray};
+/// use arrow_compile_compute::cmp;
+/// use std::sync::Arc;
+///
+/// let primitive = Int32Array::from(vec![1, 2, 3, 2]);
+/// let keys = Int8Array::from(vec![0, 1, 2, 1]);
+/// let values = Int32Array::from(vec![1, 2, 3]);
+/// let dict_array = DictionaryArray::new(keys, Arc::new(values));
+///
+/// // element-wise equal comparison
+/// let result = cmp::eq(&primitive, &dict_array).unwrap();
+/// assert_eq!(result.value(0), true);  // 1 == 1
+/// assert_eq!(result.value(1), true);  // 2 == 2
+/// assert_eq!(result.value(2), true);  // 3 == 3
+/// assert_eq!(result.value(3), true);  // 2 == 2
+/// ```
 pub mod cmp {
     use std::sync::LazyLock;
 
@@ -12,31 +41,38 @@ pub mod cmp {
     static CMP_PROGRAM_CACHE: LazyLock<KernelCache<ComparisonKernel>> =
         LazyLock::new(KernelCache::new);
 
+    /// Compute a bitvector for `lhs < rhs`
     pub fn lt(lhs: &dyn Datum, rhs: &dyn Datum) -> Result<BooleanArray, ArrowKernelError> {
         CMP_PROGRAM_CACHE.get((lhs, rhs), Predicate::Lt)
     }
 
+    /// Compute a bitvector for `lhs <= rhs`
     pub fn lt_eq(lhs: &dyn Datum, rhs: &dyn Datum) -> Result<BooleanArray, ArrowKernelError> {
         CMP_PROGRAM_CACHE.get((lhs, rhs), Predicate::Lte)
     }
 
+    /// Compute a bitvector for `lhs > rhs`
     pub fn gt(lhs: &dyn Datum, rhs: &dyn Datum) -> Result<BooleanArray, ArrowKernelError> {
         CMP_PROGRAM_CACHE.get((lhs, rhs), Predicate::Gt)
     }
 
+    /// Compute a bitvector for `lhs >= rhs`
     pub fn gt_eq(lhs: &dyn Datum, rhs: &dyn Datum) -> Result<BooleanArray, ArrowKernelError> {
         CMP_PROGRAM_CACHE.get((lhs, rhs), Predicate::Gte)
     }
 
+    /// Compute a bitvector for `lhs == rhs`
     pub fn eq(lhs: &dyn Datum, rhs: &dyn Datum) -> Result<BooleanArray, ArrowKernelError> {
         CMP_PROGRAM_CACHE.get((lhs, rhs), Predicate::Eq)
     }
 
+    /// Compute a bitvector for `lhs != rhs`
     pub fn neq(lhs: &dyn Datum, rhs: &dyn Datum) -> Result<BooleanArray, ArrowKernelError> {
         CMP_PROGRAM_CACHE.get((lhs, rhs), Predicate::Ne)
     }
 }
 
+/// Covert arrays between different data types and layouts
 pub mod cast {
     use std::sync::LazyLock;
 
@@ -54,6 +90,21 @@ pub mod cast {
     static CAST_TO_DICT_PROGRAM_CACHE: LazyLock<KernelCache<CastToDictKernel>> =
         LazyLock::new(KernelCache::new);
 
+    /// Try to convert `lhs` into an array of type `to_type`.
+    ///
+    /// For example, to cast an integer array to a dictionary array:
+    ///
+    /// ```
+    /// use arrow_array::{Int32Array, DictionaryArray};
+    /// use arrow_schema::DataType;
+    /// use arrow_compile_compute::cast::cast;
+    ///
+    /// let arr = Int32Array::from(vec![1, 2, 1]);
+    /// let dict_array = cast(&arr, &DataType::Dictionary(
+    ///     Box::new(DataType::Int8),
+    ///     Box::new(DataType::Int32),
+    /// )).unwrap();
+    /// ```
     pub fn cast(lhs: &dyn Array, to_type: &DataType) -> Result<ArrayRef, ArrowKernelError> {
         match to_type {
             DataType::Dictionary(..) => CAST_TO_DICT_PROGRAM_CACHE.get(lhs, to_type.clone()),
@@ -175,16 +226,59 @@ pub mod apply {
 pub mod select {
     use std::sync::LazyLock;
 
-    use arrow_array::{Array, ArrayRef};
+    use arrow_array::{Array, ArrayRef, BooleanArray};
 
     use crate::{
-        new_kernels::{KernelCache, TakeKernel},
+        new_kernels::{FilterKernel, KernelCache, TakeKernel},
         ArrowKernelError,
     };
 
     static TAKE_PROGRAM_CACHE: LazyLock<KernelCache<TakeKernel>> = LazyLock::new(KernelCache::new);
+    static FILTER_PROGRAM_CACHE: LazyLock<KernelCache<FilterKernel>> =
+        LazyLock::new(KernelCache::new);
 
+    /// Extract the elements in `data` at the indices specified in `idxes`.
+    ///
+    /// This function computes `data[idxes]`. No bounds checking is performed.
+    ///
+    /// ```
+    /// use arrow_array::{StringArray, Int32Array, Array};
+    /// use arrow_array::cast::AsArray;
+    /// use arrow_compile_compute::select;
+    ///
+    /// let data = StringArray::from(vec!["this", "is", "a", "test"]);
+    /// let idxs = Int32Array::from(vec![2, 3]);
+    /// let res = select::take(&data, &idxs).unwrap();
+    /// let res = res.as_string::<i32>();
+    ///
+    /// assert_eq!(res.value(0), "a");
+    /// assert_eq!(res.value(1), "test");
+    /// assert_eq!(res.len(), 2);
+    /// ```
     pub fn take(data: &dyn Array, idxes: &dyn Array) -> Result<ArrayRef, ArrowKernelError> {
         TAKE_PROGRAM_CACHE.get((data, idxes), ())
+    }
+
+    /// Extracts the elements corrosponding with the true elements of `filter`.
+    ///
+    /// This function computes `data[filter]`. Panics if `data` and `filter` do
+    /// not have the same length.
+    ///
+    /// ```
+    /// use arrow_array::{StringArray, BooleanArray, Int32Array, Array};
+    /// use arrow_array::cast::AsArray;
+    /// use arrow_compile_compute::select;
+    ///
+    /// let data = StringArray::from(vec!["this", "is", "a", "test"]);
+    /// let filter = BooleanArray::from(vec![false, true, true, false]);
+    /// let res = select::filter(&data, &filter).unwrap();
+    /// let res = res.as_string::<i32>();
+    ///
+    /// assert_eq!(res.value(0), "is");
+    /// assert_eq!(res.value(1), "a");
+    /// assert_eq!(res.len(), 2);
+    /// ```
+    pub fn filter(data: &dyn Array, filter: &BooleanArray) -> Result<ArrayRef, ArrowKernelError> {
+        FILTER_PROGRAM_CACHE.get((data, filter), ())
     }
 }

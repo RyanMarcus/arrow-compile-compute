@@ -46,7 +46,7 @@ impl Kernel for TakeKernel {
             DSLKernel::compile(&[arr, idx], |ctx| {
                 let arr = ctx.get_input(0)?;
                 let idx = ctx.get_input(1)?;
-                idx.into_iter()
+                ctx.iter_over(vec![idx])
                     .map(|i| vec![arr.at(&i[0])])
                     .collect(out_type)
             })
@@ -64,7 +64,11 @@ impl Kernel for TakeKernel {
 
 #[cfg(test)]
 mod tests {
-    use arrow_array::{cast::AsArray, types::Int32Type, Int32Array, StringArray, UInt8Array};
+    use arrow_array::{
+        cast::AsArray,
+        types::{Int32Type, Int64Type},
+        Int32Array, Int64Array, RunArray, StringArray, UInt16Array, UInt8Array,
+    };
     use itertools::Itertools;
 
     use crate::new_kernels::Kernel;
@@ -131,5 +135,17 @@ mod tests {
             .map(|x| x.unwrap())
             .collect_vec();
         assert_eq!(&res, &["x"]);
+    }
+
+    #[test]
+    fn test_take_ree() {
+        let values = Int32Array::from(vec![1, 2, 3, 4, 5]);
+        let rees = Int64Array::from(vec![10, 20, 30, 40, 50]);
+        let data = RunArray::<Int64Type>::try_new(&rees, &values).unwrap();
+        let idxes = UInt16Array::from(vec![3, 7, 15, 16, 23, 32, 41]);
+        let k = TakeKernel::compile(&(&data, &idxes), ()).unwrap();
+        let res = k.call((&data, &idxes)).unwrap();
+        let res = res.as_primitive::<Int32Type>();
+        assert_eq!(res.values(), &[1, 1, 2, 2, 3, 4, 5]);
     }
 }
