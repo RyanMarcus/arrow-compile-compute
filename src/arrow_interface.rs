@@ -259,7 +259,7 @@ pub mod select {
         TAKE_PROGRAM_CACHE.get((data, idxes), ())
     }
 
-    /// Extracts the elements corrosponding with the true elements of `filter`.
+    /// Extracts the elements corresponding with the true elements of `filter`.
     ///
     /// This function computes `data[filter]`. Panics if `data` and `filter` do
     /// not have the same length.
