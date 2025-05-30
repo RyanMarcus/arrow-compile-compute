@@ -14,18 +14,29 @@ use crate::increment_pointer;
 #[roff(usize_offsets)]
 pub struct SetBitIterator {
     data: *const u8,
-    pos: u64,
-    len: u64,
+    index: u64,
+    end_index: u64,
     byte: u8,
 }
 
 impl From<&BooleanArray> for Box<SetBitIterator> {
     fn from(value: &BooleanArray) -> Self {
+        // Note that we are indexing by byte (with each byte containing
+        // eight values)
+        let start_index = (value.offset() as u64) / 8;
+        let end_index = start_index + ((value.len() as u64) / 8);
+
+        let all_byte = value.values().values()[start_index as usize];
+        let index_into_byte = value.offset() % 8;
+        // We might have stuff in the byte that shouldn't be iterated over
+        let mask = !((1u8 << index_into_byte) - 1);
+        let byte = all_byte & mask;
+
         Box::new(SetBitIterator {
             data: value.values().values().as_ptr(),
-            pos: value.offset() as u64,
-            len: (value.len() + value.offset()) as u64,
-            byte: 0,
+            index: start_index,
+            end_index,
+            byte,
         })
     }
 }
@@ -49,26 +60,26 @@ impl SetBitIterator {
             .into_pointer_value()
     }
 
-    pub fn llvm_get_pos<'a>(
+    pub fn llvm_get_index<'a>(
         &self,
         ctx: &'a Context,
         build: &'a Builder,
         ptr: PointerValue<'a>,
     ) -> IntValue<'a> {
-        let pos_ptr = increment_pointer!(ctx, build, ptr, SetBitIterator::OFFSET_POS);
+        let pos_ptr = increment_pointer!(ctx, build, ptr, SetBitIterator::OFFSET_INDEX);
         build
             .build_load(ctx.i64_type(), pos_ptr, "pos")
             .unwrap()
             .into_int_value()
     }
 
-    pub fn llvm_get_len<'a>(
+    pub fn llvm_get_end_index<'a>(
         &self,
         ctx: &'a Context,
         build: &'a Builder,
         ptr: PointerValue<'a>,
     ) -> IntValue<'a> {
-        let len_ptr = increment_pointer!(ctx, build, ptr, SetBitIterator::OFFSET_LEN);
+        let len_ptr = increment_pointer!(ctx, build, ptr, SetBitIterator::OFFSET_END_INDEX);
         build
             .build_load(ctx.i64_type(), len_ptr, "len")
             .unwrap()
@@ -107,14 +118,14 @@ impl SetBitIterator {
         build.build_store(byte_ptr, byte_and).unwrap();
     }
 
-    pub fn llvm_load_byte_at_pos<'a>(
+    pub fn llvm_load_byte_at_index<'a>(
         &self,
         ctx: &'a Context,
         build: &'a Builder,
         ptr: PointerValue<'a>,
     ) {
         let data_ptr = self.llvm_get_data_ptr(ctx, build, ptr);
-        let curr_pos = self.llvm_get_pos(ctx, build, ptr);
+        let curr_pos = self.llvm_get_index(ctx, build, ptr);
         let byte_in_data_ptr =
             unsafe { build.build_gep(ctx.i8_type(), data_ptr, &[curr_pos], "byte_in_data_ptr") }
                 .unwrap();
@@ -125,14 +136,14 @@ impl SetBitIterator {
         build.build_store(byte_pointer, byte_in_data).unwrap();
     }
 
-    pub fn llvm_increment_pos<'a>(
+    pub fn llvm_increment_index<'a>(
         &self,
         ctx: &'a Context,
         build: &'a Builder,
         ptr: PointerValue<'a>,
         amt: IntValue<'a>,
     ) {
-        let curr_pos_ptr = increment_pointer!(ctx, build, ptr, SetBitIterator::OFFSET_POS);
+        let curr_pos_ptr = increment_pointer!(ctx, build, ptr, SetBitIterator::OFFSET_INDEX);
         let curr_pos = build
             .build_load(ctx.i64_type(), curr_pos_ptr, "curr_pos")
             .unwrap()
@@ -163,7 +174,7 @@ mod tests {
         let module = ctx.create_module("setbit_test");
         let func = generate_next(&ctx, &module, "setbit_iter", data.data_type(), &iter).unwrap();
         let fname = func.get_name().to_str().unwrap();
-
+        
         module.verify().unwrap();
 
         let ee = module

@@ -943,7 +943,7 @@ pub fn generate_next<'a>(
             build.build_unconditional_branch(while_loop).unwrap();
 
             build.position_at_end(while_loop);
-            let curr_pos = setbit_iterator.llvm_get_pos(ctx, &build, iter_ptr);
+            let index = setbit_iterator.llvm_get_index(ctx, &build, iter_ptr);
             let curr_byte = setbit_iterator.llvm_get_byte(ctx, &build, iter_ptr);
             let cmp_to_zero = build
                 .build_int_compare(
@@ -958,20 +958,9 @@ pub fn generate_next<'a>(
                 .unwrap();
 
             build.position_at_end(get_next_byte_loop);
-            let bit_len = setbit_iterator.llvm_get_len(ctx, &build, iter_ptr);
-            let bytes_len = build
-                .build_int_add(bit_len, i64_type.const_int(7, false), "round_up")
-                .unwrap();
-            let bytes_len = build
-                .build_right_shift(
-                    bytes_len,
-                    i64_type.const_int(3, false),
-                    false,
-                    "divide_by_8",
-                )
-                .unwrap();
+            let end_index = setbit_iterator.llvm_get_end_index(ctx, &build, iter_ptr);
             let cmp_pos_to_len = build
-                .build_int_compare(IntPredicate::EQ, curr_pos, bytes_len, "cmp_pos_to_len")
+                .build_int_compare(IntPredicate::EQ, index, end_index, "cmp_pos_to_len")
                 .unwrap();
             build
                 .build_conditional_branch(cmp_pos_to_len, none_left, get_next)
@@ -983,12 +972,11 @@ pub fn generate_next<'a>(
                 .unwrap();
 
             build.position_at_end(get_next);
-            setbit_iterator.llvm_load_byte_at_pos(ctx, &build, iter_ptr);
-            setbit_iterator.llvm_increment_pos(ctx, &build, iter_ptr, i64_type.const_int(1, false));
+            setbit_iterator.llvm_increment_index(ctx, &build, iter_ptr, i64_type.const_int(1, false));
+            setbit_iterator.llvm_load_byte_at_index(ctx, &build, iter_ptr);
             build.build_unconditional_branch(while_loop).unwrap();
 
             build.position_at_end(use_byte);
-
             let is_zero_undef = ctx.bool_type().const_int(0, false);
             let tz_i8 = build
                 .build_call(
@@ -1006,10 +994,7 @@ pub fn generate_next<'a>(
                 .unwrap();
             setbit_iterator.llvm_clear_trailing_bit(ctx, &build, iter_ptr);
             let setbit_position = build
-                .build_int_nuw_sub(curr_pos, i64_type.const_int(1, false), "pos_minus_one")
-                .unwrap();
-            let setbit_position = build
-                .build_int_mul(setbit_position, i64_type.const_int(8, false), "pos_mul_8")
+                .build_int_mul(index, i64_type.const_int(8, false), "pos_mul_8")
                 .unwrap();
             let setbit_position = build
                 .build_int_add(setbit_position, tz_i64, "add_tz")
