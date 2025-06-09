@@ -5,9 +5,7 @@ use std::{
     sync::Arc,
 };
 
-use arrow_array::{cast::AsArray, make_array, ArrayRef, BooleanArray, Datum};
-use arrow_buffer::{BooleanBuffer, Buffer};
-use arrow_data::ArrayDataBuilder;
+use arrow_array::{cast::AsArray, Array, ArrayRef, BooleanArray, Datum, StringArray};
 use arrow_schema::DataType;
 use inkwell::{
     builder::Builder,
@@ -30,7 +28,7 @@ use crate::{
     new_kernels::{
         cmp::{add_float_vec_to_int_vec, add_memcmp},
         gen_convert_numeric_vec, link_req_helpers, optimize_module, set_noalias_params,
-        writers::{ArrayWriter, BooleanWriter, PrimitiveArrayWriter},
+        writers::{ArrayWriter, BooleanWriter, PrimitiveArrayWriter, WriterAllocation},
     },
     ComparisonType, Predicate, PrimitiveType,
 };
@@ -130,12 +128,54 @@ impl<'a> KernelInput<'a> {
 pub enum KernelOutputType {
     Array,
     String,
+    View,
     Boolean,
     Dictionary,
     RunEnd,
 }
 
 impl KernelOutputType {
+    pub fn for_data_type(dt: &DataType) -> Result<KernelOutputType, DSLError> {
+        match dt {
+            DataType::Boolean => Ok(KernelOutputType::Boolean),
+            DataType::Null
+            | DataType::Int8
+            | DataType::Int16
+            | DataType::Int32
+            | DataType::Int64
+            | DataType::UInt8
+            | DataType::UInt16
+            | DataType::UInt32
+            | DataType::UInt64
+            | DataType::Float16
+            | DataType::Float32
+            | DataType::Float64
+            | DataType::Timestamp(..)
+            | DataType::Date32
+            | DataType::Date64
+            | DataType::Time32(..)
+            | DataType::Time64(..)
+            | DataType::Duration(..)
+            | DataType::Interval(..) => Ok(KernelOutputType::Array),
+            DataType::Binary | DataType::LargeBinary | DataType::Utf8 | DataType::LargeUtf8 => {
+                Ok(KernelOutputType::String)
+            }
+            DataType::BinaryView | DataType::Utf8View => Ok(KernelOutputType::View),
+            DataType::FixedSizeBinary(_) => todo!(),
+            DataType::List(..) => todo!(),
+            DataType::ListView(..) => todo!(),
+            DataType::FixedSizeList(..) => todo!(),
+            DataType::LargeList(..) => todo!(),
+            DataType::LargeListView(..) => todo!(),
+            DataType::Struct(..) => todo!(),
+            DataType::Union(..) => todo!(),
+            DataType::Dictionary(..) => Ok(KernelOutputType::Dictionary),
+            DataType::Decimal128(_, _) => todo!(),
+            DataType::Decimal256(_, _) => todo!(),
+            DataType::Map(..) => todo!(),
+            DataType::RunEndEncoded(..) => Ok(KernelOutputType::RunEnd),
+        }
+    }
     /// Determines if this output type can collect the passed data type. For
     /// example, the `Boolean` output type can only collect expressions that
     /// result in booleans.
@@ -165,6 +205,7 @@ impl KernelOutputType {
                     )));
                 }
             }
+            KernelOutputType::View => todo!(),
             KernelOutputType::Dictionary => todo!(),
             KernelOutputType::RunEnd => todo!(),
         };
@@ -212,6 +253,7 @@ pub enum KernelExpression<'a> {
         iter: Box<KernelInput<'a>>,
         idx: Box<KernelExpression<'a>>,
     },
+    Convert(Box<KernelExpression<'a>>, PrimitiveType),
 }
 
 impl From<u64> for KernelExpression<'_> {
@@ -268,6 +310,9 @@ impl<'a> KernelExpression<'a> {
             v2: Box::new(b.clone()),
         }
     }
+    pub fn convert(&self, pt: PrimitiveType) -> KernelExpression<'a> {
+        KernelExpression::Convert(Box::new(self.clone()), pt)
+    }
 
     fn descend<F: FnMut(&Self)>(&self, f: &mut F) {
         match self {
@@ -305,6 +350,10 @@ impl<'a> KernelExpression<'a> {
                 f(self);
                 idx.descend(f);
             }
+            KernelExpression::Convert(expr, ..) => {
+                f(self);
+                expr.descend(f);
+            }
             KernelExpression::IntConst(..) => f(self),
         }
     }
@@ -340,6 +389,7 @@ impl<'a> KernelExpression<'a> {
             | KernelExpression::Not(..) => DataType::Boolean,
             KernelExpression::IntConst(..) => DataType::UInt64,
             KernelExpression::At { iter, .. } => base_type(&iter.data_type()),
+            KernelExpression::Convert(_expr, pt) => pt.as_arrow_type(),
         }
     }
 
@@ -608,6 +658,37 @@ impl<'a> KernelExpression<'a> {
                     .unwrap()
                     .try_as_basic_value()
                     .unwrap_left())
+            }
+            KernelExpression::Convert(expr, pt) => {
+                let to_convert = expr.compile(
+                    ctx,
+                    llvm_mod,
+                    build,
+                    bufs,
+                    accessors,
+                    iter_ptrs,
+                    iter_llvm_types,
+                )?;
+                let src_pt = PrimitiveType::for_arrow_type(&expr.get_type());
+                let dst_pt = *pt;
+
+                if src_pt == dst_pt {
+                    return Ok(to_convert);
+                } else {
+                    let singleton_vec = build
+                        .build_bit_cast(
+                            to_convert,
+                            src_pt.llvm_vec_type(ctx, 1).unwrap(),
+                            "singleton_vec",
+                        )
+                        .unwrap()
+                        .into_vector_value();
+
+                    let res = gen_convert_numeric_vec(ctx, build, singleton_vec, src_pt, dst_pt);
+                    Ok(build
+                        .build_bit_cast(res, dst_pt.llvm_type(ctx), "converted_val")
+                        .unwrap())
+                }
             }
             KernelExpression::IntConst(v, s) => Ok(ctx.i64_type().const_int(*v, *s).into()),
         }
@@ -954,52 +1035,43 @@ impl DSLKernel {
             .try_collect()?;
         let mut ptrs = Vec::new();
         ptrs.extend(ihs.iter_mut().map(|ih| ih.get_mut_ptr()));
+        let p_out_type = PrimitiveType::for_arrow_type(self.borrow_out_type());
 
         match self.borrow_output_strategy() {
             KernelOutputType::Array => {
-                let width = PrimitiveType::for_arrow_type(self.borrow_out_type()).width();
-                let mut out_buf = vec![0_u64; (max_len * width).div_ceil(8)];
-                ptrs.push(out_buf.as_mut_ptr() as *mut c_void);
-                let mut kp = KernelParameters::new(ptrs);
-
-                let num_results = unsafe { self.borrow_func().1.call(kp.get_mut_ptr()) };
-
-                let res = unsafe {
-                    make_array(
-                        ArrayDataBuilder::new(self.borrow_out_type().clone())
-                            .nulls(None)
-                            .buffers(vec![Buffer::from(out_buf)])
-                            .len(max_len)
-                            .build_unchecked(),
-                    )
-                };
-                Ok(res.slice(0, num_results as usize))
-            }
-            KernelOutputType::String => {
-                let mut offset_buf = vec![0_i32; max_len + 1];
-                let mut data_buf: Vec<u8> = Vec::new();
-                ptrs.push(offset_buf.as_mut_ptr() as *mut c_void);
-                ptrs.push(&mut data_buf as *mut Vec<u8> as *mut c_void);
+                let mut alloc = PrimitiveArrayWriter::allocate(max_len, p_out_type);
+                ptrs.push(alloc.get_ptr());
                 let mut kp = KernelParameters::new(ptrs);
 
                 let num_results = unsafe { self.borrow_func().1.call(kp.get_mut_ptr()) } as usize;
+                Ok(alloc.to_array(num_results, None))
+            }
+            KernelOutputType::String => {
+                let mut alloc = StringArrayWriter::<i32>::allocate(max_len, p_out_type);
+                ptrs.push(alloc.get_ptr());
+                let mut kp = KernelParameters::new(ptrs);
 
-                let res = unsafe {
-                    StringArrayWriter::array_from_buffers(num_results, offset_buf, data_buf)
+                let num_results = unsafe { self.borrow_func().1.call(kp.get_mut_ptr()) } as usize;
+                let arr = alloc.to_array(num_results, None);
+
+                let data = unsafe {
+                    arr.into_data()
+                        .into_builder()
+                        .data_type(DataType::Utf8)
+                        .build_unchecked()
                 };
-                Ok(Arc::new(res))
+
+                Ok(Arc::new(StringArray::from(data)))
             }
             KernelOutputType::Boolean => {
-                let mut out_buf = vec![0_u8; max_len.div_ceil(8)];
-                ptrs.push(out_buf.as_mut_ptr() as *mut c_void);
+                let mut alloc = BooleanWriter::allocate(max_len, p_out_type);
+                ptrs.push(alloc.get_ptr());
                 let mut kp = KernelParameters::new(ptrs);
 
                 let num_results = unsafe { self.borrow_func().1.call(kp.get_mut_ptr()) };
-
-                let out_buf = BooleanBuffer::new(out_buf.into(), 0, num_results as usize);
-                let res = BooleanArray::new(out_buf, None);
-                Ok(Arc::new(res) as ArrayRef)
+                Ok(Arc::new(alloc.to_array(num_results as usize, None)))
             }
+            KernelOutputType::View => todo!(),
             KernelOutputType::Dictionary => todo!(),
             KernelOutputType::RunEnd => todo!(),
         }
@@ -1017,19 +1089,39 @@ fn build_kernel<'a>(
     ),
     DSLError,
 > {
+    match program.strategy() {
+        KernelOutputType::Array => {
+            build_kernel_with_writer::<PrimitiveArrayWriter>(ctx, inputs, program)
+        }
+        KernelOutputType::String => {
+            build_kernel_with_writer::<StringArrayWriter<i32>>(ctx, inputs, program)
+        }
+        KernelOutputType::Boolean => {
+            build_kernel_with_writer::<BooleanWriter>(ctx, inputs, program)
+        }
+        KernelOutputType::View => todo!(),
+        KernelOutputType::Dictionary => todo!(),
+        KernelOutputType::RunEnd => todo!(),
+    }
+}
+
+fn build_kernel_with_writer<'a, W: ArrayWriter<'a>>(
+    ctx: &'a Context,
+    inputs: &[&dyn Datum],
+    program: SealedKernelProgram<'_>,
+) -> Result<
+    (
+        Vec<KernelInputType>,
+        JitFunction<'a, unsafe extern "C" fn(*mut c_void) -> u64>,
+    ),
+    DSLError,
+> {
     let llvm_mod = ctx.create_module("kernel");
     let builder = ctx.create_builder();
     let i64_type = ctx.i64_type();
     let ptr_type = ctx.ptr_type(AddressSpace::default());
 
-    let addl_parameters = match program.strategy() {
-        KernelOutputType::Array => 1,
-        KernelOutputType::String => 2,
-        KernelOutputType::Boolean => 1,
-        KernelOutputType::RunEnd => 2,
-        KernelOutputType::Dictionary => 3,
-    };
-    let num_total_inputs = inputs.len() + addl_parameters;
+    let num_total_inputs = inputs.len() + 1;
     let func_type = i64_type.fn_type(&[ptr_type.into()], false);
     let func_outer = llvm_mod.add_function("kernel", func_type, None);
     let func_inner = llvm_mod.add_function(
@@ -1139,40 +1231,11 @@ fn build_kernel<'a>(
                 .into_pointer_value()
         })
         .collect_vec();
-    let out_ptrs = (inputs.len()..inputs.len() + addl_parameters)
-        .map(|i| {
-            func_inner
-                .get_nth_param(i as u32)
-                .unwrap()
-                .into_pointer_value()
-        })
-        .collect_vec();
-
-    let writer = match program.strategy() {
-        KernelOutputType::Array => Box::new(PrimitiveArrayWriter::allocate_array_writer(
-            ctx,
-            &llvm_mod,
-            &builder,
-            out_ptrs[0],
-            out_prim_type,
-        )) as Box<dyn ArrayWriter>,
-        KernelOutputType::String => Box::new(StringArrayWriter::allocate_string_writer(
-            ctx,
-            &llvm_mod,
-            &builder,
-            out_ptrs[0],
-            PrimitiveType::I32,
-            out_ptrs[1],
-        )) as Box<dyn ArrayWriter>,
-        KernelOutputType::Boolean => Box::new(BooleanWriter::allocate_boolean_writer(
-            ctx,
-            &llvm_mod,
-            &builder,
-            out_ptrs[0],
-        )) as Box<dyn ArrayWriter>,
-        KernelOutputType::Dictionary => todo!(),
-        KernelOutputType::RunEnd => todo!(),
-    };
+    let out_ptr = func_inner
+        .get_nth_param(inputs.len() as u32)
+        .unwrap()
+        .into_pointer_value();
+    let writer = W::llvm_init(ctx, &llvm_mod, &builder, out_prim_type, out_ptr);
 
     let bufs: HashMap<usize, PointerValue> = indexes_to_iter
         .iter()
@@ -1256,7 +1319,7 @@ fn build_kernel<'a>(
         &iter_ptrs,
         &iter_llvm_types,
     )?;
-    writer.ingest(ctx, &builder, result);
+    writer.llvm_ingest(ctx, &builder, result);
     let curr_produced = builder
         .build_load(i64_type, produced_ptr, "curr_produced")
         .unwrap()
@@ -1268,7 +1331,7 @@ fn build_kernel<'a>(
     builder.build_unconditional_branch(loop_cond).unwrap();
 
     builder.position_at_end(exit);
-    writer.flush(ctx, &builder);
+    writer.llvm_flush(ctx, &builder);
     let produced = builder
         .build_load(i64_type, produced_ptr, "produced")
         .unwrap()
@@ -1315,13 +1378,13 @@ mod test {
 
     use arrow_array::{
         cast::AsArray,
-        types::{Int32Type, UInt64Type},
-        BooleanArray, Int32Array, StringArray,
+        types::{Int32Type, Int64Type, UInt64Type},
+        BooleanArray, Float32Array, Int32Array, StringArray,
     };
     use arrow_schema::DataType;
     use itertools::Itertools;
 
-    use crate::{dictionary_data_type, new_kernels::dsl::DSLKernel};
+    use crate::{dictionary_data_type, new_kernels::dsl::DSLKernel, PrimitiveType};
 
     use super::KernelOutputType;
 
@@ -1446,6 +1509,7 @@ mod test {
         .unwrap();
 
         let res = k.call(&[&data]).unwrap();
+        println!("{:?}", res);
         let res = res
             .as_string::<i32>()
             .iter()
@@ -1506,5 +1570,33 @@ mod test {
         let res = k.call(&[&data, &scalar1]).unwrap();
         let res = res.as_primitive::<Int32Type>();
         assert_eq!(res.values(), &[1, 2, 3, 4]);
+    }
+
+    #[test]
+    fn test_kernel_convert_i32_to_i64() {
+        let data = Int32Array::from(vec![1, 2, 3, -4, 5, 6]);
+        let k = DSLKernel::compile(&[&data], |ctx| {
+            ctx.iter_over(vec![ctx.get_input(0)?])
+                .map(|v| vec![v[0].clone().convert(PrimitiveType::I64)])
+                .collect(KernelOutputType::Array)
+        })
+        .unwrap();
+        let res = k.call(&[&data]).unwrap();
+        let res = res.as_primitive::<Int64Type>();
+        assert_eq!(res.values(), &[1, 2, 3, -4, 5, 6]);
+    }
+
+    #[test]
+    fn test_kernel_convert_f32_to_i64() {
+        let data = Float32Array::from(vec![1.2, 2.1, 3.4, -4.6, 5.7, 6.0]);
+        let k = DSLKernel::compile(&[&data], |ctx| {
+            ctx.iter_over(vec![ctx.get_input(0)?])
+                .map(|v| vec![v[0].clone().convert(PrimitiveType::I64)])
+                .collect(KernelOutputType::Array)
+        })
+        .unwrap();
+        let res = k.call(&[&data]).unwrap();
+        let res = res.as_primitive::<Int64Type>();
+        assert_eq!(res.values(), &[1, 2, 3, -4, 5, 6]);
     }
 }

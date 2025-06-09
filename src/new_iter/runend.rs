@@ -503,7 +503,6 @@ mod tests {
         let func = generate_random_access(&ctx, &module, "access", ree.data_type(), &iter).unwrap();
         let fname = func.get_name().to_str().unwrap();
 
-        module.print_to_stderr();
         module.verify().unwrap();
         let ee = module
             .create_jit_execution_engine(OptimizationLevel::None)

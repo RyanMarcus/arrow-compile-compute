@@ -1,27 +1,70 @@
-use super::ArrayWriter;
-use crate::{declare_blocks, increment_pointer};
+use std::ffi::c_void;
+
+use super::{ArrayWriter, WriterAllocation};
+use crate::{declare_blocks, increment_pointer, PrimitiveType};
+use arrow_array::BooleanArray;
+use arrow_buffer::{BooleanBuffer, Buffer};
 use inkwell::builder::Builder;
 use inkwell::context::Context;
 use inkwell::module::{Linkage, Module};
 use inkwell::values::{BasicValueEnum, FunctionValue, PointerValue};
 use inkwell::AddressSpace;
 use inkwell::IntPredicate;
+use repr_offset::ReprOffset;
 
 pub struct BooleanWriter<'a> {
     ingest_func: FunctionValue<'a>,
+    ingest_u64_func: FunctionValue<'a>,
     flush_func: FunctionValue<'a>,
     buf_ptr: PointerValue<'a>,
     buf_idx_ptr: PointerValue<'a>,
     out_ptr_ptr: PointerValue<'a>,
 }
 
-impl<'a> BooleanWriter<'a> {
-    pub fn allocate_boolean_writer(
+#[repr(C)]
+#[derive(ReprOffset, Debug)]
+#[roff(usize_offsets)]
+pub struct BooleanAllocation {
+    data_ptr: *mut c_void,
+    data: Vec<u8>,
+}
+
+impl WriterAllocation for BooleanAllocation {
+    type Output = BooleanArray;
+
+    fn get_ptr(&mut self) -> *mut c_void {
+        self as *mut Self as *mut c_void
+    }
+
+    fn to_array(self, len: usize, nulls: Option<arrow_buffer::NullBuffer>) -> Self::Output {
+        let buf = Buffer::from(self.data);
+        let bb = BooleanBuffer::new(buf, 0, len);
+        BooleanArray::new(bb, nulls)
+    }
+}
+
+impl<'a> ArrayWriter<'a> for BooleanWriter<'a> {
+    type Allocation = BooleanAllocation;
+
+    fn allocate(expected_count: usize, ty: PrimitiveType) -> Self::Allocation {
+        assert_eq!(ty, PrimitiveType::U8);
+        let mut data = vec![0u8; expected_count.div_ceil(8)];
+        BooleanAllocation {
+            data_ptr: data.as_mut_ptr() as *mut c_void,
+            data,
+        }
+    }
+
+    fn llvm_init(
         ctx: &'a Context,
         llvm_mod: &Module<'a>,
         build: &Builder<'a>,
-        dest: PointerValue<'a>,
-    ) -> BooleanWriter<'a> {
+        ty: PrimitiveType,
+        alloc_ptr: PointerValue<'a>,
+    ) -> Self {
+        assert_eq!(ty, PrimitiveType::U8);
+        let ptr_type = ctx.ptr_type(AddressSpace::default());
+
         let buf_ptr = build.build_alloca(ctx.i8_type(), "bool_buf_ptr").unwrap();
         build
             .build_store(buf_ptr, ctx.i8_type().const_zero())
@@ -35,11 +78,18 @@ impl<'a> BooleanWriter<'a> {
         let out_ptr_ptr = build
             .build_alloca(ctx.ptr_type(AddressSpace::default()), "bool_out_ptr_ptr")
             .unwrap();
-        build.build_store(out_ptr_ptr, dest).unwrap();
+        let base_out_ptr = build
+            .build_load(
+                ptr_type,
+                increment_pointer!(ctx, build, alloc_ptr, BooleanAllocation::OFFSET_DATA_PTR),
+                "base_out_ptr",
+            )
+            .unwrap()
+            .into_pointer_value();
+        build.build_store(out_ptr_ptr, base_out_ptr).unwrap();
 
         let ingest_func = llvm_mod.get_function("ingest_boolean").unwrap_or_else(|| {
             let build = ctx.create_builder();
-            let ptr_type = ctx.ptr_type(AddressSpace::default());
             let bool_type = ctx.bool_type();
             let i8_type = ctx.i8_type();
             let func = llvm_mod.add_function(
@@ -121,6 +171,35 @@ impl<'a> BooleanWriter<'a> {
             func
         });
 
+        let ingest_u64_func = llvm_mod
+            .get_function("ingest_64_booleans")
+            .unwrap_or_else(|| {
+                let build = ctx.create_builder();
+                let i64_type = ctx.i64_type();
+                let func = llvm_mod.add_function(
+                    "ingest_64_booleans",
+                    ctx.void_type()
+                        .fn_type(&[ptr_type.into(), i64_type.into()], false),
+                    Some(Linkage::Private),
+                );
+
+                declare_blocks!(ctx, func, entry);
+                build.position_at_end(entry);
+                let out_ptr_ptr = func.get_nth_param(0).unwrap().into_pointer_value();
+                let val = func.get_nth_param(1).unwrap().into_int_value();
+
+                let curr_out_ptr = build
+                    .build_load(ptr_type, out_ptr_ptr, "curr_out_ptr")
+                    .unwrap()
+                    .into_pointer_value();
+                build.build_store(curr_out_ptr, val).unwrap();
+                build
+                    .build_store(out_ptr_ptr, increment_pointer!(ctx, build, curr_out_ptr, 8))
+                    .unwrap();
+                build.build_return(None).unwrap();
+                func
+            });
+
         let flush_func = llvm_mod.get_function("flush_boolean").unwrap_or_else(|| {
             let build = ctx.create_builder();
             let ptr_type = ctx.ptr_type(AddressSpace::default());
@@ -177,12 +256,11 @@ impl<'a> BooleanWriter<'a> {
             buf_idx_ptr,
             out_ptr_ptr,
             ingest_func,
+            ingest_u64_func,
             flush_func,
         }
     }
-}
-impl<'a> ArrayWriter<'a> for BooleanWriter<'a> {
-    fn ingest(&self, _ctx: &'a Context, build: &Builder<'a>, val: BasicValueEnum<'a>) {
+    fn llvm_ingest(&self, _ctx: &'a Context, build: &Builder<'a>, val: BasicValueEnum<'a>) {
         let val = val.into_int_value();
         build
             .build_call(
@@ -198,7 +276,7 @@ impl<'a> ArrayWriter<'a> for BooleanWriter<'a> {
             .unwrap();
     }
 
-    fn flush(&self, _ctx: &'a Context, build: &Builder<'a>) {
+    fn llvm_flush(&self, _ctx: &'a Context, build: &Builder<'a>) {
         build
             .build_call(
                 self.flush_func,
@@ -213,16 +291,41 @@ impl<'a> ArrayWriter<'a> for BooleanWriter<'a> {
     }
 }
 
+impl<'a> BooleanWriter<'a> {
+    /// Ingests 64 booleans at once from an LLVM i64. This bypasses the writer's
+    /// buffer, and writes directly to the output array. Thus, you should not
+    /// interleave calls to this function with calls to `llvm_ingest`. Instead,
+    /// call this function exclusively for the "body" of the array, then call
+    /// `llvm_ingest` for the "tail" of the array.
+    pub fn llvm_ingest_64_bools(
+        &self,
+        _ctx: &'a Context,
+        build: &Builder<'a>,
+        val: BasicValueEnum<'a>,
+    ) {
+        build
+            .build_call(
+                self.ingest_u64_func,
+                &[self.out_ptr_ptr.into(), val.into()],
+                "ingest_u64",
+            )
+            .unwrap();
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::ffi::c_void;
 
     use arrow_array::BooleanArray;
-    use arrow_buffer::BooleanBuffer;
     use inkwell::{context::Context, values::BasicValue, AddressSpace, OptimizationLevel};
     use itertools::Itertools;
 
-    use crate::{declare_blocks, new_kernels::writers::ArrayWriter};
+    use crate::{
+        declare_blocks,
+        new_kernels::writers::{ArrayWriter, WriterAllocation},
+        PrimitiveType,
+    };
 
     use super::BooleanWriter;
 
@@ -243,10 +346,10 @@ mod tests {
         declare_blocks!(ctx, func, entry);
         build.position_at_end(entry);
         let dest = func.get_nth_param(0).unwrap().into_pointer_value();
-        let writer = BooleanWriter::allocate_boolean_writer(&ctx, &llvm_mod, &build, dest);
+        let writer = BooleanWriter::llvm_init(&ctx, &llvm_mod, &build, PrimitiveType::U8, dest);
 
         for _ in 0..10 {
-            writer.ingest(
+            writer.llvm_ingest(
                 &ctx,
                 &build,
                 bool_type.const_all_ones().as_basic_value_enum(),
@@ -254,18 +357,18 @@ mod tests {
         }
 
         for _ in 0..5 {
-            writer.ingest(&ctx, &build, bool_type.const_zero().as_basic_value_enum());
+            writer.llvm_ingest(&ctx, &build, bool_type.const_zero().as_basic_value_enum());
         }
 
         for _ in 0..10 {
-            writer.ingest(
+            writer.llvm_ingest(
                 &ctx,
                 &build,
                 bool_type.const_all_ones().as_basic_value_enum(),
             );
         }
 
-        writer.flush(&ctx, &build);
+        writer.llvm_flush(&ctx, &build);
         build.build_return(None).unwrap();
 
         llvm_mod.verify().unwrap();
@@ -278,11 +381,12 @@ mod tests {
                 .unwrap()
         };
 
-        let mut data = vec![0_u8; 25_usize.div_ceil(8)];
+        let mut data = BooleanWriter::allocate(25, PrimitiveType::U8);
+
         unsafe {
-            f.call(data.as_mut_ptr() as *mut c_void);
+            f.call(data.get_ptr() as *mut c_void);
         }
-        let res = BooleanArray::new(BooleanBuffer::new(data.into(), 0, 25), None);
+        let res = data.to_array(25, None);
         let expected = BooleanArray::from(
             [true]
                 .repeat(10)
@@ -292,6 +396,60 @@ mod tests {
                 .copied()
                 .collect_vec(),
         );
+        assert_eq!(res, expected);
+    }
+
+    #[test]
+    fn test_bool_writer_alternating() {
+        let ctx = Context::create();
+        let bool_type = ctx.bool_type();
+        let llvm_mod = ctx.create_module("test_bool_writer");
+        let build = ctx.create_builder();
+
+        let func = llvm_mod.add_function(
+            "test",
+            ctx.void_type()
+                .fn_type(&[ctx.ptr_type(AddressSpace::default()).into()], false),
+            None,
+        );
+
+        declare_blocks!(ctx, func, entry);
+        build.position_at_end(entry);
+        let dest = func.get_nth_param(0).unwrap().into_pointer_value();
+        let writer = BooleanWriter::llvm_init(&ctx, &llvm_mod, &build, PrimitiveType::U8, dest);
+
+        for i in 0..1000 {
+            writer.llvm_ingest(
+                &ctx,
+                &build,
+                if i % 2 == 0 {
+                    bool_type.const_all_ones().as_basic_value_enum()
+                } else {
+                    bool_type.const_zero().as_basic_value_enum()
+                },
+            );
+        }
+
+        writer.llvm_flush(&ctx, &build);
+        build.build_return(None).unwrap();
+
+        llvm_mod.verify().unwrap();
+        let ee = llvm_mod
+            .create_jit_execution_engine(OptimizationLevel::None)
+            .unwrap();
+
+        let f = unsafe {
+            ee.get_function::<unsafe extern "C" fn(*mut c_void)>(func.get_name().to_str().unwrap())
+                .unwrap()
+        };
+
+        let mut data = BooleanWriter::allocate(1000, PrimitiveType::U8);
+
+        unsafe {
+            f.call(data.get_ptr() as *mut c_void);
+        }
+        let res = data.to_array(1000, None);
+        let expected = BooleanArray::from((0..1000).map(|i| i % 2 == 0).collect_vec());
         assert_eq!(res, expected);
     }
 }

@@ -1,5 +1,5 @@
 use arrow_array::{BooleanArray, Datum};
-use arrow_buffer::{BooleanBuffer, NullBuffer};
+use arrow_buffer::NullBuffer;
 use arrow_schema::DataType;
 use inkwell::execution_engine::JitFunction;
 use inkwell::intrinsics::Intrinsic;
@@ -12,7 +12,7 @@ use ouroboros::self_referencing;
 use std::ffi::c_void;
 
 use crate::new_iter::{datum_to_iter, generate_next, generate_next_block, IteratorHolder};
-use crate::new_kernels::writers::{ArrayWriter, BooleanWriter};
+use crate::new_kernels::writers::{ArrayWriter, BooleanWriter, WriterAllocation};
 use crate::new_kernels::{gen_convert_numeric_vec, optimize_module};
 use crate::{
     declare_blocks, increment_pointer, pointer_diff, ComparisonType, Predicate, PrimitiveType,
@@ -30,7 +30,7 @@ pub struct ComparisonKernel {
 
     #[borrows(context)]
     #[covariant]
-    func: JitFunction<'this, unsafe extern "C" fn(*mut c_void, *mut c_void, *mut u64)>,
+    func: JitFunction<'this, unsafe extern "C" fn(*mut c_void, *mut c_void, *mut c_void)>,
 }
 
 unsafe impl Sync for ComparisonKernel {}
@@ -83,17 +83,13 @@ impl Kernel for ComparisonKernel {
 
         let mut a_iter = datum_to_iter(a)?;
         let mut b_iter = datum_to_iter(b)?;
-        let mut out = vec![0_u64; a_arr.len().div_ceil(64)];
+        let mut alloc = BooleanWriter::allocate(a_arr.len(), PrimitiveType::U8);
 
         self.with_func(|func| unsafe {
-            func.call(a_iter.get_mut_ptr(), b_iter.get_mut_ptr(), out.as_mut_ptr())
+            func.call(a_iter.get_mut_ptr(), b_iter.get_mut_ptr(), alloc.get_ptr())
         });
 
-        let buf = BooleanBuffer::new(out.into(), 0, a_arr.len());
-        Ok(BooleanArray::new(
-            buf,
-            NullBuffer::union(a_arr.nulls(), b_arr.nulls()),
-        ))
+        Ok(alloc.to_array(a_arr.len(), NullBuffer::union(a_arr.nulls(), b_arr.nulls())))
     }
 
     fn compile(inp: &Self::Input<'_>, pred: Predicate) -> Result<Self, ArrowKernelError> {
@@ -164,7 +160,7 @@ fn generate_llvm_cmp_kernel<'a>(
     rhs_iter: &IteratorHolder,
     pred: Predicate,
 ) -> Result<
-    JitFunction<'a, unsafe extern "C" fn(*mut c_void, *mut c_void, *mut u64)>,
+    JitFunction<'a, unsafe extern "C" fn(*mut c_void, *mut c_void, *mut c_void)>,
     ArrowKernelError,
 > {
     let (lhs_arr, _lhs_scalar) = lhs.get();
@@ -204,7 +200,7 @@ fn generate_llvm_cmp_kernel<'a>(
     build.position_at_end(entry);
     let lhs_buf = build.build_alloca(lhs_llvm, "lhs_single_buf").unwrap();
     let rhs_buf = build.build_alloca(rhs_llvm, "rhs_single_buf").unwrap();
-    let bool_writer = BooleanWriter::allocate_boolean_writer(ctx, &module, &build, out_ptr);
+    let bool_writer = BooleanWriter::llvm_init(ctx, &module, &build, PrimitiveType::U8, out_ptr);
     build.build_unconditional_branch(block_cond).unwrap();
 
     build.position_at_end(block_cond);
@@ -246,21 +242,21 @@ fn generate_llvm_cmp_kernel<'a>(
                 .unwrap()
         }
     };
-    bool_writer.ingest(ctx, &build, res.as_basic_value_enum());
+    bool_writer.llvm_ingest(ctx, &build, res.as_basic_value_enum());
     build.build_unconditional_branch(block_cond).unwrap();
 
     build.position_at_end(exit);
-    bool_writer.flush(ctx, &build);
+    bool_writer.llvm_flush(ctx, &build);
     build.build_return(None).unwrap();
 
     module.verify().unwrap();
     optimize_module(&module)?;
     let ee = module
-        .create_jit_execution_engine(OptimizationLevel::Aggressive)
+        .create_jit_execution_engine(OptimizationLevel::None)
         .unwrap();
 
     Ok(unsafe {
-        ee.get_function::<unsafe extern "C" fn(*mut c_void, *mut c_void, *mut u64)>(
+        ee.get_function::<unsafe extern "C" fn(*mut c_void, *mut c_void, *mut c_void)>(
             cmp.get_name().to_str().unwrap(),
         )
         .unwrap()
@@ -275,7 +271,7 @@ fn generate_block_llvm_cmp_kernel<'a>(
     rhs_iter: &IteratorHolder,
     pred: Predicate,
 ) -> Result<
-    JitFunction<'a, unsafe extern "C" fn(*mut c_void, *mut c_void, *mut u64)>,
+    JitFunction<'a, unsafe extern "C" fn(*mut c_void, *mut c_void, *mut c_void)>,
     ArrowKernelError,
 > {
     let (lhs_arr, _lhs_scalar) = lhs.get();
@@ -312,14 +308,13 @@ fn generate_block_llvm_cmp_kernel<'a>(
     let cmp = module.add_function("cmp", fn_type, None);
     let lhs_ptr = cmp.get_nth_param(0).unwrap();
     let rhs_ptr = cmp.get_nth_param(1).unwrap();
-    let out_ptr = cmp.get_nth_param(2).unwrap();
+    let alloc_ptr = cmp.get_nth_param(2).unwrap().into_pointer_value();
 
     declare_blocks!(ctx, cmp, entry, block_cond, block_body, tail_cond, tail_body, exit);
 
     build.position_at_end(entry);
-    let out_ptr_ptr = build.build_alloca(ptr_type, "out_ptr_ptr").unwrap();
-    build.build_store(out_ptr_ptr, out_ptr).unwrap();
 
+    let writer = BooleanWriter::llvm_init(ctx, &module, &build, PrimitiveType::U8, alloc_ptr);
     let lhs_vec_buf = build.build_alloca(lhs_vec, "lhs_vec_buf").unwrap();
     let rhs_vec_buf = build.build_alloca(rhs_vec, "rhs_vec_buf").unwrap();
     let lhs_single_buf = build.build_alloca(lhs_llvm, "lhs_single_buf").unwrap();
@@ -395,13 +390,7 @@ fn generate_block_llvm_cmp_kernel<'a>(
     };
 
     let res = build.build_bit_cast(res, i64_type, "res_u64").unwrap();
-    let out_ptr = build
-        .build_load(ptr_type, out_ptr_ptr, "out_ptr")
-        .unwrap()
-        .into_pointer_value();
-    build.build_store(out_ptr, res).unwrap();
-    let next_out_ptr = increment_pointer!(ctx, build, out_ptr, 8);
-    build.build_store(out_ptr_ptr, next_out_ptr).unwrap();
+    writer.llvm_ingest_64_bools(ctx, &build, res);
     build.build_unconditional_branch(block_cond).unwrap();
 
     build.position_at_end(tail_cond);
@@ -477,42 +466,11 @@ fn generate_block_llvm_cmp_kernel<'a>(
         ComparisonType::String => todo!(),
     };
 
-    let res = build
-        .build_int_z_extend_or_bit_cast(res, i64_type, "casted_cmp")
-        .unwrap();
-
-    let tail_buf_idx = build
-        .build_load(i64_type, tail_buf_idx_ptr, "tail_buf_idx")
-        .unwrap()
-        .into_int_value();
-    let res = build
-        .build_left_shift(res, tail_buf_idx, "shifted")
-        .unwrap();
-    let tail_buf = build
-        .build_load(i64_type, tail_buf_ptr, "tail_buf")
-        .unwrap()
-        .into_int_value();
-    let new_tail_buf = build.build_or(res, tail_buf, "new_tail_buf").unwrap();
-    build.build_store(tail_buf_ptr, new_tail_buf).unwrap();
-    let new_tail_buf_idx = build
-        .build_int_add(
-            tail_buf_idx,
-            i64_type.const_int(1, false),
-            "new_tail_buf_idx",
-        )
-        .unwrap();
-    build
-        .build_store(tail_buf_idx_ptr, new_tail_buf_idx)
-        .unwrap();
-    let out_ptr = build
-        .build_load(ptr_type, out_ptr_ptr, "out_ptr")
-        .unwrap()
-        .into_pointer_value();
-
-    build.build_store(out_ptr, new_tail_buf).unwrap();
+    writer.llvm_ingest(ctx, &build, res.into());
     build.build_unconditional_branch(tail_cond).unwrap();
 
     build.position_at_end(exit);
+    writer.llvm_flush(ctx, &build);
     build.build_return(None).unwrap();
 
     module.verify().unwrap();
@@ -522,7 +480,7 @@ fn generate_block_llvm_cmp_kernel<'a>(
         .unwrap();
 
     Ok(unsafe {
-        ee.get_function::<unsafe extern "C" fn(*mut c_void, *mut c_void, *mut u64)>(
+        ee.get_function::<unsafe extern "C" fn(*mut c_void, *mut c_void, *mut c_void)>(
             cmp.get_name().to_str().unwrap(),
         )
         .unwrap()

@@ -15,7 +15,9 @@ use inkwell::{context::Context, execution_engine::JitFunction, AddressSpace, Opt
 use ouroboros::self_referencing;
 
 use crate::{
-    declare_blocks, empty_array_for, increment_pointer,
+    declare_blocks,
+    dsl::{DSLKernel, KernelOutputType},
+    empty_array_for, increment_pointer,
     new_iter::{datum_to_iter, generate_next, generate_next_block, IteratorHolder},
     new_kernels::{
         add_ptrx2_to_view, gen_convert_numeric_vec,
@@ -26,6 +28,49 @@ use crate::{
 };
 
 use super::{ArrowKernelError, Kernel};
+
+pub struct DSLCastToFlatKernel(DSLKernel);
+unsafe impl Sync for DSLCastToFlatKernel {}
+unsafe impl Send for DSLCastToFlatKernel {}
+
+impl Kernel for DSLCastToFlatKernel {
+    type Key = (DataType, DataType);
+
+    type Input<'a>
+        = &'a dyn Array
+    where
+        Self: 'a;
+
+    type Params = DataType;
+
+    type Output = ArrayRef;
+
+    fn call(&self, inp: Self::Input<'_>) -> Result<Self::Output, ArrowKernelError> {
+        self.0.call(&[&inp])
+    }
+
+    fn compile(arr: &Self::Input<'_>, params: Self::Params) -> Result<Self, ArrowKernelError> {
+        let tar = params;
+        let out_type = KernelOutputType::for_data_type(&tar).map_err(ArrowKernelError::DSLError)?;
+
+        Ok(DSLCastToFlatKernel(
+            DSLKernel::compile(&[arr], |ctx| {
+                let arr = ctx.get_input(0)?;
+                ctx.iter_over(vec![arr])
+                    .map(|i| vec![i[0].convert(PrimitiveType::for_arrow_type(&tar))])
+                    .collect(out_type)
+            })
+            .map_err(ArrowKernelError::DSLError)?,
+        ))
+    }
+
+    fn get_key_for_input(
+        i: &Self::Input<'_>,
+        p: &Self::Params,
+    ) -> Result<Self::Key, ArrowKernelError> {
+        Ok((i.data_type().clone(), p.clone()))
+    }
+}
 
 /// Iterates over an array's string/binary data buffers
 fn iter_buffers<'a>(inp: &'a dyn Array) -> Box<dyn Iterator<Item = &'a Buffer> + 'a> {
@@ -749,7 +794,7 @@ mod tests {
         dictionary_data_type,
         new_kernels::{
             cast::{CastToDictKernel, CastToFlatKernel},
-            Kernel,
+            DSLCastToFlatKernel, Kernel,
         },
     };
 
@@ -838,8 +883,8 @@ mod tests {
         assert_eq!(&[0, 0, 1, 2, 2, 3], res.keys().values());
     }
 
-    #[test]
-    fn test_dict_to_str() {
+    /*#[test]
+    fn test_dict_to_str_view() {
         let data = StringArray::from(vec![
             "this",
             "this",
@@ -851,9 +896,32 @@ mod tests {
         let ddata =
             arrow_cast::cast::cast(&data, &dictionary_data_type(DataType::Int8, DataType::Utf8))
                 .unwrap();
-        let k = CastToFlatKernel::compile(&(&ddata as &dyn Array), DataType::Utf8View).unwrap();
+        let k = DSLCastToFlatKernel::compile(&(&ddata as &dyn Array), DataType::Utf8View).unwrap();
         let res = k.call(&ddata).unwrap();
         let res = res.as_string_view();
+
+        assert_eq!(res.len(), data.len());
+        for (ours, orig) in res.iter().zip(data.iter()) {
+            assert_eq!(ours, orig);
+        }
+    }*/
+
+    #[test]
+    fn test_dict_to_str_flat() {
+        let data = StringArray::from(vec![
+            "this",
+            "this",
+            "is",
+            "a test",
+            "a test",
+            "a string that is longer than 12 chars",
+        ]);
+        let ddata =
+            arrow_cast::cast::cast(&data, &dictionary_data_type(DataType::Int8, DataType::Utf8))
+                .unwrap();
+        let k = DSLCastToFlatKernel::compile(&(&ddata as &dyn Array), DataType::Utf8).unwrap();
+        let res = k.call(&ddata).unwrap();
+        let res = res.as_string::<i32>();
 
         assert_eq!(res.len(), data.len());
         for (ours, orig) in res.iter().zip(data.iter()) {

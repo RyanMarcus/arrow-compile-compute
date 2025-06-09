@@ -1,4 +1,7 @@
+use arrow_array::{Datum, UInt64Array};
 use arrow_schema::DataType;
+use inkwell::execution_engine::JitFunction;
+use inkwell::OptimizationLevel;
 use inkwell::{
     builder::Builder,
     context::Context,
@@ -7,11 +10,18 @@ use inkwell::{
     values::{FunctionValue, IntValue, PointerValue},
     AddressSpace, IntPredicate,
 };
+use ouroboros::self_referencing;
 use repr_offset::ReprOffset;
+use std::ffi::c_void;
 
+use crate::new_iter::{datum_to_iter, generate_next};
+use crate::new_kernels::writers::{ArrayWriter, PrimitiveArrayWriter, WriterAllocation};
+use crate::new_kernels::{link_req_helpers, optimize_module, set_noalias_params};
 use crate::{
     declare_blocks, increment_pointer, new_kernels::cmp::add_memcmp, pointer_diff, PrimitiveType,
 };
+
+use super::{ArrowKernelError, Kernel};
 
 #[repr(C)]
 #[derive(ReprOffset, Debug)]
@@ -516,16 +526,149 @@ pub fn generate_hash_func<'a>(
     func
 }
 
+#[self_referencing]
+pub struct HashKernel {
+    dt: DataType,
+    context: Context,
+
+    #[borrows(context)]
+    #[covariant]
+    func: JitFunction<'this, unsafe extern "C" fn(*mut c_void, *mut c_void)>,
+}
+unsafe impl Send for HashKernel {}
+unsafe impl Sync for HashKernel {}
+
+impl Kernel for HashKernel {
+    type Key = DataType;
+
+    type Input<'a> = &'a dyn Datum;
+
+    type Params = ();
+
+    type Output = UInt64Array;
+
+    fn call(&self, inp: Self::Input<'_>) -> Result<Self::Output, ArrowKernelError> {
+        let arr = inp.get().0;
+        if arr.data_type() != self.borrow_dt() {
+            return Err(ArrowKernelError::ArgumentMismatch(format!(
+                "hash kernel expected {} but got {}",
+                self.borrow_dt(),
+                arr.data_type()
+            )));
+        }
+
+        let mut iter = datum_to_iter(inp)?;
+        let mut alloc = PrimitiveArrayWriter::allocate(arr.len(), PrimitiveType::U64);
+
+        unsafe { self.borrow_func().call(iter.get_mut_ptr(), alloc.get_ptr()) };
+
+        Ok(alloc.into_primitive_array(arr.len(), arr.nulls().cloned()))
+    }
+
+    fn compile(
+        inp: &Self::Input<'_>,
+        _params: Self::Params,
+    ) -> Result<Self, super::ArrowKernelError> {
+        let ctx = Context::create();
+
+        HashKernelTryBuilder {
+            dt: inp.get().0.data_type().clone(),
+            context: ctx,
+            func_builder: |ctx| {
+                let llvm_mod = ctx.create_module("hash");
+
+                let ptr_t = ctx.ptr_type(AddressSpace::default());
+                let p_type = PrimitiveType::for_arrow_type(inp.get().0.data_type());
+                let p_llvm = p_type.llvm_type(&ctx);
+
+                let iter = datum_to_iter(*inp)?;
+                let next_func =
+                    generate_next(&ctx, &llvm_mod, "hash_next", inp.get().0.data_type(), &iter)
+                        .unwrap();
+                let hash_func = generate_hash_func(&ctx, &llvm_mod, p_type);
+
+                let func_ty = ctx
+                    .void_type()
+                    .fn_type(&[ptr_t.into(), ptr_t.into()], false);
+                let func = llvm_mod.add_function("hash", func_ty, None);
+                set_noalias_params(&func);
+                declare_blocks!(ctx, func, entry, loop_cond, loop_body, exit);
+
+                let b = ctx.create_builder();
+                b.position_at_end(entry);
+                let iter_ptr = func.get_nth_param(0).unwrap().into_pointer_value();
+                let out_ptr = func.get_nth_param(1).unwrap().into_pointer_value();
+                let buf_ptr = b.build_alloca(p_llvm, "buf_ptr").unwrap();
+                let writer = PrimitiveArrayWriter::llvm_init(
+                    &ctx,
+                    &llvm_mod,
+                    &b,
+                    PrimitiveType::U64,
+                    out_ptr,
+                );
+                b.build_unconditional_branch(loop_cond).unwrap();
+
+                b.position_at_end(loop_cond);
+                let res = b
+                    .build_call(next_func, &[iter_ptr.into(), buf_ptr.into()], "next")
+                    .unwrap()
+                    .try_as_basic_value()
+                    .unwrap_left()
+                    .into_int_value();
+                b.build_conditional_branch(res, loop_body, exit).unwrap();
+
+                b.position_at_end(loop_body);
+                let item = b.build_load(p_llvm, buf_ptr, "item").unwrap();
+                let hashed = b
+                    .build_call(hash_func, &[item.into()], "hashed")
+                    .unwrap()
+                    .try_as_basic_value()
+                    .unwrap_left()
+                    .into_int_value();
+                writer.llvm_ingest(&ctx, &b, hashed.into());
+                b.build_unconditional_branch(loop_cond).unwrap();
+
+                b.position_at_end(exit);
+                b.build_return(None).unwrap();
+
+                llvm_mod.verify().unwrap();
+                optimize_module(&llvm_mod)?;
+
+                let ee = llvm_mod
+                    .create_jit_execution_engine(OptimizationLevel::Aggressive)
+                    .unwrap();
+                link_req_helpers(&llvm_mod, &ee)?;
+
+                Ok(unsafe {
+                    ee.get_function::<unsafe extern "C" fn(*mut c_void, *mut c_void)>(
+                        func.get_name().to_str().unwrap(),
+                    )
+                    .unwrap()
+                })
+            },
+        }
+        .try_build()
+    }
+
+    fn get_key_for_input(
+        i: &Self::Input<'_>,
+        _p: &Self::Params,
+    ) -> Result<Self::Key, super::ArrowKernelError> {
+        Ok(i.get().0.data_type().clone())
+    }
+}
+
 #[cfg(test)]
 mod tests {
 
+    use arrow_array::{Datum, Int32Array};
     use arrow_schema::DataType;
     use inkwell::{context::Context, OptimizationLevel};
     use itertools::Itertools;
 
-    use crate::PrimitiveType;
+    use crate::{new_kernels::Kernel, PrimitiveType};
 
-    use super::{generate_hash_func, generate_lookup_or_insert, TicketTable};
+    use super::{generate_hash_func, generate_lookup_or_insert, HashKernel, TicketTable};
 
     #[test]
     fn test_ticket_overflow() {
@@ -765,5 +908,13 @@ mod tests {
         let str1_hash = unsafe { next_block_func.call(str_to_u128(long_str1)) };
         let str2_hash = unsafe { next_block_func.call(str_to_u128(long_str2)) };
         assert_eq!(str1_hash, str2_hash);
+    }
+
+    #[test]
+    fn test_hash_kernel() {
+        let data = Int32Array::from(vec![-1, -2, 0, 1, 2]);
+        let k = HashKernel::compile(&(&data as &dyn Datum), ()).unwrap();
+        let res = k.call(&data).unwrap();
+        assert_eq!(res.values().iter().unique().count(), 5);
     }
 }

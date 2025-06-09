@@ -1,4 +1,9 @@
+use std::ffi::c_void;
+
 use crate::{declare_blocks, increment_pointer, PrimitiveType};
+use arrow_array::{make_array, ArrayRef, ArrowPrimitiveType, PrimitiveArray};
+use arrow_buffer::{Buffer, NullBuffer};
+use arrow_data::ArrayDataBuilder;
 use inkwell::{
     builder::Builder,
     context::Context,
@@ -6,8 +11,9 @@ use inkwell::{
     values::{BasicValueEnum, FunctionValue, PointerValue},
     AddressSpace,
 };
+use repr_offset::ReprOffset;
 
-use super::ArrayWriter;
+use super::{ArrayWriter, WriterAllocation};
 
 /// Writer for primitive arrays (ints and floats).
 pub struct PrimitiveArrayWriter<'a> {
@@ -15,30 +21,89 @@ pub struct PrimitiveArrayWriter<'a> {
     out_ptr_ptr: PointerValue<'a>,
 }
 
-impl<'a> PrimitiveArrayWriter<'a> {
-    /// Allocate a new primitive array writer.
-    /// `element_type` is the LLVM type of each element (e.g., i32, f64).
-    pub fn allocate_array_writer(
+#[repr(C)]
+#[derive(ReprOffset, Debug)]
+#[roff(usize_offsets)]
+pub struct ArrayOutput {
+    out_ptr: *mut c_void,
+    out: Vec<u128>,
+    pt: PrimitiveType,
+}
+
+impl WriterAllocation for ArrayOutput {
+    type Output = ArrayRef;
+
+    fn get_ptr(&mut self) -> *mut c_void {
+        self.out_ptr
+    }
+    fn to_array(self, len: usize, nulls: Option<NullBuffer>) -> Self::Output {
+        let buf = Buffer::from(self.out);
+        let buf = buf.slice_with_length(0, len * self.pt.width());
+        let ad = unsafe {
+            ArrayDataBuilder::new(self.pt.as_arrow_type())
+                .add_buffer(buf)
+                .nulls(nulls)
+                .len(len)
+                .build_unchecked()
+        };
+        make_array(ad)
+    }
+}
+
+impl ArrayOutput {
+    pub fn into_primitive_array<T: ArrowPrimitiveType>(
+        self,
+        len: usize,
+        nulls: Option<NullBuffer>,
+    ) -> PrimitiveArray<T> {
+        let buf = Buffer::from(self.out);
+        let buf = buf.slice_with_length(0, len * self.pt.width());
+        let buf = buf.slice_with_length(0, len * self.pt.width());
+        let ad = unsafe {
+            ArrayDataBuilder::new(T::DATA_TYPE)
+                .add_buffer(buf)
+                .nulls(nulls)
+                .len(len)
+                .build_unchecked()
+        };
+        PrimitiveArray::<T>::from(ad)
+    }
+}
+
+impl<'a> ArrayWriter<'a> for PrimitiveArrayWriter<'a> {
+    type Allocation = ArrayOutput;
+    fn allocate(expected_count: usize, ty: PrimitiveType) -> Self::Allocation {
+        let mut data = vec![0_u128; (ty.width() * expected_count).div_ceil(16)];
+        let data_ptr = data.as_mut_ptr() as *mut c_void;
+        ArrayOutput {
+            out_ptr: data_ptr,
+            out: data,
+            pt: ty,
+        }
+    }
+
+    fn llvm_init(
         ctx: &'a Context,
         llvm_mod: &Module<'a>,
         build: &Builder<'a>,
-        dest: PointerValue<'a>,
-        element_type: PrimitiveType,
-    ) -> PrimitiveArrayWriter<'a> {
+        ty: PrimitiveType,
+        alloc_ptr: PointerValue<'a>,
+    ) -> Self {
         let ptr_type = ctx.ptr_type(AddressSpace::default());
+        // extract the pointer to the output array from alloc_ptr
+        let out_base_ptr = alloc_ptr;
         let out_ptr_ptr = build.build_alloca(ptr_type, "out_ptr_ptr").unwrap();
-        build.build_store(out_ptr_ptr, dest).unwrap();
+        build.build_store(out_ptr_ptr, out_base_ptr).unwrap();
 
-        let width = element_type.width();
+        let width = ty.width();
         let func_name = format!("ingest_prim_{}b", width);
 
         // Create or retrieve the ingest function:
         let ingest_func = llvm_mod.get_function(&func_name).unwrap_or_else(|| {
             let b2 = ctx.create_builder();
-            let fn_type = ctx.void_type().fn_type(
-                &[ptr_type.into(), element_type.llvm_type(ctx).into()],
-                false,
-            );
+            let fn_type = ctx
+                .void_type()
+                .fn_type(&[ptr_type.into(), ty.llvm_type(ctx).into()], false);
             let func = llvm_mod.add_function(&func_name, fn_type, Some(Linkage::Private));
             declare_blocks!(ctx, func, entry);
             b2.position_at_end(entry);
@@ -61,10 +126,8 @@ impl<'a> PrimitiveArrayWriter<'a> {
             out_ptr_ptr,
         }
     }
-}
 
-impl<'a> ArrayWriter<'a> for PrimitiveArrayWriter<'a> {
-    fn ingest(&self, _ctx: &'a Context, build: &Builder<'a>, val: BasicValueEnum<'a>) {
+    fn llvm_ingest(&self, _ctx: &'a Context, build: &Builder<'a>, val: BasicValueEnum<'a>) {
         build
             .build_call(
                 self.ingest_func,
@@ -74,7 +137,7 @@ impl<'a> ArrayWriter<'a> for PrimitiveArrayWriter<'a> {
             .unwrap();
     }
 
-    fn flush(&self, _ctx: &'a Context, _build: &Builder<'a>) {
+    fn llvm_flush(&self, _ctx: &'a Context, _build: &Builder<'a>) {
         // No-op for primitive arrays
     }
 }
@@ -82,7 +145,12 @@ impl<'a> ArrayWriter<'a> for PrimitiveArrayWriter<'a> {
 #[cfg(test)]
 mod tests {
     use super::PrimitiveArrayWriter;
-    use crate::{declare_blocks, new_kernels::writers::ArrayWriter, PrimitiveType};
+    use crate::{
+        declare_blocks,
+        new_kernels::writers::{ArrayWriter, WriterAllocation},
+        PrimitiveType,
+    };
+    use arrow_array::{cast::AsArray, types::Int32Type};
     use inkwell::{context::Context, values::BasicValue, AddressSpace, OptimizationLevel};
     use std::ffi::c_void;
 
@@ -102,23 +170,18 @@ mod tests {
         declare_blocks!(ctx, func, entry);
         build.position_at_end(entry);
         let dest = func.get_nth_param(0).unwrap().into_pointer_value();
-        let writer = PrimitiveArrayWriter::allocate_array_writer(
-            &ctx,
-            &llvm_mod,
-            &build,
-            dest,
-            PrimitiveType::I32,
-        );
+        let writer =
+            PrimitiveArrayWriter::llvm_init(&ctx, &llvm_mod, &build, PrimitiveType::I32, dest);
 
         for i in 0..10 {
-            writer.ingest(
+            writer.llvm_ingest(
                 &ctx,
                 &build,
                 ctx.i32_type().const_int(i, true).as_basic_value_enum(),
             );
         }
 
-        writer.flush(&ctx, &build);
+        writer.llvm_flush(&ctx, &build);
         build.build_return(None).unwrap();
 
         llvm_mod.verify().unwrap();
@@ -131,11 +194,13 @@ mod tests {
                 .unwrap()
         };
 
-        let mut data = vec![0_i32; 10];
+        let mut data = PrimitiveArrayWriter::allocate(10, PrimitiveType::I32);
         unsafe {
-            f.call(data.as_mut_ptr() as *mut c_void);
+            f.call(data.get_ptr());
         }
+        let data = data.to_array(10, None);
+        let data = data.as_primitive::<Int32Type>().values();
 
-        assert_eq!(data, (0..10).collect::<Vec<_>>());
+        assert_eq!(data, &(0..10).collect::<Vec<_>>());
     }
 }

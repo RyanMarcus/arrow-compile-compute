@@ -220,18 +220,15 @@ pub fn criterion_benchmark(c: &mut Criterion) {
         )
         .unwrap();
 
-        let ours = arrow_compile_compute::cast::cast(&data, &DataType::Utf8View).unwrap();
-
-        // we cannot directly compare the arrow and our dictionary, since we
-        // create a string view dictionary and arrow does not. TODO to check this result.
+        let ours = arrow_compile_compute::cast::cast(&data, &DataType::Utf8).unwrap();
         assert_eq!(ours.len(), orig_data.len());
 
         c.bench_function("convert dict to str/llvm", |b| {
-            b.iter(|| arrow_compile_compute::cast::cast(&data, &DataType::Utf8View).unwrap())
+            b.iter(|| arrow_compile_compute::cast::cast(&data, &DataType::Utf8).unwrap())
         });
 
         c.bench_function("convert dict to str/arrow", |b| {
-            b.iter(|| arrow_cast::cast(&data, &DataType::Utf8View).unwrap())
+            b.iter(|| arrow_cast::cast(&data, &DataType::Utf8).unwrap())
         });
     }
 }

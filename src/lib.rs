@@ -22,6 +22,7 @@ mod new_kernels;
 pub use arrow_interface::apply;
 pub use arrow_interface::cast;
 pub use arrow_interface::cmp;
+pub use arrow_interface::compute;
 pub use arrow_interface::select;
 
 pub use new_kernels::dsl;
@@ -142,7 +143,7 @@ pub fn empty_array_for(dt: &DataType) -> ArrayRef {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-enum PrimitiveType {
+pub enum PrimitiveType {
     I8,
     I16,
     I32,

@@ -81,11 +81,11 @@ pub mod cast {
     use arrow_schema::DataType;
 
     use crate::new_kernels::CastToDictKernel;
-    use crate::new_kernels::CastToFlatKernel;
+    use crate::new_kernels::DSLCastToFlatKernel;
     use crate::new_kernels::KernelCache;
     use crate::ArrowKernelError;
 
-    static CAST_PROGRAM_CACHE: LazyLock<KernelCache<CastToFlatKernel>> =
+    static CAST_PROGRAM_CACHE: LazyLock<KernelCache<DSLCastToFlatKernel>> =
         LazyLock::new(KernelCache::new);
     static CAST_TO_DICT_PROGRAM_CACHE: LazyLock<KernelCache<CastToDictKernel>> =
         LazyLock::new(KernelCache::new);
@@ -280,5 +280,40 @@ pub mod select {
     /// ```
     pub fn filter(data: &dyn Array, filter: &BooleanArray) -> Result<ArrayRef, ArrowKernelError> {
         FILTER_PROGRAM_CACHE.get((data, filter), ())
+    }
+}
+
+pub mod compute {
+    use std::sync::LazyLock;
+
+    use arrow_array::{Datum, UInt64Array};
+
+    use crate::{
+        new_kernels::{HashKernel, KernelCache},
+        ArrowKernelError,
+    };
+
+    static HASH_PROGRAM_CACHE: LazyLock<KernelCache<HashKernel>> = LazyLock::new(KernelCache::new);
+
+    /// Compute a 64-bit hash for each element in `data`.
+    ///
+    /// This function computes a hash of the input, returning a `UInt64Array`
+    /// where each value is the hash of the corresponding element in the input.
+    ///
+    /// # Example
+    ///
+    /// ```
+    /// use arrow_array::{Int32Array, Datum, UInt64Array};
+    /// use arrow_compile_compute::compute::hash;
+    ///
+    /// let arr = Int32Array::from(vec![10, 20, 10]);
+    /// let hashes: UInt64Array = hash(&arr).unwrap();
+    /// assert_eq!(hashes.len(), arr.len());
+    ///
+    /// // The same input produces the same hash
+    /// assert_eq!(hashes.value(0), hashes.value(2));
+    /// ```
+    pub fn hash(data: &dyn Datum) -> Result<UInt64Array, ArrowKernelError> {
+        HASH_PROGRAM_CACHE.get(data, ())
     }
 }

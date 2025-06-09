@@ -1,6 +1,8 @@
+use std::ffi::c_void;
+use std::marker::PhantomData;
+
 use crate::{declare_blocks, increment_pointer, pointer_diff, PrimitiveType};
-use arrow_array::types::GenericStringType;
-use arrow_array::{GenericByteArray, OffsetSizeTrait};
+use arrow_array::{GenericBinaryArray, GenericByteArray, OffsetSizeTrait};
 use arrow_buffer::{Buffer, OffsetBuffer, ScalarBuffer};
 use inkwell::{
     builder::Builder,
@@ -9,46 +11,105 @@ use inkwell::{
     values::{BasicValueEnum, FunctionValue, PointerValue},
     AddressSpace,
 };
+use repr_offset::ReprOffset;
 
-use super::ArrayWriter;
+use super::{ArrayWriter, WriterAllocation};
 
-/// Writer for primitive arrays (ints and floats).
-pub struct StringArrayWriter<'a> {
+/// Writer for string arrays (utf8 or bytes)
+pub struct StringArrayWriter<'a, T: OffsetSizeTrait> {
     ingest_func: FunctionValue<'a>,
     offsets_out_ptr_ptr: PointerValue<'a>,
     data_out_vec_ptr: PointerValue<'a>,
     last_offset_ptr: PointerValue<'a>,
+    _pd: PhantomData<T>,
 }
 
-impl<'a> StringArrayWriter<'a> {
-    /// Allocate a new string array writer.
-    /// `element_type` is the LLVM type of the offset (either i32 or i64)
-    pub fn allocate_string_writer(
+#[repr(C)]
+#[derive(ReprOffset)]
+#[roff(usize_offsets)]
+pub struct StringAllocation<T: OffsetSizeTrait> {
+    offsets_ptr: *mut c_void,
+    offsets: Vec<T>,
+    data: Vec<u8>,
+    pt: PrimitiveType,
+}
+
+impl<T: OffsetSizeTrait> WriterAllocation for StringAllocation<T> {
+    type Output = GenericBinaryArray<T>;
+
+    fn get_ptr(&mut self) -> *mut c_void {
+        self as *mut Self as *mut c_void
+    }
+
+    fn to_array(mut self, len: usize, nulls: Option<arrow_buffer::NullBuffer>) -> Self::Output {
+        self.offsets.truncate(len + 1);
+        let last_offset = self.offsets.last().map(|o| o.as_usize()).unwrap_or(0);
+        self.data.truncate(last_offset);
+
+        self.offsets.shrink_to_fit();
+        self.data.shrink_to_fit();
+
+        let offsets = ScalarBuffer::from(self.offsets);
+        let data = Buffer::from(self.data);
+
+        let offsets = unsafe { OffsetBuffer::new_unchecked(offsets) };
+        GenericByteArray::new(offsets, data, nulls)
+    }
+}
+
+impl<'a, T: OffsetSizeTrait> ArrayWriter<'a> for StringArrayWriter<'a, T> {
+    type Allocation = StringAllocation<T>;
+
+    fn allocate(expected_count: usize, ty: PrimitiveType) -> Self::Allocation {
+        let mut offsets = vec![T::zero(); (expected_count + 1) * ty.width()];
+        let data = Vec::with_capacity(expected_count);
+        let offsets_ptr = offsets.as_mut_ptr() as *mut c_void;
+        StringAllocation {
+            offsets_ptr,
+            offsets,
+            data,
+            pt: ty,
+        }
+    }
+
+    fn llvm_init(
         ctx: &'a Context,
         llvm_mod: &Module<'a>,
         build: &Builder<'a>,
-        offsets: PointerValue<'a>,
-        element_type: PrimitiveType,
-        data_out_vec_ptr: PointerValue<'a>,
-    ) -> StringArrayWriter<'a> {
+        ty: PrimitiveType,
+        alloc_ptr: PointerValue<'a>,
+    ) -> Self {
+        assert_eq!(ty, PrimitiveType::P64x2, "string writer type must be P64x2");
         let ptr_type = ctx.ptr_type(AddressSpace::default());
         let i64_type = ctx.i64_type();
+        let offset_element_type = if T::IS_LARGE {
+            ctx.i64_type()
+        } else {
+            ctx.i32_type()
+        };
+
+        let offset_ptr_ptr = increment_pointer!(
+            ctx,
+            build,
+            alloc_ptr,
+            StringAllocation::<T>::OFFSET_OFFSETS_PTR
+        );
+        let offset_ptr = build
+            .build_load(ptr_type, offset_ptr_ptr, "offset_base")
+            .unwrap()
+            .into_pointer_value();
 
         // write the initial zero -- each call to ingest will just write the end point
         build
-            .build_store(offsets, element_type.llvm_type(ctx).const_zero())
+            .build_store(offset_ptr, offset_element_type.const_zero())
             .unwrap();
-        let next_offset = increment_pointer!(ctx, build, offsets, element_type.width());
-
-        let offsets_out_ptr_ptr = build.build_alloca(ptr_type, "offsets_out_ptr_ptr").unwrap();
-        build.build_store(offsets_out_ptr_ptr, next_offset).unwrap();
+        let next_offset = increment_pointer!(ctx, build, offset_ptr, T::get_byte_width());
+        build.build_store(offset_ptr_ptr, next_offset).unwrap();
 
         let last_offset_ptr = build.build_alloca(ptr_type, "last_offset_ptr").unwrap();
         build
             .build_store(last_offset_ptr, i64_type.const_zero())
             .unwrap();
-
-        let width = element_type.width();
 
         let extend_f = llvm_mod
             .get_function("str_writer_append_bytes")
@@ -62,7 +123,7 @@ impl<'a> StringArrayWriter<'a> {
             });
 
         // Create or retrieve the ingest function:
-        let func_name = format!("ingest_str_{}b", width);
+        let func_name = format!("ingest_str_{}b", T::get_byte_width());
         let ingest_func = llvm_mod.get_function(&func_name).unwrap_or_else(|| {
             let b2 = ctx.create_builder();
             let fn_type = ctx.void_type().fn_type(
@@ -102,11 +163,7 @@ impl<'a> StringArrayWriter<'a> {
                 .into_int_value();
             let curr_offset = b2.build_int_add(prev_offset, len, "curr_offset").unwrap();
             let curr_offset = b2
-                .build_int_truncate_or_bit_cast(
-                    curr_offset,
-                    element_type.llvm_type(ctx).into_int_type(),
-                    "curr_offset",
-                )
+                .build_int_truncate_or_bit_cast(curr_offset, offset_element_type, "curr_offset")
                 .unwrap();
             b2.build_store(offset_out_ptr, curr_offset).unwrap();
             b2.build_call(
@@ -117,7 +174,7 @@ impl<'a> StringArrayWriter<'a> {
             .unwrap();
 
             // update pointers
-            let new_offset_ptr = increment_pointer!(ctx, b2, offset_out_ptr, element_type.width());
+            let new_offset_ptr = increment_pointer!(ctx, b2, offset_out_ptr, T::get_byte_width());
             b2.build_store(offsets_out_ptr_ptr, new_offset_ptr).unwrap();
             b2.build_store(last_offset_ptr, curr_offset).unwrap();
 
@@ -127,33 +184,19 @@ impl<'a> StringArrayWriter<'a> {
 
         StringArrayWriter {
             ingest_func,
-            offsets_out_ptr_ptr,
-            data_out_vec_ptr,
+            offsets_out_ptr_ptr: offset_ptr_ptr,
+            data_out_vec_ptr: increment_pointer!(
+                ctx,
+                build,
+                alloc_ptr,
+                StringAllocation::<T>::OFFSET_DATA
+            ),
             last_offset_ptr,
+            _pd: PhantomData,
         }
     }
 
-    pub unsafe fn array_from_buffers<T: OffsetSizeTrait>(
-        num_strs: usize,
-        mut offsets: Vec<T>,
-        mut data: Vec<u8>,
-    ) -> GenericByteArray<GenericStringType<T>> {
-        offsets.truncate(num_strs + 1);
-        let last_offset = offsets.last().map(|o| o.as_usize()).unwrap_or(0);
-        data.truncate(last_offset);
-        offsets.shrink_to_fit();
-        data.shrink_to_fit();
-
-        let offsets = ScalarBuffer::from(offsets);
-        let data = Buffer::from(data);
-
-        let offsets = OffsetBuffer::new_unchecked(offsets);
-        GenericByteArray::new(offsets, data, None)
-    }
-}
-
-impl<'a> ArrayWriter<'a> for StringArrayWriter<'a> {
-    fn ingest(&self, _ctx: &'a Context, build: &Builder<'a>, val: BasicValueEnum<'a>) {
+    fn llvm_ingest(&self, _ctx: &'a Context, build: &Builder<'a>, val: BasicValueEnum<'a>) {
         build
             .build_call(
                 self.ingest_func,
@@ -168,7 +211,7 @@ impl<'a> ArrayWriter<'a> for StringArrayWriter<'a> {
             .unwrap();
     }
 
-    fn flush(&self, _ctx: &'a Context, _build: &Builder<'a>) {
+    fn llvm_flush(&self, _ctx: &'a Context, _build: &Builder<'a>) {
         // No-op for string arrays
     }
 }
@@ -178,9 +221,13 @@ mod tests {
     use super::StringArrayWriter;
     use crate::{
         declare_blocks,
-        new_kernels::{link_req_helpers, writers::ArrayWriter},
+        new_kernels::{
+            link_req_helpers,
+            writers::{ArrayWriter, WriterAllocation},
+        },
         PrimitiveType,
     };
+    use arrow_array::StringArray;
     use inkwell::{context::Context, AddressSpace, OptimizationLevel};
     use itertools::Itertools;
     use std::ffi::c_void;
@@ -202,15 +249,14 @@ mod tests {
 
         declare_blocks!(ctx, func, entry);
         build.position_at_end(entry);
-        let offsets_out = func.get_nth_param(0).unwrap().into_pointer_value();
-        let data_out = func.get_nth_param(1).unwrap().into_pointer_value();
-        let writer = StringArrayWriter::allocate_string_writer(
+        let alloc_ptr = func.get_nth_param(0).unwrap().into_pointer_value();
+
+        let writer = StringArrayWriter::<i32>::llvm_init(
             &ctx,
             &llvm_mod,
             &build,
-            offsets_out,
-            PrimitiveType::I32,
-            data_out,
+            PrimitiveType::P64x2,
+            alloc_ptr,
         );
 
         let strs = ["this", "is", "a", "test!"];
@@ -226,37 +272,31 @@ mod tests {
                     i64_type.const_int(ptr1 as usize as u64, false).into(),
                     i64_type.const_int(ptr2 as usize as u64, false).into(),
                 ]);
-            writer.ingest(&ctx, &build, px2.into());
+            writer.llvm_ingest(&ctx, &build, px2.into());
         }
 
-        writer.flush(&ctx, &build);
+        writer.llvm_flush(&ctx, &build);
         build.build_return(None).unwrap();
 
         llvm_mod.verify().unwrap();
         let ee = llvm_mod
             .create_jit_execution_engine(OptimizationLevel::None)
             .unwrap();
-
         link_req_helpers(&llvm_mod, &ee).unwrap();
 
         let f = unsafe {
-            ee.get_function::<unsafe extern "C" fn(*mut c_void, *mut c_void)>(
-                func.get_name().to_str().unwrap(),
-            )
-            .unwrap()
+            ee.get_function::<unsafe extern "C" fn(*mut c_void)>(func.get_name().to_str().unwrap())
+                .unwrap()
         };
 
-        let mut offsets = vec![0_i32; 4 + 1];
-        let mut data = Vec::new();
+        let mut alloc = StringArrayWriter::allocate(100, PrimitiveType::I32);
 
         unsafe {
-            f.call(
-                offsets.as_mut_ptr() as *mut c_void,
-                (&mut data) as *mut Vec<u8> as *mut c_void,
-            );
+            f.call(alloc.get_ptr());
         }
 
-        let arr = unsafe { StringArrayWriter::array_from_buffers(4, offsets, data) };
+        let arr = alloc.to_array(4, None);
+        let arr = StringArray::from(arr);
         let arr = arr.iter().map(|s| s.unwrap()).collect_vec();
         assert_eq!(arr, strs);
     }
