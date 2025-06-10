@@ -673,7 +673,7 @@ impl<'a> KernelExpression<'a> {
                 let dst_pt = *pt;
 
                 if src_pt == dst_pt {
-                    return Ok(to_convert);
+                    Ok(to_convert)
                 } else {
                     let singleton_vec = build
                         .build_bit_cast(
