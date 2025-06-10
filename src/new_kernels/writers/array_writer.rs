@@ -94,6 +94,7 @@ impl<'a> ArrayWriter<'a> for PrimitiveArrayWriter<'a> {
 
         let global_alloc_ptr = llvm_mod.add_global(ptr_type, None, "ARRAY_WRITER_ALLOC_PTR");
         global_alloc_ptr.set_initializer(&ptr_type.const_null());
+        global_alloc_ptr.set_linkage(Linkage::Private);
         let global_alloc_ptr_ptr = global_alloc_ptr.as_pointer_value();
 
         build.build_store(global_alloc_ptr_ptr, alloc_ptr).unwrap();
