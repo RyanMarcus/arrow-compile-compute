@@ -11,6 +11,7 @@ use inkwell::{
 
 mod array_writer;
 mod bool_writer;
+mod dict_writer;
 mod str_writer;
 
 pub use array_writer::PrimitiveArrayWriter;

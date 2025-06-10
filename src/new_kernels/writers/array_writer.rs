@@ -18,7 +18,7 @@ use super::{ArrayWriter, WriterAllocation};
 /// Writer for primitive arrays (ints and floats).
 pub struct PrimitiveArrayWriter<'a> {
     ingest_func: FunctionValue<'a>,
-    out_ptr_ptr: PointerValue<'a>,
+    global_alloc_ptr_ptr: PointerValue<'a>,
 }
 
 #[repr(C)]
@@ -74,6 +74,7 @@ impl<'a> ArrayWriter<'a> for PrimitiveArrayWriter<'a> {
     type Allocation = ArrayOutput;
     fn allocate(expected_count: usize, ty: PrimitiveType) -> Self::Allocation {
         let mut data = vec![0_u128; (ty.width() * expected_count).div_ceil(16)];
+        assert!(data.capacity() > 0 || expected_count == 0);
         let data_ptr = data.as_mut_ptr() as *mut c_void;
         ArrayOutput {
             out_ptr: data_ptr,
@@ -90,10 +91,12 @@ impl<'a> ArrayWriter<'a> for PrimitiveArrayWriter<'a> {
         alloc_ptr: PointerValue<'a>,
     ) -> Self {
         let ptr_type = ctx.ptr_type(AddressSpace::default());
-        // extract the pointer to the output array from alloc_ptr
-        let out_base_ptr = alloc_ptr;
-        let out_ptr_ptr = build.build_alloca(ptr_type, "out_ptr_ptr").unwrap();
-        build.build_store(out_ptr_ptr, out_base_ptr).unwrap();
+
+        let global_alloc_ptr = llvm_mod.add_global(ptr_type, None, "ARRAY_WRITER_ALLOC_PTR");
+        global_alloc_ptr.set_initializer(&ptr_type.const_null());
+        let global_alloc_ptr_ptr = global_alloc_ptr.as_pointer_value();
+
+        build.build_store(global_alloc_ptr_ptr, alloc_ptr).unwrap();
 
         let width = ty.width();
         let func_name = format!("ingest_prim_{}b", width);
@@ -114,6 +117,7 @@ impl<'a> ArrayWriter<'a> for PrimitiveArrayWriter<'a> {
                 .build_load(ptr_type, out_ptr_ptr, "curr_ptr")
                 .unwrap()
                 .into_pointer_value();
+
             b2.build_store(curr_ptr, val).unwrap();
             let new_ptr = increment_pointer!(ctx, b2, curr_ptr, width);
             b2.build_store(out_ptr_ptr, new_ptr).unwrap();
@@ -123,7 +127,7 @@ impl<'a> ArrayWriter<'a> for PrimitiveArrayWriter<'a> {
 
         PrimitiveArrayWriter {
             ingest_func,
-            out_ptr_ptr,
+            global_alloc_ptr_ptr,
         }
     }
 
@@ -131,7 +135,7 @@ impl<'a> ArrayWriter<'a> for PrimitiveArrayWriter<'a> {
         build
             .build_call(
                 self.ingest_func,
-                &[self.out_ptr_ptr.into(), val.into()],
+                &[self.global_alloc_ptr_ptr.into(), val.into()],
                 "ingest",
             )
             .unwrap();

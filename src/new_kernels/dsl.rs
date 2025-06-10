@@ -1509,7 +1509,6 @@ mod test {
         .unwrap();
 
         let res = k.call(&[&data]).unwrap();
-        println!("{:?}", res);
         let res = res
             .as_string::<i32>()
             .iter()

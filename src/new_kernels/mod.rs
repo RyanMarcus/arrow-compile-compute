@@ -37,6 +37,8 @@ use inkwell::{
     AddressSpace, IntPredicate, OptimizationLevel,
 };
 
+use crate::new_kernels::llvm_utils::debug_i64;
+use crate::new_kernels::llvm_utils::debug_ptr;
 use crate::{declare_blocks, increment_pointer, pointer_diff, PrimitiveType};
 
 #[derive(Debug)]
@@ -110,6 +112,14 @@ impl<K: Kernel> KernelCache<K> {
 fn link_req_helpers(module: &Module, ee: &ExecutionEngine) -> Result<(), ArrowKernelError> {
     if let Some(func) = module.get_function("str_writer_append_bytes") {
         ee.add_global_mapping(&func, str_writer_append_bytes as usize);
+    }
+
+    if let Some(func) = module.get_function("debug_i64") {
+        ee.add_global_mapping(&func, debug_i64 as usize);
+    }
+
+    if let Some(func) = module.get_function("debug_ptr") {
+        ee.add_global_mapping(&func, debug_ptr as usize);
     }
 
     Ok(())

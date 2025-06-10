@@ -57,6 +57,12 @@ impl TicketTable {
         }
     }
 
+    /// Returns the number of elements in the table (not the maximum size of the
+    /// table)
+    pub fn len(&self) -> usize {
+        self.last_val as usize
+    }
+
     fn llvm_max_size<'a>(
         &self,
         ctx: &'a Context,
@@ -136,10 +142,10 @@ pub fn generate_lookup_or_insert<'a>(
         "lookup_or_insert",
         ticket_type.fn_type(
             &[
-                ptr_type.into(),
+                ptr_type.into(), // pointer to the hash table
                 key_type.into(),
-                i64_type.into(),
-                ptr_type.into(),
+                i64_type.into(), // hash value of the key
+                ptr_type.into(), // output ptr to bool, true if new value was inserted
             ],
             false,
         ),
@@ -330,6 +336,12 @@ const MURMUR_C1: u64 = 0xff51afd7ed558ccd;
 const MURMUR_C2: u64 = 0xc4ceb9fe1a85ec53;
 const UPPER_MASK: u64 = 0x00000000FFFFFFFF;
 
+/// Generate a murmur hash function.
+///
+/// The returned function takes a single parameter of type `pt` and returns an
+/// `i64` hash value.
+///
+/// Strings are hashed by taking the first and last 32 bits.
 pub fn generate_hash_func<'a>(
     ctx: &'a Context,
     llvm_mod: &Module<'a>,
@@ -666,7 +678,10 @@ mod tests {
     use inkwell::{context::Context, OptimizationLevel};
     use itertools::Itertools;
 
-    use crate::{new_kernels::Kernel, PrimitiveType};
+    use crate::{
+        new_kernels::{link_req_helpers, Kernel},
+        PrimitiveType,
+    };
 
     use super::{generate_hash_func, generate_lookup_or_insert, HashKernel, TicketTable};
 
@@ -682,6 +697,7 @@ mod tests {
         let ee = module
             .create_jit_execution_engine(OptimizationLevel::None)
             .unwrap();
+        link_req_helpers(&module, &ee).unwrap();
 
         let test_func = unsafe {
             ee.get_function::<unsafe extern "C" fn(*mut TicketTable, i32, i64, *mut u8) -> i8>(
@@ -714,6 +730,7 @@ mod tests {
         let ee = module
             .create_jit_execution_engine(OptimizationLevel::None)
             .unwrap();
+        link_req_helpers(&module, &ee).unwrap();
 
         let test_func = unsafe {
             ee.get_function::<unsafe extern "C" fn(*mut TicketTable, i32, i64, *mut u8) -> i8>(
@@ -769,6 +786,7 @@ mod tests {
         let ee = module
             .create_jit_execution_engine(OptimizationLevel::None)
             .unwrap();
+        link_req_helpers(&module, &ee).unwrap();
 
         let test_func = unsafe {
             ee.get_function::<unsafe extern "C" fn(*mut TicketTable, u128, i64, *mut u8) -> i8>(
@@ -829,6 +847,7 @@ mod tests {
         let ee = module
             .create_jit_execution_engine(OptimizationLevel::None)
             .unwrap();
+        link_req_helpers(&module, &ee).unwrap();
 
         let next_block_func = unsafe {
             ee.get_function::<unsafe extern "C" fn(i32) -> i64>(fname)
@@ -856,6 +875,7 @@ mod tests {
         let ee = module
             .create_jit_execution_engine(OptimizationLevel::None)
             .unwrap();
+        link_req_helpers(&module, &ee).unwrap();
 
         let next_block_func = unsafe {
             ee.get_function::<unsafe extern "C" fn(f32) -> i64>(fname)
@@ -895,6 +915,7 @@ mod tests {
         let ee = module
             .create_jit_execution_engine(OptimizationLevel::None)
             .unwrap();
+        link_req_helpers(&module, &ee).unwrap();
 
         let next_block_func = unsafe {
             ee.get_function::<unsafe extern "C" fn(u128) -> i64>(fname)
