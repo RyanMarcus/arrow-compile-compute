@@ -1,6 +1,7 @@
 use arrow_array::{Datum, UInt64Array};
 use arrow_schema::DataType;
 use inkwell::execution_engine::JitFunction;
+use inkwell::values::BasicValue;
 use inkwell::OptimizationLevel;
 use inkwell::{
     builder::Builder,
@@ -69,14 +70,19 @@ impl TicketTable {
         build: &Builder<'a>,
         ptr: PointerValue<'a>,
     ) -> IntValue<'a> {
-        build
+        let max = build
             .build_load(
                 ctx.i64_type(),
                 increment_pointer!(ctx, build, ptr, TicketTable::OFFSET_MAX_SIZE),
                 "max_size",
             )
             .unwrap()
-            .into_int_value()
+            .into_int_value();
+        max.as_instruction_value()
+            .unwrap()
+            .set_metadata(ctx.metadata_node(&[]), ctx.get_kind_id("invariant.load"))
+            .unwrap();
+        max
     }
 
     fn llvm_keys_ptr<'a>(
@@ -85,14 +91,19 @@ impl TicketTable {
         build: &Builder<'a>,
         ptr: PointerValue<'a>,
     ) -> PointerValue<'a> {
-        build
+        let keys = build
             .build_load(
                 ctx.ptr_type(AddressSpace::default()),
                 increment_pointer!(ctx, build, ptr, TicketTable::OFFSET_KEYS),
                 "keys_ptr",
             )
             .unwrap()
-            .into_pointer_value()
+            .into_pointer_value();
+        keys.as_instruction_value()
+            .unwrap()
+            .set_metadata(ctx.metadata_node(&[]), ctx.get_kind_id("invariant.load"))
+            .unwrap();
+        keys
     }
 
     fn llvm_tickets_ptr<'a>(
@@ -101,14 +112,20 @@ impl TicketTable {
         build: &Builder<'a>,
         ptr: PointerValue<'a>,
     ) -> PointerValue<'a> {
-        build
+        let tickets = build
             .build_load(
                 ctx.ptr_type(AddressSpace::default()),
                 increment_pointer!(ctx, build, ptr, TicketTable::OFFSET_TICKETS),
                 "tickets_ptr",
             )
             .unwrap()
-            .into_pointer_value()
+            .into_pointer_value();
+        tickets
+            .as_instruction_value()
+            .unwrap()
+            .set_metadata(ctx.metadata_node(&[]), ctx.get_kind_id("invariant.load"))
+            .unwrap();
+        tickets
     }
 
     fn llvm_last_val_ptr<'a>(
