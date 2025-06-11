@@ -80,15 +80,11 @@ pub mod cast {
     use arrow_array::ArrayRef;
     use arrow_schema::DataType;
 
-    use crate::new_kernels::CastToDictKernel;
-    use crate::new_kernels::DSLCastToFlatKernel;
+    use crate::new_kernels::CastKernel;
     use crate::new_kernels::KernelCache;
     use crate::ArrowKernelError;
 
-    static CAST_PROGRAM_CACHE: LazyLock<KernelCache<DSLCastToFlatKernel>> =
-        LazyLock::new(KernelCache::new);
-    static CAST_TO_DICT_PROGRAM_CACHE: LazyLock<KernelCache<CastToDictKernel>> =
-        LazyLock::new(KernelCache::new);
+    static CAST_PROGRAM_CACHE: LazyLock<KernelCache<CastKernel>> = LazyLock::new(KernelCache::new);
 
     /// Try to convert `lhs` into an array of type `to_type`.
     ///
@@ -106,10 +102,7 @@ pub mod cast {
     /// )).unwrap();
     /// ```
     pub fn cast(lhs: &dyn Array, to_type: &DataType) -> Result<ArrayRef, ArrowKernelError> {
-        match to_type {
-            DataType::Dictionary(..) => CAST_TO_DICT_PROGRAM_CACHE.get(lhs, to_type.clone()),
-            _ => CAST_PROGRAM_CACHE.get(lhs, to_type.clone()),
-        }
+        CAST_PROGRAM_CACHE.get(lhs, to_type.clone())
     }
 }
 

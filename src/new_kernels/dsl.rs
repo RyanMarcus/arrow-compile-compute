@@ -5,7 +5,11 @@ use std::{
     sync::Arc,
 };
 
-use arrow_array::{cast::AsArray, Array, ArrayRef, BooleanArray, Datum, StringArray};
+use arrow_array::{
+    cast::AsArray,
+    types::{ArrowDictionaryKeyType, Int16Type, Int32Type, Int64Type, Int8Type},
+    Array, ArrayRef, BooleanArray, Datum, StringArray,
+};
 use arrow_schema::DataType;
 use inkwell::{
     builder::Builder,
@@ -28,7 +32,7 @@ use crate::{
     new_kernels::{
         cmp::{add_float_vec_to_int_vec, add_memcmp},
         gen_convert_numeric_vec, link_req_helpers, optimize_module, set_noalias_params,
-        writers::{ArrayWriter, BooleanWriter, PrimitiveArrayWriter, WriterAllocation},
+        writers::{ArrayWriter, BooleanWriter, DictWriter, PrimitiveArrayWriter, WriterAllocation},
     },
     ComparisonType, Predicate, PrimitiveType,
 };
@@ -125,12 +129,20 @@ impl<'a> KernelInput<'a> {
 }
 
 #[derive(Debug, Copy, Clone, PartialEq, Eq)]
+pub enum DictKeyType {
+    Int8,
+    Int16,
+    Int32,
+    Int64,
+}
+
+#[derive(Debug, Copy, Clone, PartialEq, Eq)]
 pub enum KernelOutputType {
     Array,
     String,
     View,
     Boolean,
-    Dictionary,
+    Dictionary(DictKeyType),
     RunEnd,
 }
 
@@ -169,7 +181,16 @@ impl KernelOutputType {
             DataType::LargeListView(..) => todo!(),
             DataType::Struct(..) => todo!(),
             DataType::Union(..) => todo!(),
-            DataType::Dictionary(..) => Ok(KernelOutputType::Dictionary),
+            DataType::Dictionary(k, _v) => match k.as_ref() {
+                DataType::Int8 => Ok(KernelOutputType::Dictionary(DictKeyType::Int8)),
+                DataType::Int16 => Ok(KernelOutputType::Dictionary(DictKeyType::Int16)),
+                DataType::Int32 => Ok(KernelOutputType::Dictionary(DictKeyType::Int32)),
+                DataType::Int64 => Ok(KernelOutputType::Dictionary(DictKeyType::Int64)),
+                _ => Err(DSLError::TypeMismatch(format!(
+                    "dictionary key type must be signed int, but has type {}",
+                    dt
+                ))),
+            },
             DataType::Decimal128(_, _) => todo!(),
             DataType::Decimal256(_, _) => todo!(),
             DataType::Map(..) => todo!(),
@@ -206,7 +227,7 @@ impl KernelOutputType {
                 }
             }
             KernelOutputType::View => todo!(),
-            KernelOutputType::Dictionary => todo!(),
+            KernelOutputType::Dictionary(_) => {}
             KernelOutputType::RunEnd => todo!(),
         };
 
@@ -1072,8 +1093,39 @@ impl DSLKernel {
                 Ok(Arc::new(alloc.to_array(num_results as usize, None)))
             }
             KernelOutputType::View => todo!(),
-            KernelOutputType::Dictionary => todo!(),
+            KernelOutputType::Dictionary(key) => Ok(match key {
+                DictKeyType::Int8 => self.exec_to_dict::<Int8Type>(ptrs, max_len, p_out_type),
+                DictKeyType::Int16 => self.exec_to_dict::<Int16Type>(ptrs, max_len, p_out_type),
+                DictKeyType::Int32 => self.exec_to_dict::<Int32Type>(ptrs, max_len, p_out_type),
+                DictKeyType::Int64 => self.exec_to_dict::<Int64Type>(ptrs, max_len, p_out_type),
+            }),
             KernelOutputType::RunEnd => todo!(),
+        }
+    }
+
+    fn exec_to_dict<K: ArrowDictionaryKeyType>(
+        &self,
+        mut ptrs: Vec<*mut c_void>,
+        max_len: usize,
+        pt: PrimitiveType,
+    ) -> Arc<dyn arrow_array::Array> {
+        match pt {
+            PrimitiveType::P64x2 => {
+                let mut alloc = DictWriter::<K, StringArrayWriter<i32>>::allocate(max_len, pt);
+                ptrs.push(alloc.get_ptr());
+                let mut kp = KernelParameters::new(ptrs);
+
+                let num_results = unsafe { self.borrow_func().1.call(kp.get_mut_ptr()) };
+                alloc.to_array(num_results as usize, None)
+            }
+            _ => {
+                let mut alloc = DictWriter::<K, PrimitiveArrayWriter>::allocate(max_len, pt);
+                ptrs.push(alloc.get_ptr());
+                let mut kp = KernelParameters::new(ptrs);
+
+                let num_results = unsafe { self.borrow_func().1.call(kp.get_mut_ptr()) };
+                alloc.to_array(num_results as usize, None)
+            }
         }
     }
 }
@@ -1100,7 +1152,9 @@ fn build_kernel<'a>(
             build_kernel_with_writer::<BooleanWriter>(ctx, inputs, program)
         }
         KernelOutputType::View => todo!(),
-        KernelOutputType::Dictionary => todo!(),
+        KernelOutputType::Dictionary(key) => {
+            todo!()
+        }
         KernelOutputType::RunEnd => todo!(),
     }
 }
