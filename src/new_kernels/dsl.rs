@@ -8,7 +8,7 @@ use std::{
 use arrow_array::{
     cast::AsArray,
     types::{ArrowDictionaryKeyType, Int16Type, Int32Type, Int64Type, Int8Type},
-    Array, ArrayRef, BooleanArray, Datum, StringArray,
+    Array, ArrayRef, BooleanArray, Datum, DictionaryArray, StringArray,
 };
 use arrow_schema::DataType;
 use inkwell::{
@@ -1095,10 +1095,18 @@ impl DSLKernel {
             }
             KernelOutputType::View => todo!(),
             KernelOutputType::Dictionary(key) => Ok(match key {
-                DictKeyType::Int8 => self.exec_to_dict::<Int8Type>(ptrs, max_len, p_out_type),
-                DictKeyType::Int16 => self.exec_to_dict::<Int16Type>(ptrs, max_len, p_out_type),
-                DictKeyType::Int32 => self.exec_to_dict::<Int32Type>(ptrs, max_len, p_out_type),
-                DictKeyType::Int64 => self.exec_to_dict::<Int64Type>(ptrs, max_len, p_out_type),
+                DictKeyType::Int8 => {
+                    Arc::new(self.exec_to_dict::<Int8Type>(ptrs, max_len, p_out_type))
+                }
+                DictKeyType::Int16 => {
+                    Arc::new(self.exec_to_dict::<Int16Type>(ptrs, max_len, p_out_type))
+                }
+                DictKeyType::Int32 => {
+                    Arc::new(self.exec_to_dict::<Int32Type>(ptrs, max_len, p_out_type))
+                }
+                DictKeyType::Int64 => {
+                    Arc::new(self.exec_to_dict::<Int64Type>(ptrs, max_len, p_out_type))
+                }
             }),
             KernelOutputType::RunEnd => todo!(),
         }
@@ -1109,7 +1117,7 @@ impl DSLKernel {
         mut ptrs: Vec<*mut c_void>,
         max_len: usize,
         pt: PrimitiveType,
-    ) -> Arc<dyn arrow_array::Array> {
+    ) -> DictionaryArray<K> {
         match pt {
             PrimitiveType::P64x2 => {
                 let mut alloc = DictWriter::<K, StringArrayWriter<i32>>::allocate(max_len, pt);

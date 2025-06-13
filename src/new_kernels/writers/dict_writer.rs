@@ -1,6 +1,8 @@
-use std::{ffi::c_void, sync::Arc};
+use std::{ffi::c_void, marker::PhantomData};
 
-use arrow_array::{make_array, types::ArrowDictionaryKeyType, Array};
+use arrow_array::{
+    cast::AsArray, make_array, types::ArrowDictionaryKeyType, Array, DictionaryArray,
+};
 use arrow_data::ArrayDataBuilder;
 use inkwell::{
     module::Linkage,
@@ -21,16 +23,21 @@ use crate::{
 #[repr(C)]
 #[derive(ReprOffset)]
 #[roff(usize_offsets)]
-pub struct DictAllocation<'a, VW: ArrayWriter<'a>> {
+pub struct DictAllocation<'a, K: ArrowDictionaryKeyType, VW: ArrayWriter<'a>> {
     tt: TicketTable,
     keys_ptr: *mut c_void,
     values_ptr: *mut c_void,
     keys: Box<ArrayOutput>,
     values: Box<VW::Allocation>,
+
+    #[roff(offset = "OFFSET_MARKER")]
+    _marker: PhantomData<K>,
 }
 
-impl<'a, VW: ArrayWriter<'a>> WriterAllocation for DictAllocation<'a, VW> {
-    type Output = Arc<dyn Array>;
+impl<'a, K: ArrowDictionaryKeyType, VW: ArrayWriter<'a>> WriterAllocation
+    for DictAllocation<'a, K, VW>
+{
+    type Output = DictionaryArray<K>;
 
     fn get_ptr(&mut self) -> *mut c_void {
         self as *mut Self as *mut c_void
@@ -58,6 +65,8 @@ impl<'a, VW: ArrayWriter<'a>> WriterAllocation for DictAllocation<'a, VW> {
                 .build_unchecked(),
             )
         }
+        .as_dictionary::<K>()
+        .clone()
     }
 }
 
@@ -69,7 +78,7 @@ pub struct DictWriter<'a, K: ArrowDictionaryKeyType, VW: ArrayWriter<'a>> {
 }
 
 impl<'a, K: ArrowDictionaryKeyType, VW: ArrayWriter<'a>> ArrayWriter<'a> for DictWriter<'a, K, VW> {
-    type Allocation = DictAllocation<'a, VW>;
+    type Allocation = DictAllocation<'a, K, VW>;
 
     fn allocate(expected_count: usize, ty: PrimitiveType) -> Self::Allocation {
         let tt = TicketTable::new(expected_count * 2, ty.as_arrow_type(), K::DATA_TYPE);
@@ -84,6 +93,7 @@ impl<'a, K: ArrowDictionaryKeyType, VW: ArrayWriter<'a>> ArrayWriter<'a> for Dic
             values_ptr: vw.get_ptr(),
             keys: kw,
             values: vw,
+            _marker: PhantomData::default(),
         }
     }
 
@@ -107,7 +117,7 @@ impl<'a, K: ArrowDictionaryKeyType, VW: ArrayWriter<'a>> ArrayWriter<'a> for Dic
                         ctx,
                         build,
                         alloc_ptr,
-                        DictAllocation::<VW>::OFFSET_KEYS_PTR
+                        DictAllocation::<K, VW>::OFFSET_KEYS_PTR
                     ),
                     "keys_ptr",
                 )
@@ -121,7 +131,7 @@ impl<'a, K: ArrowDictionaryKeyType, VW: ArrayWriter<'a>> ArrayWriter<'a> for Dic
                     ctx,
                     build,
                     alloc_ptr,
-                    DictAllocation::<VW>::OFFSET_VALUES_PTR
+                    DictAllocation::<K, VW>::OFFSET_VALUES_PTR
                 ),
                 "values_ptr",
             )
@@ -135,7 +145,7 @@ impl<'a, K: ArrowDictionaryKeyType, VW: ArrayWriter<'a>> ArrayWriter<'a> for Dic
         let hash_func = generate_hash_func(ctx, llvm_mod, ty);
         let ht_lookup = generate_lookup_or_insert(ctx, llvm_mod, &dummy_ht);
 
-        let ht_ptr = increment_pointer!(ctx, build, alloc_ptr, DictAllocation::<VW>::OFFSET_TT);
+        let ht_ptr = increment_pointer!(ctx, build, alloc_ptr, DictAllocation::<K, VW>::OFFSET_TT);
 
         let ingest_func = {
             let b = ctx.create_builder();
@@ -240,7 +250,7 @@ impl<'a, K: ArrowDictionaryKeyType, VW: ArrayWriter<'a>> ArrayWriter<'a> for Dic
 mod tests {
     use std::ffi::c_void;
 
-    use arrow_array::{cast::AsArray, types::Int8Type, Int32Array};
+    use arrow_array::{types::Int8Type, Int32Array};
     use inkwell::{context::Context, AddressSpace, OptimizationLevel};
     use itertools::Itertools;
 
@@ -307,10 +317,7 @@ mod tests {
             f.call(data.get_ptr());
         }
         let data = data.to_array(100, None);
-        let data = data
-            .as_dictionary::<Int8Type>()
-            .downcast_dict::<Int32Array>()
-            .unwrap();
+        let data = data.downcast_dict::<Int32Array>().unwrap();
         let data: Vec<i32> = data.into_iter().map(|x| x.unwrap()).collect_vec();
 
         assert_eq!(data, expected);
