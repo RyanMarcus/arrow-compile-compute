@@ -1,6 +1,6 @@
 use std::{ffi::c_void, sync::Arc};
 
-use arrow_array::{make_array, types::ArrowDictionaryKeyType, Array, ArrayRef};
+use arrow_array::{make_array, types::ArrowDictionaryKeyType, Array};
 use arrow_data::ArrayDataBuilder;
 use inkwell::{
     module::Linkage,
@@ -13,11 +13,7 @@ use crate::{
     declare_blocks, dictionary_data_type, increment_pointer,
     new_kernels::{
         ht::{generate_hash_func, generate_lookup_or_insert, TicketTable},
-        writers::{
-            array_writer::{ArrayOutput, EArrayOutput, EPrimitiveArrayWriter},
-            str_writer::EStringArrayWriter,
-            ArrayWriter, EWriterAllocation, PrimitiveArrayWriter, WriterAllocation,
-        },
+        writers::{array_writer::ArrayOutput, ArrayWriter, PrimitiveArrayWriter, WriterAllocation},
     },
     PrimitiveType,
 };
@@ -25,22 +21,22 @@ use crate::{
 #[repr(C)]
 #[derive(ReprOffset)]
 #[roff(usize_offsets)]
-pub struct DictAllocation {
+pub struct DictAllocation<'a, VW: ArrayWriter<'a>> {
     tt: TicketTable,
     keys_ptr: *mut c_void,
     values_ptr: *mut c_void,
-    keys: EArrayOutput,
-    values: EWriterAllocation,
-    key_type: PrimitiveType,
-    val_type: PrimitiveType,
+    keys: Box<ArrayOutput>,
+    values: Box<VW::Allocation>,
 }
 
-impl DictAllocation {
+impl<'a, VW: ArrayWriter<'a>> WriterAllocation for DictAllocation<'a, VW> {
+    type Output = Arc<dyn Array>;
+
     fn get_ptr(&mut self) -> *mut c_void {
         self as *mut Self as *mut c_void
     }
 
-    fn to_array(self, len: usize, nulls: Option<arrow_buffer::NullBuffer>) -> ArrayRef {
+    fn to_array(self, len: usize, nulls: Option<arrow_buffer::NullBuffer>) -> Self::Output {
         let keys = self.keys.to_array(len, None).into_data();
         assert_eq!(
             keys.buffers().len(),
@@ -65,36 +61,29 @@ impl DictAllocation {
     }
 }
 
-pub struct DictWriter<'a> {
+pub struct DictWriter<'a, K: ArrowDictionaryKeyType, VW: ArrayWriter<'a>> {
     ht_ptr: PointerValue<'a>,
     ingest_func: FunctionValue<'a>,
+    _phantom1: std::marker::PhantomData<K>,
+    _phantom2: std::marker::PhantomData<VW>,
 }
 
-impl<'a> DictWriter<'a> {
-    pub fn allocate(
-        expected_count: usize,
-        key_type: PrimitiveType,
-        val_type: PrimitiveType,
-    ) -> DictAllocation {
-        let tt = TicketTable::new(
-            expected_count * 2,
-            val_type.as_arrow_type(),
-            key_type.as_arrow_type(),
-        );
-        let mut kw = EPrimitiveArrayWriter::allocate(expected_count, key_type);
-        let mut vw: EWriterAllocation = match val_type {
-            PrimitiveType::P64x2 => EStringArrayWriter::<i32>::allocate(expected_count).into(),
-            _ => EPrimitiveArrayWriter::allocate(expected_count, val_type).into(),
-        };
+impl<'a, K: ArrowDictionaryKeyType, VW: ArrayWriter<'a>> ArrayWriter<'a> for DictWriter<'a, K, VW> {
+    type Allocation = DictAllocation<'a, VW>;
 
+    fn allocate(expected_count: usize, ty: PrimitiveType) -> Self::Allocation {
+        let tt = TicketTable::new(expected_count * 2, ty.as_arrow_type(), K::DATA_TYPE);
+        let mut kw = Box::new(PrimitiveArrayWriter::allocate(
+            expected_count,
+            PrimitiveType::for_arrow_type(&K::DATA_TYPE),
+        ));
+        let mut vw = Box::new(VW::allocate(expected_count, ty));
         DictAllocation {
             tt,
             keys_ptr: kw.get_ptr(),
             values_ptr: vw.get_ptr(),
             keys: kw,
             values: vw,
-            key_type,
-            val_type,
         }
     }
 
@@ -102,8 +91,7 @@ impl<'a> DictWriter<'a> {
         ctx: &'a inkwell::context::Context,
         llvm_mod: &inkwell::module::Module<'a>,
         build: &inkwell::builder::Builder<'a>,
-        key_type: PrimitiveType,
-        val_type: PrimitiveType,
+        ty: PrimitiveType,
         alloc_ptr: inkwell::values::PointerValue<'a>,
     ) -> Self {
         let ptr_type = ctx.ptr_type(AddressSpace::default());
@@ -111,21 +99,7 @@ impl<'a> DictWriter<'a> {
             ctx,
             llvm_mod,
             build,
-            key_type,
-            build
-                .build_load(
-                    ptr_type,
-                    increment_pointer!(ctx, build, alloc_ptr, DictAllocation::OFFSET_KEYS_PTR),
-                    "keys_ptr",
-                )
-                .unwrap()
-                .into_pointer_value(),
-        );
-        let vw = VW::llvm_init(
-            ctx,
-            llvm_mod,
-            build,
-            ty,
+            PrimitiveType::for_arrow_type(&K::DATA_TYPE),
             build
                 .build_load(
                     ptr_type,
@@ -133,13 +107,27 @@ impl<'a> DictWriter<'a> {
                         ctx,
                         build,
                         alloc_ptr,
-                        DictAllocation::<VW>::OFFSET_VALUES_PTR
+                        DictAllocation::<VW>::OFFSET_KEYS_PTR
                     ),
-                    "values_ptr",
+                    "keys_ptr",
                 )
                 .unwrap()
                 .into_pointer_value(),
         );
+        let vw_ptr = build
+            .build_load(
+                ptr_type,
+                increment_pointer!(
+                    ctx,
+                    build,
+                    alloc_ptr,
+                    DictAllocation::<VW>::OFFSET_VALUES_PTR
+                ),
+                "values_ptr",
+            )
+            .unwrap()
+            .into_pointer_value();
+        let vw = VW::llvm_init(ctx, llvm_mod, build, ty, vw_ptr);
 
         let i8_type = ctx.i8_type();
 

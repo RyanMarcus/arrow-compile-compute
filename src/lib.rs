@@ -28,6 +28,17 @@ pub use arrow_interface::select;
 pub use new_kernels::dsl;
 pub use new_kernels::ArrowKernelError;
 
+macro_rules! ptr_to_global {
+    ($module:expr, $label:ident) => {{
+        let ptr_type = $module.get_context().ptr_type(AddressSpace::default());
+        let global_var = $module.add_global(ptr_type, None, stringify!($label));
+        global_var.set_initializer(&ptr_type.const_null());
+        global_var.set_linkage(Linkage::Private);
+        global_var.as_pointer_value()
+    }};
+}
+pub(crate) use ptr_to_global;
+
 /// Declare a set of basic blocks at once
 macro_rules! declare_blocks {
     ($ctx:expr, $func:expr, $name:ident) => {
@@ -246,7 +257,7 @@ impl PrimitiveType {
             PrimitiveType::U16 => DataType::UInt16,
             PrimitiveType::U32 => DataType::UInt32,
             PrimitiveType::U64 => DataType::UInt64,
-            PrimitiveType::P64x2 => DataType::Utf8View,
+            PrimitiveType::P64x2 => DataType::Utf8,
             PrimitiveType::F16 => DataType::Float16,
             PrimitiveType::F32 => DataType::Float32,
             PrimitiveType::F64 => DataType::Float64,

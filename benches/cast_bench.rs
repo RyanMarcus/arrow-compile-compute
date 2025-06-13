@@ -1,6 +1,6 @@
 use arrow_array::{
     cast::AsArray,
-    types::{Int16Type, Int64Type},
+    types::{Int16Type, Int32Type, Int64Type},
     Array, Int32Array, Int64Array, Int8Array, RunArray, StringArray, UInt64Array,
 };
 use arrow_compile_compute::dictionary_data_type;
@@ -167,25 +167,27 @@ pub fn criterion_benchmark(c: &mut Criterion) {
             .collect_vec();
         let data = StringArray::from(random_strings);
 
-        let _arrow_dict = arrow_cast::cast(
+        let arrow_dict = arrow_cast::cast(
             &data,
             &dictionary_data_type(DataType::Int32, DataType::Utf8),
         )
         .unwrap();
-        let _our_dict = arrow_compile_compute::cast::cast(
+        let our_dict = arrow_compile_compute::cast::cast(
             &data,
-            &dictionary_data_type(DataType::Int32, DataType::Utf8View),
+            &dictionary_data_type(DataType::Int32, DataType::Utf8),
         )
         .unwrap();
 
-        // we cannot directly compare the arrow and our dictionary, since we
-        // create a string view dictionary and arrow does not. TODO to check this result.
+        assert_eq!(
+            arrow_dict.as_dictionary::<Int32Type>(),
+            our_dict.as_dictionary::<Int32Type>()
+        );
 
         c.bench_function("convert str to dict/llvm", |b| {
             b.iter(|| {
                 arrow_compile_compute::cast::cast(
                     &data,
-                    &dictionary_data_type(DataType::Int32, DataType::Utf8View),
+                    &dictionary_data_type(DataType::Int32, DataType::Utf8),
                 )
                 .unwrap()
             })

@@ -1,4 +1,4 @@
-use arrow_array::{cast::AsArray, types::Int64Type, Int32Array};
+use arrow_array::{cast::AsArray, types::Int64Type, Int32Array, StringArray};
 use arrow_compile_compute::dictionary_data_type;
 use arrow_schema::DataType;
 use proptest::proptest;
@@ -37,6 +37,18 @@ proptest! {
         let our_res = arrow_compile_compute::cast::cast(&arr1, &dt).unwrap();
         let our_res = our_res.as_dictionary::<Int64Type>();
         assert_eq!(our_res.len(), arr_res.len());
+    }
 
+    #[test]
+    fn test_str_cast_dict(arr: Vec<String>) {
+        let arr1 = StringArray::from(arr.clone());
+        let dt = dictionary_data_type(DataType::Int64, DataType::Utf8);
+
+        let arr_res = arrow_cast::cast(&arr1, &dt).unwrap();
+        let arr_res = arr_res.as_dictionary::<Int64Type>();
+
+        let our_res = arrow_compile_compute::cast::cast(&arr1, &dt).unwrap();
+        let our_res = our_res.as_dictionary::<Int64Type>();
+        assert_eq!(our_res.len(), arr_res.len());
     }
 }

@@ -1,14 +1,73 @@
+use std::sync::Arc;
+
 use super::{ArrowKernelError, Kernel};
 use crate::{
     dsl::{DSLKernel, KernelOutputType},
     PrimitiveType,
 };
-use arrow_array::{Array, ArrayRef};
+use arrow_array::{
+    cast::AsArray,
+    types::{Int16Type, Int32Type, Int64Type, Int8Type},
+    Array, ArrayRef, StringArray,
+};
 use arrow_schema::DataType;
 
-pub struct CastKernel(DSLKernel);
+pub struct CastKernel {
+    k: DSLKernel,
+    tar: DataType,
+}
 unsafe impl Sync for CastKernel {}
 unsafe impl Send for CastKernel {}
+
+fn coalesce_type(res: ArrayRef, tar: &DataType) -> Result<ArrayRef, ArrowKernelError> {
+    if res.data_type() == tar {
+        return Ok(res);
+    }
+
+    // might need to translate binary type to string type
+    match (res.data_type(), tar) {
+        (DataType::Binary, DataType::Utf8) => {
+            let res = res.as_binary();
+            let (offsets, data, nulls) = res.clone().into_parts();
+            let s = Arc::new(unsafe { StringArray::new_unchecked(offsets, data, nulls) });
+            Ok(s)
+        }
+        (DataType::Dictionary(kt, _vt), DataType::Dictionary(t_kt, t_vt)) if kt == t_kt => {
+            match kt.as_ref() {
+                DataType::Int8 => {
+                    let res = res.as_dictionary::<Int8Type>();
+                    Ok(Arc::new(res.with_values(coalesce_type(
+                        res.values().clone(),
+                        t_vt.as_ref(),
+                    )?)))
+                }
+                DataType::Int16 => {
+                    let res = res.as_dictionary::<Int16Type>();
+                    Ok(Arc::new(res.with_values(coalesce_type(
+                        res.values().clone(),
+                        t_vt.as_ref(),
+                    )?)))
+                }
+                DataType::Int32 => {
+                    let res = res.as_dictionary::<Int32Type>();
+                    Ok(Arc::new(res.with_values(coalesce_type(
+                        res.values().clone(),
+                        t_vt.as_ref(),
+                    )?)))
+                }
+                DataType::Int64 => {
+                    let res = res.as_dictionary::<Int64Type>();
+                    Ok(Arc::new(res.with_values(coalesce_type(
+                        res.values().clone(),
+                        t_vt.as_ref(),
+                    )?)))
+                }
+                _ => unreachable!("invalid dictionary key type {}", kt),
+            }
+        }
+        _ => todo!("unable to coalesce {} into {}", res.data_type(), tar),
+    }
+}
 
 impl Kernel for CastKernel {
     type Key = (DataType, DataType);
@@ -23,22 +82,24 @@ impl Kernel for CastKernel {
     type Output = ArrayRef;
 
     fn call(&self, inp: Self::Input<'_>) -> Result<Self::Output, ArrowKernelError> {
-        self.0.call(&[&inp])
+        let res = self.k.call(&[&inp])?;
+        coalesce_type(res, &self.tar)
     }
 
     fn compile(arr: &Self::Input<'_>, params: Self::Params) -> Result<Self, ArrowKernelError> {
         let tar = params;
         let out_type = KernelOutputType::for_data_type(&tar).map_err(ArrowKernelError::DSLError)?;
 
-        Ok(CastKernel(
-            DSLKernel::compile(&[arr], |ctx| {
+        Ok(CastKernel {
+            k: DSLKernel::compile(&[arr], |ctx| {
                 let arr = ctx.get_input(0)?;
                 ctx.iter_over(vec![arr])
                     .map(|i| vec![i[0].convert(PrimitiveType::for_arrow_type(&tar))])
                     .collect(out_type)
             })
             .map_err(ArrowKernelError::DSLError)?,
-        ))
+            tar,
+        })
     }
 
     fn get_key_for_input(
@@ -143,8 +204,9 @@ mod tests {
         .unwrap();
         let res = k.call(&data).unwrap();
         assert_eq!(res.len(), 6);
+
         let res = res.as_dictionary::<Int8Type>();
-        let strv = res.values().as_string_view();
+        let strv = res.values().as_string::<i32>();
         assert_eq!("this", strv.value(0));
         assert_eq!("is", strv.value(1));
         assert_eq!("a test", strv.value(2));

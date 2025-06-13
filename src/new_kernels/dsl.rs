@@ -46,6 +46,7 @@ pub enum DSLError {
     TypeMismatch(String),
     BooleanExpected(String),
     UnusedInput(String),
+    UnsupportedDictionaryValueType(DataType),
     NoIteration,
 }
 
@@ -1152,10 +1153,41 @@ fn build_kernel<'a>(
             build_kernel_with_writer::<BooleanWriter>(ctx, inputs, program)
         }
         KernelOutputType::View => todo!(),
-        KernelOutputType::Dictionary(key) => {
-            todo!()
-        }
+        KernelOutputType::Dictionary(key) => match key {
+            DictKeyType::Int8 => build_dict_kernel::<Int8Type>(ctx, inputs, program),
+            DictKeyType::Int16 => build_dict_kernel::<Int16Type>(ctx, inputs, program),
+            DictKeyType::Int32 => build_dict_kernel::<Int32Type>(ctx, inputs, program),
+            DictKeyType::Int64 => build_dict_kernel::<Int64Type>(ctx, inputs, program),
+        },
         KernelOutputType::RunEnd => todo!(),
+    }
+}
+
+fn build_dict_kernel<'a, T: ArrowDictionaryKeyType>(
+    ctx: &'a Context,
+    inputs: &[&dyn Datum],
+    program: SealedKernelProgram<'_>,
+) -> Result<
+    (
+        Vec<KernelInputType>,
+        JitFunction<'a, unsafe extern "C" fn(*mut c_void) -> u64>,
+    ),
+    DSLError,
+> {
+    if program.out_type().is_primitive() {
+        build_kernel_with_writer::<DictWriter<T, PrimitiveArrayWriter>>(ctx, inputs, program)
+    } else {
+        match program.out_type() {
+            DataType::Binary | DataType::Utf8 => build_kernel_with_writer::<
+                DictWriter<T, StringArrayWriter<i32>>,
+            >(ctx, inputs, program),
+            DataType::LargeBinary | DataType::LargeUtf8 => build_kernel_with_writer::<
+                DictWriter<T, StringArrayWriter<i64>>,
+            >(ctx, inputs, program),
+            _ => Err(DSLError::UnsupportedDictionaryValueType(
+                program.out_type().clone(),
+            )),
+        }
     }
 }
 
