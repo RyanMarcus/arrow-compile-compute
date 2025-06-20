@@ -22,35 +22,49 @@ pub struct SetBitIterator {
 
 impl From<&BooleanArray> for Box<SetBitIterator> {
     fn from(value: &BooleanArray) -> Self {
-        let all_byte = value.values().values()[value.offset() / 8];
-        let index_into_byte = value.offset() % 8;
-        // We might have stuff in the byte that shouldn't be iterated over
-        let mask = !((1u8 << index_into_byte) - 1);
-        let byte = all_byte & mask;
+        // Note that an array like [true, true, false, false], [true, false, true, false]
+        // is packed as 0011, 0101.
 
-        // Note that we are indexing by byte (with each byte containing
-        // eight values)
-        let start_index = ((value.offset() as u64) / 8) + 1;
-        let end_index = 1 + ((value.len() + (value.offset() % 8) - 1) / 8) as u64;
+        // We are indexing by byte (with each byte containing eight values)
+        let mut start_index = value.offset() / 8;
+        let byte_len = 1 + ((value.len() + (value.offset() % 8) - 1) / 8);
+        let end_index = start_index + byte_len;
+        
+        // Load the first byte
+        // We need to remove least significant bits because of slicing
+        let all_first_byte = value.values().values()[start_index];
+        let index_into_first_byte = value.offset() % 8;
+        let mask = !((1u8 << index_into_first_byte) - 1);
+        let mut byte = all_first_byte & mask;
+        start_index += 1;
 
+        // Load the last byte
+        // We need to remove significant bits because of slicing
         let all_end_byte = value.values().values()[end_index as usize - 1];
         let index_into_end_byte = (value.len() + value.offset()) % 8;
-        let end_byte = if index_into_end_byte == 0 {
+        let mut end_byte = if index_into_end_byte == 0 {
             all_end_byte
         } else {
             let end_mask = (!0u8) >> (8 - index_into_end_byte);
             all_end_byte & end_mask
         };
 
+        // Special case where the first byte is the same as the last byte
+        if value.len() < 8 {
+            let one_byte = byte & end_byte;
+            byte = one_byte;
+            end_byte = one_byte;
+        }
+
         println!("Working");
-        println!("Input. Offset: {}, Len: {}, All Byte: {:08b}", value.offset(), value.len(), all_byte);
+        println!("Input. Offset: {}, Len: {}, All Byte: {:08b}", value.offset(), value.len(), all_first_byte);
         println!("start_index: {}, end_index: {}, byte: {:08b}", start_index, end_index, byte);
         println!("all_end_byte: {:08b}, end_byte: {:08b}", all_end_byte, end_byte);
 
         Box::new(SetBitIterator {
             data: value.values().values().as_ptr(),
-            index: start_index,
-            end_index,
+            index: start_index as u64,
+            end_index: end_index as u64,
             byte,
             end_byte,
         })
@@ -446,6 +460,58 @@ mod tests {
         }
     }
 
+    #[test]
+    fn test_setbit_slice5() {
+        let data = BooleanArray::from(vec![
+            true, true, false, true, false, false, false, true, true, true,
+        ]);
+        let data2 = data.slice(1, 4);
+        
+        array_to_setbit_iter(&data);
+        let mut iter = array_to_setbit_iter(&data2);
+
+        let ctx = Context::create();
+        let module = ctx.create_module("setbit_test");
+        let func = generate_next(&ctx, &module, "setbit_iter", data.data_type(), &iter).unwrap();
+        let fname = func.get_name().to_str().unwrap();
+        
+        module.verify().unwrap();
+
+        let ee = module
+            .create_jit_execution_engine(OptimizationLevel::None)
+            .unwrap();
+
+        let next_func = unsafe {
+            ee.get_function::<unsafe extern "C" fn(*mut c_void, *mut u64) -> bool>(fname)
+                .unwrap()
+        };
+
+        let mut buf: u64 = 0;
+        unsafe {
+            assert_eq!(
+                next_func.call(iter.get_mut_ptr(), &mut buf as *mut u64),
+                true
+            );
+            assert_eq!(buf, 1);
+            assert_eq!(
+                next_func.call(iter.get_mut_ptr(), &mut buf as *mut u64),
+                true
+            );
+            assert_eq!(buf, 3);
+            assert_eq!(
+                next_func.call(iter.get_mut_ptr(), &mut buf as *mut u64),
+                false
+            );
+            assert_eq!(
+                next_func.call(iter.get_mut_ptr(), &mut buf as *mut u64),
+                false
+            );
+            assert_eq!(
+                next_func.call(iter.get_mut_ptr(), &mut buf as *mut u64),
+                false
+            );
+        }
+    }
 
     #[test]
     fn test_setbit_iter() {
