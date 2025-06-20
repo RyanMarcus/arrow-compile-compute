@@ -927,6 +927,8 @@ pub fn generate_next<'a>(
                 get_next_byte_loop,
                 none_left,
                 get_next,
+                get_next_intermediate,
+                get_next_end,
                 use_byte
             );
 
@@ -972,8 +974,24 @@ pub fn generate_next<'a>(
                 .unwrap();
 
             build.position_at_end(get_next);
+            let end_index_minus_one = build
+                .build_int_sub(end_index, i64_type.const_int(1, false), "end_index_minus_1")
+                .unwrap();
+            let cmp_index_to_end_index_minus_1 = build
+                .build_int_compare(IntPredicate::EQ, index, end_index_minus_one, "cmp_index_to_end_index_minus_1")
+                .unwrap();
+            build
+                .build_conditional_branch(cmp_index_to_end_index_minus_1, get_next_end, get_next_intermediate)
+                .unwrap();
+            
+            build.position_at_end(get_next_end);
+            setbit_iterator.llvm_load_end_byte(ctx, &build, iter_ptr);
             setbit_iterator.llvm_increment_index(ctx, &build, iter_ptr, i64_type.const_int(1, false));
+            build.build_unconditional_branch(while_loop).unwrap();
+
+            build.position_at_end(get_next_intermediate);
             setbit_iterator.llvm_load_byte_at_index(ctx, &build, iter_ptr);
+            setbit_iterator.llvm_increment_index(ctx, &build, iter_ptr, i64_type.const_int(1, false));
             build.build_unconditional_branch(while_loop).unwrap();
 
             build.position_at_end(use_byte);
@@ -994,10 +1012,13 @@ pub fn generate_next<'a>(
                 .unwrap();
             setbit_iterator.llvm_clear_trailing_bit(ctx, &build, iter_ptr);
             let setbit_position = build
-                .build_int_mul(index, i64_type.const_int(8, false), "pos_mul_8")
+                .build_int_sub(index, i64_type.const_int(1, false), "pos_sub_1")
                 .unwrap();
             let setbit_position = build
-                .build_int_add(setbit_position, tz_i64, "add_tz")
+                .build_int_mul(setbit_position, i64_type.const_int(8, false), "pos_mul_8")
+                .unwrap();
+            let setbit_position = build
+                .build_int_add(setbit_position, tz_i64, "pos_add_tz")
                 .unwrap();
             build.build_store(out_ptr, setbit_position).unwrap();
             build
