@@ -1,7 +1,9 @@
 use std::ffi::c_void;
 use std::marker::PhantomData;
 
-use crate::{declare_blocks, increment_pointer, pointer_diff, ptr_to_global, PrimitiveType};
+use crate::{
+    declare_blocks, declare_global_pointer, increment_pointer, pointer_diff, PrimitiveType,
+};
 
 use arrow_array::{GenericBinaryArray, GenericByteArray, OffsetSizeTrait};
 use arrow_buffer::{Buffer, OffsetBuffer, ScalarBuffer};
@@ -99,8 +101,10 @@ impl<'a, T: OffsetSizeTrait> ArrayWriter<'a> for StringArrayWriter<'a, T> {
             .unwrap()
             .into_pointer_value();
 
-        let global_offsets_ptr_ptr = ptr_to_global!(llvm_mod, STRING_WRITER_OFFSETS_PTR_PTR);
-        let global_data_ptr_ptr = ptr_to_global!(llvm_mod, STRING_WRITER_DATA_PTR_PTR);
+        let global_offsets_ptr_ptr =
+            declare_global_pointer!(llvm_mod, STRING_WRITER_OFFSETS_PTR_PTR).as_pointer_value();
+        let global_data_ptr_ptr =
+            declare_global_pointer!(llvm_mod, STRING_WRITER_DATA_PTR_PTR).as_pointer_value();
         build
             .build_store(
                 global_data_ptr_ptr,

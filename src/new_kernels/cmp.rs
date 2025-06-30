@@ -599,6 +599,9 @@ fn add_float_to_int<'a>(
     func
 }
 
+/// Adds or returns the `memcmp` function to the module.
+///
+/// `memcmp` takes two `PrimitiveType::P64x2` values.
 pub fn add_memcmp<'a>(ctx: &'a Context, module: &Module<'a>) -> FunctionValue<'a> {
     if let Some(func) = module.get_function("memcmp") {
         return func;

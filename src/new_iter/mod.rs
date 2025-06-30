@@ -5,6 +5,7 @@ mod runend;
 mod scalar;
 mod setbit;
 mod string;
+mod view;
 
 use std::ffi::c_void;
 
@@ -35,7 +36,10 @@ use scalar::{ScalarPrimitiveIterator, ScalarStringIterator};
 use setbit::SetBitIterator;
 use string::{LargeStringIterator, StringIterator};
 
-use crate::{declare_blocks, increment_pointer, ArrowKernelError, PrimitiveType};
+use crate::{
+    declare_blocks, increment_pointer, new_iter::view::ViewIterator, ArrowKernelError,
+    PrimitiveType,
+};
 
 pub fn array_to_setbit_iter(arr: &BooleanArray) -> Result<IteratorHolder, ArrowKernelError> {
     Ok(IteratorHolder::SetBit((arr).into()))
@@ -196,6 +200,7 @@ pub enum IteratorHolder {
     Primitive(Box<PrimitiveIterator>),
     String(Box<StringIterator>),
     LargeString(Box<LargeStringIterator>),
+    View(Box<ViewIterator>),
     Bitmap(Box<BitmapIterator>),
     SetBit(Box<SetBitIterator>),
     Dictionary {
@@ -220,6 +225,7 @@ impl IteratorHolder {
             IteratorHolder::Primitive(iter) => &mut **iter as *mut _ as *mut c_void,
             IteratorHolder::String(iter) => &mut **iter as *mut _ as *mut c_void,
             IteratorHolder::LargeString(iter) => &mut **iter as *mut _ as *mut c_void,
+            IteratorHolder::View(iter) => &mut **iter as *mut _ as *mut c_void,
             IteratorHolder::Bitmap(iter) => &mut **iter as *mut _ as *mut c_void,
             IteratorHolder::SetBit(iter) => &mut **iter as *mut _ as *mut c_void,
             IteratorHolder::Dictionary { arr: iter, .. } => &mut **iter as *mut _ as *mut c_void,
@@ -243,36 +249,13 @@ impl IteratorHolder {
             IteratorHolder::Primitive(iter) => &**iter as *const _ as *const c_void,
             IteratorHolder::String(iter) => &**iter as *const _ as *const c_void,
             IteratorHolder::LargeString(iter) => &**iter as *const _ as *const c_void,
+            IteratorHolder::View(iter) => &**iter as *const _ as *const c_void,
             IteratorHolder::Bitmap(iter) => &**iter as *const _ as *const c_void,
             IteratorHolder::SetBit(iter) => &**iter as *const _ as *const c_void,
             IteratorHolder::Dictionary { arr: iter, .. } => &**iter as *const _ as *const c_void,
             IteratorHolder::RunEnd { arr: iter, .. } => &**iter as *const _ as *const c_void,
             IteratorHolder::ScalarPrimitive(iter) => &**iter as *const _ as *const c_void,
             IteratorHolder::ScalarString(iter) => &**iter as *const _ as *const c_void,
-        }
-    }
-
-    /// If this iterator has a base pointer, generate LLVM code to fetch it. The
-    /// base pointer is a pointer to the start of the data section for an array,
-    /// such as a string array or a binary array.
-    pub fn llvm_get_base_ptr<'a>(
-        &self,
-        ctx: &'a Context,
-        build: &'a Builder,
-        ptr: PointerValue<'a>,
-    ) -> Option<PointerValue<'a>> {
-        match self {
-            IteratorHolder::String(s) => Some(s.llvm_get_data_ptr(ctx, build, ptr)),
-            IteratorHolder::LargeString(s) => Some(s.llvm_get_data_ptr(ctx, build, ptr)),
-            IteratorHolder::Dictionary { arr, values, .. } => {
-                let val_ptr = arr.llvm_val_iter_ptr(ctx, build, ptr);
-                values.llvm_get_base_ptr(ctx, build, val_ptr)
-            }
-            IteratorHolder::RunEnd { arr, values, .. } => {
-                let val_ptr = arr.llvm_val_iter_ptr(ctx, build, ptr);
-                values.llvm_get_base_ptr(ctx, build, val_ptr)
-            }
-            _ => None,
         }
     }
 }
@@ -350,6 +333,7 @@ pub fn generate_next_block<'a, const N: u32>(
             Some(next)
         }
         IteratorHolder::String(_) | IteratorHolder::LargeString(_) => None,
+        IteratorHolder::View(_) => None,
         IteratorHolder::Bitmap(_bitmap_iterator) => todo!(),
         IteratorHolder::SetBit(_) => unimplemented!("No block iterator for setbit!"),
         IteratorHolder::Dictionary { arr, keys, values } => match dt {
@@ -891,6 +875,14 @@ pub fn generate_next<'a>(
                 .unwrap();
 
             Some(next)
+        }
+        IteratorHolder::View(iter) => {
+            declare_blocks!(ctx, next, entry, none_left, get_next);
+
+            build.position_at_end(entry);
+            let curr_pos = iter.llvm_pos(ctx, &build, iter_ptr);
+            let curr_len = iter.llvm_len(ctx, &build, iter_ptr);
+            todo!()
         }
         IteratorHolder::Bitmap(bitmap_iterator) => {
             let access = generate_random_access(ctx, llvm_mod, label, dt, ih).unwrap();
@@ -1444,6 +1436,75 @@ pub fn generate_random_access<'a>(
                 .build_insert_value(to_return, ptr2, 1, "to_return")
                 .unwrap();
             build.build_return(Some(&to_return)).unwrap();
+            Some(access_f)
+        }
+        IteratorHolder::View(iter) => {
+            let i128_type = ctx.i128_type();
+            let i32_type = ctx.i32_type();
+            let ret_type = PrimitiveType::P64x2.llvm_type(ctx).into_struct_type();
+
+            declare_blocks!(ctx, access_f, entry, short_str, long_str);
+
+            build.position_at_end(entry);
+            let view_ptr = iter.llvm_view_ptr(ctx, &build, iter_ptr);
+            let our_view_ptr = increment_pointer!(ctx, build, view_ptr, 16, idx);
+            let our_view = build
+                .build_load(i128_type, our_view_ptr, "our_view")
+                .unwrap()
+                .into_int_value();
+            let as_vec = build
+                .build_bit_cast(our_view, i32_type.vec_type(4), "as_vec")
+                .unwrap()
+                .into_vector_value();
+            let str_len = build
+                .build_extract_element(as_vec, i64_type.const_zero(), "str_len")
+                .unwrap()
+                .into_int_value();
+            let cmp = build
+                .build_int_compare(
+                    IntPredicate::SLE,
+                    str_len,
+                    i32_type.const_int(12, true),
+                    "cmp",
+                )
+                .unwrap();
+            build
+                .build_conditional_branch(cmp, short_str, long_str)
+                .unwrap();
+
+            build.position_at_end(short_str);
+            let ptr1 = increment_pointer!(ctx, build, our_view_ptr, 4);
+            let ptr2 = increment_pointer!(ctx, build, ptr1, 1, str_len);
+            let to_return = ret_type.const_zero();
+            let to_return = build
+                .build_insert_value(to_return, ptr1, 0, "to_return")
+                .unwrap();
+            let to_return = build
+                .build_insert_value(to_return, ptr2, 1, "to_return")
+                .unwrap();
+            build.build_return(Some(&to_return)).unwrap();
+
+            build.position_at_end(long_str);
+            let buf_idx = build
+                .build_extract_element(as_vec, i64_type.const_int(2, false), "buf_idx")
+                .unwrap()
+                .into_int_value();
+            let buf_base = iter.llvm_buffer_ptr(ctx, &build, iter_ptr, buf_idx);
+            let offset = build
+                .build_extract_element(as_vec, i64_type.const_int(3, false), "offset")
+                .unwrap()
+                .into_int_value();
+            let ptr1 = increment_pointer!(ctx, build, buf_base, 1, offset);
+            let ptr2 = increment_pointer!(ctx, build, ptr1, 1, str_len);
+            let to_return = ret_type.const_zero();
+            let to_return = build
+                .build_insert_value(to_return, ptr1, 0, "to_return")
+                .unwrap();
+            let to_return = build
+                .build_insert_value(to_return, ptr2, 1, "to_return")
+                .unwrap();
+            build.build_return(Some(&to_return)).unwrap();
+
             Some(access_f)
         }
         IteratorHolder::Bitmap(bitmap_iterator) => {

@@ -102,7 +102,7 @@ impl<'a> ArrayWriter<'a> for PrimitiveArrayWriter<'a> {
         let func_name = format!("ingest_prim_{}b", width);
 
         // Create or retrieve the ingest function:
-        let ingest_func = llvm_mod.get_function(&func_name).unwrap_or_else(|| {
+        let ingest_func = {
             let b2 = ctx.create_builder();
             let fn_type = ctx.void_type().fn_type(&[ty.llvm_type(ctx).into()], false);
             let func = llvm_mod.add_function(&func_name, fn_type, Some(Linkage::Private));
@@ -120,7 +120,7 @@ impl<'a> ArrayWriter<'a> for PrimitiveArrayWriter<'a> {
             b2.build_store(global_alloc_ptr_ptr, new_ptr).unwrap();
             b2.build_return(None).unwrap();
             func
-        });
+        };
 
         PrimitiveArrayWriter { ingest_func }
     }

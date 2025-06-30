@@ -44,29 +44,10 @@ impl<'a, K: ArrowDictionaryKeyType, VW: ArrayWriter<'a>> WriterAllocation
     }
 
     fn to_array(self, len: usize, nulls: Option<arrow_buffer::NullBuffer>) -> Self::Output {
-        let keys = self.keys.to_array(len, None).into_data();
-        assert_eq!(
-            keys.buffers().len(),
-            1,
-            "invalid key type for dictionary writer (multiple buffers)"
-        );
-        let values = self.values.to_array(self.tt.len(), None);
-
-        unsafe {
-            make_array(
-                ArrayDataBuilder::new(dictionary_data_type(
-                    keys.data_type().clone(),
-                    values.data_type().clone(),
-                ))
-                .add_buffer(keys.buffers()[0].clone())
-                .add_child_data(values.into_data())
-                .len(len)
-                .nulls(nulls)
-                .build_unchecked(),
-            )
-        }
-        .as_dictionary::<K>()
-        .clone()
+        let keys = self.keys.to_array(len, nulls);
+        let keys = keys.as_primitive::<K>().clone();
+        let values = make_array(self.values.to_array(self.tt.len(), None).to_data());
+        unsafe { DictionaryArray::<K>::new_unchecked(keys, values) }
     }
 }
 

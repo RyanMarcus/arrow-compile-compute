@@ -28,16 +28,16 @@ pub use arrow_interface::select;
 pub use new_kernels::dsl;
 pub use new_kernels::ArrowKernelError;
 
-macro_rules! ptr_to_global {
+macro_rules! declare_global_pointer {
     ($module:expr, $label:ident) => {{
         let ptr_type = $module.get_context().ptr_type(AddressSpace::default());
         let global_var = $module.add_global(ptr_type, None, stringify!($label));
         global_var.set_initializer(&ptr_type.const_null());
-        global_var.set_linkage(Linkage::Private);
-        global_var.as_pointer_value()
+        global_var.set_linkage(inkwell::module::Linkage::Private);
+        global_var
     }};
 }
-pub(crate) use ptr_to_global;
+pub(crate) use declare_global_pointer;
 
 /// Declare a set of basic blocks at once
 macro_rules! declare_blocks {
@@ -176,8 +176,32 @@ enum ComparisonType {
     String,
 }
 
+impl std::fmt::Display for PrimitiveType {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            PrimitiveType::I8 => "I8".fmt(f),
+            PrimitiveType::I16 => "I16".fmt(f),
+            PrimitiveType::I32 => "I32".fmt(f),
+            PrimitiveType::I64 => "I64".fmt(f),
+            PrimitiveType::U8 => "U8".fmt(f),
+            PrimitiveType::U16 => "U16".fmt(f),
+            PrimitiveType::U32 => "U32".fmt(f),
+            PrimitiveType::U64 => "U64".fmt(f),
+            PrimitiveType::P64x2 => "P64x2".fmt(f),
+            PrimitiveType::F16 => "F16".fmt(f),
+            PrimitiveType::F32 => "F32".fmt(f),
+            PrimitiveType::F64 => "F64".fmt(f),
+        }
+    }
+}
+
 impl PrimitiveType {
-    fn width(&self) -> usize {
+    const fn max_width() -> usize {
+        16
+    }
+    const fn width(&self) -> usize {
+        // if any of these widths are updated, make sure to check `max_width` as
+        // well!
         match self {
             PrimitiveType::I8 | PrimitiveType::U8 => 1,
             PrimitiveType::I16 | PrimitiveType::U16 => 2,

@@ -6,12 +6,13 @@ use inkwell::{
     builder::Builder,
     context::Context,
     module::Module,
-    values::{BasicValueEnum, PointerValue},
+    values::{BasicValueEnum, IntValue, PointerValue},
 };
 
 mod array_writer;
 mod bool_writer;
 mod dict_writer;
+mod ree_writer;
 mod str_writer;
 
 pub use array_writer::PrimitiveArrayWriter;
