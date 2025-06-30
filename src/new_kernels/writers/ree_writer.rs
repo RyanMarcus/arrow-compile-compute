@@ -352,6 +352,7 @@ mod tests {
         types::{Int32Type, Int64Type},
         Int32Array,
     };
+    use arrow_schema::DataType;
     use inkwell::{
         context::Context, module::Module, passes::PassManagerSubType, AddressSpace,
         OptimizationLevel,
@@ -416,7 +417,7 @@ mod tests {
             f.call(data.get_ptr());
         }
         let ree = data.to_array(5, None);
-        panic!("{:?}", ree);
+        arrow_cast::cast(&ree, &DataType::Int32).unwrap();
     }
 
     #[test]
