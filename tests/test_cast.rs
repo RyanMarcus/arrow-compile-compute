@@ -1,6 +1,11 @@
-use arrow_array::{cast::AsArray, types::Int64Type, Int32Array, StringArray};
-use arrow_compile_compute::dictionary_data_type;
+use arrow_array::{
+    cast::AsArray,
+    types::{Int32Type, Int64Type},
+    Int32Array, PrimitiveArray, RunArray, StringArray,
+};
+use arrow_compile_compute::{dictionary_data_type, run_end_data_type};
 use arrow_schema::DataType;
+use itertools::Itertools;
 use proptest::proptest;
 
 proptest! {
@@ -29,14 +34,24 @@ proptest! {
     #[test]
     fn test_prim_i32_cast_dict(arr: Vec<i32>) {
         let arr1 = Int32Array::from(arr.clone());
-        let dt = dictionary_data_type(DataType::Int64, DataType::Int32);
 
-        let arr_res = arrow_cast::cast(&arr1, &dt).unwrap();
-        let arr_res = arr_res.as_dictionary::<Int64Type>();
+        let dt = dictionary_data_type(DataType::Int64, DataType::Int32);
+        let our_res = arrow_compile_compute::cast::cast(&arr1, &dt).unwrap();
+        let our_res = our_res.as_dictionary::<Int64Type>().downcast_dict::<PrimitiveArray<Int32Type>>().unwrap();
+        let our_res = our_res.into_iter().map(|x| x.unwrap()).collect_vec();
+        assert_eq!(our_res, arr);
+    }
+
+    #[test]
+    fn test_prim_i32_cast_ree(arr: Vec<i32>) {
+        let arr1 = Int32Array::from(arr.clone());
+        let dt = run_end_data_type(&DataType::Int64, &DataType::Int32);
 
         let our_res = arrow_compile_compute::cast::cast(&arr1, &dt).unwrap();
-        let our_res = our_res.as_dictionary::<Int64Type>();
-        assert_eq!(our_res.len(), arr_res.len());
+        let our_res = our_res.as_any().downcast_ref::<RunArray<Int64Type>>().unwrap();
+        let our_res = our_res.downcast::<PrimitiveArray<Int32Type>>().unwrap();
+        let our_res = our_res.into_iter().map(|x| x.unwrap()).collect_vec();
+        assert_eq!(our_res, arr);
     }
 
     #[test]

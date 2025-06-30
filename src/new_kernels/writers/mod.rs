@@ -18,6 +18,7 @@ mod str_writer;
 pub use array_writer::PrimitiveArrayWriter;
 pub use bool_writer::BooleanWriter;
 pub use dict_writer::DictWriter;
+pub use ree_writer::REEWriter;
 pub use str_writer::StringArrayWriter;
 
 use crate::PrimitiveType;

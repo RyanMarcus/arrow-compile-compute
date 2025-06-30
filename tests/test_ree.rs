@@ -34,7 +34,6 @@ proptest! {
         let arrow_casted = Int32Array::from_iter(run_array.downcast::<Int32Array>().unwrap());
         let our_casted = arrow_compile_compute::cast::cast(&run_array, &DataType::Int32).unwrap();
 
-
         assert_eq!(&arrow_casted as &dyn Array, &our_casted);
     }
 

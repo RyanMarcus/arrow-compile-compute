@@ -7,8 +7,8 @@ use std::{
 
 use arrow_array::{
     cast::AsArray,
-    types::{ArrowDictionaryKeyType, Int16Type, Int32Type, Int64Type, Int8Type},
-    Array, ArrayRef, BooleanArray, Datum, DictionaryArray, StringArray,
+    types::{ArrowDictionaryKeyType, Int16Type, Int32Type, Int64Type, Int8Type, RunEndIndexType},
+    Array, ArrayRef, BooleanArray, Datum, DictionaryArray, RunArray, StringArray,
 };
 use arrow_schema::DataType;
 use inkwell::{
@@ -32,7 +32,10 @@ use crate::{
     new_kernels::{
         cmp::{add_float_vec_to_int_vec, add_memcmp},
         gen_convert_numeric_vec, link_req_helpers, optimize_module, set_noalias_params,
-        writers::{ArrayWriter, BooleanWriter, DictWriter, PrimitiveArrayWriter, WriterAllocation},
+        writers::{
+            ArrayWriter, BooleanWriter, DictWriter, PrimitiveArrayWriter, REEWriter,
+            WriterAllocation,
+        },
     },
     ComparisonType, Predicate, PrimitiveType,
 };
@@ -138,13 +141,20 @@ pub enum DictKeyType {
 }
 
 #[derive(Debug, Copy, Clone, PartialEq, Eq)]
+pub enum RunEndType {
+    Int16,
+    Int32,
+    Int64,
+}
+
+#[derive(Debug, Copy, Clone, PartialEq, Eq)]
 pub enum KernelOutputType {
     Array,
     String,
     View,
     Boolean,
     Dictionary(DictKeyType),
-    RunEnd,
+    RunEnd(RunEndType),
 }
 
 impl KernelOutputType {
@@ -195,7 +205,15 @@ impl KernelOutputType {
             DataType::Decimal128(_, _) => todo!(),
             DataType::Decimal256(_, _) => todo!(),
             DataType::Map(..) => todo!(),
-            DataType::RunEndEncoded(..) => Ok(KernelOutputType::RunEnd),
+            DataType::RunEndEncoded(k, _v) => match k.data_type() {
+                DataType::Int16 => Ok(KernelOutputType::RunEnd(RunEndType::Int16)),
+                DataType::Int32 => Ok(KernelOutputType::RunEnd(RunEndType::Int32)),
+                DataType::Int64 => Ok(KernelOutputType::RunEnd(RunEndType::Int64)),
+                _ => Err(DSLError::TypeMismatch(format!(
+                    "run end type must i16, i32, or i64, but has type {}",
+                    dt
+                ))),
+            },
         }
     }
     /// Determines if this output type can collect the passed data type. For
@@ -229,7 +247,7 @@ impl KernelOutputType {
             }
             KernelOutputType::View => todo!(),
             KernelOutputType::Dictionary(_) => {}
-            KernelOutputType::RunEnd => todo!(),
+            KernelOutputType::RunEnd(_) => {}
         };
 
         Ok(())
@@ -1108,7 +1126,17 @@ impl DSLKernel {
                     Arc::new(self.exec_to_dict::<Int64Type>(ptrs, max_len, p_out_type))
                 }
             }),
-            KernelOutputType::RunEnd => todo!(),
+            KernelOutputType::RunEnd(re_type) => Ok(match re_type {
+                RunEndType::Int16 => {
+                    Arc::new(self.exec_to_ree::<Int16Type>(ptrs, max_len, p_out_type))
+                }
+                RunEndType::Int32 => {
+                    Arc::new(self.exec_to_ree::<Int32Type>(ptrs, max_len, p_out_type))
+                }
+                RunEndType::Int64 => {
+                    Arc::new(self.exec_to_ree::<Int64Type>(ptrs, max_len, p_out_type))
+                }
+            }),
         }
     }
 
@@ -1129,6 +1157,32 @@ impl DSLKernel {
             }
             _ => {
                 let mut alloc = DictWriter::<K, PrimitiveArrayWriter>::allocate(max_len, pt);
+                ptrs.push(alloc.get_ptr());
+                let mut kp = KernelParameters::new(ptrs);
+
+                let num_results = unsafe { self.borrow_func().1.call(kp.get_mut_ptr()) };
+                alloc.to_array(num_results as usize, None)
+            }
+        }
+    }
+
+    fn exec_to_ree<K: RunEndIndexType>(
+        &self,
+        mut ptrs: Vec<*mut c_void>,
+        max_len: usize,
+        pt: PrimitiveType,
+    ) -> RunArray<K> {
+        match pt {
+            PrimitiveType::P64x2 => {
+                let mut alloc = REEWriter::<K, StringArrayWriter<i32>>::allocate(max_len, pt);
+                ptrs.push(alloc.get_ptr());
+                let mut kp = KernelParameters::new(ptrs);
+
+                let num_results = unsafe { self.borrow_func().1.call(kp.get_mut_ptr()) };
+                alloc.to_array(num_results as usize, None)
+            }
+            _ => {
+                let mut alloc = REEWriter::<K, PrimitiveArrayWriter>::allocate(max_len, pt);
                 ptrs.push(alloc.get_ptr());
                 let mut kp = KernelParameters::new(ptrs);
 
@@ -1167,7 +1221,11 @@ fn build_kernel<'a>(
             DictKeyType::Int32 => build_dict_kernel::<Int32Type>(ctx, inputs, program),
             DictKeyType::Int64 => build_dict_kernel::<Int64Type>(ctx, inputs, program),
         },
-        KernelOutputType::RunEnd => todo!(),
+        KernelOutputType::RunEnd(key) => match key {
+            RunEndType::Int16 => build_ree_kernel::<Int16Type>(ctx, inputs, program),
+            RunEndType::Int32 => build_ree_kernel::<Int32Type>(ctx, inputs, program),
+            RunEndType::Int64 => build_ree_kernel::<Int64Type>(ctx, inputs, program),
+        },
     }
 }
 
@@ -1191,6 +1249,34 @@ fn build_dict_kernel<'a, T: ArrowDictionaryKeyType>(
             >(ctx, inputs, program),
             DataType::LargeBinary | DataType::LargeUtf8 => build_kernel_with_writer::<
                 DictWriter<T, StringArrayWriter<i64>>,
+            >(ctx, inputs, program),
+            _ => Err(DSLError::UnsupportedDictionaryValueType(
+                program.out_type().clone(),
+            )),
+        }
+    }
+}
+
+fn build_ree_kernel<'a, T: RunEndIndexType>(
+    ctx: &'a Context,
+    inputs: &[&dyn Datum],
+    program: SealedKernelProgram<'_>,
+) -> Result<
+    (
+        Vec<KernelInputType>,
+        JitFunction<'a, unsafe extern "C" fn(*mut c_void) -> u64>,
+    ),
+    DSLError,
+> {
+    if program.out_type().is_primitive() {
+        build_kernel_with_writer::<REEWriter<T, PrimitiveArrayWriter>>(ctx, inputs, program)
+    } else {
+        match program.out_type() {
+            DataType::Binary | DataType::Utf8 => build_kernel_with_writer::<
+                REEWriter<T, StringArrayWriter<i32>>,
+            >(ctx, inputs, program),
+            DataType::LargeBinary | DataType::LargeUtf8 => build_kernel_with_writer::<
+                REEWriter<T, StringArrayWriter<i64>>,
             >(ctx, inputs, program),
             _ => Err(DSLError::UnsupportedDictionaryValueType(
                 program.out_type().clone(),

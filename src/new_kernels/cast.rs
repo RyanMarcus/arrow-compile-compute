@@ -7,9 +7,11 @@ use crate::{
 };
 use arrow_array::{
     cast::AsArray,
+    make_array,
     types::{Int16Type, Int32Type, Int64Type, Int8Type},
     Array, ArrayRef, StringArray,
 };
+use arrow_data::ArrayDataBuilder;
 use arrow_schema::DataType;
 
 pub struct CastKernel {
@@ -65,6 +67,23 @@ fn coalesce_type(res: ArrayRef, tar: &DataType) -> Result<ArrayRef, ArrowKernelE
                 _ => unreachable!("invalid dictionary key type {}", kt),
             }
         }
+        (DataType::RunEndEncoded(re, _v), DataType::RunEndEncoded(t_re, t_v))
+            if re.data_type() == t_re.data_type() =>
+        {
+            let arr = res.into_data();
+            let res = arr.child_data()[0].clone();
+            let val = make_array(arr.child_data()[1].clone());
+            let val = coalesce_type(val, t_v.data_type())?;
+
+            Ok(make_array(unsafe {
+                ArrayDataBuilder::new(tar.clone())
+                    .len(arr.len())
+                    .add_child_data(res)
+                    .add_child_data(val.into_data())
+                    .build_unchecked()
+            }))
+        }
+
         _ => todo!("unable to coalesce {} into {}", res.data_type(), tar),
     }
 }
@@ -117,7 +136,8 @@ mod tests {
     use arrow_array::{
         cast::AsArray,
         types::{Int32Type, Int8Type},
-        Array, ArrayRef, DictionaryArray, Int32Array, Int64Array, StringArray, UInt8Array,
+        Array, ArrayRef, DictionaryArray, Int32Array, Int64Array, RunArray, StringArray,
+        UInt8Array,
     };
     use arrow_schema::DataType;
     use itertools::Itertools;
@@ -125,6 +145,7 @@ mod tests {
     use crate::{
         dictionary_data_type,
         new_kernels::{CastKernel, Kernel},
+        run_end_data_type,
     };
 
     #[test]
@@ -255,6 +276,35 @@ mod tests {
 
         assert_eq!(res.len(), data.len());
         for (ours, orig) in res.iter().zip(data.iter()) {
+            assert_eq!(ours, orig);
+        }
+    }
+
+    #[test]
+    fn test_str_dict_to_ree() {
+        let data = StringArray::from(vec![
+            "this",
+            "this",
+            "is",
+            "a test",
+            "a test",
+            "a string that is longer than 12 chars",
+        ]);
+        let ddata =
+            arrow_cast::cast::cast(&data, &dictionary_data_type(DataType::Int8, DataType::Utf8))
+                .unwrap();
+
+        let k = CastKernel::compile(
+            &(&ddata as &dyn Array),
+            run_end_data_type(&DataType::Int32, &DataType::Utf8),
+        )
+        .unwrap();
+        let res = k.call(&ddata).unwrap();
+        let res = res.as_any().downcast_ref::<RunArray<Int32Type>>().unwrap();
+        let res = res.downcast::<StringArray>().unwrap();
+
+        assert_eq!(res.len(), data.len());
+        for (ours, orig) in res.into_iter().zip(data.iter()) {
             assert_eq!(ours, orig);
         }
     }
