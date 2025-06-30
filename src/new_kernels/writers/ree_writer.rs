@@ -5,7 +5,7 @@ use arrow_data::ArrayDataBuilder;
 use arrow_schema::{DataType, Field};
 use inkwell::{
     module::Linkage,
-    values::{AnyValue, FunctionValue, GlobalValue, PointerValue},
+    values::{FunctionValue, PointerValue},
     AddressSpace, IntPredicate,
 };
 use repr_offset::ReprOffset;
@@ -43,8 +43,7 @@ impl<'a, K: RunEndIndexType, VW: ArrayWriter<'a>> WriterAllocation for REEAlloca
     }
 
     fn to_array(self, len: usize, nulls: Option<arrow_buffer::NullBuffer>) -> Self::Output {
-        let run_ends = self.res.to_array(len, None);
-        println!("{}, {:?}", K::DATA_TYPE, run_ends);
+        let run_ends = self.res.to_array(self.num_unique as usize, None);
         let res = run_ends.as_primitive::<K>();
         let values = self.values.to_array(self.num_unique as usize, nulls);
 
@@ -53,7 +52,8 @@ impl<'a, K: RunEndIndexType, VW: ArrayWriter<'a>> WriterAllocation for REEAlloca
             Arc::new(Field::new("values", values.data_type().clone(), true)),
         );
 
-        let len = RunArray::logical_len(&res);
+        let rec_len = RunArray::logical_len(&res);
+        assert_eq!(rec_len, len);
         let builder = ArrayDataBuilder::new(ree_array_type)
             .len(len)
             .add_child_data(res.to_data())
@@ -350,26 +350,26 @@ mod tests {
 
     use arrow_array::{
         types::{Int32Type, Int64Type},
-        Int32Array,
+        BinaryArray, Int32Array,
     };
-    use arrow_schema::DataType;
-    use inkwell::{
-        context::Context, module::Module, passes::PassManagerSubType, AddressSpace,
-        OptimizationLevel,
-    };
+    use inkwell::{context::Context, AddressSpace, OptimizationLevel};
+    use itertools::Itertools;
 
     use crate::{
         declare_blocks,
         new_kernels::{
             link_req_helpers,
-            writers::{ree_writer::REEWriter, ArrayWriter, PrimitiveArrayWriter, WriterAllocation},
+            writers::{
+                ree_writer::REEWriter, ArrayWriter, PrimitiveArrayWriter, StringArrayWriter,
+                WriterAllocation,
+            },
         },
         PrimitiveType,
     };
 
     #[test]
     fn test_ree_writer_int_full() {
-        let data = vec![1, 1, 1, 2, 3, 3, 4, 4, 4, 4, 50];
+        let data: Vec<i32> = vec![1, 1, 1, 2, 3, 3, 4, 4, 4, 4, 50];
         let ctx = Context::create();
         let llvm_mod = ctx.create_module("test_primitive_array_writer");
         let build = ctx.create_builder();
@@ -392,8 +392,12 @@ mod tests {
             dest,
         );
 
-        for el in data {
-            writer.llvm_ingest(&ctx, &build, ctx.i32_type().const_int(el, true).into());
+        for el in data.iter() {
+            writer.llvm_ingest(
+                &ctx,
+                &build,
+                ctx.i32_type().const_int(*el as u64, true).into(),
+            );
         }
         writer.llvm_flush(&ctx, &build);
         build.build_return(None).unwrap();
@@ -410,14 +414,16 @@ mod tests {
                 .unwrap()
         };
 
-        let mut data =
+        let mut alloc =
             REEWriter::<Int32Type, PrimitiveArrayWriter>::allocate(100, PrimitiveType::I32);
 
         unsafe {
-            f.call(data.get_ptr());
+            f.call(alloc.get_ptr());
         }
-        let ree = data.to_array(5, None);
-        arrow_cast::cast(&ree, &DataType::Int32).unwrap();
+        let ree = alloc.to_array(11, None);
+        let ree = ree.downcast::<Int32Array>().unwrap();
+        let ree_vec = ree.into_iter().map(|x| x.unwrap()).collect_vec();
+        assert_eq!(ree_vec, data);
     }
 
     #[test]
@@ -505,5 +511,74 @@ mod tests {
             2
         );
         assert_eq!(data.num_unique, 2);
+    }
+
+    #[test]
+    fn test_ree_writer_str_full() {
+        let data: Vec<&str> = vec!["hello", "this", "this", "is", "is", "a test"];
+
+        let ctx = Context::create();
+        let i64_type = ctx.i64_type();
+        let llvm_mod = ctx.create_module("test_array_writer");
+        let build = ctx.create_builder();
+        let ptr_type = ctx.ptr_type(AddressSpace::default());
+
+        let func = llvm_mod.add_function(
+            "test",
+            ctx.void_type().fn_type(&[ptr_type.into()], false),
+            None,
+        );
+
+        declare_blocks!(ctx, func, entry);
+        build.position_at_end(entry);
+        let dest = func.get_nth_param(0).unwrap().into_pointer_value();
+        let writer = REEWriter::<Int32Type, StringArrayWriter<i32>>::llvm_init(
+            &ctx,
+            &llvm_mod,
+            &build,
+            PrimitiveType::P64x2,
+            dest,
+        );
+
+        for el in data.iter() {
+            let start = el.as_ptr();
+            let end = start.wrapping_add(el.len());
+            let px2 = PrimitiveType::P64x2
+                .llvm_type(&ctx)
+                .into_struct_type()
+                .const_named_struct(&[
+                    i64_type.const_int(start as usize as u64, false).into(),
+                    i64_type.const_int(end as usize as u64, false).into(),
+                ]);
+            writer.llvm_ingest(&ctx, &build, px2.into());
+        }
+        writer.llvm_flush(&ctx, &build);
+        build.build_return(None).unwrap();
+
+        llvm_mod.print_to_stderr();
+        llvm_mod.verify().unwrap();
+        let ee = llvm_mod
+            .create_jit_execution_engine(OptimizationLevel::None)
+            .unwrap();
+        link_req_helpers(&llvm_mod, &ee).unwrap();
+
+        let f = unsafe {
+            ee.get_function::<unsafe extern "C" fn(*mut c_void)>(func.get_name().to_str().unwrap())
+                .unwrap()
+        };
+
+        let mut alloc =
+            REEWriter::<Int32Type, StringArrayWriter<i32>>::allocate(100, PrimitiveType::P64x2);
+
+        unsafe {
+            f.call(alloc.get_ptr());
+        }
+        let ree = alloc.to_array(6, None);
+        let ree = ree.downcast::<BinaryArray>().unwrap();
+        let ree_vec = ree
+            .into_iter()
+            .map(|x| std::str::from_utf8(x.unwrap()).unwrap())
+            .collect_vec();
+        assert_eq!(ree_vec, data);
     }
 }

@@ -22,12 +22,11 @@ use arrow_schema::DataType;
 use bitmap::BitmapIterator;
 use dictionary::DictionaryIterator;
 use inkwell::{
-    builder::Builder,
     context::Context,
     intrinsics::Intrinsic,
     module::{Linkage, Module},
     types::BasicType,
-    values::{BasicValue, FunctionValue, PointerValue},
+    values::{BasicValue, FunctionValue},
     AddressSpace, IntPredicate,
 };
 use primitive::PrimitiveIterator;

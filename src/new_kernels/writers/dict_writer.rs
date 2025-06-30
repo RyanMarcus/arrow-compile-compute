@@ -3,7 +3,7 @@ use std::{ffi::c_void, marker::PhantomData};
 use arrow_array::{
     cast::AsArray, make_array, types::ArrowDictionaryKeyType, Array, DictionaryArray,
 };
-use arrow_data::ArrayDataBuilder;
+
 use inkwell::{
     module::Linkage,
     values::{FunctionValue, PointerValue},
@@ -12,7 +12,7 @@ use inkwell::{
 use repr_offset::ReprOffset;
 
 use crate::{
-    declare_blocks, dictionary_data_type, increment_pointer,
+    declare_blocks, increment_pointer,
     new_kernels::{
         ht::{generate_hash_func, generate_lookup_or_insert, TicketTable},
         writers::{array_writer::ArrayOutput, ArrayWriter, PrimitiveArrayWriter, WriterAllocation},

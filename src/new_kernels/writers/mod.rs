@@ -6,7 +6,7 @@ use inkwell::{
     builder::Builder,
     context::Context,
     module::Module,
-    values::{BasicValueEnum, IntValue, PointerValue},
+    values::{BasicValueEnum, PointerValue},
 };
 
 mod array_writer;
