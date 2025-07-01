@@ -761,7 +761,8 @@ mod tests {
     use std::cmp::Ordering;
 
     use arrow_array::{
-        BooleanArray, Float32Array, Int32Array, Int64Array, Scalar, StringArray, UInt32Array,
+        BooleanArray, Float32Array, Int32Array, Int64Array, Scalar, StringArray, StringViewArray,
+        UInt32Array,
     };
     use arrow_schema::DataType;
     use itertools::Itertools;
@@ -858,6 +859,18 @@ mod tests {
     fn test_string_scalar_cmp() {
         let values = (0..100).map(|i| format!("value{}", i)).collect_vec();
         let a = StringArray::from(values);
+        let b = Scalar::new(StringArray::from(vec!["value50"]));
+        let k = ComparisonKernel::compile(&(&a, &b), Predicate::Eq).unwrap();
+        let r = k.call((&a, &b)).unwrap();
+
+        let expected_result = (0..100).map(|i| i == 50).collect_vec();
+        assert_eq!(r, BooleanArray::from(expected_result));
+    }
+
+    #[test]
+    fn test_string_view_scalar_cmp() {
+        let values = (0..100).map(|i| format!("value{}", i)).collect_vec();
+        let a = StringViewArray::from(values);
         let b = Scalar::new(StringArray::from(vec!["value50"]));
         let k = ComparisonKernel::compile(&(&a, &b), Predicate::Eq).unwrap();
         let r = k.call((&a, &b)).unwrap();
