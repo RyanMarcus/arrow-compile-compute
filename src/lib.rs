@@ -96,6 +96,20 @@ macro_rules! increment_pointer {
 }
 pub(crate) use increment_pointer;
 
+#[cfg(test)]
+unsafe fn pointers_to_str(ptrs: u128) -> String {
+    let b = ptrs.to_le_bytes();
+    let ptr1 = u64::from_le_bytes(b[0..8].try_into().unwrap());
+    let ptr2 = u64::from_le_bytes(b[8..16].try_into().unwrap());
+    let len = (ptr2 - ptr1) as usize;
+
+    unsafe {
+        let slice = std::slice::from_raw_parts(ptr1 as *const u8, len);
+        let string = std::str::from_utf8(slice).unwrap();
+        string.to_string()
+    }
+}
+
 /// Utility function to create the appropriate `DataType` for a dictionary array
 pub fn dictionary_data_type(key_type: DataType, val_type: DataType) -> DataType {
     DataType::Dictionary(Box::new(key_type.clone()), Box::new(val_type.clone()))

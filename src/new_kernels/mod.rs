@@ -28,17 +28,16 @@ use dsl::DSLError;
 use inkwell::{
     builder::Builder,
     context::Context,
-    intrinsics::Intrinsic,
     module::Module,
     passes::PassBuilderOptions,
     targets::{CodeModel, RelocMode, Target, TargetMachine},
     values::{FunctionValue, VectorValue},
-    AddressSpace, IntPredicate, OptimizationLevel,
+    OptimizationLevel,
 };
 
 use crate::new_kernels::llvm_utils::debug_i64;
 use crate::new_kernels::llvm_utils::debug_ptr;
-use crate::{declare_blocks, increment_pointer, pointer_diff, PrimitiveType};
+use crate::PrimitiveType;
 
 #[derive(Debug)]
 pub enum ArrowKernelError {
@@ -216,121 +215,6 @@ fn gen_convert_numeric_vec<'ctx>(
             }
         }
     }
-}
-
-/// Adds a function to the current context that takes in a start and end string
-/// pointer, along with a base buffer pointer, and returns a view. The buffer
-/// index is always zero.
-pub fn add_ptrx2_to_view<'a>(ctx: &'a Context, llvm_mod: &Module<'a>) -> FunctionValue<'a> {
-    let i1_type = ctx.bool_type();
-    let i32_type = ctx.i32_type();
-    let i64_type = ctx.i64_type();
-    let i128_type = ctx.i128_type();
-    let ptr_type = ctx.ptr_type(AddressSpace::default());
-    let str_type = PrimitiveType::P64x2.llvm_type(ctx);
-
-    let memcpy = Intrinsic::find("llvm.memcpy").unwrap();
-    let memcpy_f = memcpy
-        .get_declaration(
-            llvm_mod,
-            &[ptr_type.into(), ptr_type.into(), i64_type.into()],
-        )
-        .unwrap();
-
-    let func_type = i128_type.fn_type(&[str_type.into(), ptr_type.into()], false);
-    let func = llvm_mod.add_function("ptrx2_to_view", func_type, None);
-
-    let ptrs = func.get_nth_param(0).unwrap().into_struct_value();
-    let base_ptr = func.get_nth_param(1).unwrap().into_pointer_value();
-
-    declare_blocks!(ctx, func, entry, fits, no_fit, exit);
-    let builder = ctx.create_builder();
-    builder.position_at_end(entry);
-    let ptr1 = builder
-        .build_extract_value(ptrs, 0, "ptr1")
-        .unwrap()
-        .into_pointer_value();
-    let ptr2 = builder
-        .build_extract_value(ptrs, 1, "ptr2")
-        .unwrap()
-        .into_pointer_value();
-    let to_return_ptr = builder.build_alloca(i128_type, "to_return_ptr").unwrap();
-    let len_u64 = pointer_diff!(ctx, &builder, ptr1, ptr2);
-    let len = builder
-        .build_int_truncate(len_u64, i32_type, "len_u32")
-        .unwrap();
-    let len_128 = builder
-        .build_int_z_extend(len, i128_type, "len_128")
-        .unwrap();
-    builder.build_store(to_return_ptr, len_128).unwrap();
-    let is_short = builder
-        .build_int_compare(IntPredicate::ULE, len, i32_type.const_int(12, false), "cmp")
-        .unwrap();
-    builder
-        .build_conditional_branch(is_short, fits, no_fit)
-        .unwrap();
-
-    builder.position_at_end(fits);
-    builder
-        .build_call(
-            memcpy_f,
-            &[
-                increment_pointer!(
-                    ctx,
-                    &builder,
-                    to_return_ptr,
-                    4,
-                    i64_type.const_int(1, false)
-                )
-                .into(),
-                ptr1.into(),
-                len_u64.into(),
-                i1_type.const_zero().into(),
-            ],
-            "memcpy",
-        )
-        .unwrap();
-    builder.build_unconditional_branch(exit).unwrap();
-
-    builder.position_at_end(no_fit);
-    let prefix = builder.build_load(i32_type, ptr1, "prefix").unwrap();
-    builder
-        .build_store(
-            increment_pointer!(
-                ctx,
-                &builder,
-                to_return_ptr,
-                4,
-                i64_type.const_int(1, false)
-            ),
-            prefix,
-        )
-        .unwrap();
-    let offset = pointer_diff!(ctx, &builder, base_ptr, ptr1);
-    let offset = builder
-        .build_int_truncate(offset, i32_type, "offset")
-        .unwrap();
-    builder
-        .build_store(
-            increment_pointer!(
-                ctx,
-                &builder,
-                to_return_ptr,
-                4,
-                i64_type.const_int(3, false)
-            ),
-            offset,
-        )
-        .unwrap();
-    builder.build_unconditional_branch(exit).unwrap();
-
-    builder.position_at_end(exit);
-    let result = builder
-        .build_load(i128_type, to_return_ptr, "result")
-        .unwrap();
-    builder.build_return(Some(&result)).unwrap();
-
-    func
 }
 
 #[cfg(test)]

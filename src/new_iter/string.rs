@@ -233,7 +233,10 @@ mod tests {
     use arrow_array::{Datum, LargeStringArray, StringArray};
     use inkwell::{context::Context, OptimizationLevel};
 
-    use crate::new_iter::{datum_to_iter, generate_next, generate_random_access};
+    use crate::{
+        new_iter::{datum_to_iter, generate_next, generate_random_access},
+        pointers_to_str,
+    };
 
     #[test]
     fn test_string_scalar() {
@@ -302,19 +305,6 @@ mod tests {
             let slice = std::slice::from_raw_parts(ptr1 as *const u8, len);
             let string = std::str::from_utf8(slice).unwrap();
             assert_eq!(string, "hello");
-        }
-    }
-
-    unsafe fn pointers_to_str(ptrs: u128) -> String {
-        let b = ptrs.to_le_bytes();
-        let ptr1 = u64::from_le_bytes(b[0..8].try_into().unwrap());
-        let ptr2 = u64::from_le_bytes(b[8..16].try_into().unwrap());
-        let len = (ptr2 - ptr1) as usize;
-
-        unsafe {
-            let slice = std::slice::from_raw_parts(ptr1 as *const u8, len);
-            let string = std::str::from_utf8(slice).unwrap();
-            string.to_string()
         }
     }
 

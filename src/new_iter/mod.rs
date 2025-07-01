@@ -12,8 +12,8 @@ use std::ffi::c_void;
 use arrow_array::{
     cast::AsArray,
     types::{
-        Float16Type, Float32Type, Float64Type, Int16Type, Int32Type, Int64Type, Int8Type,
-        UInt16Type, UInt32Type, UInt64Type, UInt8Type,
+        BinaryViewType, Float16Type, Float32Type, Float64Type, Int16Type, Int32Type, Int64Type,
+        Int8Type, StringViewType, UInt16Type, UInt32Type, UInt64Type, UInt8Type,
     },
     Array, BooleanArray, Datum, GenericStringArray, Int16RunArray, Int32RunArray, Int64RunArray,
 };
@@ -97,7 +97,10 @@ fn array_to_iter(arr: &dyn Array) -> IteratorHolder {
         arrow_schema::DataType::Binary => todo!(),
         arrow_schema::DataType::FixedSizeBinary(_) => todo!(),
         arrow_schema::DataType::LargeBinary => todo!(),
-        arrow_schema::DataType::BinaryView => todo!(),
+        arrow_schema::DataType::BinaryView => {
+            IteratorHolder::View(arr.as_byte_view::<BinaryViewType>().into())
+        }
+
         arrow_schema::DataType::Utf8 => IteratorHolder::String(arr.as_string().into()),
         arrow_schema::DataType::LargeUtf8 => IteratorHolder::LargeString(
             arr.as_any()
@@ -105,7 +108,9 @@ fn array_to_iter(arr: &dyn Array) -> IteratorHolder {
                 .unwrap()
                 .into(),
         ),
-        arrow_schema::DataType::Utf8View => todo!(),
+        arrow_schema::DataType::Utf8View => {
+            IteratorHolder::View(arr.as_byte_view::<StringViewType>().into())
+        }
         arrow_schema::DataType::List(_field) => todo!(),
         arrow_schema::DataType::ListView(_field) => todo!(),
         arrow_schema::DataType::FixedSizeList(_field, _) => todo!(),
@@ -876,12 +881,39 @@ pub fn generate_next<'a>(
             Some(next)
         }
         IteratorHolder::View(iter) => {
+            let access = generate_random_access(ctx, llvm_mod, label, dt, ih).unwrap();
             declare_blocks!(ctx, next, entry, none_left, get_next);
 
             build.position_at_end(entry);
             let curr_pos = iter.llvm_pos(ctx, &build, iter_ptr);
             let curr_len = iter.llvm_len(ctx, &build, iter_ptr);
-            todo!()
+            let have_more = build
+                .build_int_compare(IntPredicate::ULT, curr_pos, curr_len, "have_enough")
+                .unwrap();
+            build
+                .build_conditional_branch(have_more, get_next, none_left)
+                .unwrap();
+
+            build.position_at_end(none_left);
+            build
+                .build_return(Some(&bool_type.const_int(0, false)))
+                .unwrap();
+
+            build.position_at_end(get_next);
+            // there are at least n elements left, we can load them and increment
+            let result = build
+                .build_call(access, &[iter_ptr.into(), curr_pos.into()], "access_result")
+                .unwrap()
+                .try_as_basic_value()
+                .unwrap_left();
+
+            build.build_store(out_ptr, result).unwrap();
+            iter.llvm_increment_pos(ctx, &build, iter_ptr, i64_type.const_int(1, false));
+            build
+                .build_return(Some(&bool_type.const_int(1, false)))
+                .unwrap();
+
+            Some(next)
         }
         IteratorHolder::Bitmap(bitmap_iterator) => {
             let access = generate_random_access(ctx, llvm_mod, label, dt, ih).unwrap();
@@ -1459,11 +1491,14 @@ pub fn generate_random_access<'a>(
                 .build_extract_element(as_vec, i64_type.const_zero(), "str_len")
                 .unwrap()
                 .into_int_value();
+            let str_len = build
+                .build_int_s_extend(str_len, i64_type, "ext_len")
+                .unwrap();
             let cmp = build
                 .build_int_compare(
                     IntPredicate::SLE,
                     str_len,
-                    i32_type.const_int(12, true),
+                    i64_type.const_int(12, true),
                     "cmp",
                 )
                 .unwrap();
@@ -1493,6 +1528,9 @@ pub fn generate_random_access<'a>(
                 .build_extract_element(as_vec, i64_type.const_int(3, false), "offset")
                 .unwrap()
                 .into_int_value();
+            let offset = build
+                .build_int_s_extend_or_bit_cast(offset, i64_type, "offset_ext")
+                .unwrap();
             let ptr1 = increment_pointer!(ctx, build, buf_base, 1, offset);
             let ptr2 = increment_pointer!(ctx, build, ptr1, 1, str_len);
             let to_return = ret_type.const_zero();

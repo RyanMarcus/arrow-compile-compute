@@ -1,7 +1,7 @@
 use arrow_array::{
     cast::AsArray,
     types::{Int32Type, Int64Type},
-    Int32Array, PrimitiveArray, RunArray, StringArray,
+    Int32Array, PrimitiveArray, RunArray, StringArray, StringViewArray,
 };
 use arrow_compile_compute::{dictionary_data_type, run_end_data_type};
 use arrow_schema::DataType;
@@ -59,11 +59,22 @@ proptest! {
         let arr1 = StringArray::from(arr.clone());
         let dt = dictionary_data_type(DataType::Int64, DataType::Utf8);
 
-        let arr_res = arrow_cast::cast(&arr1, &dt).unwrap();
-        let arr_res = arr_res.as_dictionary::<Int64Type>();
+        let our_res = arrow_compile_compute::cast::cast(&arr1, &dt).unwrap();
+        let our_res = our_res.as_dictionary::<Int64Type>();
+        let our_res = our_res.downcast_dict::<StringArray>().unwrap();
+        let our_res = our_res.into_iter().map(|x| x.unwrap()).collect_vec();
+        assert_eq!(arr, our_res);
+    }
+
+    #[test]
+    fn test_str_view_cast_dict(arr: Vec<String>) {
+        let arr1 = StringViewArray::from(arr.clone());
+        let dt = dictionary_data_type(DataType::Int64, DataType::Utf8);
 
         let our_res = arrow_compile_compute::cast::cast(&arr1, &dt).unwrap();
         let our_res = our_res.as_dictionary::<Int64Type>();
-        assert_eq!(our_res.len(), arr_res.len());
+        let our_res = our_res.downcast_dict::<StringArray>().unwrap();
+        let our_res = our_res.into_iter().map(|x| x.unwrap()).collect_vec();
+        assert_eq!(arr, our_res);
     }
 }
