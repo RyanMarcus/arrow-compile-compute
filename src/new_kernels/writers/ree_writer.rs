@@ -52,7 +52,7 @@ impl<'a, K: RunEndIndexType, VW: ArrayWriter<'a>> WriterAllocation for REEAlloca
             Arc::new(Field::new("values", values.data_type().clone(), true)),
         );
 
-        let rec_len = RunArray::logical_len(&res);
+        let rec_len = RunArray::logical_len(res);
         assert_eq!(rec_len, len);
         let builder = ArrayDataBuilder::new(ree_array_type)
             .len(len)

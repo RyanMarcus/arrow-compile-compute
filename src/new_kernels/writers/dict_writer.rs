@@ -74,7 +74,7 @@ impl<'a, K: ArrowDictionaryKeyType, VW: ArrayWriter<'a>> ArrayWriter<'a> for Dic
             values_ptr: vw.get_ptr(),
             keys: kw,
             values: vw,
-            _marker: PhantomData::default(),
+            _marker: PhantomData,
         }
     }
 

@@ -68,6 +68,15 @@ proptest! {
     }
 
     #[test]
+    fn test_apply_str_view(arr: Vec<String>) {
+        let arr1 = arrow_array::StringViewArray::from(arr.clone());
+
+        let mut v = Vec::new();
+        arrow_compile_compute::apply::apply_str(&arr1, |x| v.push(std::str::from_utf8(x).unwrap().to_string())).unwrap();
+        assert_eq!(v, arr);
+    }
+
+    #[test]
     fn test_apply_i32_dict(arr: Vec<i32>) {
         let arr1 = Int32Array::from(arr.clone());
         let dt = dictionary_data_type(DataType::Int64, DataType::Int32);

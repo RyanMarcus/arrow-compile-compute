@@ -608,13 +608,13 @@ impl Kernel for HashKernel {
 
                 let ptr_t = ctx.ptr_type(AddressSpace::default());
                 let p_type = PrimitiveType::for_arrow_type(inp.get().0.data_type());
-                let p_llvm = p_type.llvm_type(&ctx);
+                let p_llvm = p_type.llvm_type(ctx);
 
                 let iter = datum_to_iter(*inp)?;
                 let next_func =
-                    generate_next(&ctx, &llvm_mod, "hash_next", inp.get().0.data_type(), &iter)
+                    generate_next(ctx, &llvm_mod, "hash_next", inp.get().0.data_type(), &iter)
                         .unwrap();
-                let hash_func = generate_hash_func(&ctx, &llvm_mod, p_type);
+                let hash_func = generate_hash_func(ctx, &llvm_mod, p_type);
 
                 let func_ty = ctx
                     .void_type()
@@ -629,7 +629,7 @@ impl Kernel for HashKernel {
                 let out_ptr = func.get_nth_param(1).unwrap().into_pointer_value();
                 let buf_ptr = b.build_alloca(p_llvm, "buf_ptr").unwrap();
                 let writer = PrimitiveArrayWriter::llvm_init(
-                    &ctx,
+                    ctx,
                     &llvm_mod,
                     &b,
                     PrimitiveType::U64,
@@ -654,7 +654,7 @@ impl Kernel for HashKernel {
                     .try_as_basic_value()
                     .unwrap_left()
                     .into_int_value();
-                writer.llvm_ingest(&ctx, &b, hashed.into());
+                writer.llvm_ingest(ctx, &b, hashed.into());
                 b.build_unconditional_branch(loop_cond).unwrap();
 
                 b.position_at_end(exit);
