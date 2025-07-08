@@ -1,7 +1,7 @@
 use arrow_array::{
     cast::AsArray,
     types::{Int32Type, Int64Type},
-    Int32Array, PrimitiveArray, RunArray, StringArray, StringViewArray,
+    Array, Int32Array, PrimitiveArray, RunArray, StringArray, StringViewArray,
 };
 use arrow_compile_compute::{dictionary_data_type, run_end_data_type};
 use arrow_schema::DataType;
@@ -76,5 +76,18 @@ proptest! {
         let our_res = our_res.downcast_dict::<StringArray>().unwrap();
         let our_res = our_res.into_iter().map(|x| x.unwrap()).collect_vec();
         assert_eq!(arr, our_res);
+    }
+
+    #[test]
+    fn test_str_cast_view(arr: Vec<String>) {
+        let arr1 = StringArray::from(arr.clone());
+
+        let as_view = arrow_compile_compute::cast::cast(&arr1, &DataType::Utf8View).unwrap();
+        let as_view = as_view.as_string_view();
+
+        assert_eq!(as_view.len(), arr.len());
+        println!("{:?}", arr);
+        let view_res = as_view.iter().map(|x| x.unwrap()).collect_vec();
+        assert_eq!(arr, view_res);
     }
 }

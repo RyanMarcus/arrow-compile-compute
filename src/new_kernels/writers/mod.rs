@@ -14,12 +14,15 @@ mod bool_writer;
 mod dict_writer;
 mod ree_writer;
 mod str_writer;
+mod view_writer;
 
 pub use array_writer::PrimitiveArrayWriter;
 pub use bool_writer::BooleanWriter;
 pub use dict_writer::DictWriter;
 pub use ree_writer::REEWriter;
 pub use str_writer::StringArrayWriter;
+pub use view_writer::StringViewWriter;
+pub(crate) use view_writer::ViewBufferWriter;
 
 use crate::PrimitiveType;
 pub trait ArrayWriter<'a> {

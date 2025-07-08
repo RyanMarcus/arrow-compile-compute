@@ -63,8 +63,8 @@ impl<'a, T: OffsetSizeTrait> ArrayWriter<'a> for StringArrayWriter<'a, T> {
 
     fn allocate(expected_count: usize, ty: PrimitiveType) -> Self::Allocation {
         assert_eq!(ty, PrimitiveType::P64x2, "string writer type must be P64x2");
-        let mut offsets = vec![T::zero(); (expected_count + 1) * T::get_byte_width()];
         let data = Vec::with_capacity(expected_count);
+        let mut offsets = vec![T::zero(); (expected_count + 1) * T::get_byte_width()];
         let offsets_ptr = offsets.as_mut_ptr() as *mut c_void;
         StringAllocation {
             offsets_ptr,

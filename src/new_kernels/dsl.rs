@@ -34,7 +34,7 @@ use crate::{
         gen_convert_numeric_vec, link_req_helpers, optimize_module, set_noalias_params,
         writers::{
             ArrayWriter, BooleanWriter, DictWriter, PrimitiveArrayWriter, REEWriter,
-            WriterAllocation,
+            StringViewWriter, WriterAllocation,
         },
     },
     ComparisonType, Predicate, PrimitiveType,
@@ -245,7 +245,14 @@ impl KernelOutputType {
                     )));
                 }
             }
-            KernelOutputType::View => todo!(),
+            KernelOutputType::View => {
+                if PrimitiveType::for_arrow_type(dt) != PrimitiveType::P64x2 {
+                    return Err(DSLError::TypeMismatch(format!(
+                        "cannot collect type {} into view",
+                        dt
+                    )));
+                }
+            }
             KernelOutputType::Dictionary(_) => {}
             KernelOutputType::RunEnd(_) => {}
         };
@@ -1111,7 +1118,14 @@ impl DSLKernel {
                 let num_results = unsafe { self.borrow_func().1.call(kp.get_mut_ptr()) };
                 Ok(Arc::new(alloc.to_array(num_results as usize, None)))
             }
-            KernelOutputType::View => todo!(),
+            KernelOutputType::View => {
+                let mut alloc = StringViewWriter::allocate(max_len, p_out_type);
+                ptrs.push(alloc.get_ptr());
+                let mut kp = KernelParameters::new(ptrs);
+
+                let num_results = unsafe { self.borrow_func().1.call(kp.get_mut_ptr()) };
+                Ok(Arc::new(alloc.to_array(num_results as usize, None)))
+            }
             KernelOutputType::Dictionary(key) => Ok(match key {
                 DictKeyType::Int8 => {
                     Arc::new(self.exec_to_dict::<Int8Type>(ptrs, max_len, p_out_type))
@@ -1214,7 +1228,9 @@ fn build_kernel<'a>(
         KernelOutputType::Boolean => {
             build_kernel_with_writer::<BooleanWriter>(ctx, inputs, program)
         }
-        KernelOutputType::View => todo!(),
+        KernelOutputType::View => {
+            build_kernel_with_writer::<StringViewWriter>(ctx, inputs, program)
+        }
         KernelOutputType::Dictionary(key) => match key {
             DictKeyType::Int8 => build_dict_kernel::<Int8Type>(ctx, inputs, program),
             DictKeyType::Int16 => build_dict_kernel::<Int16Type>(ctx, inputs, program),
@@ -1558,7 +1574,7 @@ mod test {
 
     use arrow_array::{
         cast::AsArray,
-        types::{Int32Type, Int64Type, UInt64Type},
+        types::{BinaryViewType, Int32Type, Int64Type, UInt64Type},
         BooleanArray, Float32Array, Int32Array, StringArray,
     };
     use arrow_schema::DataType;
@@ -1777,5 +1793,41 @@ mod test {
         let res = k.call(&[&data]).unwrap();
         let res = res.as_primitive::<Int64Type>();
         assert_eq!(res.values(), &[1, 2, 3, -4, 5, 6]);
+    }
+
+    #[test]
+    fn test_kernel_convert_str_to_view() {
+        let strs = vec!["this", "is", "a test with at least one long string"];
+        let data = StringArray::from(strs.clone());
+        let k = DSLKernel::compile(&[&data], |ctx| {
+            ctx.iter_over(vec![ctx.get_input(0)?])
+                .collect(KernelOutputType::View)
+        })
+        .unwrap();
+        let res = k.call(&[&data]).unwrap();
+        let res = res.as_byte_view::<BinaryViewType>();
+        let res = res
+            .iter()
+            .map(|b| std::str::from_utf8(b.unwrap()).unwrap())
+            .collect_vec();
+        assert_eq!(res, strs);
+    }
+
+    #[test]
+    fn test_kernel_convert_str_to_view_single() {
+        let strs = vec!["𑚀aAￒￚA"];
+        let data = StringArray::from(strs.clone());
+        let k = DSLKernel::compile(&[&data], |ctx| {
+            ctx.iter_over(vec![ctx.get_input(0)?])
+                .collect(KernelOutputType::View)
+        })
+        .unwrap();
+        let res = k.call(&[&data]).unwrap();
+        let res = res.as_byte_view::<BinaryViewType>();
+        let res = res
+            .iter()
+            .map(|b| std::str::from_utf8(b.unwrap()).unwrap())
+            .collect_vec();
+        assert_eq!(res, strs);
     }
 }

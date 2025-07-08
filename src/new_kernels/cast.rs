@@ -9,7 +9,7 @@ use arrow_array::{
     cast::AsArray,
     make_array,
     types::{Int16Type, Int32Type, Int64Type, Int8Type},
-    Array, ArrayRef, StringArray,
+    Array, ArrayRef, StringArray, StringViewArray,
 };
 use arrow_data::ArrayDataBuilder;
 use arrow_schema::DataType;
@@ -31,7 +31,16 @@ fn coalesce_type(res: ArrayRef, tar: &DataType) -> Result<ArrayRef, ArrowKernelE
         (DataType::Binary, DataType::Utf8) => {
             let res = res.as_binary();
             let (offsets, data, nulls) = res.clone().into_parts();
+            debug_assert!(
+                StringArray::try_new(offsets.clone(), data.clone(), nulls.clone()).is_ok()
+            );
             let s = Arc::new(unsafe { StringArray::new_unchecked(offsets, data, nulls) });
+            Ok(s)
+        }
+        (DataType::BinaryView, DataType::Utf8View) => {
+            let res = res.as_binary_view();
+            let (view, bufs, nulls) = res.clone().into_parts();
+            let s = Arc::new(StringViewArray::new(view, bufs, nulls));
             Ok(s)
         }
         (DataType::Dictionary(kt, _vt), DataType::Dictionary(t_kt, t_vt)) if kt == t_kt => {
@@ -234,20 +243,20 @@ mod tests {
         assert_eq!(&[0, 0, 1, 2, 2, 3], res.keys().values());
     }
 
-    /*#[test]
+    #[test]
     fn test_dict_to_str_view() {
         let data = StringArray::from(vec![
             "this",
             "this",
             "is",
             "a test",
-            "a test",
             "a string that is longer than 12 chars",
+            "a test",
         ]);
         let ddata =
             arrow_cast::cast::cast(&data, &dictionary_data_type(DataType::Int8, DataType::Utf8))
                 .unwrap();
-        let k = DSLCastToFlatKernel::compile(&(&ddata as &dyn Array), DataType::Utf8View).unwrap();
+        let k = CastKernel::compile(&(&ddata as &dyn Array), DataType::Utf8View).unwrap();
         let res = k.call(&ddata).unwrap();
         let res = res.as_string_view();
 
@@ -255,7 +264,7 @@ mod tests {
         for (ours, orig) in res.iter().zip(data.iter()) {
             assert_eq!(ours, orig);
         }
-    }*/
+    }
 
     #[test]
     fn test_dict_to_str_flat() {
