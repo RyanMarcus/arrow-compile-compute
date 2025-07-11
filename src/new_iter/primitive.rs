@@ -163,6 +163,48 @@ mod test {
     }
 
     #[test]
+    fn test_primitive_iter_block_slice() {
+        let data_full = Int32Array::from((0..24).collect_vec());
+        let data = data_full.slice(4, 16);
+        let mut iter = array_to_iter(&data);
+
+        let iter_ptr = iter.get_mut_ptr();
+        unsafe {
+            let pos: u64 = (iter_ptr.add(8) as *mut u64).read();
+            let len: u64 = (iter_ptr.add(16) as *mut u64).read();
+
+            assert_eq!(pos, 0);
+            assert_eq!(len, 16);
+        }
+
+        let ctx = Context::create();
+        let module = ctx.create_module("test_iter");
+        let func =
+            generate_next_block::<8>(&ctx, &module, "iter_prim_test", data.data_type(), &iter)
+                .unwrap();
+        let fname = func.get_name().to_str().unwrap();
+
+        module.verify().unwrap();
+        let ee = module
+            .create_jit_execution_engine(OptimizationLevel::None)
+            .unwrap();
+
+        let next_func = unsafe {
+            ee.get_function::<unsafe extern "C" fn(*mut c_void, *mut i32) -> bool>(fname)
+                .unwrap()
+        };
+
+        let mut buf = [0_i32; 8];
+        unsafe {
+            assert_eq!(next_func.call(iter.get_mut_ptr(), buf.as_mut_ptr()), true);
+            assert_eq!(buf, [4, 5, 6, 7, 8, 9, 10, 11]);
+            assert_eq!(next_func.call(iter.get_mut_ptr(), buf.as_mut_ptr()), true);
+            assert_eq!(buf, [12, 13, 14, 15, 16, 17, 18, 19]);
+            assert_eq!(next_func.call(iter.get_mut_ptr(), buf.as_mut_ptr()), false);
+        };
+    }
+
+    #[test]
     fn test_primitive_iter_nonblock() {
         let data = Int32Array::from((0..5).collect_vec());
         let mut iter = array_to_iter(&data);
@@ -226,6 +268,61 @@ mod test {
     }
 
     #[test]
+    fn test_primitive_iter_nonblock_slice() {
+        let data_full = Int32Array::from((0..5).collect_vec());
+        let data = data_full.slice(2, 3);
+        let mut iter = array_to_iter(&data);
+
+        let iter_ptr = iter.get_mut_ptr();
+        unsafe {
+            let pos: u64 = (iter_ptr.add(8) as *mut u64).read();
+            let len: u64 = (iter_ptr.add(16) as *mut u64).read();
+
+            assert_eq!(pos, 0);
+            assert_eq!(len, 3);
+        }
+
+        let ctx = Context::create();
+        let module = ctx.create_module("test_iter");
+        let func = generate_next(&ctx, &module, "iter_prim_test", data.data_type(), &iter).unwrap();
+        let fname = func.get_name().to_str().unwrap();
+
+        module.verify().unwrap();
+        let ee = module
+            .create_jit_execution_engine(OptimizationLevel::None)
+            .unwrap();
+
+        let next_func = unsafe {
+            ee.get_function::<unsafe extern "C" fn(*mut c_void, *mut i32) -> bool>(fname)
+                .unwrap()
+        };
+
+        let mut buf: i32 = 0;
+        unsafe {
+            assert_eq!(
+                next_func.call(iter.get_mut_ptr(), &mut buf as *mut i32),
+                true
+            );
+            assert_eq!(buf, 2);
+            assert_eq!(
+                next_func.call(iter.get_mut_ptr(), &mut buf as *mut i32),
+                true
+            );
+            assert_eq!(buf, 3);
+            assert_eq!(
+                next_func.call(iter.get_mut_ptr(), &mut buf as *mut i32),
+                true
+            );
+            assert_eq!(buf, 4);
+            assert_eq!(
+                next_func.call(iter.get_mut_ptr(), &mut buf as *mut i32),
+                false
+            );
+        };
+    }
+
+
+    #[test]
     fn test_primitive_random_access() {
         let data = Int32Array::from((0..5).collect_vec());
         let mut iter = array_to_iter(&data);
@@ -252,6 +349,35 @@ mod test {
             assert_eq!(next_func.call(iter.get_mut_ptr(), 2), 2);
             assert_eq!(next_func.call(iter.get_mut_ptr(), 3), 3);
             assert_eq!(next_func.call(iter.get_mut_ptr(), 4), 4);
+        };
+    }
+
+    #[test]
+    fn test_primitive_random_access_slice() {
+        let data_full = Int32Array::from((0..5).collect_vec());
+        let data = data_full.slice(2, 3);
+        let mut iter = array_to_iter(&data);
+
+        let ctx = Context::create();
+        let module = ctx.create_module("test_iter");
+        let func = generate_random_access(&ctx, &module, "iter_prim_test", data.data_type(), &iter)
+            .unwrap();
+        let fname = func.get_name().to_str().unwrap();
+
+        module.verify().unwrap();
+        let ee = module
+            .create_jit_execution_engine(OptimizationLevel::None)
+            .unwrap();
+
+        let next_func = unsafe {
+            ee.get_function::<unsafe extern "C" fn(*mut c_void, u64) -> i32>(fname)
+                .unwrap()
+        };
+
+        unsafe {
+            assert_eq!(next_func.call(iter.get_mut_ptr(), 0), 2);
+            assert_eq!(next_func.call(iter.get_mut_ptr(), 1), 3);
+            assert_eq!(next_func.call(iter.get_mut_ptr(), 2), 4);
         };
     }
 }

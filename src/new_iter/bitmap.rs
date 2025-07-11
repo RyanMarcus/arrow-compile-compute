@@ -200,6 +200,82 @@ mod tests {
     }
 
     #[test]
+    fn test_bitmap_iter_slice() {
+        use arrow_array::BooleanArray;
+        let full_data = BooleanArray::from(vec![
+            true, true, false, true, false, false, false, false, true, true, false, true, false,
+        ]);
+
+        let data = full_data.slice(2, 8);
+
+        let mut iter = array_to_iter(&data);
+
+        let ctx = Context::create();
+        let module = ctx.create_module("test_bitmap_iter");
+        let func = generate_next(&ctx, &module, "bitmap_iter", data.data_type(), &iter).unwrap();
+        let fname = func.get_name().to_str().unwrap();
+
+        module.verify().unwrap();
+        let ee = module
+            .create_jit_execution_engine(OptimizationLevel::None)
+            .unwrap();
+
+        let next_func = unsafe {
+            ee.get_function::<unsafe extern "C" fn(*mut c_void, *mut i32) -> bool>(fname)
+                .unwrap()
+        };
+
+        let mut buf: i32 = 0;
+        unsafe {
+            assert_eq!(
+                next_func.call(iter.get_mut_ptr(), &mut buf as *mut i32),
+                true
+            );
+            assert_eq!(buf, 0);
+            assert_eq!(
+                next_func.call(iter.get_mut_ptr(), &mut buf as *mut i32),
+                true
+            );
+            assert_eq!(buf, 1);
+            assert_eq!(
+                next_func.call(iter.get_mut_ptr(), &mut buf as *mut i32),
+                true
+            );
+            assert_eq!(buf, 0);
+            assert_eq!(
+                next_func.call(iter.get_mut_ptr(), &mut buf as *mut i32),
+                true
+            );
+            assert_eq!(buf, 0);
+            assert_eq!(
+                next_func.call(iter.get_mut_ptr(), &mut buf as *mut i32),
+                true
+            );
+            assert_eq!(buf, 0);
+            assert_eq!(
+                next_func.call(iter.get_mut_ptr(), &mut buf as *mut i32),
+                true
+            );
+            assert_eq!(buf, 0);
+            assert_eq!(
+                next_func.call(iter.get_mut_ptr(), &mut buf as *mut i32),
+                true
+            );
+            assert_eq!(buf, 1);
+            assert_eq!(
+                next_func.call(iter.get_mut_ptr(), &mut buf as *mut i32),
+                true
+            );
+            assert_eq!(buf, 1);
+            assert_eq!(
+                next_func.call(iter.get_mut_ptr(), &mut buf as *mut i32),
+                false
+            );
+        }
+    }
+    
+
+    #[test]
     fn test_bitmap_random_access() {
         use arrow_array::BooleanArray;
         let data = BooleanArray::from(vec![
@@ -245,4 +321,53 @@ mod tests {
             assert_eq!(next_func.call(iter.get_mut_ptr(), 10), 0);
         };
     }
+
+#[test]
+    fn test_bitmap_random_access_slice() {
+        use arrow_array::BooleanArray;
+        let full_data = BooleanArray::from(vec![
+            true, true, false, true, false, false, false, false, true, true, false, true, false,
+        ]);
+        let data = full_data.slice(2, 8);
+
+        let mut iter = array_to_iter(&data);
+
+        let ctx = Context::create();
+        let module = ctx.create_module("test_bitmap_iter");
+        let func =
+            generate_random_access(&ctx, &module, "bitmap_iter", data.data_type(), &iter).unwrap();
+        let fname = func.get_name().to_str().unwrap();
+
+        module.verify().unwrap();
+        let ee = module
+            .create_jit_execution_engine(OptimizationLevel::None)
+            .unwrap();
+
+        let next_func = unsafe {
+            ee.get_function::<unsafe extern "C" fn(*mut c_void, u64) -> i8>(fname)
+                .unwrap()
+        };
+
+        unsafe {
+            assert_eq!(next_func.call(iter.get_mut_ptr(), 0), 1);
+            assert_eq!(next_func.call(iter.get_mut_ptr(), 1), 1);
+            assert_eq!(next_func.call(iter.get_mut_ptr(), 2), 0);
+            assert_eq!(next_func.call(iter.get_mut_ptr(), 3), 1);
+            assert_eq!(next_func.call(iter.get_mut_ptr(), 4), 0);
+            assert_eq!(next_func.call(iter.get_mut_ptr(), 5), 0);
+            assert_eq!(next_func.call(iter.get_mut_ptr(), 6), 0);
+            assert_eq!(next_func.call(iter.get_mut_ptr(), 7), 0);
+            assert_eq!(next_func.call(iter.get_mut_ptr(), 8), 1);
+            assert_eq!(next_func.call(iter.get_mut_ptr(), 9), 1);
+            assert_eq!(next_func.call(iter.get_mut_ptr(), 10), 0);
+            assert_eq!(next_func.call(iter.get_mut_ptr(), 11), 1);
+            assert_eq!(next_func.call(iter.get_mut_ptr(), 12), 0);
+            assert_eq!(next_func.call(iter.get_mut_ptr(), 3), 1);
+            assert_eq!(next_func.call(iter.get_mut_ptr(), 4), 0);
+            assert_eq!(next_func.call(iter.get_mut_ptr(), 8), 1);
+            assert_eq!(next_func.call(iter.get_mut_ptr(), 9), 1);
+            assert_eq!(next_func.call(iter.get_mut_ptr(), 10), 0);
+        };
+    }
+
 }

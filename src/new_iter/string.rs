@@ -350,6 +350,38 @@ mod tests {
     }
 
     #[test]
+    fn test_string_random_access_slice() {
+        let data_full = StringArray::from(vec!["this", "is", "a", "test", "string", "hi", "hello"]);
+        let data = data_full.slice(2, 4);
+        let mut iter = datum_to_iter(&data).unwrap();
+
+        let ctx = Context::create();
+        let module = ctx.create_module("test_string_random_access");
+        let func_access =
+            generate_random_access(&ctx, &module, "access", data.get().0.data_type(), &iter)
+                .unwrap();
+        let fname = func_access.get_name().to_str().unwrap();
+
+        module.verify().unwrap();
+        let ee = module
+            .create_jit_execution_engine(OptimizationLevel::None)
+            .unwrap();
+
+        let func = unsafe {
+            ee.get_function::<unsafe extern "C" fn(*mut c_void, u64) -> u128>(fname)
+                .unwrap()
+        };
+
+        unsafe {
+            let b = func.call(iter.get_mut_ptr(), 0);
+            assert_eq!(pointers_to_str(b), "a");
+
+            let b = func.call(iter.get_mut_ptr(), 2);
+            assert_eq!(pointers_to_str(b), "string");
+        }
+    }
+
+    #[test]
     fn test_string_next() {
         let data = StringArray::from(vec!["this", "is", "a", "test"]);
         let mut iter = datum_to_iter(&data).unwrap();
@@ -383,6 +415,46 @@ mod tests {
 
             assert!(func.call(iter.get_mut_ptr(), &mut b));
             assert_eq!(pointers_to_str(b), "test");
+
+            assert!(!func.call(iter.get_mut_ptr(), &mut b));
+        }
+    }
+
+    #[test]
+    fn test_string_next_slice() {
+        let data_full = StringArray::from(vec!["this", "is", "a", "test", "string", "tomato", "potato"]);
+        let data = data_full.slice(2, 4);
+        let mut iter = datum_to_iter(&data).unwrap();
+
+        let ctx = Context::create();
+        let module = ctx.create_module("test_string_next");
+        let func_access =
+            generate_next(&ctx, &module, "access", data.get().0.data_type(), &iter).unwrap();
+        let fname = func_access.get_name().to_str().unwrap();
+
+        module.verify().unwrap();
+        let ee = module
+            .create_jit_execution_engine(OptimizationLevel::None)
+            .unwrap();
+
+        let func = unsafe {
+            ee.get_function::<unsafe extern "C" fn(*mut c_void, *mut u128) -> bool>(fname)
+                .unwrap()
+        };
+
+        unsafe {
+            let mut b: u128 = 0;
+            assert!(func.call(iter.get_mut_ptr(), &mut b));
+            assert_eq!(pointers_to_str(b), "a");
+
+            assert!(func.call(iter.get_mut_ptr(), &mut b));
+            assert_eq!(pointers_to_str(b), "test");
+
+            assert!(func.call(iter.get_mut_ptr(), &mut b));
+            assert_eq!(pointers_to_str(b), "string");
+
+            assert!(func.call(iter.get_mut_ptr(), &mut b));
+            assert_eq!(pointers_to_str(b), "tomato");
 
             assert!(!func.call(iter.get_mut_ptr(), &mut b));
         }
