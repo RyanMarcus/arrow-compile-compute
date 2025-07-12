@@ -945,7 +945,7 @@ impl<'a> SealedKernelProgram<'a> {
 #[repr(C)]
 #[derive(ReprOffset, Debug)]
 #[roff(usize_offsets)]
-struct KernelParameters {
+pub struct KernelParameters {
     base_ptr: *const c_void,
     holder: Vec<*mut c_void>,
 }

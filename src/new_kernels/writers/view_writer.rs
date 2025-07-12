@@ -42,7 +42,6 @@ impl ViewBufferWriter {
         };
 
         let buffer_index = self.buffers.len() as i32 - 1;
-        let offset = offset as i32;
         let len = data.len() as i32;
         let prefix = i32::from_le_bytes(data[0..4].try_into().unwrap());
 

@@ -27,6 +27,8 @@ pub use arrow_interface::select;
 
 pub use new_kernels::dsl;
 pub use new_kernels::ArrowKernelError;
+pub use new_kernels::Kernel;
+pub use new_kernels::SortOptions;
 
 macro_rules! declare_global_pointer {
     ($module:expr, $label:ident) => {{

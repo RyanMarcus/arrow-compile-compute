@@ -252,7 +252,7 @@ fn generate_llvm_cmp_kernel<'a>(
     module.verify().unwrap();
     optimize_module(&module)?;
     let ee = module
-        .create_jit_execution_engine(OptimizationLevel::None)
+        .create_jit_execution_engine(OptimizationLevel::Aggressive)
         .unwrap();
 
     Ok(unsafe {

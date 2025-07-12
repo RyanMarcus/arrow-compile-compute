@@ -30,16 +30,22 @@
 pub mod cmp {
     use std::sync::LazyLock;
 
+    use arrow_array::Array;
     use arrow_array::BooleanArray;
     use arrow_array::Datum;
+    use arrow_array::UInt32Array;
 
-    use crate::new_kernels::ComparisonKernel;
+    pub use crate::new_kernels::ComparisonKernel;
     use crate::new_kernels::KernelCache;
+    use crate::new_kernels::SortKernel;
+    use crate::new_kernels::SortOptions;
     use crate::ArrowKernelError;
     use crate::Predicate;
 
     static CMP_PROGRAM_CACHE: LazyLock<KernelCache<ComparisonKernel>> =
         LazyLock::new(KernelCache::new);
+
+    static SORT_PROGRAM_CACHE: LazyLock<KernelCache<SortKernel>> = LazyLock::new(KernelCache::new);
 
     /// Compute a bitvector for `lhs < rhs`
     pub fn lt(lhs: &dyn Datum, rhs: &dyn Datum) -> Result<BooleanArray, ArrowKernelError> {
@@ -69,6 +75,24 @@ pub mod cmp {
     /// Compute a bitvector for `lhs != rhs`
     pub fn neq(lhs: &dyn Datum, rhs: &dyn Datum) -> Result<BooleanArray, ArrowKernelError> {
         CMP_PROGRAM_CACHE.get((lhs, rhs), Predicate::Ne)
+    }
+
+    /// Returns an array of indices that would sort the input array. Combine
+    /// this kernel with `take` to physically sort the array.
+    pub fn sort_to_indices(
+        arr: &dyn Array,
+        options: SortOptions,
+    ) -> Result<UInt32Array, ArrowKernelError> {
+        SORT_PROGRAM_CACHE.get(vec![arr], vec![options])
+    }
+
+    /// Returns an array of indices that would sort the input arrays. Combine
+    /// this kernel with `take` to physically sort the array.
+    pub fn multicol_sort_to_indices(
+        arr: &[&dyn Array],
+        options: &[SortOptions],
+    ) -> Result<UInt32Array, ArrowKernelError> {
+        SORT_PROGRAM_CACHE.get(arr.to_vec(), options.to_vec())
     }
 }
 

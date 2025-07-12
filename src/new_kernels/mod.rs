@@ -5,6 +5,7 @@ pub mod dsl;
 mod filter;
 mod ht;
 mod llvm_utils;
+mod sort;
 mod take;
 mod writers;
 use std::{collections::HashMap, sync::RwLock};
@@ -22,6 +23,7 @@ use inkwell::attributes::Attribute;
 use inkwell::attributes::AttributeLoc;
 use inkwell::execution_engine::ExecutionEngine;
 use llvm_utils::str_writer_append_bytes;
+pub use sort::{SortKernel, SortOptions};
 pub use take::TakeKernel;
 
 use dsl::DSLError;
@@ -118,6 +120,7 @@ fn link_req_helpers(module: &Module, ee: &ExecutionEngine) -> Result<(), ArrowKe
     }
 
     if let Some(func) = module.get_function("debug_i64") {
+        println!("linking debug_i64");
         ee.add_global_mapping(&func, debug_i64 as usize);
     }
 

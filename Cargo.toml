@@ -5,7 +5,7 @@ edition = "2021"
 license = "GPL-3.0"
 
 [dependencies]
-inkwell = { version = "0.5.0", features = ["llvm18-0-prefer-static"] }
+inkwell = { version = "0.6.0", features = ["llvm18-1"] }
 arrow-schema = "55.2"
 arrow-buffer = "55.2"
 arrow-data = "55.2"
@@ -48,6 +48,10 @@ name = "parallel_bench"
 harness = false
 
 [[bench]]
+name = "compile_bench"
+harness = false
+
+[[bench]]
 name = "dsl_bench"
 harness = false
 
@@ -57,4 +61,8 @@ harness = false
 
 [[bench]]
 name = "filter_bench"
+harness = false
+
+[[bench]]
+name = "sort_bench"
 harness = false

@@ -402,7 +402,6 @@ mod tests {
         writer.llvm_flush(&ctx, &build);
         build.build_return(None).unwrap();
 
-        llvm_mod.print_to_stderr();
         llvm_mod.verify().unwrap();
         let ee = llvm_mod
             .create_jit_execution_engine(OptimizationLevel::None)
@@ -455,7 +454,6 @@ mod tests {
         writer.llvm_ingest(&ctx, &build, val.into());
         build.build_return(None).unwrap();
 
-        llvm_mod.print_to_stderr();
         llvm_mod.verify().unwrap();
         let ee = llvm_mod
             .create_jit_execution_engine(OptimizationLevel::None)
@@ -555,7 +553,6 @@ mod tests {
         writer.llvm_flush(&ctx, &build);
         build.build_return(None).unwrap();
 
-        llvm_mod.print_to_stderr();
         llvm_mod.verify().unwrap();
         let ee = llvm_mod
             .create_jit_execution_engine(OptimizationLevel::None)
