@@ -122,7 +122,8 @@ fn generate_single_cmp<'a>(
     llvm_mod: &Module<'a>,
     pt: PrimitiveType,
     reverse: bool,
-    access: FunctionValue<'a>,
+    access1: FunctionValue<'a>,
+    access2: FunctionValue<'a>,
 ) -> FunctionValue<'a> {
     let fname = format!("sort_cmp_{}", pt);
     if let Some(f) = llvm_mod.get_function(&fname) {
@@ -148,12 +149,12 @@ fn generate_single_cmp<'a>(
     let idx2 = func.get_nth_param(2).unwrap().into_int_value();
 
     let val1 = b
-        .build_call(access, &[data_ptr.into(), idx1.into()], "val1")
+        .build_call(access1, &[data_ptr.into(), idx1.into()], "val1")
         .unwrap()
         .try_as_basic_value()
         .unwrap_left();
     let val2 = b
-        .build_call(access, &[data_ptr.into(), idx2.into()], "val2")
+        .build_call(access2, &[data_ptr.into(), idx2.into()], "val2")
         .unwrap()
         .try_as_basic_value()
         .unwrap_left();
@@ -165,7 +166,38 @@ fn generate_single_cmp<'a>(
         PrimitiveType::U8 | PrimitiveType::U16 | PrimitiveType::U32 | PrimitiveType::U64 => {
             get_ucmp(ctx, llvm_mod, llvm_type)
         }
-        PrimitiveType::P64x2 => add_memcmp(ctx, llvm_mod),
+        PrimitiveType::P64x2 => {
+            let llvm_type = pt.llvm_type(ctx);
+            let memcmp = add_memcmp(ctx, llvm_mod);
+            let cmp_f = llvm_mod.add_function(
+                "cmp_str",
+                i8_type.fn_type(&[llvm_type.into(), llvm_type.into()], false),
+                Some(Linkage::Private),
+            );
+            declare_blocks!(ctx, cmp_f, entry);
+            let b2 = ctx.create_builder();
+            b2.position_at_end(entry);
+            let v1 = cmp_f.get_nth_param(0).unwrap().into_struct_value();
+            let v2 = cmp_f.get_nth_param(1).unwrap().into_struct_value();
+            let res = b2
+                .build_call(memcmp, &[v1.into(), v2.into()], "memcmp")
+                .unwrap()
+                .try_as_basic_value()
+                .unwrap_left()
+                .into_int_value();
+            let res = b2
+                .build_call(
+                    get_scmp(ctx, llvm_mod, i64_type.into()),
+                    &[res.into(), i64_type.const_zero().into()],
+                    "scmp_res",
+                )
+                .unwrap()
+                .try_as_basic_value()
+                .unwrap_left()
+                .into_int_value();
+            b2.build_return(Some(&res)).unwrap();
+            cmp_f
+        }
         PrimitiveType::F16 => todo!(),
         PrimitiveType::F32 => todo!(),
         PrimitiveType::F64 => todo!(),
@@ -193,11 +225,12 @@ fn fill_in_cmp<'a>(
         Option<FunctionValue<'a>>,
         SortOptions,
         FunctionValue<'a>,
+        FunctionValue<'a>,
     )],
 ) {
     let mut all_cmps = Vec::new();
-    for (pt, _nullable, opts, access) in pts {
-        let cmp = generate_single_cmp(ctx, llvm_mod, *pt, opts.descending, *access);
+    for (pt, _nullable, opts, access1, access2) in pts {
+        let cmp = generate_single_cmp(ctx, llvm_mod, *pt, opts.descending, *access1, *access2);
         all_cmps.push(cmp);
     }
 
@@ -228,7 +261,7 @@ fn fill_in_cmp<'a>(
     let mut data_ptrs = Vec::new();
 
     let mut idx = 0;
-    for (_, nullable, _, _) in pts.iter() {
+    for (_, nullable, _, _, _) in pts.iter() {
         if nullable.is_some() {
             let ptr = KernelParameters::llvm_get(ctx, &b, data_ptr, idx);
             bitmap_ptrs.push(Some(ptr));
@@ -485,7 +518,7 @@ fn generate_sort<'a>(
         )
         .unwrap();
 
-        config.push((ptype, null_access, *opts, access));
+        config.push((ptype, null_access, *opts, access, access));
     }
     fill_in_cmp(ctx, &llvm_mod, &config);
 
@@ -510,7 +543,7 @@ mod test {
         new_kernels::sort::{SortKernel, SortOptions},
         Kernel,
     };
-    use arrow_array::{Array, ArrayRef, Int32Array, Int64Array, UInt32Array};
+    use arrow_array::{Array, ArrayRef, Int32Array, Int64Array, StringArray, UInt32Array};
     use itertools::Itertools;
     use std::sync::Arc;
 
@@ -624,5 +657,17 @@ mod test {
         let k = SortKernel::compile(&input, vec![SortOptions::default()]).unwrap();
         let our_res = k.call(input).unwrap();
         assert_eq!(our_res, UInt32Array::from(perm));
+    }
+
+    #[test]
+    fn test_sort_string() {
+        let data = StringArray::from(vec!["hello", "this", "is", "a", "test"]);
+
+        let k =
+            SortKernel::compile(&vec![&data as &dyn Array], vec![SortOptions::default()]).unwrap();
+        let res = k.call(vec![&data]).unwrap();
+        let res = res.iter().map(|x| x.unwrap()).collect_vec();
+
+        assert_eq!(res, vec![3, 0, 2, 4, 1]);
     }
 }
