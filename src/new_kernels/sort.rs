@@ -15,7 +15,10 @@ use crate::{
     declare_blocks,
     dsl::KernelParameters,
     new_iter::{datum_to_iter, generate_random_access},
-    new_kernels::{cmp::add_memcmp, link_req_helpers, optimize_module, Kernel},
+    new_kernels::{
+        cmp::{add_float_to_int, add_memcmp},
+        link_req_helpers, optimize_module, Kernel,
+    },
     ArrowKernelError, PrimitiveType,
 };
 
@@ -198,9 +201,48 @@ fn generate_single_cmp<'a>(
             b2.build_return(Some(&res)).unwrap();
             cmp_f
         }
-        PrimitiveType::F16 => todo!(),
-        PrimitiveType::F32 => todo!(),
-        PrimitiveType::F64 => todo!(),
+        PrimitiveType::F16 | PrimitiveType::F32 | PrimitiveType::F64 => {
+            let f_to_i = add_float_to_int(ctx, llvm_mod, pt);
+            let llvm_type = pt.llvm_type(ctx);
+            let cmp_f = llvm_mod.add_function(
+                &format!("cmp_{}", pt),
+                i8_type.fn_type(&[llvm_type.into(), llvm_type.into()], false),
+                Some(Linkage::Private),
+            );
+            declare_blocks!(ctx, cmp_f, entry);
+            let b2 = ctx.create_builder();
+            b2.position_at_end(entry);
+            let v1 = cmp_f.get_nth_param(0).unwrap().into_float_value();
+            let v2 = cmp_f.get_nth_param(1).unwrap().into_float_value();
+            let v1_int = b2
+                .build_call(f_to_i, &[v1.into()], "f_to_i1")
+                .unwrap()
+                .try_as_basic_value()
+                .unwrap_left()
+                .into_int_value();
+            let v2_int = b2
+                .build_call(f_to_i, &[v2.into()], "f_to_i2")
+                .unwrap()
+                .try_as_basic_value()
+                .unwrap_left()
+                .into_int_value();
+            let res = b2
+                .build_call(
+                    get_scmp(
+                        ctx,
+                        llvm_mod,
+                        PrimitiveType::int_with_width(pt.width()).llvm_type(ctx),
+                    ),
+                    &[v1_int.into(), v2_int.into()],
+                    "scmp_res",
+                )
+                .unwrap()
+                .try_as_basic_value()
+                .unwrap_left()
+                .into_int_value();
+            b2.build_return(Some(&res)).unwrap();
+            cmp_f
+        }
     };
 
     let cmp = if reverse {
@@ -543,7 +585,9 @@ mod test {
         new_kernels::sort::{SortKernel, SortOptions},
         Kernel,
     };
-    use arrow_array::{Array, ArrayRef, Int32Array, Int64Array, StringArray, UInt32Array};
+    use arrow_array::{
+        Array, ArrayRef, Float32Array, Int32Array, Int64Array, StringArray, UInt32Array,
+    };
     use itertools::Itertools;
     use std::sync::Arc;
 
@@ -669,5 +713,17 @@ mod test {
         let res = res.iter().map(|x| x.unwrap()).collect_vec();
 
         assert_eq!(res, vec![3, 0, 2, 4, 1]);
+    }
+
+    #[test]
+    fn test_sort_f32() {
+        let data = Float32Array::from(vec![32.0, 16.0, f32::NAN, f32::INFINITY]);
+
+        let k =
+            SortKernel::compile(&vec![&data as &dyn Array], vec![SortOptions::default()]).unwrap();
+        let res = k.call(vec![&data]).unwrap();
+        let res = res.iter().map(|x| x.unwrap()).collect_vec();
+
+        assert_eq!(res, vec![1, 0, 3, 2]);
     }
 }

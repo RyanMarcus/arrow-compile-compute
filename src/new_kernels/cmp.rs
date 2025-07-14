@@ -559,7 +559,7 @@ pub fn add_float_vec_to_int_vec<'a>(
     func
 }
 
-fn add_float_to_int<'a>(
+pub fn add_float_to_int<'a>(
     ctx: &'a Context,
     module: &Module<'a>,
     ptype: PrimitiveType,

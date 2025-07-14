@@ -16,8 +16,8 @@ enum-as-inner = "0.6.1"
 repr_offset = { version = "0.2.2", features = ["derive"] }
 itertools = "0.13.0"
 
-
 [dev-dependencies]
+float-ord = "0.3.2"
 half = "2.4.1"
 arrow-ord = "55.2"
 arrow-cast = "55.2"
