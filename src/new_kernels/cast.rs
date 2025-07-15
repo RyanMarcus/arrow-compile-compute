@@ -21,7 +21,7 @@ pub struct CastKernel {
 unsafe impl Sync for CastKernel {}
 unsafe impl Send for CastKernel {}
 
-fn coalesce_type(res: ArrayRef, tar: &DataType) -> Result<ArrayRef, ArrowKernelError> {
+pub fn coalesce_type(res: ArrayRef, tar: &DataType) -> Result<ArrayRef, ArrowKernelError> {
     if res.data_type() == tar {
         return Ok(res);
     }

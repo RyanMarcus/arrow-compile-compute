@@ -1,6 +1,7 @@
 mod apply;
 mod cast;
 mod cmp;
+mod concat;
 pub mod dsl;
 mod filter;
 mod ht;
@@ -17,6 +18,7 @@ pub use apply::UIntFuncCache;
 use arrow_schema::DataType;
 pub use cast::CastKernel;
 pub use cmp::ComparisonKernel;
+pub use concat::ConcatKernel;
 pub use filter::FilterKernel;
 pub use ht::HashKernel;
 use inkwell::attributes::Attribute;
@@ -51,6 +53,7 @@ pub enum ArrowKernelError {
     LLVMError(String),
     NonVectorizableType(DataType),
     DictionaryFullError(DataType),
+    TypeMismatch(PrimitiveType, PrimitiveType),
     DSLError(DSLError),
 }
 

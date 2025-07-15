@@ -243,15 +243,17 @@ pub mod apply {
 pub mod select {
     use std::sync::LazyLock;
 
-    use arrow_array::{Array, ArrayRef, BooleanArray};
+    use arrow_array::{make_array, Array, ArrayRef, BooleanArray};
 
     use crate::{
-        new_kernels::{FilterKernel, KernelCache, TakeKernel},
+        new_kernels::{ConcatKernel, FilterKernel, KernelCache, TakeKernel},
         ArrowKernelError,
     };
 
     static TAKE_PROGRAM_CACHE: LazyLock<KernelCache<TakeKernel>> = LazyLock::new(KernelCache::new);
     static FILTER_PROGRAM_CACHE: LazyLock<KernelCache<FilterKernel>> =
+        LazyLock::new(KernelCache::new);
+    static CONCAT_PROGRAM_CACHE: LazyLock<KernelCache<ConcatKernel>> =
         LazyLock::new(KernelCache::new);
 
     /// Extract the elements in `data` at the indices specified in `idxes`.
@@ -298,12 +300,35 @@ pub mod select {
     pub fn filter(data: &dyn Array, filter: &BooleanArray) -> Result<ArrayRef, ArrowKernelError> {
         FILTER_PROGRAM_CACHE.get((data, filter), ())
     }
+
+    /// Concatenates multiple arrays into a single array.
+    ///
+    /// The logical type of each array must be the same, but the physical type
+    /// may differ.
+    ///
+    /// ```
+    /// use arrow_array::{Int32Array, Array};
+    /// use arrow_compile_compute::select::concat;
+    ///
+    /// let data1 = Int32Array::from(vec![1, 2, 3, 4]);
+    /// let data2 = Int32Array::from(vec![5, 6, 7, 8]);
+    /// let res = concat(&[&data1, &data2]).unwrap();
+    ///
+    /// assert_eq!(res.len(), 8);
+    /// ```
+    pub fn concat(data: &[&dyn Array]) -> Result<ArrayRef, ArrowKernelError> {
+        if data.len() == 1 {
+            return Ok(make_array(data[0].to_data()));
+        }
+        CONCAT_PROGRAM_CACHE.get(data, ())
+    }
 }
 
 pub mod compute {
     use std::sync::LazyLock;
 
-    use arrow_array::{Datum, UInt64Array};
+    use arrow_array::{Array, Datum, UInt64Array};
+    use cardinality_estimator::CardinalityEstimator;
 
     use crate::{
         new_kernels::{HashKernel, KernelCache},
@@ -332,5 +357,77 @@ pub mod compute {
     /// ```
     pub fn hash(data: &dyn Datum) -> Result<UInt64Array, ArrowKernelError> {
         HASH_PROGRAM_CACHE.get(data, ())
+    }
+
+    /// Compute an approximation of the maximum run length inside of an array.
+    /// Uses a constant amount of time.
+    ///
+    /// # Example
+    ///
+    /// ```
+    /// use arrow_array::{Int32Array, Datum, UInt64Array};
+    /// use arrow_compile_compute::compute::approx_max_run_length;
+    /// let arr = Int32Array::from(vec![0, 10, 10, 10, 20, 30, 50]);
+    /// let max_run = approx_max_run_length(&arr).unwrap();
+    /// assert_eq!(max_run, 3);
+    /// ```
+    pub fn approx_max_run_length(data: &dyn Array) -> Result<u64, ArrowKernelError> {
+        if data.len() < 2 {
+            return Ok(1);
+        }
+
+        let mut without_last = data.slice(0, data.len() - 1);
+        let mut without_first = data.slice(1, data.len() - 1);
+
+        if without_last.len() > 8192 {
+            without_last = without_last.slice(0, 8192);
+            without_first = without_first.slice(0, 8192);
+        }
+
+        let bitmap = crate::cmp::eq(&without_last, &without_first)?;
+        let mut cur_run = 0;
+        let mut max_run = 0;
+        for el in bitmap.iter() {
+            if let Some(true) = el {
+                cur_run += 1;
+                max_run = max_run.max(cur_run);
+            } else {
+                cur_run = 0;
+            }
+        }
+
+        Ok(max_run + 1)
+    }
+
+    /// Compute an approximation of the percentage of values that are distinct.
+    /// Runs in constant time.
+    ///
+    /// # Example
+    ///
+    /// ```
+    /// use arrow_array::{Int32Array, Datum, UInt64Array};
+    /// use arrow_compile_compute::compute::approx_perc_distinct;
+    /// let arr = Int32Array::from(vec![10, 20, 20, 20, 30, 10, 10, 1, 2, 3]);
+    /// let pdist = approx_perc_distinct(&arr).unwrap();
+    /// assert!(pdist > 0.5 && pdist < 0.7);
+    /// ```
+    pub fn approx_perc_distinct(data: &dyn Array) -> Result<f32, ArrowKernelError> {
+        if data.len() <= 1 {
+            return Ok(1.0);
+        }
+
+        let data = if data.len() > 8192 {
+            data.slice(0, 8192)
+        } else {
+            data.slice(0, data.len())
+        };
+
+        let hashed = hash(&data)?;
+        let mut ce = CardinalityEstimator::<u64>::new();
+        hashed
+            .iter()
+            .filter_map(|x| x)
+            .for_each(|x| ce.insert_hash(x));
+        Ok(ce.estimate() as f32 / data.len() as f32)
     }
 }
