@@ -32,9 +32,8 @@ proptest! {
     }
 
     #[test]
-    fn test_concat_nullable_str(data_pre: (Vec<Option<String>>, Vec<Option<String>>), mut data: Vec<Vec<Option<String>>>) {
-        data.push(data_pre.0);
-        data.push(data_pre.1);
+    fn test_concat_nullable_str(data1: Vec<Option<String>>, data2: Vec<Option<String>>) {
+        let data = vec![data1, data2];
         let combined = data.iter().flat_map(|v| v.iter().cloned()).collect_vec();
         let arrays = data.into_iter().map(|v| StringArray::from(v)).collect_vec();
         let refs = arrays.iter().map(|x| x as &dyn Array).collect_vec();
