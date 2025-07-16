@@ -108,8 +108,8 @@ impl Kernel for ConcatKernel {
             context: Context::create(),
             types,
             func_builder: |ctx| match PrimitiveType::for_arrow_type(inp[0].data_type()) {
-                PrimitiveType::P64x2 => build_concat::<StringViewWriter>(ctx, *inp),
-                _ => build_concat::<PrimitiveArrayWriter>(ctx, *inp),
+                PrimitiveType::P64x2 => build_concat::<StringViewWriter>(ctx, inp),
+                _ => build_concat::<PrimitiveArrayWriter>(ctx, inp),
             },
         }
         .try_build()
@@ -119,7 +119,7 @@ impl Kernel for ConcatKernel {
         i: &Self::Input<'_>,
         _p: &Self::Params,
     ) -> Result<Self::Key, ArrowKernelError> {
-        if i.len() < 1 {
+        if i.is_empty() {
             return Err(ArrowKernelError::ArgumentMismatch(
                 "concat on empty sequence of arrays".to_string(),
             ));

@@ -440,6 +440,7 @@ impl<'a> KernelExpression<'a> {
         }
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn compile<'b>(
         &self,
         ctx: &'b Context,

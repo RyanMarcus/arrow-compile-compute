@@ -19,6 +19,7 @@ mod arrow_interface;
 mod new_iter;
 mod new_kernels;
 
+pub use arrow_interface::aggregate;
 pub use arrow_interface::apply;
 pub use arrow_interface::cast;
 pub use arrow_interface::cmp;
@@ -29,6 +30,17 @@ pub use new_kernels::dsl;
 pub use new_kernels::ArrowKernelError;
 pub use new_kernels::Kernel;
 pub use new_kernels::SortOptions;
+
+macro_rules! mark_load_invariant {
+    ($ctx:expr, $instruction:expr) => {
+        $instruction
+            .as_instruction_value()
+            .unwrap()
+            .set_metadata($ctx.metadata_node(&[]), $ctx.get_kind_id("invariant.load"))
+            .unwrap();
+    };
+}
+pub(crate) use mark_load_invariant;
 
 macro_rules! declare_global_pointer {
     ($module:expr, $label:ident) => {{
@@ -215,6 +227,11 @@ impl PrimitiveType {
     const fn max_width() -> usize {
         16
     }
+
+    const fn max_width_type() -> Self {
+        PrimitiveType::P64x2
+    }
+
     const fn width(&self) -> usize {
         // if any of these widths are updated, make sure to check `max_width` as
         // well!

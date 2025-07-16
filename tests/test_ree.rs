@@ -36,6 +36,4 @@ proptest! {
 
         assert_eq!(&arrow_casted as &dyn Array, &our_casted);
     }
-
-
 }

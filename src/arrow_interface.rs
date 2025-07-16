@@ -424,10 +424,77 @@ pub mod compute {
 
         let hashed = hash(&data)?;
         let mut ce = CardinalityEstimator::<u64>::new();
-        hashed
-            .iter()
-            .filter_map(|x| x)
-            .for_each(|x| ce.insert_hash(x));
+        hashed.iter().flatten().for_each(|x| ce.insert_hash(x));
         Ok(ce.estimate() as f32 / data.len() as f32)
+    }
+}
+
+/// Grouped aggregation kernels, following a ["ticketing" approach](https://arxiv.org/abs/2505.04153).
+///
+/// Aggregators can `ingest` data, `merge` with other aggregators (of the same
+/// type), and `finalize` to produce the final aggregation results.
+///
+/// # Example
+///
+/// ```rust
+/// # use arrow_array::{Int32Array, Int64Array, cast::AsArray, types::Int64Type};
+/// # use arrow_schema::DataType;
+/// # use arrow_compile_compute::aggregate::SumAggregator;
+/// # use itertools::Itertools;
+///
+/// // thread 1:
+/// let mut agg1 = SumAggregator::new(&[&DataType::Int32]);
+/// agg1.ingest(
+///     &[0, 1, 0, 1, 0, 1],
+///     &Int32Array::from(vec![1, 2, 3, 4, 5, 6]),
+/// );
+/// // more calls to `ingest` here...
+///
+/// // thread 2:
+/// let mut agg2 = SumAggregator::new(&[&DataType::Int32]);
+/// agg2.ingest(
+///     &[0, 1, 0, 1, 0, 1],
+///     &Int32Array::from(vec![1, 2, 3, 4, 5, 6]),
+/// );
+/// // more calls to `ingest` here...
+///
+/// // join thread 1 and thread 2, merge results and get answer
+/// let agg = agg1.merge(agg2);
+/// let res = agg.finish();
+/// let res = res
+///     .as_primitive::<Int64Type>()
+///     .values()
+///     .iter()
+///     .copied()
+///     .collect_vec();
+/// assert_eq!(res, vec![18, 24]);
+/// ```
+///
+///
+pub mod aggregate {
+    use arrow_schema::DataType;
+
+    pub use crate::new_kernels::{CountAggregator, MaxAggregator, MinAggregator, SumAggregator};
+    use crate::ArrowKernelError;
+
+    /// Creates a new sum aggregator. Final results are 64-bit versions of their
+    /// inputs (e.g., `f32` is summed to `f64`).
+    pub fn sum(ty: &DataType) -> Result<SumAggregator, ArrowKernelError> {
+        Ok(SumAggregator::new(&[ty]))
+    }
+
+    /// Creates a new min aggregator. Final results will match the input type.
+    pub fn min(ty: &DataType) -> Result<MinAggregator, ArrowKernelError> {
+        Ok(MinAggregator::new(&[ty]))
+    }
+
+    /// Creates a new max aggregator. Final results will match the input type.
+    pub fn max(ty: &DataType) -> Result<MaxAggregator, ArrowKernelError> {
+        Ok(MaxAggregator::new(&[ty]))
+    }
+
+    /// Creates a new count aggregator. Final results will be `u64`.
+    pub fn count() -> Result<CountAggregator, ArrowKernelError> {
+        Ok(CountAggregator::new(&[]))
     }
 }

@@ -1,3 +1,4 @@
+mod aggregate;
 mod apply;
 mod cast;
 mod cmp;
@@ -11,6 +12,7 @@ mod take;
 mod writers;
 use std::{collections::HashMap, sync::RwLock};
 
+pub use aggregate::{CountAggregator, MaxAggregator, MinAggregator, SumAggregator};
 pub use apply::FloatFuncCache;
 pub use apply::IntFuncCache;
 pub use apply::StrFuncCache;
@@ -41,6 +43,7 @@ use inkwell::{
 
 use crate::new_kernels::llvm_utils::debug_i64;
 use crate::new_kernels::llvm_utils::debug_ptr;
+use crate::new_kernels::llvm_utils::save_to_string_saver;
 use crate::new_kernels::llvm_utils::str_view_writer_append_bytes;
 use crate::PrimitiveType;
 
@@ -120,6 +123,10 @@ fn link_req_helpers(module: &Module, ee: &ExecutionEngine) -> Result<(), ArrowKe
 
     if let Some(func) = module.get_function("str_view_writer_append_bytes") {
         ee.add_global_mapping(&func, str_view_writer_append_bytes as usize);
+    }
+
+    if let Some(func) = module.get_function("save_to_string_saver") {
+        ee.add_global_mapping(&func, save_to_string_saver as usize);
     }
 
     if let Some(func) = module.get_function("debug_i64") {

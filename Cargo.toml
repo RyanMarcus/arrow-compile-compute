@@ -11,11 +11,12 @@ arrow-buffer = "55.2"
 arrow-data = "55.2"
 arrow-array = "55.2"
 ouroboros = "0.18"
-half = "2.4.1"
+half = { version = "2.4", features = ["bytemuck"] }
 enum-as-inner = "0.6.1"
 repr_offset = { version = "0.2.2", features = ["derive"] }
 itertools = "0.13.0"
 cardinality-estimator = "1.0.2"
+bytemuck = { version = "1.23", features = ["extern_crate_alloc"] }
 
 [dev-dependencies]
 float-ord = "0.3.2"

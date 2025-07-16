@@ -2,7 +2,7 @@ use std::ffi::c_void;
 
 use inkwell::{context::Context, module::Module, values::FunctionValue, AddressSpace};
 
-use crate::new_kernels::writers::ViewBufferWriter;
+use crate::new_kernels::{aggregate::StringSaver, writers::ViewBufferWriter};
 
 #[no_mangle]
 pub extern "C" fn str_writer_append_bytes(ptr: *const u8, len: u64, vec: *mut c_void) {
@@ -24,6 +24,22 @@ pub extern "C" fn str_view_writer_append_bytes(
 
     unsafe {
         *view_ptr = view as u128;
+    }
+}
+
+#[no_mangle]
+pub extern "C" fn save_to_string_saver(
+    str_ptr: *const u8,
+    len: u64,
+    saver: *mut c_void,
+    out_ptr: *mut u128,
+) {
+    let bytes = unsafe { std::slice::from_raw_parts(str_ptr, len as usize) };
+    let data = unsafe { &mut *(saver as *mut StringSaver) };
+    let result = data.insert(bytes);
+
+    unsafe {
+        *out_ptr = result as u128;
     }
 }
 
