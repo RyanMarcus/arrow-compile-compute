@@ -1,3 +1,4 @@
+mod aggregate;
 mod apply;
 mod cast;
 mod cmp;

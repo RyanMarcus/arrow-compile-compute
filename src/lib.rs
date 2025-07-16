@@ -215,6 +215,11 @@ impl PrimitiveType {
     const fn max_width() -> usize {
         16
     }
+
+    const fn max_width_type() -> Self {
+        PrimitiveType::P64x2
+    }
+
     const fn width(&self) -> usize {
         // if any of these widths are updated, make sure to check `max_width` as
         // well!
