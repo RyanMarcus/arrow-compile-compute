@@ -405,6 +405,55 @@ mod tests {
     }
 
     #[test]
+    fn test_ree_iter_block_slice() {
+        let data = Int32Array::from(vec![1, 2, 3, 4]);
+        let ends = Int32Array::from(vec![4, 8, 17, 18]);
+        let ree_full = RunArray::try_new(&ends, &data).unwrap();
+        let ree = ree_full.slice(4, 10);
+
+        let mut iter = datum_to_iter(&ree).unwrap();
+
+        let ctx = Context::create();
+        let module = ctx.create_module("test_iter");
+        let func =
+            generate_next_block::<8>(&ctx, &module, "iter_block_next", ree.data_type(), &iter)
+                .unwrap();
+        let fname = func.get_name().to_str().unwrap();
+
+        let next_func = generate_next(&ctx, &module, "iter_next", ree.data_type(), &iter).unwrap();
+        let next_fname = next_func.get_name().to_str().unwrap();
+
+        module.verify().unwrap();
+        let ee = module
+            .create_jit_execution_engine(OptimizationLevel::None)
+            .unwrap();
+
+        let next_block = unsafe {
+            ee.get_function::<unsafe extern "C" fn(*mut c_void, *mut i32) -> bool>(fname)
+                .unwrap()
+        };
+
+        let next = unsafe {
+            ee.get_function::<unsafe extern "C" fn(*mut c_void, *mut i32) -> bool>(next_fname)
+                .unwrap()
+        };
+
+        let mut buf = [0_i32; 8];
+        let mut sbuf: i32 = 0;
+        unsafe {
+            assert_eq!(next_block.call(iter.get_mut_ptr(), buf.as_mut_ptr()), true);
+            assert_eq!(buf, [2, 2, 2, 2, 3, 3, 3, 3]);
+            assert_eq!(next_block.call(iter.get_mut_ptr(), buf.as_mut_ptr()), false);
+
+            assert_eq!(next.call(iter.get_mut_ptr(), &mut sbuf), true);
+            assert_eq!(sbuf, 3);
+            assert_eq!(next.call(iter.get_mut_ptr(), &mut sbuf), true);
+            assert_eq!(sbuf, 3);
+            assert_eq!(next.call(iter.get_mut_ptr(), &mut sbuf), false);
+        };
+    }
+
+    #[test]
     fn test_re_iter() {
         let values = Int32Array::from(vec![10, 20]);
         let res = Int32Array::from(vec![2, 4]);
@@ -438,6 +487,45 @@ mod tests {
 
         assert!(unsafe { next_func.call(iter.get_mut_ptr(), &mut res as *mut i32) });
         assert_eq!(res, 20);
+
+        assert!(!unsafe { next_func.call(iter.get_mut_ptr(), &mut res as *mut i32) });
+    }
+
+    #[test]
+    fn test_re_iter_slice() {
+        let values = Int32Array::from(vec![10, 20, 30]);
+        let res = Int32Array::from(vec![2, 4, 6]);
+        let ree_full = Int32RunArray::try_new(&res, &values).unwrap();
+        let ree = ree_full.slice(2, 4);
+        let mut iter = datum_to_iter(&ree).unwrap();
+
+        let ctx = Context::create();
+        let module = ctx.create_module("test_runend");
+
+        let func = generate_next(&ctx, &module, "runend", ree.data_type(), &iter).unwrap();
+        let fname = func.get_name().to_str().unwrap();
+
+        module.verify().unwrap();
+        let ee = module
+            .create_jit_execution_engine(OptimizationLevel::None)
+            .unwrap();
+        let next_func = unsafe {
+            ee.get_function::<unsafe extern "C" fn(*mut c_void, *mut i32) -> bool>(fname)
+                .unwrap()
+        };
+
+        let mut res = 0;
+        assert!(unsafe { next_func.call(iter.get_mut_ptr(), &mut res as *mut i32) });
+        assert_eq!(res, 20);
+
+        assert!(unsafe { next_func.call(iter.get_mut_ptr(), &mut res as *mut i32) });
+        assert_eq!(res, 20);
+
+        assert!(unsafe { next_func.call(iter.get_mut_ptr(), &mut res as *mut i32) });
+        assert_eq!(res, 30);
+
+        assert!(unsafe { next_func.call(iter.get_mut_ptr(), &mut res as *mut i32) });
+        assert_eq!(res, 30);
 
         assert!(!unsafe { next_func.call(iter.get_mut_ptr(), &mut res as *mut i32) });
     }

@@ -17,6 +17,7 @@ use crate::increment_pointer;
 #[roff(usize_offsets)]
 pub struct BitmapIterator {
     data: *const u8,
+    slice_offset: u64,
     pos: u64,
     len: u64,
 }
@@ -37,6 +38,19 @@ impl BitmapIterator {
             )
             .unwrap()
             .into_pointer_value()
+    }
+
+    pub fn llvm_slice_offset<'a>(
+        &self,
+        ctx: &'a Context,
+        build: &'a Builder,
+        ptr: PointerValue<'a>,
+    ) -> IntValue<'a> {
+        let slice_offset_ptr = increment_pointer!(ctx, build, ptr, BitmapIterator::OFFSET_SLICE_OFFSET);
+        build
+            .build_load(ctx.i64_type(), slice_offset_ptr, "slice_offset")
+            .unwrap()
+            .into_int_value()
     }
 
     pub fn llvm_pos<'a>(
@@ -86,8 +100,9 @@ impl From<&BooleanArray> for Box<BitmapIterator> {
     fn from(value: &BooleanArray) -> Self {
         Box::new(BitmapIterator {
             data: value.values().values().as_ptr(),
-            pos: value.offset() as u64,
-            len: (value.len() + value.offset()) as u64,
+            slice_offset: value.offset() as u64,
+            pos: 0,
+            len: value.len() as u64,
         })
     }
 }
@@ -200,6 +215,82 @@ mod tests {
     }
 
     #[test]
+    fn test_bitmap_iter_slice() {
+        use arrow_array::BooleanArray;
+        let full_data = BooleanArray::from(vec![
+            true, true, false, true, false, false, false, false, true, true, false, true, false,
+        ]);
+
+        let data = full_data.slice(2, 8);
+
+        let mut iter = array_to_iter(&data);
+
+        let ctx = Context::create();
+        let module = ctx.create_module("test_bitmap_iter");
+        let func = generate_next(&ctx, &module, "bitmap_iter", data.data_type(), &iter).unwrap();
+        let fname = func.get_name().to_str().unwrap();
+
+        module.verify().unwrap();
+        let ee = module
+            .create_jit_execution_engine(OptimizationLevel::None)
+            .unwrap();
+
+        let next_func = unsafe {
+            ee.get_function::<unsafe extern "C" fn(*mut c_void, *mut i32) -> bool>(fname)
+                .unwrap()
+        };
+
+        let mut buf: i32 = 0;
+        unsafe {
+            assert_eq!(
+                next_func.call(iter.get_mut_ptr(), &mut buf as *mut i32),
+                true
+            );
+            assert_eq!(buf, 0);
+            assert_eq!(
+                next_func.call(iter.get_mut_ptr(), &mut buf as *mut i32),
+                true
+            );
+            assert_eq!(buf, 1);
+            assert_eq!(
+                next_func.call(iter.get_mut_ptr(), &mut buf as *mut i32),
+                true
+            );
+            assert_eq!(buf, 0);
+            assert_eq!(
+                next_func.call(iter.get_mut_ptr(), &mut buf as *mut i32),
+                true
+            );
+            assert_eq!(buf, 0);
+            assert_eq!(
+                next_func.call(iter.get_mut_ptr(), &mut buf as *mut i32),
+                true
+            );
+            assert_eq!(buf, 0);
+            assert_eq!(
+                next_func.call(iter.get_mut_ptr(), &mut buf as *mut i32),
+                true
+            );
+            assert_eq!(buf, 0);
+            assert_eq!(
+                next_func.call(iter.get_mut_ptr(), &mut buf as *mut i32),
+                true
+            );
+            assert_eq!(buf, 1);
+            assert_eq!(
+                next_func.call(iter.get_mut_ptr(), &mut buf as *mut i32),
+                true
+            );
+            assert_eq!(buf, 1);
+            assert_eq!(
+                next_func.call(iter.get_mut_ptr(), &mut buf as *mut i32),
+                false
+            );
+        }
+    }
+    
+
+    #[test]
     fn test_bitmap_random_access() {
         use arrow_array::BooleanArray;
         let data = BooleanArray::from(vec![
@@ -245,4 +336,46 @@ mod tests {
             assert_eq!(next_func.call(iter.get_mut_ptr(), 10), 0);
         };
     }
+
+#[test]
+    fn test_bitmap_random_access_slice() {
+        use arrow_array::BooleanArray;
+        let full_data = BooleanArray::from(vec![
+            true, true, false, true, false, false, false, false, true, true, false, true, false,
+        ]);
+        let data = full_data.slice(2, 8);
+
+        let mut iter = array_to_iter(&data);
+
+        let ctx = Context::create();
+        let module = ctx.create_module("test_bitmap_iter");
+        let func =
+            generate_random_access(&ctx, &module, "bitmap_iter", data.data_type(), &iter).unwrap();
+        let fname = func.get_name().to_str().unwrap();
+
+        module.verify().unwrap();
+        let ee = module
+            .create_jit_execution_engine(OptimizationLevel::None)
+            .unwrap();
+
+        let next_func = unsafe {
+            ee.get_function::<unsafe extern "C" fn(*mut c_void, u64) -> i8>(fname)
+                .unwrap()
+        };
+
+        unsafe {
+            //assert_eq!(next_func.call(iter.get_mut_ptr(), 0), 0);
+            assert_eq!(next_func.call(iter.get_mut_ptr(), 1), 1);
+            assert_eq!(next_func.call(iter.get_mut_ptr(), 2), 0);
+            assert_eq!(next_func.call(iter.get_mut_ptr(), 3), 0);
+            assert_eq!(next_func.call(iter.get_mut_ptr(), 4), 0);
+            assert_eq!(next_func.call(iter.get_mut_ptr(), 5), 0);
+            assert_eq!(next_func.call(iter.get_mut_ptr(), 6), 1);
+            assert_eq!(next_func.call(iter.get_mut_ptr(), 7), 1);
+            assert_eq!(next_func.call(iter.get_mut_ptr(), 3), 0);
+            assert_eq!(next_func.call(iter.get_mut_ptr(), 4), 0);
+            assert_eq!(next_func.call(iter.get_mut_ptr(), 7), 1);
+        };
+    }
+
 }

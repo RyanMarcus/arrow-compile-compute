@@ -954,57 +954,48 @@ pub fn generate_next<'a>(
                 next,
                 entry,
                 while_loop,
-                get_next_byte_loop,
+                get_next_long_loop,
                 none_left,
                 get_next,
-                use_byte
+                get_next_intermediate,
+                get_next_end,
+                use_long
             );
 
             let cttz_id = Intrinsic::find("llvm.cttz").expect("llvm.cttz not in Intrinsic list");
             cttz_id
-                .get_declaration(llvm_mod, &[ctx.i8_type().into()])
-                .expect("Couldn't declare llvm.cttz.i8");
+                .get_declaration(&llvm_mod, &[ctx.i64_type().into()])
+                .expect("Couldn't declare llvm.cttz.i64");
 
-            let cttz_i8 = llvm_mod
-                .get_function("llvm.cttz.i8")
-                .expect("llvm.cttz.i8 should have been declared in the CodeGen constructor");
+            let cttz_i64 = llvm_mod
+                .get_function("llvm.cttz.i64")
+                .expect("llvm.cttz.i64 should have been declared");
 
             build.position_at_end(entry);
             build.build_unconditional_branch(while_loop).unwrap();
 
             build.position_at_end(while_loop);
-            let curr_pos = setbit_iterator.llvm_get_pos(ctx, &build, iter_ptr);
-            let curr_byte = setbit_iterator.llvm_get_byte(ctx, &build, iter_ptr);
+            let index = setbit_iterator.llvm_get_index(ctx, &build, iter_ptr);
+            let curr_long = setbit_iterator.llvm_get_long(ctx, &build, iter_ptr);
             let cmp_to_zero = build
                 .build_int_compare(
                     IntPredicate::EQ,
-                    curr_byte,
-                    ctx.i8_type().const_int(0, false),
-                    "cmp_byte_to_zero",
+                    curr_long,
+                    ctx.i64_type().const_int(0, false),
+                    "cmp_long_to_zero",
                 )
                 .unwrap();
             build
-                .build_conditional_branch(cmp_to_zero, get_next_byte_loop, use_byte)
+                .build_conditional_branch(cmp_to_zero, get_next_long_loop, use_long)
                 .unwrap();
 
-            build.position_at_end(get_next_byte_loop);
-            let bit_len = setbit_iterator.llvm_get_len(ctx, &build, iter_ptr);
-            let bytes_len = build
-                .build_int_add(bit_len, i64_type.const_int(7, false), "round_up")
-                .unwrap();
-            let bytes_len = build
-                .build_right_shift(
-                    bytes_len,
-                    i64_type.const_int(3, false),
-                    false,
-                    "divide_by_8",
-                )
-                .unwrap();
-            let cmp_pos_to_len = build
-                .build_int_compare(IntPredicate::EQ, curr_pos, bytes_len, "cmp_pos_to_len")
+            build.position_at_end(get_next_long_loop);
+            let end_index = setbit_iterator.llvm_get_end_index(ctx, &build, iter_ptr);
+            let cmp_index_to_end_index = build
+                .build_int_compare(IntPredicate::EQ, index, end_index, "cmp_index_to_end_index")
                 .unwrap();
             build
-                .build_conditional_branch(cmp_pos_to_len, none_left, get_next)
+                .build_conditional_branch(cmp_index_to_end_index, none_left, get_next)
                 .unwrap();
 
             build.position_at_end(none_left);
@@ -1013,38 +1004,54 @@ pub fn generate_next<'a>(
                 .unwrap();
 
             build.position_at_end(get_next);
-            setbit_iterator.llvm_load_byte_at_pos(ctx, &build, iter_ptr);
-            setbit_iterator.llvm_increment_pos(ctx, &build, iter_ptr, i64_type.const_int(1, false));
+            let end_index_minus_one = build
+                .build_int_sub(end_index, i64_type.const_int(1, false), "end_index_minus_1")
+                .unwrap();
+            let cmp_index_to_end_index_minus_1 = build
+                .build_int_compare(IntPredicate::EQ, index, end_index_minus_one, "cmp_index_to_end_index_minus_1")
+                .unwrap();
+            build
+                .build_conditional_branch(cmp_index_to_end_index_minus_1, get_next_end, get_next_intermediate)
+                .unwrap();
+            
+            build.position_at_end(get_next_end);
+            setbit_iterator.llvm_load_last_long(ctx, &build, iter_ptr);
+            setbit_iterator.llvm_increment_index(ctx, &build, iter_ptr, i64_type.const_int(1, false));
             build.build_unconditional_branch(while_loop).unwrap();
 
-            build.position_at_end(use_byte);
+            build.position_at_end(get_next_intermediate);
+            setbit_iterator.llvm_load_long_at_index(ctx, &build, iter_ptr);
+            setbit_iterator.llvm_increment_index(ctx, &build, iter_ptr, i64_type.const_int(1, false));
+            build.build_unconditional_branch(while_loop).unwrap();
 
+            build.position_at_end(use_long);
             let is_zero_undef = ctx.bool_type().const_int(0, false);
-            let tz_i8 = build
+            let tz_i64 = build
                 .build_call(
-                    cttz_i8,
-                    &[curr_byte.into(), is_zero_undef.into()],
-                    "cttz_i8",
+                    cttz_i64,
+                    &[curr_long.into(), is_zero_undef.into()],
+                    "cttz_i64",
                 )
                 .unwrap()
                 .try_as_basic_value()
                 .left()
                 .expect("cttz should return a value")
                 .into_int_value();
-            let tz_i64 = build
-                .build_int_z_extend(tz_i8, i64_type, "extend_tz")
-                .unwrap();
             setbit_iterator.llvm_clear_trailing_bit(ctx, &build, iter_ptr);
             let setbit_position = build
-                .build_int_nuw_sub(curr_pos, i64_type.const_int(1, false), "pos_minus_one")
+                .build_int_sub(index, i64_type.const_int(1, false), "pos_sub_1")
                 .unwrap();
             let setbit_position = build
-                .build_int_mul(setbit_position, i64_type.const_int(8, false), "pos_mul_8")
+                .build_int_mul(setbit_position, i64_type.const_int(64, false), "pos_mul_64")
                 .unwrap();
             let setbit_position = build
-                .build_int_add(setbit_position, tz_i64, "add_tz")
+                .build_int_add(setbit_position, tz_i64, "pos_add_tz")
                 .unwrap();
-            build.build_store(out_ptr, setbit_position).unwrap();
+            let slice_offset = setbit_iterator.llvm_get_slice_offset(ctx, &build, iter_ptr);
+            let final_position = build
+                .build_int_sub(setbit_position, slice_offset, "setbit_position_minus_slice_offset")
+                .unwrap();
+            build.build_store(out_ptr, final_position).unwrap();
             build
                 .build_return(Some(&bool_type.const_int(1, false)))
                 .unwrap();
@@ -1549,11 +1556,15 @@ pub fn generate_random_access<'a>(
 
             build.position_at_end(entry);
             let data_ptr = bitmap_iterator.llvm_get_data_ptr(ctx, &build, iter_ptr);
+            let slice_offset = bitmap_iterator.llvm_slice_offset(ctx, &build, iter_ptr);
+            let bit_index = build
+                .build_int_add(slice_offset, idx, "slice_offset_plus_index")
+                .unwrap();
             let byte_index = build
-                .build_right_shift(idx, i64_type.const_int(3, false), false, "byte_index")
+                .build_right_shift(bit_index, i64_type.const_int(3, false), false, "byte_index")
                 .unwrap();
             let bit_in_byte_i64 = build
-                .build_and(idx, i64_type.const_int(7, false), "bit_in_byte_i64")
+                .build_and(bit_index, i64_type.const_int(7, false), "bit_in_byte_i64")
                 .unwrap();
             let bit_in_byte_i8 = build
                 .build_int_truncate(bit_in_byte_i64, ctx.i8_type(), "bit_in_byte_i8")
