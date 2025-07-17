@@ -477,8 +477,8 @@ mod tests {
         ]);
         let data2 = data.slice(0, 8);
         
-        array_to_setbit_iter(&data);
-        let mut iter = array_to_setbit_iter(&data2);
+        array_to_setbit_iter(&data).unwrap();
+        let mut iter = array_to_setbit_iter(&data2).unwrap();
         println!("{:?}", iter);
 
         let ctx = Context::create();
@@ -536,8 +536,8 @@ mod tests {
         ]);
         let data2 = data.slice(1, 9);
         
-        array_to_setbit_iter(&data);
-        let mut iter = array_to_setbit_iter(&data2);
+        array_to_setbit_iter(&data).unwrap();
+        let mut iter = array_to_setbit_iter(&data2).unwrap();
 
         let ctx = Context::create();
         let module = ctx.create_module("setbit_test");
@@ -599,8 +599,8 @@ mod tests {
         ]);
         let data2 = data.slice(1, 8);
         
-        array_to_setbit_iter(&data);
-        let mut iter = array_to_setbit_iter(&data2);
+        array_to_setbit_iter(&data).unwrap();
+        let mut iter = array_to_setbit_iter(&data2).unwrap();
 
         let ctx = Context::create();
         let module = ctx.create_module("setbit_test");
@@ -659,8 +659,8 @@ mod tests {
         ]);
         let data2 = data.slice(7, 10);
         
-        array_to_setbit_iter(&data);
-        let mut iter = array_to_setbit_iter(&data2);
+        array_to_setbit_iter(&data).unwrap();
+        let mut iter = array_to_setbit_iter(&data2).unwrap();
 
         let ctx = Context::create();
         let module = ctx.create_module("setbit_test");
@@ -722,8 +722,8 @@ mod tests {
         ]);
         let data2 = data.slice(1, 4);
         
-        array_to_setbit_iter(&data);
-        let mut iter = array_to_setbit_iter(&data2);
+        array_to_setbit_iter(&data).unwrap();
+        let mut iter = array_to_setbit_iter(&data2).unwrap();
 
         let ctx = Context::create();
         let module = ctx.create_module("setbit_test");
@@ -840,7 +840,7 @@ mod tests {
             true, true, false, true, false, false, false, false,
         ]);
 
-        let mut iter = array_to_setbit_iter(&data);
+        let mut iter = array_to_setbit_iter(&data).unwrap();
 
         let ctx = Context::create();
         let module = ctx.create_module("setbit_test");
@@ -906,7 +906,7 @@ mod tests {
             false, false, false, false, false, false, false, true,
         ]);
 
-        let mut iter = array_to_setbit_iter(&data);
+        let mut iter = array_to_setbit_iter(&data).unwrap();
 
         let ctx = Context::create();
         let module = ctx.create_module("setbit_test");
