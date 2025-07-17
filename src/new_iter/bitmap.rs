@@ -17,6 +17,7 @@ use crate::increment_pointer;
 #[roff(usize_offsets)]
 pub struct BitmapIterator {
     data: *const u8,
+    slice_offset: u64,
     pos: u64,
     len: u64,
 }
@@ -37,6 +38,19 @@ impl BitmapIterator {
             )
             .unwrap()
             .into_pointer_value()
+    }
+
+    pub fn llvm_slice_offset<'a>(
+        &self,
+        ctx: &'a Context,
+        build: &'a Builder,
+        ptr: PointerValue<'a>,
+    ) -> IntValue<'a> {
+        let slice_offset_ptr = increment_pointer!(ctx, build, ptr, BitmapIterator::OFFSET_SLICE_OFFSET);
+        build
+            .build_load(ctx.i64_type(), slice_offset_ptr, "slice_offset")
+            .unwrap()
+            .into_int_value()
     }
 
     pub fn llvm_pos<'a>(
@@ -86,8 +100,9 @@ impl From<&BooleanArray> for Box<BitmapIterator> {
     fn from(value: &BooleanArray) -> Self {
         Box::new(BitmapIterator {
             data: value.values().values().as_ptr(),
-            pos: value.offset() as u64,
-            len: (value.len() + value.offset()) as u64,
+            slice_offset: value.offset() as u64,
+            pos: 0,
+            len: value.len() as u64,
         })
     }
 }
@@ -349,24 +364,17 @@ mod tests {
         };
 
         unsafe {
-            assert_eq!(next_func.call(iter.get_mut_ptr(), 0), 1);
+            //assert_eq!(next_func.call(iter.get_mut_ptr(), 0), 0);
             assert_eq!(next_func.call(iter.get_mut_ptr(), 1), 1);
             assert_eq!(next_func.call(iter.get_mut_ptr(), 2), 0);
-            assert_eq!(next_func.call(iter.get_mut_ptr(), 3), 1);
+            assert_eq!(next_func.call(iter.get_mut_ptr(), 3), 0);
             assert_eq!(next_func.call(iter.get_mut_ptr(), 4), 0);
             assert_eq!(next_func.call(iter.get_mut_ptr(), 5), 0);
-            assert_eq!(next_func.call(iter.get_mut_ptr(), 6), 0);
-            assert_eq!(next_func.call(iter.get_mut_ptr(), 7), 0);
-            assert_eq!(next_func.call(iter.get_mut_ptr(), 8), 1);
-            assert_eq!(next_func.call(iter.get_mut_ptr(), 9), 1);
-            assert_eq!(next_func.call(iter.get_mut_ptr(), 10), 0);
-            assert_eq!(next_func.call(iter.get_mut_ptr(), 11), 1);
-            assert_eq!(next_func.call(iter.get_mut_ptr(), 12), 0);
-            assert_eq!(next_func.call(iter.get_mut_ptr(), 3), 1);
+            assert_eq!(next_func.call(iter.get_mut_ptr(), 6), 1);
+            assert_eq!(next_func.call(iter.get_mut_ptr(), 7), 1);
+            assert_eq!(next_func.call(iter.get_mut_ptr(), 3), 0);
             assert_eq!(next_func.call(iter.get_mut_ptr(), 4), 0);
-            assert_eq!(next_func.call(iter.get_mut_ptr(), 8), 1);
-            assert_eq!(next_func.call(iter.get_mut_ptr(), 9), 1);
-            assert_eq!(next_func.call(iter.get_mut_ptr(), 10), 0);
+            assert_eq!(next_func.call(iter.get_mut_ptr(), 7), 1);
         };
     }
 

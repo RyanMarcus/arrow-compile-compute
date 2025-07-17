@@ -1017,7 +1017,11 @@ pub fn generate_next<'a>(
             let setbit_position = build
                 .build_int_add(setbit_position, tz_i64, "pos_add_tz")
                 .unwrap();
-            build.build_store(out_ptr, setbit_position).unwrap();
+            let slice_offset = setbit_iterator.llvm_get_slice_offset(ctx, &build, iter_ptr);
+            let final_position = build
+                .build_int_sub(setbit_position, slice_offset, "setbit_position_minus_slice_offset")
+                .unwrap();
+            build.build_store(out_ptr, final_position).unwrap();
             build
                 .build_return(Some(&bool_type.const_int(1, false)))
                 .unwrap();
@@ -1447,11 +1451,15 @@ pub fn generate_random_access<'a>(
 
             build.position_at_end(entry);
             let data_ptr = bitmap_iterator.llvm_get_data_ptr(ctx, &build, iter_ptr);
+            let slice_offset = bitmap_iterator.llvm_slice_offset(ctx, &build, iter_ptr);
+            let bit_index = build
+                .build_int_add(slice_offset, idx, "slice_offset_plus_index")
+                .unwrap();
             let byte_index = build
-                .build_right_shift(idx, i64_type.const_int(3, false), false, "byte_index")
+                .build_right_shift(bit_index, i64_type.const_int(3, false), false, "byte_index")
                 .unwrap();
             let bit_in_byte_i64 = build
-                .build_and(idx, i64_type.const_int(7, false), "bit_in_byte_i64")
+                .build_and(bit_index, i64_type.const_int(7, false), "bit_in_byte_i64")
                 .unwrap();
             let bit_in_byte_i8 = build
                 .build_int_truncate(bit_in_byte_i64, ctx.i8_type(), "bit_in_byte_i8")

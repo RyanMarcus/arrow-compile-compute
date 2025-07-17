@@ -14,6 +14,7 @@ use crate::increment_pointer;
 #[roff(usize_offsets)]
 pub struct SetBitIterator {
     data: *const u8,
+    slice_offset: u64,
     index: u64,
     end_index: u64,
     long: u64,
@@ -119,6 +120,7 @@ impl From<&BooleanArray> for Box<SetBitIterator> {
 
         Box::new(SetBitIterator {
             data: value.values().values().as_ptr(),
+            slice_offset: value.offset() as u64,
             index: long_offset as u64,
             end_index: long_len as u64,
             long: first_long,
@@ -144,6 +146,19 @@ impl SetBitIterator {
             )
             .unwrap()
             .into_pointer_value()
+    }
+
+    pub fn llvm_get_slice_offset<'a>(
+        &self,
+        ctx: &'a Context,
+        build: &'a Builder,
+        ptr: PointerValue<'a>
+    ) -> IntValue<'a> {
+        let slice_offset_ptr = increment_pointer!(ctx, build, ptr, SetBitIterator::OFFSET_SLICE_OFFSET);
+        build
+            .build_load(ctx.i64_type(), slice_offset_ptr, "slice_offset")
+            .unwrap()
+            .into_int_value()
     }
 
     pub fn llvm_get_index<'a>(
@@ -546,22 +561,22 @@ mod tests {
                 next_func.call(iter.get_mut_ptr(), &mut buf as *mut u64),
                 true
             );
-            assert_eq!(buf, 1);
+            assert_eq!(buf, 0);
             assert_eq!(
                 next_func.call(iter.get_mut_ptr(), &mut buf as *mut u64),
                 true
             );
-            assert_eq!(buf, 3);
+            assert_eq!(buf, 2);
+            assert_eq!(
+                next_func.call(iter.get_mut_ptr(), &mut buf as *mut u64),
+                true
+            );
+            assert_eq!(buf, 7);
             assert_eq!(
                 next_func.call(iter.get_mut_ptr(), &mut buf as *mut u64),
                 true
             );
             assert_eq!(buf, 8);
-            assert_eq!(
-                next_func.call(iter.get_mut_ptr(), &mut buf as *mut u64),
-                true
-            );
-            assert_eq!(buf, 9);
             assert_eq!(
                 next_func.call(iter.get_mut_ptr(), &mut buf as *mut u64),
                 false
@@ -609,17 +624,17 @@ mod tests {
                 next_func.call(iter.get_mut_ptr(), &mut buf as *mut u64),
                 true
             );
-            assert_eq!(buf, 1);
+            assert_eq!(buf, 0);
             assert_eq!(
                 next_func.call(iter.get_mut_ptr(), &mut buf as *mut u64),
                 true
             );
-            assert_eq!(buf, 3);
+            assert_eq!(buf, 2);
             assert_eq!(
                 next_func.call(iter.get_mut_ptr(), &mut buf as *mut u64),
                 true
             );
-            assert_eq!(buf, 8);
+            assert_eq!(buf, 7);
             assert_eq!(
                 next_func.call(iter.get_mut_ptr(), &mut buf as *mut u64),
                 false
@@ -669,22 +684,22 @@ mod tests {
                 next_func.call(iter.get_mut_ptr(), &mut buf as *mut u64),
                 true
             );
-            assert_eq!(buf, 8);
+            assert_eq!(buf, 1);
+            assert_eq!(
+                next_func.call(iter.get_mut_ptr(), &mut buf as *mut u64),
+                true
+            );
+            assert_eq!(buf, 2);
+            assert_eq!(
+                next_func.call(iter.get_mut_ptr(), &mut buf as *mut u64),
+                true
+            );
+            assert_eq!(buf, 4);
             assert_eq!(
                 next_func.call(iter.get_mut_ptr(), &mut buf as *mut u64),
                 true
             );
             assert_eq!(buf, 9);
-            assert_eq!(
-                next_func.call(iter.get_mut_ptr(), &mut buf as *mut u64),
-                true
-            );
-            assert_eq!(buf, 11);
-            assert_eq!(
-                next_func.call(iter.get_mut_ptr(), &mut buf as *mut u64),
-                true
-            );
-            assert_eq!(buf, 16);
             assert_eq!(
                 next_func.call(iter.get_mut_ptr(), &mut buf as *mut u64),
                 false
@@ -732,12 +747,12 @@ mod tests {
                 next_func.call(iter.get_mut_ptr(), &mut buf as *mut u64),
                 true
             );
-            assert_eq!(buf, 1);
+            assert_eq!(buf, 0);
             assert_eq!(
                 next_func.call(iter.get_mut_ptr(), &mut buf as *mut u64),
                 true
             );
-            assert_eq!(buf, 3);
+            assert_eq!(buf, 2);
             assert_eq!(
                 next_func.call(iter.get_mut_ptr(), &mut buf as *mut u64),
                 false
