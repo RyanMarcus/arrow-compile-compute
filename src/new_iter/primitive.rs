@@ -32,7 +32,7 @@ impl<K: ArrowPrimitiveType> From<&PrimitiveArray<K>> for Box<PrimitiveIterator> 
     fn from(value: &PrimitiveArray<K>) -> Self {
         Box::new(PrimitiveIterator {
             data: value.values().as_ptr() as *const c_void,
-            pos: value.offset() as u64,
+            pos: value.offset() as u64, // always zero
             len: (value.len() + value.offset()) as u64,
         })
     }
@@ -320,7 +320,6 @@ mod test {
             );
         };
     }
-
 
     #[test]
     fn test_primitive_random_access() {
