@@ -64,14 +64,21 @@ fn get_first_last_bytes(data: &[u8], bit_offset: usize, bit_len: usize) -> (u8, 
     (first_byte, last_byte)
 }
 
-fn get_first_last_long(data: &[u8], long_len: usize, byte_offset: usize, byte_len: usize, first_byte: u8, last_byte: u8) -> (u64, u64) {
+fn get_first_last_long(
+    data: &[u8],
+    long_len: usize,
+    byte_offset: usize,
+    byte_len: usize,
+    first_byte: u8,
+    last_byte: u8,
+) -> (u64, u64) {
     let last_byte_offset = byte_offset + byte_len - 1;
-    
+
     // Put the first byte into the first long
-    let mut first_long: [u8; 8]= [0; 8];
+    let mut first_long: [u8; 8] = [0; 8];
     let position_in_first_long = byte_offset % 8;
     first_long[position_in_first_long] = first_byte;
-    
+
     // Put the remaining bytes in the first long
     let next_8_multiple = byte_offset + (8 - (byte_offset % 8));
     for i in (byte_offset + 1)..next_8_multiple.min(byte_offset + byte_len) {
@@ -79,7 +86,7 @@ fn get_first_last_long(data: &[u8], long_len: usize, byte_offset: usize, byte_le
     }
 
     // Put the last byte into the last long
-    let mut last_long: [u8; 8]= [0; 8];
+    let mut last_long: [u8; 8] = [0; 8];
     let position_in_last_long = last_byte_offset % 8;
     last_long[position_in_last_long] = last_byte;
 
@@ -105,16 +112,34 @@ fn get_first_last_long(data: &[u8], long_len: usize, byte_offset: usize, byte_le
 
 impl From<&BooleanArray> for Box<SetBitIterator> {
     fn from(value: &BooleanArray) -> Self {
+        if value.is_empty() {
+            return Box::new(SetBitIterator {
+                data: value.values().values().as_ptr(),
+                slice_offset: value.offset() as u64,
+                index: 0,
+                end_index: 0,
+                long: 0,
+                last_long: 0,
+            });
+        }
         // Note that an array like [true, true, false, false], [true, false, true, false]
         // is packed as 0011, 0101.
 
         // Generate the first and last bytes
-        let (first_byte, last_byte) = get_first_last_bytes(value.values().values(), value.offset(), value.len());
-        
+        let (first_byte, last_byte) =
+            get_first_last_bytes(value.values().values(), value.offset(), value.len());
+
         // Generate the first and last longs
         let (byte_offset, byte_len) = get_byte_offset_len(value.offset(), value.len());
         let (mut long_offset, long_len) = get_long_offset_len(value.offset(), value.len());
-        let (first_long, last_long) = get_first_last_long(value.values().values(), long_len, byte_offset, byte_len, first_byte, last_byte);
+        let (first_long, last_long) = get_first_last_long(
+            value.values().values(),
+            long_len,
+            byte_offset,
+            byte_len,
+            first_byte,
+            last_byte,
+        );
 
         long_offset += 1;
 
@@ -124,7 +149,7 @@ impl From<&BooleanArray> for Box<SetBitIterator> {
             index: long_offset as u64,
             end_index: long_len as u64,
             long: first_long,
-            last_long
+            last_long,
         })
     }
 }
@@ -152,9 +177,10 @@ impl SetBitIterator {
         &self,
         ctx: &'a Context,
         build: &'a Builder,
-        ptr: PointerValue<'a>
+        ptr: PointerValue<'a>,
     ) -> IntValue<'a> {
-        let slice_offset_ptr = increment_pointer!(ctx, build, ptr, SetBitIterator::OFFSET_SLICE_OFFSET);
+        let slice_offset_ptr =
+            increment_pointer!(ctx, build, ptr, SetBitIterator::OFFSET_SLICE_OFFSET);
         build
             .build_load(ctx.i64_type(), slice_offset_ptr, "slice_offset")
             .unwrap()
@@ -241,13 +267,27 @@ impl SetBitIterator {
         let data_ptr = self.llvm_get_data_ptr(ctx, build, ptr);
         let curr_index = self.llvm_get_index(ctx, build, ptr);
         let byte_curr_index = build
-            .build_int_mul(curr_index, ctx.i64_type().const_int(4, false), "byte_curr_index")
+            .build_int_mul(
+                curr_index,
+                ctx.i64_type().const_int(4, false),
+                "byte_curr_index",
+            )
             .unwrap();
-        let byte_in_data_ptr =
-            unsafe { build.build_gep(ctx.i8_type(), data_ptr, &[byte_curr_index], "byte_in_data_ptr") }
-                .unwrap();
+        let byte_in_data_ptr = unsafe {
+            build.build_gep(
+                ctx.i8_type(),
+                data_ptr,
+                &[byte_curr_index],
+                "byte_in_data_ptr",
+            )
+        }
+        .unwrap();
         let long_in_data_ptr = build
-            .build_bit_cast(byte_in_data_ptr, ctx.ptr_type(AddressSpace::default()), "byte_to_long_ptr")
+            .build_bit_cast(
+                byte_in_data_ptr,
+                ctx.ptr_type(AddressSpace::default()),
+                "byte_to_long_ptr",
+            )
             .unwrap()
             .into_pointer_value();
         let long_in_data = build
@@ -292,7 +332,12 @@ mod tests {
     use arrow_array::{Array, BooleanArray};
     use inkwell::{context::Context, OptimizationLevel};
 
-    use crate::new_iter::{array_to_setbit_iter, generate_next, setbit::{get_byte_offset_len, get_first_last_bytes, get_first_last_long, get_long_offset_len}};
+    use crate::new_iter::{
+        array_to_setbit_iter, generate_next,
+        setbit::{
+            get_byte_offset_len, get_first_last_bytes, get_first_last_long, get_long_offset_len,
+        },
+    };
 
     #[test]
     fn test_setbit_get_long_offset_len() {
@@ -384,7 +429,7 @@ mod tests {
         let (first, last) = get_first_last_bytes(&data, 0, 4);
         assert_eq!(first, 0b0000_0001);
         assert_eq!(last, 0b0000_0001);
-    
+
         let data: Vec<u8> = vec![0b0000_0001, 0b0000_0010, 0b0000_0011];
         let (first, last) = get_first_last_bytes(&data, 1, 4);
         assert_eq!(first, 0b0000_0000);
@@ -425,45 +470,55 @@ mod tests {
         assert_eq!(first, 0xB0070605040302A0);
         assert_eq!(last, 0xB0070605040302A0);
 
-        let data: Vec<u8> = vec![0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08,
-                                 0x09, 0x0A, 0x0B, 0x0C, 0x0D, 0x0E, 0x0F, 0x10];
+        let data: Vec<u8> = vec![
+            0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x09, 0x0A, 0x0B, 0x0C, 0x0D, 0x0E,
+            0x0F, 0x10,
+        ];
         let (_, long_len) = get_long_offset_len(0, 128);
         let (first, last) = get_first_last_long(&data, long_len, 0, 16, 0xA0, 0xB0);
         assert_eq!(first, 0x08070605040302A0);
         assert_eq!(last, 0xB00F0E0D0C0B0A09);
 
-        let data: Vec<u8> = vec![0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08,
-                                 0x09, 0x0A, 0x0B, 0x0C, 0x0D, 0x0E, 0x0F, 0x10];
+        let data: Vec<u8> = vec![
+            0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x09, 0x0A, 0x0B, 0x0C, 0x0D, 0x0E,
+            0x0F, 0x10,
+        ];
         let (_, long_len) = get_long_offset_len(32, 64);
         let (first, last) = get_first_last_long(&data, long_len, 4, 8, 0xA0, 0xB0);
         assert_eq!(first, 0x080706A000000000);
         assert_eq!(last, 0x00000000B00B0A09);
 
-        let data: Vec<u8> = vec![0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08,
-                                 0x09, 0x0A, 0x0B, 0x0C, 0x0D, 0x0E, 0x0F, 0x10];
+        let data: Vec<u8> = vec![
+            0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x09, 0x0A, 0x0B, 0x0C, 0x0D, 0x0E,
+            0x0F, 0x10,
+        ];
         let (_, long_len) = get_long_offset_len(32, 32);
         let (first, last) = get_first_last_long(&data, long_len, 4, 4, 0xA0, 0xB0);
         assert_eq!(first, 0xB00706A000000000);
         assert_eq!(last, 0xB00706A000000000);
 
-        let data: Vec<u8> = vec![0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08,
-                                 0x09, 0x0A, 0x0B, 0x0C, 0x0D, 0x0E, 0x0F, 0x10];
+        let data: Vec<u8> = vec![
+            0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x09, 0x0A, 0x0B, 0x0C, 0x0D, 0x0E,
+            0x0F, 0x10,
+        ];
         let (_, long_len) = get_long_offset_len(32, 48);
         let (first, last) = get_first_last_long(&data, long_len, 4, 6, 0xA0, 0xB0);
         assert_eq!(first, 0x080706A000000000);
         assert_eq!(last, 0x000000000000B009);
 
-        let data: Vec<u8> = vec![0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08,
-                                 0x09, 0x0A, 0x0B, 0x0C, 0x0D, 0x0E, 0x0F, 0x10,
-                                 0x11, 0x12, 0x13, 0x14, 0x15, 0x16, 0x17, 0x18];
+        let data: Vec<u8> = vec![
+            0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x09, 0x0A, 0x0B, 0x0C, 0x0D, 0x0E,
+            0x0F, 0x10, 0x11, 0x12, 0x13, 0x14, 0x15, 0x16, 0x17, 0x18,
+        ];
         let (_, long_len) = get_long_offset_len(32, 128);
         let (first, last) = get_first_last_long(&data, long_len, 4, 16, 0xA0, 0xB0);
         assert_eq!(first, 0x080706A000000000);
         assert_eq!(last, 0x00000000B0131211);
 
-        let data: Vec<u8> = vec![0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08,
-                                 0x09, 0x0A, 0x0B, 0x0C, 0x0D, 0x0E, 0x0F, 0x10,
-                                 0x11, 0x12, 0x13, 0x14, 0x15, 0x16, 0x17, 0x18];
+        let data: Vec<u8> = vec![
+            0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x09, 0x0A, 0x0B, 0x0C, 0x0D, 0x0E,
+            0x0F, 0x10, 0x11, 0x12, 0x13, 0x14, 0x15, 0x16, 0x17, 0x18,
+        ];
         let (_, long_len) = get_long_offset_len(32, 8);
         let (first, last) = get_first_last_long(&data, long_len, 4, 1, 0xA0, 0xA0);
         assert_eq!(first, 0x000000A000000000);
@@ -476,7 +531,7 @@ mod tests {
             true, true, false, true, false, false, false, false, true, true,
         ]);
         let data2 = data.slice(0, 8);
-        
+
         array_to_setbit_iter(&data).unwrap();
         let mut iter = array_to_setbit_iter(&data2).unwrap();
         println!("{:?}", iter);
@@ -485,7 +540,7 @@ mod tests {
         let module = ctx.create_module("setbit_test");
         let func = generate_next(&ctx, &module, "setbit_iter", data.data_type(), &iter).unwrap();
         let fname = func.get_name().to_str().unwrap();
-        
+
         module.verify().unwrap();
 
         let ee = module
@@ -535,7 +590,7 @@ mod tests {
             true, true, false, true, false, false, false, false, true, true,
         ]);
         let data2 = data.slice(1, 9);
-        
+
         array_to_setbit_iter(&data).unwrap();
         let mut iter = array_to_setbit_iter(&data2).unwrap();
 
@@ -543,7 +598,7 @@ mod tests {
         let module = ctx.create_module("setbit_test");
         let func = generate_next(&ctx, &module, "setbit_iter", data.data_type(), &iter).unwrap();
         let fname = func.get_name().to_str().unwrap();
-        
+
         module.verify().unwrap();
 
         let ee = module
@@ -598,7 +653,7 @@ mod tests {
             true, true, false, true, false, false, false, false, true, true,
         ]);
         let data2 = data.slice(1, 8);
-        
+
         array_to_setbit_iter(&data).unwrap();
         let mut iter = array_to_setbit_iter(&data2).unwrap();
 
@@ -606,7 +661,7 @@ mod tests {
         let module = ctx.create_module("setbit_test");
         let func = generate_next(&ctx, &module, "setbit_iter", data.data_type(), &iter).unwrap();
         let fname = func.get_name().to_str().unwrap();
-        
+
         module.verify().unwrap();
 
         let ee = module
@@ -653,12 +708,11 @@ mod tests {
     #[test]
     fn test_setbit_slice4() {
         let data = BooleanArray::from(vec![
-            true, true, false, true, false, false, false, false,
-            true, true, false, true, false, false, false, false,
-            true, true, false, true, false, false, false, false,
+            true, true, false, true, false, false, false, false, true, true, false, true, false,
+            false, false, false, true, true, false, true, false, false, false, false,
         ]);
         let data2 = data.slice(7, 10);
-        
+
         array_to_setbit_iter(&data).unwrap();
         let mut iter = array_to_setbit_iter(&data2).unwrap();
 
@@ -666,7 +720,7 @@ mod tests {
         let module = ctx.create_module("setbit_test");
         let func = generate_next(&ctx, &module, "setbit_iter", data.data_type(), &iter).unwrap();
         let fname = func.get_name().to_str().unwrap();
-        
+
         module.verify().unwrap();
 
         let ee = module
@@ -721,7 +775,7 @@ mod tests {
             true, true, false, true, false, false, false, true, true, true,
         ]);
         let data2 = data.slice(1, 4);
-        
+
         array_to_setbit_iter(&data).unwrap();
         let mut iter = array_to_setbit_iter(&data2).unwrap();
 
@@ -729,7 +783,7 @@ mod tests {
         let module = ctx.create_module("setbit_test");
         let func = generate_next(&ctx, &module, "setbit_iter", data.data_type(), &iter).unwrap();
         let fname = func.get_name().to_str().unwrap();
-        
+
         module.verify().unwrap();
 
         let ee = module
@@ -780,7 +834,7 @@ mod tests {
         let module = ctx.create_module("setbit_test");
         let func = generate_next(&ctx, &module, "setbit_iter", data.data_type(), &iter).unwrap();
         let fname = func.get_name().to_str().unwrap();
-        
+
         module.verify().unwrap();
 
         let ee = module
@@ -836,9 +890,7 @@ mod tests {
 
     #[test]
     fn test_setbit_iter2() {
-        let data = BooleanArray::from(vec![
-            true, true, false, true, false, false, false, false,
-        ]);
+        let data = BooleanArray::from(vec![true, true, false, true, false, false, false, false]);
 
         let mut iter = array_to_setbit_iter(&data).unwrap();
 
@@ -846,7 +898,7 @@ mod tests {
         let module = ctx.create_module("setbit_test");
         let func = generate_next(&ctx, &module, "setbit_iter", data.data_type(), &iter).unwrap();
         let fname = func.get_name().to_str().unwrap();
-        
+
         module.verify().unwrap();
 
         let ee = module
@@ -893,17 +945,14 @@ mod tests {
     #[test]
     fn test_setbit_iter3() {
         let data = BooleanArray::from(vec![
-            true, true, false, true, false, false, false, false,
-            false, false, false, false, false, false, false, true,
-            false, false, false, false, false, false, false, true,
-            false, false, false, false, false, false, false, true,
-            false, false, false, false, false, false, false, true,
-            false, false, false, false, false, false, false, true,
-            false, false, false, false, false, false, false, true,
-            false, false, false, false, false, false, false, true,
-            false, false, false, false, false, false, false, true,
-            false, false, false, false, false, false, false, true,
-            false, false, false, false, false, false, false, true,
+            true, true, false, true, false, false, false, false, false, false, false, false, false,
+            false, false, true, false, false, false, false, false, false, false, true, false,
+            false, false, false, false, false, false, true, false, false, false, false, false,
+            false, false, true, false, false, false, false, false, false, false, true, false,
+            false, false, false, false, false, false, true, false, false, false, false, false,
+            false, false, true, false, false, false, false, false, false, false, true, false,
+            false, false, false, false, false, false, true, false, false, false, false, false,
+            false, false, true,
         ]);
 
         let mut iter = array_to_setbit_iter(&data).unwrap();
@@ -912,7 +961,7 @@ mod tests {
         let module = ctx.create_module("setbit_test");
         let func = generate_next(&ctx, &module, "setbit_iter", data.data_type(), &iter).unwrap();
         let fname = func.get_name().to_str().unwrap();
-        
+
         module.verify().unwrap();
 
         let ee = module
@@ -991,7 +1040,6 @@ mod tests {
                 true
             );
             assert_eq!(buf, 87);
-
 
             assert_eq!(
                 next_func.call(iter.get_mut_ptr(), &mut buf as *mut u64),
