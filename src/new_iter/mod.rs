@@ -505,7 +505,16 @@ pub fn generate_next_block<'a, const N: u32>(
                 build
                     .build_store(buf_idx_ptr, i64_type.const_zero())
                     .unwrap();
-                build.build_unconditional_branch(loop_cond).unwrap();
+
+                let log_pos = arr.llvm_logical_pos(ctx, &build, iter_ptr);
+                let log_len = arr.llvm_logical_len(ctx, &build, iter_ptr);
+                let log_rem = build.build_int_sub(log_len, log_pos, "log_rem").unwrap();
+                let log_have_more = build
+                    .build_int_compare(IntPredicate::UGE, log_rem, llvm_n, "have_log_next")
+                    .unwrap();
+                build
+                    .build_conditional_branch(log_have_more, loop_cond, not_enough)
+                    .unwrap();
 
                 build.position_at_end(check_vec_full);
                 let buf_idx = build
@@ -542,11 +551,11 @@ pub fn generate_next_block<'a, const N: u32>(
                 arr.llvm_inc_pos(ctx, &build, iter_ptr, i64_type.const_int(1, false));
                 let pos = arr.llvm_pos(ctx, &build, iter_ptr);
                 let len = arr.llvm_len(ctx, &build, iter_ptr);
-                let res = build
-                    .build_int_compare(IntPredicate::ULT, pos, len, "have_next")
+                let phs_have_more = build
+                    .build_int_compare(IntPredicate::ULT, pos, len, "have_phs_next")
                     .unwrap();
                 build
-                    .build_conditional_branch(res, fetch_next, not_enough)
+                    .build_conditional_branch(phs_have_more, fetch_next, not_enough)
                     .unwrap();
 
                 build.position_at_end(not_enough);
@@ -699,6 +708,12 @@ pub fn generate_next_block<'a, const N: u32>(
 
                 build.position_at_end(exit);
                 let result = build.build_load(vec_type, vbuf, "result").unwrap();
+                arr.llvm_inc_logical_pos(
+                    ctx,
+                    &build,
+                    iter_ptr,
+                    i64_type.const_int(N as u64, false),
+                );
                 build.build_store(out_ptr, result).unwrap();
                 build
                     .build_return(Some(&bool_type.const_all_ones()))
@@ -1008,20 +1023,39 @@ pub fn generate_next<'a>(
                 .build_int_sub(end_index, i64_type.const_int(1, false), "end_index_minus_1")
                 .unwrap();
             let cmp_index_to_end_index_minus_1 = build
-                .build_int_compare(IntPredicate::EQ, index, end_index_minus_one, "cmp_index_to_end_index_minus_1")
+                .build_int_compare(
+                    IntPredicate::EQ,
+                    index,
+                    end_index_minus_one,
+                    "cmp_index_to_end_index_minus_1",
+                )
                 .unwrap();
             build
-                .build_conditional_branch(cmp_index_to_end_index_minus_1, get_next_end, get_next_intermediate)
+                .build_conditional_branch(
+                    cmp_index_to_end_index_minus_1,
+                    get_next_end,
+                    get_next_intermediate,
+                )
                 .unwrap();
-            
+
             build.position_at_end(get_next_end);
             setbit_iterator.llvm_load_last_long(ctx, &build, iter_ptr);
-            setbit_iterator.llvm_increment_index(ctx, &build, iter_ptr, i64_type.const_int(1, false));
+            setbit_iterator.llvm_increment_index(
+                ctx,
+                &build,
+                iter_ptr,
+                i64_type.const_int(1, false),
+            );
             build.build_unconditional_branch(while_loop).unwrap();
 
             build.position_at_end(get_next_intermediate);
             setbit_iterator.llvm_load_long_at_index(ctx, &build, iter_ptr);
-            setbit_iterator.llvm_increment_index(ctx, &build, iter_ptr, i64_type.const_int(1, false));
+            setbit_iterator.llvm_increment_index(
+                ctx,
+                &build,
+                iter_ptr,
+                i64_type.const_int(1, false),
+            );
             build.build_unconditional_branch(while_loop).unwrap();
 
             build.position_at_end(use_long);
@@ -1049,7 +1083,11 @@ pub fn generate_next<'a>(
                 .unwrap();
             let slice_offset = setbit_iterator.llvm_get_slice_offset(ctx, &build, iter_ptr);
             let final_position = build
-                .build_int_sub(setbit_position, slice_offset, "setbit_position_minus_slice_offset")
+                .build_int_sub(
+                    setbit_position,
+                    slice_offset,
+                    "setbit_position_minus_slice_offset",
+                )
                 .unwrap();
             build.build_store(out_ptr, final_position).unwrap();
             build
@@ -1154,7 +1192,14 @@ pub fn generate_next<'a>(
                 build.position_at_end(entry);
                 let val_iter_ptr = arr.llvm_val_iter_ptr(ctx, &build, iter_ptr);
                 let re_iter_ptr = arr.llvm_re_iter_ptr(ctx, &build, iter_ptr);
-                build.build_unconditional_branch(check_remaining).unwrap();
+                let log_pos = arr.llvm_logical_pos(ctx, &build, iter_ptr);
+                let log_len = arr.llvm_logical_len(ctx, &build, iter_ptr);
+                let log_have_more = build
+                    .build_int_compare(IntPredicate::ULT, log_pos, log_len, "have_log_next")
+                    .unwrap();
+                build
+                    .build_conditional_branch(log_have_more, check_remaining, exhausted)
+                    .unwrap();
 
                 build.position_at_end(check_remaining);
                 let remaining = arr.llvm_remaining(ctx, &build, iter_ptr);
@@ -1180,6 +1225,7 @@ pub fn generate_next<'a>(
                     .unwrap_left();
                 build.build_store(out_ptr, val).unwrap();
                 arr.llvm_dec_remaining(ctx, &build, iter_ptr, i64_type.const_int(1, false));
+                arr.llvm_inc_logical_pos(ctx, &build, iter_ptr, i64_type.const_int(1, false));
                 build
                     .build_return(Some(&bool_type.const_all_ones()))
                     .unwrap();

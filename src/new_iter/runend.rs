@@ -1,8 +1,6 @@
 use std::ffi::c_void;
 
-use arrow_array::{
-    types::RunEndIndexType, ArrowNativeTypeOp, ArrowPrimitiveType, PrimitiveArray, RunArray,
-};
+use arrow_array::{types::RunEndIndexType, Array, ArrowPrimitiveType, PrimitiveArray, RunArray};
 use arrow_buffer::ArrowNativeType;
 use inkwell::{
     builder::Builder,
@@ -34,6 +32,12 @@ pub struct RunEndIterator {
 
     /// the total number of run ends (and values)
     len: u64,
+
+    /// logical position (output index)
+    logical_pos: u64,
+
+    /// logical length (total number produced)
+    logical_len: u64,
 
     /// the remaining number of values in the current run
     remaining: u64,
@@ -89,6 +93,19 @@ impl RunEndIterator {
             .into_int_value()
     }
 
+    pub fn llvm_logical_pos<'a>(
+        &self,
+        ctx: &'a Context,
+        builder: &'a Builder,
+        ptr: PointerValue<'a>,
+    ) -> IntValue<'a> {
+        let ptr = increment_pointer!(ctx, builder, ptr, RunEndIterator::OFFSET_LOGICAL_POS);
+        builder
+            .build_load(ctx.i64_type(), ptr, "log_pos")
+            .unwrap()
+            .into_int_value()
+    }
+
     pub fn llvm_len<'a>(
         &self,
         ctx: &'a Context,
@@ -98,6 +115,24 @@ impl RunEndIterator {
         let ptr = increment_pointer!(ctx, builder, ptr, RunEndIterator::OFFSET_LEN);
         let len = builder
             .build_load(ctx.i64_type(), ptr, "len")
+            .unwrap()
+            .into_int_value();
+        len.as_instruction_value()
+            .unwrap()
+            .set_metadata(ctx.metadata_node(&[]), ctx.get_kind_id("invariant.load"))
+            .unwrap();
+        len
+    }
+
+    pub fn llvm_logical_len<'a>(
+        &self,
+        ctx: &'a Context,
+        builder: &'a Builder,
+        ptr: PointerValue<'a>,
+    ) -> IntValue<'a> {
+        let ptr = increment_pointer!(ctx, builder, ptr, RunEndIterator::OFFSET_LOGICAL_LEN);
+        let len = builder
+            .build_load(ctx.i64_type(), ptr, "log_len")
             .unwrap()
             .into_int_value();
         len.as_instruction_value()
@@ -133,6 +168,22 @@ impl RunEndIterator {
             .unwrap()
             .into_int_value();
         let new_pos = builder.build_int_add(curr_pos, amt, "new_pos").unwrap();
+        builder.build_store(ptr, new_pos).unwrap();
+    }
+
+    pub fn llvm_inc_logical_pos<'a>(
+        &self,
+        ctx: &'a Context,
+        builder: &'a Builder,
+        ptr: PointerValue<'a>,
+        amt: IntValue<'a>,
+    ) {
+        let ptr = increment_pointer!(ctx, builder, ptr, RunEndIterator::OFFSET_LOGICAL_POS);
+        let curr_pos = builder
+            .build_load(ctx.i64_type(), ptr, "curr_log_pos")
+            .unwrap()
+            .into_int_value();
+        let new_pos = builder.build_int_add(curr_pos, amt, "new_log_pos").unwrap();
         builder.build_store(ptr, new_pos).unwrap();
     }
 
@@ -179,32 +230,35 @@ impl RunEndIterator {
 
 impl<R: RunEndIndexType + ArrowPrimitiveType> From<&RunArray<R>> for IteratorHolder {
     fn from(arr: &RunArray<R>) -> Self {
-        let re = arr.run_ends().inner().clone();
+        let re = arr.run_ends().inner().clone(); // note: .inner() removes slicing offset
         let re: PrimitiveArray<R> = PrimitiveArray::new(re, None);
         let run_ends = Box::new(array_to_iter(&re));
         let values = Box::new(array_to_iter(arr.values()));
 
-        let first_pos = re
+        let first_idx = re
             .values()
-            .iter()
-            .enumerate()
-            .find(|(_idx, val)| !val.is_zero())
-            .map(|(idx, _val)| idx)
-            .unwrap_or(0);
+            .partition_point(|x| x.as_usize() <= arr.offset());
 
-        let first_remaining = if first_pos < re.len() {
-            re.value(first_pos).as_usize()
-        } else {
+        let prev_end = if first_idx == 0 {
             0
+        } else {
+            re.value(first_idx - 1).as_usize()
         };
+        let first_partition_size = re.value(first_idx).as_usize() - prev_end;
+        let first_remaining = first_partition_size - (arr.offset() - prev_end);
+
+        println!("pos: {} len: {} loglen: {}", first_idx, re.len(), arr.len());
 
         let iter = RunEndIterator {
             run_ends: run_ends.get_ptr(),
             val_iter: values.get_ptr(),
-            pos: first_pos as u64,
+            pos: first_idx as u64,
             len: re.len() as u64,
+            logical_pos: 0 as u64,
+            logical_len: arr.len() as u64,
             remaining: first_remaining as u64,
         };
+
         IteratorHolder::RunEnd {
             arr: Box::new(iter),
             run_ends,
@@ -355,7 +409,7 @@ mod tests {
     use super::add_bsearch;
 
     #[test]
-    fn test_ree_iter_block() {
+    fn test_ree_iter_block_noslice() {
         let data = Int32Array::from(vec![1, 2, 3, 4]);
         let ends = Int32Array::from(vec![4, 8, 17, 18]);
         let ree = RunArray::try_new(&ends, &data).unwrap();
@@ -390,17 +444,17 @@ mod tests {
         let mut buf = [0_i32; 8];
         let mut sbuf: i32 = 0;
         unsafe {
-            assert_eq!(next_block.call(iter.get_mut_ptr(), buf.as_mut_ptr()), true);
+            assert!(next_block.call(iter.get_mut_ptr(), buf.as_mut_ptr()));
             assert_eq!(buf, [1, 1, 1, 1, 2, 2, 2, 2]);
-            assert_eq!(next_block.call(iter.get_mut_ptr(), buf.as_mut_ptr()), true);
+            assert!(next_block.call(iter.get_mut_ptr(), buf.as_mut_ptr()));
             assert_eq!(buf, [3, 3, 3, 3, 3, 3, 3, 3]);
-            assert_eq!(next_block.call(iter.get_mut_ptr(), buf.as_mut_ptr()), false);
+            assert!(!next_block.call(iter.get_mut_ptr(), buf.as_mut_ptr()));
 
-            assert_eq!(next.call(iter.get_mut_ptr(), &mut sbuf), true);
+            assert!(next.call(iter.get_mut_ptr(), &mut sbuf));
             assert_eq!(sbuf, 3);
-            assert_eq!(next.call(iter.get_mut_ptr(), &mut sbuf), true);
+            assert!(next.call(iter.get_mut_ptr(), &mut sbuf));
             assert_eq!(sbuf, 4);
-            assert_eq!(next.call(iter.get_mut_ptr(), &mut sbuf), false);
+            assert!(!next.call(iter.get_mut_ptr(), &mut sbuf));
         };
     }
 
@@ -424,6 +478,7 @@ mod tests {
         let next_fname = next_func.get_name().to_str().unwrap();
 
         module.verify().unwrap();
+        module.print_to_stderr();
         let ee = module
             .create_jit_execution_engine(OptimizationLevel::None)
             .unwrap();
@@ -441,9 +496,13 @@ mod tests {
         let mut buf = [0_i32; 8];
         let mut sbuf: i32 = 0;
         unsafe {
-            assert_eq!(next_block.call(iter.get_mut_ptr(), buf.as_mut_ptr()), true);
+            assert!(next_block.call(iter.get_mut_ptr(), buf.as_mut_ptr()));
             assert_eq!(buf, [2, 2, 2, 2, 3, 3, 3, 3]);
-            assert_eq!(next_block.call(iter.get_mut_ptr(), buf.as_mut_ptr()), false);
+            assert!(
+                !next_block.call(iter.get_mut_ptr(), buf.as_mut_ptr()),
+                "expected false, but got slice with {:?}",
+                buf
+            );
 
             assert_eq!(next.call(iter.get_mut_ptr(), &mut sbuf), true);
             assert_eq!(sbuf, 3);
