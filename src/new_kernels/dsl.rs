@@ -275,9 +275,8 @@ fn base_type(dt: &DataType) -> DataType {
     }
 }
 
-pub type KernelOutput<'a> = (KernelOutputType, KernelExpression<'a>);
-
 #[derive(Clone, Debug)]
+#[allow(dead_code)]
 pub enum KernelExpression<'a> {
     Item(KernelInput<'a>),
     IntConst(u64, bool),
@@ -321,6 +320,7 @@ impl From<i32> for KernelExpression<'_> {
     }
 }
 
+#[allow(dead_code)]
 impl<'a> KernelExpression<'a> {
     pub fn cmp(&self, pred: Predicate, other: &KernelExpression<'a>) -> KernelExpression<'a> {
         KernelExpression::Cmp(pred, Box::new(self.clone()), Box::new(other.clone()))
@@ -763,6 +763,8 @@ impl<'a> KernelContext<'a> {
 pub struct BaseKernelProgram<'a> {
     inputs: Vec<KernelInput<'a>>,
 }
+
+#[allow(dead_code)]
 impl<'a> BaseKernelProgram<'a> {
     pub fn map<F: Fn(&[KernelExpression<'a>]) -> Vec<KernelExpression<'a>>>(
         self,
@@ -796,6 +798,7 @@ pub struct FilteredKernelProgram<'a> {
     cond: KernelExpression<'a>,
 }
 
+#[allow(dead_code)]
 impl<'a> FilteredKernelProgram<'a> {
     pub fn map<F: Fn(&[KernelExpression<'a>]) -> Vec<KernelExpression<'a>>>(
         self,
@@ -819,6 +822,7 @@ pub struct MappedKernelProgram<'a> {
     expr: Vec<KernelExpression<'a>>,
 }
 
+#[allow(dead_code)]
 impl<'a> MappedKernelProgram<'a> {
     pub fn map<F: Fn(&[KernelExpression<'a>]) -> Vec<KernelExpression<'a>>>(
         self,
@@ -841,6 +845,7 @@ pub struct FilterMappedKernelProgram<'a> {
     expr: Vec<KernelExpression<'a>>,
 }
 
+#[allow(dead_code)]
 impl<'a> FilterMappedKernelProgram<'a> {
     pub fn map<F: Fn(&[KernelExpression<'a>]) -> Vec<KernelExpression<'a>>>(
         self,

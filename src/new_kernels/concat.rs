@@ -9,10 +9,10 @@ use ouroboros::self_referencing;
 
 use crate::{
     declare_blocks,
-    dsl::KernelParameters,
     new_iter::{datum_to_iter, generate_next, IteratorHolder},
     new_kernels::{
         cast::coalesce_type,
+        dsl::KernelParameters,
         link_req_helpers, optimize_module,
         writers::{ArrayWriter, PrimitiveArrayWriter, StringViewWriter, WriterAllocation},
     },

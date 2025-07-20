@@ -26,7 +26,6 @@ pub use arrow_interface::cmp;
 pub use arrow_interface::compute;
 pub use arrow_interface::select;
 
-pub use new_kernels::dsl;
 pub use new_kernels::ArrowKernelError;
 pub use new_kernels::Kernel;
 pub use new_kernels::SortOptions;

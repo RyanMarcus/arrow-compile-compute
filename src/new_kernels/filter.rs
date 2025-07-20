@@ -1,10 +1,8 @@
 use arrow_array::{Array, ArrayRef, BooleanArray};
 use arrow_schema::DataType;
 
-use crate::{
-    dsl::{DSLKernel, KernelOutputType},
-    ArrowKernelError, PrimitiveType,
-};
+use crate::new_kernels::dsl::{DSLKernel, KernelOutputType};
+use crate::{ArrowKernelError, PrimitiveType};
 
 use crate::new_kernels::Kernel;
 

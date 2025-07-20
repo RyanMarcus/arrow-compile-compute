@@ -54,10 +54,6 @@ name = "compile_bench"
 harness = false
 
 [[bench]]
-name = "dsl_bench"
-harness = false
-
-[[bench]]
 name = "take_bench"
 harness = false
 

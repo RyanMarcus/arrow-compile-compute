@@ -13,10 +13,10 @@ use ouroboros::self_referencing;
 
 use crate::{
     declare_blocks,
-    dsl::KernelParameters,
     new_iter::{datum_to_iter, generate_random_access},
     new_kernels::{
         cmp::{add_float_to_int, add_memcmp},
+        dsl::KernelParameters,
         link_req_helpers, optimize_module, Kernel,
     },
     ArrowKernelError, PrimitiveType,

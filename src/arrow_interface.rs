@@ -240,6 +240,7 @@ pub mod apply {
     }
 }
 
+/// Selection kernels, like `filter` and `take`.
 pub mod select {
     use std::sync::LazyLock;
 
@@ -324,6 +325,7 @@ pub mod select {
     }
 }
 
+/// Computations (like hashing) over Arrow arrays.
 pub mod compute {
     use std::sync::LazyLock;
 

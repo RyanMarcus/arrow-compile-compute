@@ -2,7 +2,7 @@ use std::sync::Arc;
 
 use super::{ArrowKernelError, Kernel};
 use crate::{
-    dsl::{DSLKernel, KernelOutputType},
+    new_kernels::dsl::{DSLKernel, KernelOutputType},
     PrimitiveType,
 };
 use arrow_array::{
