@@ -40,6 +40,7 @@ use inkwell::{
     values::{FunctionValue, VectorValue},
     OptimizationLevel,
 };
+use thiserror::Error;
 
 use crate::new_kernels::llvm_utils::debug_i64;
 use crate::new_kernels::llvm_utils::debug_ptr;
@@ -47,17 +48,34 @@ use crate::new_kernels::llvm_utils::save_to_string_saver;
 use crate::new_kernels::llvm_utils::str_view_writer_append_bytes;
 use crate::PrimitiveType;
 
-#[derive(Debug)]
+#[derive(Debug, Error)]
 pub enum ArrowKernelError {
+    #[error("input sizes did not match")]
     SizeMismatch,
+
+    #[error("argument mismatch: {0}")]
     ArgumentMismatch(String),
+
+    #[error("unsupported argument: {0}")]
     UnsupportedArguments(String),
+
+    #[error("unsupported scalar type: {0}")]
     UnsupportedScalar(DataType),
+
+    #[error("underlying llvm error: {0}")]
     LLVMError(String),
+
+    #[error("Datatype {0} cannot be vectorized")]
     NonVectorizableType(DataType),
+
+    #[error("Dictionary of type {0} is full")]
     DictionaryFullError(DataType),
+
+    #[error("Type mismatch: expected {0:?}, got {1:?}")]
     TypeMismatch(PrimitiveType, PrimitiveType),
-    DSLError(DSLError),
+
+    #[error("dsl error")]
+    DSLError(#[from] DSLError),
 }
 
 pub trait Kernel: Sized {

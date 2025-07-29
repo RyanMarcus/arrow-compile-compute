@@ -2,7 +2,7 @@
 
 An experimental project for testing LLVM-compiled kernels for Arrow.
 
-Compared to [arrow-rs](https://github.com/apache/arrow-rs), this crate:
+Compared to `arrow`, this crate:
 
 * ➕ Operates on *recursive* Arrow arrays, for example, a dictionary-of-dictionary array.
 * ➕ Casting to and from arbitrary Arrow array types, like casting a dictionary to a run-end encoded array.

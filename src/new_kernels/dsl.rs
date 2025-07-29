@@ -23,6 +23,7 @@ use inkwell::{
 use itertools::Itertools;
 use ouroboros::self_referencing;
 use repr_offset::ReprOffset;
+use thiserror::Error;
 
 use crate::{
     declare_blocks, increment_pointer,
@@ -42,14 +43,21 @@ use crate::{
 
 use super::{writers::StringArrayWriter, ArrowKernelError};
 
-#[derive(Debug)]
+#[derive(Debug, Error)]
 pub enum DSLError {
+    #[error("Invalid input index: {0}")]
     InvalidInputIndex(usize),
+    #[error("Invalid kernel output length: {0}")]
     InvalidKernelOutputLength(usize),
+    #[error("Type mismatch: {0}")]
     TypeMismatch(String),
+    #[error("Boolean expected: {0}")]
     BooleanExpected(String),
+    #[error("Unused input: {0}")]
     UnusedInput(String),
+    #[error("Unsupported dictionary value type: {0}")]
     UnsupportedDictionaryValueType(DataType),
+    #[error("No iteration")]
     NoIteration,
 }
 

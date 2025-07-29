@@ -412,7 +412,9 @@ mod tests {
 
     #[test]
     fn test_string_next_slice() {
-        let data_full = StringArray::from(vec!["this", "is", "a", "test", "string", "tomato", "potato"]);
+        let data_full = StringArray::from(vec![
+            "this", "is", "a", "test", "string", "tomato", "potato",
+        ]);
         let data = data_full.slice(2, 4);
         let mut iter = datum_to_iter(&data).unwrap();
 

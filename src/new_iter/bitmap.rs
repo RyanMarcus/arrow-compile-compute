@@ -46,7 +46,8 @@ impl BitmapIterator {
         build: &'a Builder,
         ptr: PointerValue<'a>,
     ) -> IntValue<'a> {
-        let slice_offset_ptr = increment_pointer!(ctx, build, ptr, BitmapIterator::OFFSET_SLICE_OFFSET);
+        let slice_offset_ptr =
+            increment_pointer!(ctx, build, ptr, BitmapIterator::OFFSET_SLICE_OFFSET);
         build
             .build_load(ctx.i64_type(), slice_offset_ptr, "slice_offset")
             .unwrap()
@@ -288,7 +289,6 @@ mod tests {
             );
         }
     }
-    
 
     #[test]
     fn test_bitmap_random_access() {
@@ -337,7 +337,7 @@ mod tests {
         };
     }
 
-#[test]
+    #[test]
     fn test_bitmap_random_access_slice() {
         use arrow_array::BooleanArray;
         let full_data = BooleanArray::from(vec![
@@ -377,5 +377,4 @@ mod tests {
             assert_eq!(next_func.call(iter.get_mut_ptr(), 7), 1);
         };
     }
-
 }
