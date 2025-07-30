@@ -206,6 +206,7 @@ struct GroupedAggFunc {
     #[covariant]
     func: JitFunction<'this, unsafe extern "C" fn(*mut c_void, *const c_void, *mut c_void)>,
 }
+unsafe impl Send for GroupedAggFunc {}
 
 fn compile_grouped_agg_func<A: Aggregation>(agg: &A, inp: &dyn Array) -> GroupedAggFunc {
     GroupedAggFuncBuilder {
@@ -245,6 +246,7 @@ struct UngroupedAggFunc {
     #[covariant]
     func: JitFunction<'this, unsafe extern "C" fn(*mut c_void, *mut c_void)>,
 }
+unsafe impl Send for UngroupedAggFunc {}
 
 fn compile_ungrouped_agg_func<A: Aggregation>(agg: &A, inp: &dyn Array) -> UngroupedAggFunc {
     UngroupedAggFuncBuilder {
