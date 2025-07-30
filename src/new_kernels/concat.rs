@@ -8,7 +8,7 @@ use itertools::Itertools;
 use ouroboros::self_referencing;
 
 use crate::{
-    declare_blocks,
+    declare_blocks, logical_arrow_type,
     new_iter::{datum_to_iter, generate_next, IteratorHolder},
     new_kernels::{
         cast::coalesce_type,
@@ -74,14 +74,15 @@ impl Kernel for ConcatKernel {
                     self.borrow_func().call(kp.get_mut_ptr(), alloc.get_ptr());
                 }
                 let view = Arc::new(alloc.to_array(total_size, nulls));
+
                 coalesce_type(
                     view,
-                    &match inp[0].data_type() {
+                    &match logical_arrow_type(inp[0].data_type()) {
                         DataType::Utf8 => DataType::Utf8View,
                         DataType::LargeUtf8 => DataType::Utf8View,
                         DataType::Binary => DataType::BinaryView,
                         DataType::LargeBinary => DataType::BinaryView,
-                        _ => inp[0].data_type().clone(),
+                        _ => todo!(),
                     },
                 )
             }
@@ -91,7 +92,7 @@ impl Kernel for ConcatKernel {
                     self.borrow_func().call(kp.get_mut_ptr(), alloc.get_ptr());
                 }
                 let view = Arc::new(alloc.to_array(total_size, nulls));
-                coalesce_type(view, inp[0].data_type())
+                coalesce_type(view, &pt.as_arrow_type())
             }
         }
     }
@@ -234,9 +235,10 @@ fn build_concat<'a, W: ArrayWriter<'a>>(
 #[cfg(test)]
 mod tests {
     use arrow_array::{cast::AsArray, types::Int32Type, Array, Int32Array, StringArray};
+    use arrow_schema::DataType;
     use itertools::Itertools;
 
-    use crate::{new_kernels::concat::ConcatKernel, Kernel};
+    use crate::{cast, dictionary_data_type, new_kernels::concat::ConcatKernel, Kernel};
 
     #[test]
     fn test_concat_i32() {
@@ -277,5 +279,57 @@ mod tests {
                 "this is a longer string that is more than 12 chars"
             ]
         );
+    }
+
+    #[test]
+    fn test_concat_dicts() {
+        let data1 = StringArray::from(vec!["hello", "hello", "world"]);
+        let data2 = StringArray::from(vec!["world", "world", "hello"]);
+        let data1 = cast::cast(
+            &data1,
+            &dictionary_data_type(DataType::Int8, DataType::Utf8),
+        )
+        .unwrap();
+        let data2 = cast::cast(
+            &data2,
+            &dictionary_data_type(DataType::Int8, DataType::Utf8),
+        )
+        .unwrap();
+
+        let k = ConcatKernel::compile(&[&data1 as &dyn Array, &data2 as &dyn Array].as_slice(), ())
+            .unwrap();
+
+        let res = k
+            .call(&[&data1 as &dyn Array, &data2 as &dyn Array])
+            .unwrap();
+        let res = res.as_string_view();
+        let res = res.iter().map(|x| x.unwrap()).collect_vec();
+        assert_eq!(res, &["hello", "hello", "world", "world", "world", "hello"]);
+    }
+
+    #[test]
+    fn test_concat_int_dicts() {
+        let data1 = Int32Array::from(vec![100, 1000, 1000]);
+        let data2 = Int32Array::from(vec![200, 2000, 1000]);
+        let data1 = cast::cast(
+            &data1,
+            &dictionary_data_type(DataType::Int8, DataType::Int32),
+        )
+        .unwrap();
+        let data2 = cast::cast(
+            &data2,
+            &dictionary_data_type(DataType::Int8, DataType::Int32),
+        )
+        .unwrap();
+
+        let k = ConcatKernel::compile(&[&data1 as &dyn Array, &data2 as &dyn Array].as_slice(), ())
+            .unwrap();
+
+        let res = k
+            .call(&[&data1 as &dyn Array, &data2 as &dyn Array])
+            .unwrap();
+        let res = res.as_primitive::<Int32Type>();
+        let res = res.iter().map(|x| x.unwrap()).collect_vec();
+        assert_eq!(res, &[100, 1000, 1000, 200, 2000, 1000]);
     }
 }

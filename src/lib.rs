@@ -180,6 +180,14 @@ pub fn empty_array_for(dt: &DataType) -> ArrayRef {
     }
 }
 
+pub fn logical_arrow_type(dt: &DataType) -> DataType {
+    match dt {
+        DataType::Dictionary(_kt, vt) => logical_arrow_type(vt),
+        DataType::RunEndEncoded(_re_type, vt) => logical_arrow_type(vt.data_type()),
+        _ => dt.clone(),
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum PrimitiveType {
     I8,
