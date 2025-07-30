@@ -446,7 +446,7 @@ pub mod compute {
 ///
 /// // thread 1:
 /// let mut agg1 = SumAggregator::new(&[&DataType::Int32]);
-/// agg1.ingest(
+/// agg1.ingest_grouped(
 ///     &[0, 1, 0, 1, 0, 1],
 ///     &Int32Array::from(vec![1, 2, 3, 4, 5, 6]),
 /// );
@@ -454,7 +454,7 @@ pub mod compute {
 ///
 /// // thread 2:
 /// let mut agg2 = SumAggregator::new(&[&DataType::Int32]);
-/// agg2.ingest(
+/// agg2.ingest_grouped(
 ///     &[0, 1, 0, 1, 0, 1],
 ///     &Int32Array::from(vec![1, 2, 3, 4, 5, 6]),
 /// );

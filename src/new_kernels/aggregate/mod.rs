@@ -60,7 +60,58 @@ pub trait Aggregation {
     fn ptype(&self) -> PrimitiveType;
     fn merge_allocs(&self, alloc1: Self::Allocation, alloc2: Self::Allocation) -> Self::Allocation;
 
-    /// Returns the LLVM function that performs the aggregation. The function should take four parameters:
+    /// Returns the LLVM function that performs *ungrouped* aggregation. The
+    /// function should take:
+    ///
+    /// * A pointer to the aggregation state.
+    /// * A pointer to the input iterator.
+    fn llvm_ungrouped_agg_func<'a>(
+        &self,
+        ctx: &'a Context,
+        llvm_mod: &Module<'a>,
+        next_func: FunctionValue<'a>,
+    ) -> FunctionValue<'a> {
+        let ptr_type = ctx.ptr_type(AddressSpace::default());
+        let i64_type = ctx.i64_type();
+        let fn_type = ctx
+            .void_type()
+            .fn_type(&[ptr_type.into(), ptr_type.into(), ptr_type.into()], false);
+        let func = llvm_mod.add_function("agg", fn_type, None);
+        let b = ctx.create_builder();
+        let agg_ptr = func.get_nth_param(0).unwrap().into_pointer_value();
+        let iter_ptr = func.get_nth_param(1).unwrap().into_pointer_value();
+        declare_blocks!(ctx, func, entry, loop_cond, loop_body, exit);
+
+        b.position_at_end(entry);
+        let buf_ptr = b
+            .build_alloca(self.ptype().llvm_type(ctx), "buf_ptr")
+            .unwrap();
+        b.build_unconditional_branch(loop_cond).unwrap();
+
+        b.position_at_end(loop_cond);
+        let had_next = b
+            .build_call(next_func, &[iter_ptr.into(), buf_ptr.into()], "next")
+            .unwrap()
+            .try_as_basic_value()
+            .unwrap_left()
+            .into_int_value();
+        b.build_conditional_branch(had_next, loop_body, exit)
+            .unwrap();
+
+        b.position_at_end(loop_body);
+        let value = b
+            .build_load(self.ptype().llvm_type(ctx), buf_ptr, "value")
+            .unwrap();
+        self.llvm_agg_one(ctx, llvm_mod, &b, agg_ptr, i64_type.const_zero(), value);
+        b.build_unconditional_branch(loop_cond).unwrap();
+
+        b.position_at_end(exit);
+        b.build_return(None).unwrap();
+        func
+    }
+
+    /// Returns the LLVM function that performs the aggregation. The function
+    /// should take:
     ///
     /// * A pointer to the aggregation state.
     /// * A pointer to the ticket array.
@@ -148,7 +199,7 @@ impl<T: Copy + Default> AggAlloc for Vec<T> {
 }
 
 #[self_referencing]
-struct AggFunc {
+struct GroupedAggFunc {
     ctx: Context,
 
     #[borrows(ctx)]
@@ -156,11 +207,11 @@ struct AggFunc {
     func: JitFunction<'this, unsafe extern "C" fn(*mut c_void, *const c_void, *mut c_void)>,
 }
 
-fn compile_agg_func<A: Aggregation>(agg: &A, inp: &dyn Array) -> AggFunc {
-    AggFuncBuilder {
+fn compile_grouped_agg_func<A: Aggregation>(agg: &A, inp: &dyn Array) -> GroupedAggFunc {
+    GroupedAggFuncBuilder {
         ctx: Context::create(),
         func_builder: |ctx| {
-            let llvm_mod = ctx.create_module("agg_func");
+            let llvm_mod = ctx.create_module("grouped_agg_func");
             let ih = datum_to_iter(&inp).unwrap();
             let next_func =
                 generate_next(ctx, &llvm_mod, "agg_next", inp.data_type(), &ih).unwrap();
@@ -186,10 +237,50 @@ fn compile_agg_func<A: Aggregation>(agg: &A, inp: &dyn Array) -> AggFunc {
     .build()
 }
 
+#[self_referencing]
+struct UngroupedAggFunc {
+    ctx: Context,
+
+    #[borrows(ctx)]
+    #[covariant]
+    func: JitFunction<'this, unsafe extern "C" fn(*mut c_void, *mut c_void)>,
+}
+
+fn compile_ungrouped_agg_func<A: Aggregation>(agg: &A, inp: &dyn Array) -> UngroupedAggFunc {
+    UngroupedAggFuncBuilder {
+        ctx: Context::create(),
+        func_builder: |ctx| {
+            let llvm_mod = ctx.create_module("ungrouped_agg_func");
+            let ih = datum_to_iter(&inp).unwrap();
+            let next_func =
+                generate_next(ctx, &llvm_mod, "agg_next", inp.data_type(), &ih).unwrap();
+            let func = agg.llvm_ungrouped_agg_func(ctx, &llvm_mod, next_func);
+
+            llvm_mod.verify().unwrap();
+            optimize_module(&llvm_mod).unwrap();
+            let ee = llvm_mod
+                .create_jit_execution_engine(OptimizationLevel::Aggressive)
+                .unwrap();
+            link_req_helpers(&llvm_mod, &ee).unwrap();
+
+            let agg_func = unsafe {
+                ee.get_function::<unsafe extern "C" fn(*mut c_void, *mut c_void)>(
+                    func.get_name().to_str().unwrap(),
+                )
+                .unwrap()
+            };
+
+            agg_func
+        },
+    }
+    .build()
+}
+
 pub struct Aggregator<A: Aggregation> {
     agg: A,
     alloc: A::Allocation,
-    funcs: HashMap<DataType, AggFunc>,
+    grouped_funcs: HashMap<DataType, GroupedAggFunc>,
+    ungrouped_funcs: HashMap<DataType, UngroupedAggFunc>,
 }
 
 impl<A: Aggregation> Aggregator<A> {
@@ -203,19 +294,51 @@ impl<A: Aggregation> Aggregator<A> {
         Self {
             agg,
             alloc,
-            funcs: HashMap::new(),
+            grouped_funcs: HashMap::new(),
+            ungrouped_funcs: HashMap::new(),
         }
     }
 
-    pub fn ingest(&mut self, tickets: &[u64], data: &dyn Array) {
+    /// Ingests new *ungrouped* data into the aggregator. This is equivalent to
+    /// calling `ingest_grouped` with 0 as every group ID, but much faster.
+    pub fn ingest_ungrouped(&mut self, data: &dyn Array) {
         assert!(!data.is_nullable(), "can only aggregate non-nullable data");
+        if data.is_empty() {
+            return;
+        }
+        self.alloc.ensure_capacity(1);
+        let agg_func = self
+            .ungrouped_funcs
+            .entry(data.data_type().clone())
+            .or_insert_with(|| compile_ungrouped_agg_func(&self.agg, data));
+
+        let mut ih = datum_to_iter(&data).unwrap();
+        unsafe {
+            agg_func
+                .borrow_func()
+                .call(self.alloc.get_mut_ptr(), ih.get_mut_ptr());
+        }
+    }
+
+    /// Ingests new data into the aggregator. The `tickets` slice should be the
+    /// group IDs of the corresponding elements in `data`.
+    pub fn ingest_grouped(&mut self, tickets: &[u64], data: &dyn Array) {
+        assert!(!data.is_nullable(), "can only aggregate non-nullable data");
+        assert_eq!(
+            tickets.len(),
+            data.len(),
+            "tickets and data must have the same length"
+        );
+        if tickets.is_empty() {
+            return;
+        }
         let max_ticket = tickets.iter().copied().max().unwrap_or(0) + 1;
         self.alloc.ensure_capacity(max_ticket as usize);
 
         let agg_func = self
-            .funcs
+            .grouped_funcs
             .entry(data.data_type().clone())
-            .or_insert_with(|| compile_agg_func(&self.agg, data));
+            .or_insert_with(|| compile_grouped_agg_func(&self.agg, data));
 
         let mut ih = datum_to_iter(&data).unwrap();
         unsafe {
@@ -229,11 +352,13 @@ impl<A: Aggregation> Aggregator<A> {
 
     pub fn merge(mut self, other: Self) -> Self {
         let alloc = self.agg.merge_allocs(self.alloc, other.alloc);
-        self.funcs.extend(other.funcs);
+        self.grouped_funcs.extend(other.grouped_funcs);
+        self.ungrouped_funcs.extend(other.ungrouped_funcs);
         Self {
             agg: self.agg,
             alloc,
-            funcs: self.funcs,
+            grouped_funcs: self.grouped_funcs,
+            ungrouped_funcs: self.ungrouped_funcs,
         }
     }
 
@@ -262,11 +387,11 @@ mod tests {
     #[test]
     fn test_count_aggregator() {
         let mut agg = CountAggregator::new(&[]);
-        agg.ingest(
+        agg.ingest_grouped(
             &[0, 1, 0, 1, 0, 1],
             &Int32Array::from(vec![1, 2, 3, 4, 5, 6]),
         );
-        agg.ingest(
+        agg.ingest_grouped(
             &[0, 1, 0, 1, 0, 1],
             &Int32Array::from(vec![1, 2, 3, 4, 5, 6]),
         );
@@ -277,12 +402,12 @@ mod tests {
     #[test]
     fn test_count_merge_aggregator() {
         let mut agg1 = CountAggregator::new(&[]);
-        agg1.ingest(
+        agg1.ingest_grouped(
             &[0, 1, 0, 1, 0, 1],
             &Int32Array::from(vec![1, 2, 3, 4, 5, 6]),
         );
         let mut agg2 = CountAggregator::new(&[]);
-        agg2.ingest(
+        agg2.ingest_grouped(
             &[0, 1, 0, 1, 0, 1],
             &Int32Array::from(vec![1, 2, 3, 4, 5, 6]),
         );
@@ -294,11 +419,11 @@ mod tests {
     #[test]
     fn test_sum_aggregator() {
         let mut agg = SumAggregator::new(&[&DataType::Int32]);
-        agg.ingest(
+        agg.ingest_grouped(
             &[0, 1, 0, 1, 0, 1],
             &Int32Array::from(vec![1, 2, 3, 4, 5, 6]),
         );
-        agg.ingest(
+        agg.ingest_grouped(
             &[0, 1, 0, 1, 0, 1],
             &Int32Array::from(vec![1, 2, 3, 4, 5, 6]),
         );
@@ -315,13 +440,13 @@ mod tests {
     #[test]
     fn test_sum_merge_aggregator() {
         let mut agg1 = SumAggregator::new(&[&DataType::Int32]);
-        agg1.ingest(
+        agg1.ingest_grouped(
             &[0, 1, 0, 1, 0, 1],
             &Int32Array::from(vec![1, 2, 3, 4, 5, 6]),
         );
 
         let mut agg2 = SumAggregator::new(&[&DataType::Int32]);
-        agg2.ingest(
+        agg2.ingest_grouped(
             &[0, 1, 0, 1, 0, 1],
             &Int32Array::from(vec![1, 2, 3, 4, 5, 6]),
         );
@@ -339,11 +464,11 @@ mod tests {
     #[test]
     fn test_min_aggregator() {
         let mut agg = MinAggregator::new(&[&DataType::Int32]);
-        agg.ingest(
+        agg.ingest_grouped(
             &[0, 1, 0, 1, 0, 1],
             &Int32Array::from(vec![1, -2, 3, 4, 5, 6]),
         );
-        agg.ingest(
+        agg.ingest_grouped(
             &[0, 1, 0, 1, 0, 1],
             &Int32Array::from(vec![0, 2, 3000, 4, 50, 60]),
         );
@@ -360,12 +485,12 @@ mod tests {
     #[test]
     fn test_min_merge_aggregator() {
         let mut agg1 = MinAggregator::new(&[&DataType::Int32]);
-        agg1.ingest(
+        agg1.ingest_grouped(
             &[0, 1, 0, 1, 0, 1],
             &Int32Array::from(vec![1, -2, 3, 4, 5, 6]),
         );
         let mut agg2 = MinAggregator::new(&[&DataType::Int32]);
-        agg2.ingest(
+        agg2.ingest_grouped(
             &[0, 1, 0, 1, 0, 1],
             &Int32Array::from(vec![0, 2, 3000, 4, 50, 60]),
         );
@@ -383,11 +508,11 @@ mod tests {
     #[test]
     fn test_max_aggregator() {
         let mut agg = MaxAggregator::new(&[&DataType::Int32]);
-        agg.ingest(
+        agg.ingest_grouped(
             &[0, 1, 0, 1, 0, 1],
             &Int32Array::from(vec![1, -2, 3, 4, 5, 6]),
         );
-        agg.ingest(
+        agg.ingest_grouped(
             &[0, 1, 0, 1, 0, 1],
             &Int32Array::from(vec![0, 2, 3000, 4, 50, 60]),
         );
@@ -404,12 +529,12 @@ mod tests {
     #[test]
     fn test_max_merge_aggregator() {
         let mut agg1 = MaxAggregator::new(&[&DataType::Int32]);
-        agg1.ingest(
+        agg1.ingest_grouped(
             &[0, 1, 0, 1, 0, 1],
             &Int32Array::from(vec![1, -2, 3, 4, 5, 6]),
         );
         let mut agg2 = MaxAggregator::new(&[&DataType::Int32]);
-        agg2.ingest(
+        agg2.ingest_grouped(
             &[0, 1, 0, 1, 0, 1],
             &Int32Array::from(vec![0, 2, 3000, 4, 50, 60]),
         );
@@ -427,11 +552,11 @@ mod tests {
     #[test]
     fn test_min_str_aggregator() {
         let mut agg = MinAggregator::new(&[&DataType::Utf8]);
-        agg.ingest(
+        agg.ingest_grouped(
             &[0, 1, 0, 1, 0, 1],
             &StringArray::from(vec!["apple", "banana", "cherry", "date", "elder", "fig"]),
         );
-        agg.ingest(
+        agg.ingest_grouped(
             &[0, 1, 0, 1, 0, 1],
             &StringArray::from(vec!["zeta", "gamma", "luma", "puma", "alpha", "mango"]),
         );
@@ -447,12 +572,12 @@ mod tests {
     #[test]
     fn test_min_str_merge_aggregator() {
         let mut agg1 = MinAggregator::new(&[&DataType::Utf8]);
-        agg1.ingest(
+        agg1.ingest_grouped(
             &[0, 1, 0, 1, 0, 1],
             &StringArray::from(vec!["apple", "banana", "cherry", "date", "elder", "fig"]),
         );
         let mut agg2 = MinAggregator::new(&[&DataType::Utf8]);
-        agg2.ingest(
+        agg2.ingest_grouped(
             &[0, 1, 0, 1, 0, 1],
             &StringArray::from(vec!["zeta", "gamma", "luma", "puma", "alpha", "mango"]),
         );
@@ -463,5 +588,20 @@ mod tests {
             .map(|x| std::str::from_utf8(x.unwrap()).unwrap())
             .collect_vec();
         assert_eq!(res, vec!["alpha", "banana"]);
+    }
+
+    #[test]
+    fn test_ungrouped_sum() {
+        let mut agg = SumAggregator::new(&[&DataType::Int32]);
+        agg.ingest_ungrouped(&Int32Array::from(vec![1, 2, 3, 4, 5, 6]));
+        agg.ingest_ungrouped(&Int32Array::from(vec![1, 2, 3, 4, 5, 6]));
+        let res = agg.finish();
+        let res = res
+            .as_primitive::<Int64Type>()
+            .values()
+            .iter()
+            .copied()
+            .collect_vec();
+        assert_eq!(res, vec![2 * (6 + 5 + 4 + 3 + 2 + 1)]);
     }
 }
