@@ -39,6 +39,7 @@ pub struct StringAlloc {
     data_ptr: *mut c_void,
     saver_ptr: *mut StringSaver,
 }
+unsafe impl Send for StringAlloc {}
 
 pub enum MinMaxAlloc {
     W8(Vec<COption<u8>>),

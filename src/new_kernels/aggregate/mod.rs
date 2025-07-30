@@ -386,6 +386,16 @@ mod tests {
 
     use crate::new_kernels::{CountAggregator, MaxAggregator, MinAggregator, SumAggregator};
 
+    fn assert_send<T: Send>() {}
+
+    #[test]
+    fn aggs_are_send() {
+        assert_send::<CountAggregator>();
+        assert_send::<SumAggregator>();
+        assert_send::<MinAggregator>();
+        assert_send::<MaxAggregator>();
+    }
+
     #[test]
     fn test_count_aggregator() {
         let mut agg = CountAggregator::new(&[]);
