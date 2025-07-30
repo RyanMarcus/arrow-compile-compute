@@ -73,6 +73,7 @@ impl Kernel for FilterKernel {
 mod tests {
     use arrow_array::{cast::AsArray, types::Int32Type, BooleanArray, Int32Array, RunArray};
     use arrow_schema::DataType;
+    use itertools::Itertools;
 
     use crate::{dictionary_data_type, new_kernels::Kernel};
 
@@ -87,6 +88,15 @@ mod tests {
         let res = k.call((&data, &filt)).unwrap();
 
         assert_eq!(res.as_primitive::<Int32Type>().values(), &[1, 2, 5, 6]);
+    }
+
+    #[test]
+    fn test_filter_i32_long() {
+        let data = Int32Array::from((0..1000).collect_vec());
+        let filt = BooleanArray::from((0..1000).map(|x| x < 500).collect_vec());
+        let k = FilterKernel::compile(&(&data, &filt), ()).unwrap();
+        let res = k.call((&data, &filt)).unwrap();
+        assert_eq!(res.len(), 500);
     }
 
     #[test]

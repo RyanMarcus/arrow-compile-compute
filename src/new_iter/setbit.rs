@@ -102,8 +102,6 @@ fn get_first_last_long(
         last_long[position_in_first_long] = first_byte;
     }
 
-    println!("{:?}", first_long);
-
     let first_long = u64::from_le_bytes(first_long);
     let last_long = u64::from_le_bytes(last_long);
 
@@ -331,6 +329,7 @@ mod tests {
 
     use arrow_array::{Array, BooleanArray};
     use inkwell::{context::Context, OptimizationLevel};
+    use itertools::Itertools;
 
     use crate::new_iter::{
         array_to_setbit_iter, generate_next,
@@ -534,8 +533,6 @@ mod tests {
 
         array_to_setbit_iter(&data).unwrap();
         let mut iter = array_to_setbit_iter(&data2).unwrap();
-        println!("{:?}", iter);
-
         let ctx = Context::create();
         let module = ctx.create_module("setbit_test");
         let func = generate_next(&ctx, &module, "setbit_iter", data.data_type(), &iter).unwrap();
@@ -1052,6 +1049,46 @@ mod tests {
             assert_eq!(
                 next_func.call(iter.get_mut_ptr(), &mut buf as *mut u64),
                 false
+            );
+        }
+    }
+
+    #[test]
+    fn test_setbit_iter_half() {
+        let data = BooleanArray::from((0..1000).map(|i| i < 500).collect_vec());
+        let mut iter = array_to_setbit_iter(&data).unwrap();
+
+        let ctx = Context::create();
+        let module = ctx.create_module("setbit_test");
+        let func = generate_next(&ctx, &module, "setbit_iter", data.data_type(), &iter).unwrap();
+        let fname = func.get_name().to_str().unwrap();
+
+        module.verify().unwrap();
+
+        let ee = module
+            .create_jit_execution_engine(OptimizationLevel::None)
+            .unwrap();
+
+        let next_func = unsafe {
+            ee.get_function::<unsafe extern "C" fn(*mut c_void, *mut u64) -> bool>(fname)
+                .unwrap()
+        };
+
+        let mut buf: u64 = 0;
+        unsafe {
+            for i in 0..500 {
+                assert_eq!(
+                    next_func.call(iter.get_mut_ptr(), &mut buf as *mut u64),
+                    true
+                );
+                assert_eq!(buf, i);
+            }
+
+            assert_eq!(
+                next_func.call(iter.get_mut_ptr(), &mut buf as *mut u64),
+                false,
+                "got value {}",
+                buf
             );
         }
     }

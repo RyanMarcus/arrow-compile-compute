@@ -247,8 +247,6 @@ impl<R: RunEndIndexType + ArrowPrimitiveType> From<&RunArray<R>> for IteratorHol
         let first_partition_size = re.value(first_idx).as_usize() - prev_end;
         let first_remaining = first_partition_size - (arr.offset() - prev_end);
 
-        println!("pos: {} len: {} loglen: {}", first_idx, re.len(), arr.len());
-
         let iter = RunEndIterator {
             run_ends: run_ends.get_ptr(),
             val_iter: values.get_ptr(),
