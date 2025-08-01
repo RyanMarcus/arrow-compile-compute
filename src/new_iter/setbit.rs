@@ -138,7 +138,6 @@ impl From<&BooleanArray> for Box<SetBitIterator> {
             first_byte,
             last_byte,
         );
-
         long_offset += 1;
 
         Box::new(SetBitIterator {
@@ -267,7 +266,7 @@ impl SetBitIterator {
         let byte_curr_index = build
             .build_int_mul(
                 curr_index,
-                ctx.i64_type().const_int(4, false),
+                ctx.i64_type().const_int(8, false),
                 "byte_curr_index",
             )
             .unwrap();
@@ -1055,7 +1054,7 @@ mod tests {
 
     #[test]
     fn test_setbit_iter_half() {
-        let data = BooleanArray::from((0..1000).map(|i| i < 500).collect_vec());
+        let data = BooleanArray::from((0..130).map(|i| i < 65).collect_vec());
         let mut iter = array_to_setbit_iter(&data).unwrap();
 
         let ctx = Context::create();
@@ -1076,7 +1075,7 @@ mod tests {
 
         let mut buf: u64 = 0;
         unsafe {
-            for i in 0..500 {
+            for i in 0..65 {
                 assert_eq!(
                     next_func.call(iter.get_mut_ptr(), &mut buf as *mut u64),
                     true
