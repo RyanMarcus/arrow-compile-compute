@@ -308,6 +308,11 @@ pub enum KernelExpression<'a> {
         idx: Box<KernelExpression<'a>>,
     },
     Convert(Box<KernelExpression<'a>>, PrimitiveType),
+    Add(Box<KernelExpression<'a>>, Box<KernelExpression<'a>>),
+    Sub(Box<KernelExpression<'a>>, Box<KernelExpression<'a>>),
+    Mul(Box<KernelExpression<'a>>, Box<KernelExpression<'a>>),
+    Div(Box<KernelExpression<'a>>, Box<KernelExpression<'a>>),
+    Rem(Box<KernelExpression<'a>>, Box<KernelExpression<'a>>),
 }
 
 impl From<u64> for KernelExpression<'_> {
@@ -368,6 +373,21 @@ impl<'a> KernelExpression<'a> {
     pub fn convert(&self, pt: PrimitiveType) -> KernelExpression<'a> {
         KernelExpression::Convert(Box::new(self.clone()), pt)
     }
+    pub fn add(&self, other: &KernelExpression<'a>) -> KernelExpression<'a> {
+        KernelExpression::Add(Box::new(self.clone()), Box::new(other.clone()))
+    }
+    pub fn sub(&self, other: &KernelExpression<'a>) -> KernelExpression<'a> {
+        KernelExpression::Sub(Box::new(self.clone()), Box::new(other.clone()))
+    }
+    pub fn div(&self, other: &KernelExpression<'a>) -> KernelExpression<'a> {
+        KernelExpression::Div(Box::new(self.clone()), Box::new(other.clone()))
+    }
+    pub fn rem(&self, other: &KernelExpression<'a>) -> KernelExpression<'a> {
+        KernelExpression::Rem(Box::new(self.clone()), Box::new(other.clone()))
+    }
+    pub fn mul(&self, other: &KernelExpression<'a>) -> KernelExpression<'a> {
+        KernelExpression::Mul(Box::new(self.clone()), Box::new(other.clone()))
+    }
 
     fn descend<F: FnMut(&Self)>(&self, f: &mut F) {
         match self {
@@ -410,6 +430,15 @@ impl<'a> KernelExpression<'a> {
                 expr.descend(f);
             }
             KernelExpression::IntConst(..) => f(self),
+            KernelExpression::Add(lhs, rhs)
+            | KernelExpression::Sub(lhs, rhs)
+            | KernelExpression::Mul(lhs, rhs)
+            | KernelExpression::Div(lhs, rhs)
+            | KernelExpression::Rem(lhs, rhs) => {
+                f(self);
+                lhs.descend(f);
+                rhs.descend(f);
+            }
         }
     }
 
@@ -445,6 +474,11 @@ impl<'a> KernelExpression<'a> {
             KernelExpression::IntConst(..) => DataType::UInt64,
             KernelExpression::At { iter, .. } => base_type(&iter.data_type()),
             KernelExpression::Convert(_expr, pt) => pt.as_arrow_type(),
+            KernelExpression::Add(lhs, _rhs)
+            | KernelExpression::Sub(lhs, _rhs)
+            | KernelExpression::Mul(lhs, _rhs)
+            | KernelExpression::Div(lhs, _rhs)
+            | KernelExpression::Rem(lhs, _rhs) => lhs.get_type(),
         }
     }
 
@@ -747,6 +781,325 @@ impl<'a> KernelExpression<'a> {
                 }
             }
             KernelExpression::IntConst(v, s) => Ok(ctx.i64_type().const_int(*v, *s).into()),
+            KernelExpression::Add(lhs, rhs) => {
+                let lhs_pt = PrimitiveType::for_arrow_type(&lhs.get_type());
+                let rhs_pt = PrimitiveType::for_arrow_type(&rhs.get_type());
+
+                if lhs_pt != rhs_pt {
+                    return Err(DSLError::TypeMismatch(format!(
+                        "cannot add different types: {} and {}",
+                        lhs_pt, rhs_pt
+                    )));
+                }
+
+                let lhs = lhs
+                    .compile(
+                        ctx,
+                        llvm_mod,
+                        build,
+                        bufs,
+                        accessors,
+                        iter_ptrs,
+                        iter_llvm_types,
+                    )
+                    .unwrap();
+                let rhs = rhs
+                    .compile(
+                        ctx,
+                        llvm_mod,
+                        build,
+                        bufs,
+                        accessors,
+                        iter_ptrs,
+                        iter_llvm_types,
+                    )
+                    .unwrap();
+
+                match lhs_pt {
+                    PrimitiveType::I8
+                    | PrimitiveType::I16
+                    | PrimitiveType::I32
+                    | PrimitiveType::I64
+                    | PrimitiveType::U8
+                    | PrimitiveType::U16
+                    | PrimitiveType::U32
+                    | PrimitiveType::U64 => Ok(build
+                        .build_int_add(lhs.into_int_value(), rhs.into_int_value(), "add_int")
+                        .unwrap()
+                        .into()),
+                    PrimitiveType::F16 | PrimitiveType::F32 | PrimitiveType::F64 => Ok(build
+                        .build_float_add(
+                            lhs.into_float_value(),
+                            rhs.into_float_value(),
+                            "add_float",
+                        )
+                        .unwrap()
+                        .into()),
+                    PrimitiveType::P64x2 => {
+                        return Err(DSLError::TypeMismatch(
+                            "cannot add string types".to_string(),
+                        ))
+                    }
+                }
+            }
+            KernelExpression::Div(lhs, rhs) => {
+                let lhs_pt = PrimitiveType::for_arrow_type(&lhs.get_type());
+                let rhs_pt = PrimitiveType::for_arrow_type(&rhs.get_type());
+
+                if lhs_pt != rhs_pt {
+                    return Err(DSLError::TypeMismatch(format!(
+                        "cannot divide different types: {} and {}",
+                        lhs_pt, rhs_pt
+                    )));
+                }
+
+                let lhs = lhs
+                    .compile(
+                        ctx,
+                        llvm_mod,
+                        build,
+                        bufs,
+                        accessors,
+                        iter_ptrs,
+                        iter_llvm_types,
+                    )
+                    .unwrap();
+                let rhs = rhs
+                    .compile(
+                        ctx,
+                        llvm_mod,
+                        build,
+                        bufs,
+                        accessors,
+                        iter_ptrs,
+                        iter_llvm_types,
+                    )
+                    .unwrap();
+
+                match lhs_pt {
+                    PrimitiveType::I8
+                    | PrimitiveType::I16
+                    | PrimitiveType::I32
+                    | PrimitiveType::I64 => Ok(build
+                        .build_int_signed_div(lhs.into_int_value(), rhs.into_int_value(), "div_int")
+                        .unwrap()
+                        .into()),
+                    PrimitiveType::U8
+                    | PrimitiveType::U16
+                    | PrimitiveType::U32
+                    | PrimitiveType::U64 => Ok(build
+                        .build_int_unsigned_div(
+                            lhs.into_int_value(),
+                            rhs.into_int_value(),
+                            "div_int",
+                        )
+                        .unwrap()
+                        .into()),
+                    PrimitiveType::F16 | PrimitiveType::F32 | PrimitiveType::F64 => Ok(build
+                        .build_float_div(
+                            lhs.into_float_value(),
+                            rhs.into_float_value(),
+                            "div_float",
+                        )
+                        .unwrap()
+                        .into()),
+                    PrimitiveType::P64x2 => {
+                        return Err(DSLError::TypeMismatch(
+                            "cannot divide string types".to_string(),
+                        ))
+                    }
+                }
+            }
+            KernelExpression::Mul(lhs, rhs) => {
+                let lhs_pt = PrimitiveType::for_arrow_type(&lhs.get_type());
+                let rhs_pt = PrimitiveType::for_arrow_type(&rhs.get_type());
+
+                if lhs_pt != rhs_pt {
+                    return Err(DSLError::TypeMismatch(format!(
+                        "cannot multiply different types: {} and {}",
+                        lhs_pt, rhs_pt
+                    )));
+                }
+
+                let lhs = lhs
+                    .compile(
+                        ctx,
+                        llvm_mod,
+                        build,
+                        bufs,
+                        accessors,
+                        iter_ptrs,
+                        iter_llvm_types,
+                    )
+                    .unwrap();
+                let rhs = rhs
+                    .compile(
+                        ctx,
+                        llvm_mod,
+                        build,
+                        bufs,
+                        accessors,
+                        iter_ptrs,
+                        iter_llvm_types,
+                    )
+                    .unwrap();
+
+                match lhs_pt {
+                    PrimitiveType::I8
+                    | PrimitiveType::I16
+                    | PrimitiveType::I32
+                    | PrimitiveType::I64
+                    | PrimitiveType::U8
+                    | PrimitiveType::U16
+                    | PrimitiveType::U32
+                    | PrimitiveType::U64 => Ok(build
+                        .build_int_mul(lhs.into_int_value(), rhs.into_int_value(), "mul_int")
+                        .unwrap()
+                        .into()),
+                    PrimitiveType::F16 | PrimitiveType::F32 | PrimitiveType::F64 => Ok(build
+                        .build_float_mul(
+                            lhs.into_float_value(),
+                            rhs.into_float_value(),
+                            "mul_float",
+                        )
+                        .unwrap()
+                        .into()),
+                    PrimitiveType::P64x2 => {
+                        return Err(DSLError::TypeMismatch(
+                            "cannot multiply string types".to_string(),
+                        ))
+                    }
+                }
+            }
+            KernelExpression::Rem(lhs, rhs) => {
+                let lhs_pt = PrimitiveType::for_arrow_type(&lhs.get_type());
+                let rhs_pt = PrimitiveType::for_arrow_type(&rhs.get_type());
+
+                if lhs_pt != rhs_pt {
+                    return Err(DSLError::TypeMismatch(format!(
+                        "cannot rem different types: {} and {}",
+                        lhs_pt, rhs_pt
+                    )));
+                }
+
+                let lhs = lhs
+                    .compile(
+                        ctx,
+                        llvm_mod,
+                        build,
+                        bufs,
+                        accessors,
+                        iter_ptrs,
+                        iter_llvm_types,
+                    )
+                    .unwrap();
+                let rhs = rhs
+                    .compile(
+                        ctx,
+                        llvm_mod,
+                        build,
+                        bufs,
+                        accessors,
+                        iter_ptrs,
+                        iter_llvm_types,
+                    )
+                    .unwrap();
+
+                match lhs_pt {
+                    PrimitiveType::I8
+                    | PrimitiveType::I16
+                    | PrimitiveType::I32
+                    | PrimitiveType::I64 => Ok(build
+                        .build_int_signed_rem(lhs.into_int_value(), rhs.into_int_value(), "rem_int")
+                        .unwrap()
+                        .into()),
+                    PrimitiveType::U8
+                    | PrimitiveType::U16
+                    | PrimitiveType::U32
+                    | PrimitiveType::U64 => Ok(build
+                        .build_int_unsigned_rem(
+                            lhs.into_int_value(),
+                            rhs.into_int_value(),
+                            "rem_int",
+                        )
+                        .unwrap()
+                        .into()),
+                    PrimitiveType::F16 | PrimitiveType::F32 | PrimitiveType::F64 => Ok(build
+                        .build_float_rem(
+                            lhs.into_float_value(),
+                            rhs.into_float_value(),
+                            "rem_float",
+                        )
+                        .unwrap()
+                        .into()),
+                    PrimitiveType::P64x2 => {
+                        return Err(DSLError::TypeMismatch(
+                            "cannot compute remainder of string types".to_string(),
+                        ))
+                    }
+                }
+            }
+            KernelExpression::Sub(lhs, rhs) => {
+                let lhs_pt = PrimitiveType::for_arrow_type(&lhs.get_type());
+                let rhs_pt = PrimitiveType::for_arrow_type(&rhs.get_type());
+
+                if lhs_pt != rhs_pt {
+                    return Err(DSLError::TypeMismatch(format!(
+                        "cannot sub different types: {} and {}",
+                        lhs_pt, rhs_pt
+                    )));
+                }
+
+                let lhs = lhs
+                    .compile(
+                        ctx,
+                        llvm_mod,
+                        build,
+                        bufs,
+                        accessors,
+                        iter_ptrs,
+                        iter_llvm_types,
+                    )
+                    .unwrap();
+                let rhs = rhs
+                    .compile(
+                        ctx,
+                        llvm_mod,
+                        build,
+                        bufs,
+                        accessors,
+                        iter_ptrs,
+                        iter_llvm_types,
+                    )
+                    .unwrap();
+
+                match lhs_pt {
+                    PrimitiveType::I8
+                    | PrimitiveType::I16
+                    | PrimitiveType::I32
+                    | PrimitiveType::I64
+                    | PrimitiveType::U8
+                    | PrimitiveType::U16
+                    | PrimitiveType::U32
+                    | PrimitiveType::U64 => Ok(build
+                        .build_int_sub(lhs.into_int_value(), rhs.into_int_value(), "sub_int")
+                        .unwrap()
+                        .into()),
+                    PrimitiveType::F16 | PrimitiveType::F32 | PrimitiveType::F64 => Ok(build
+                        .build_float_sub(
+                            lhs.into_float_value(),
+                            rhs.into_float_value(),
+                            "sub_float",
+                        )
+                        .unwrap()
+                        .into()),
+                    PrimitiveType::P64x2 => {
+                        return Err(DSLError::TypeMismatch(
+                            "cannot subtract string types".to_string(),
+                        ))
+                    }
+                }
+            }
         }
     }
 }
@@ -1538,7 +1891,18 @@ fn build_kernel_with_writer<'a, W: ArrayWriter<'a>>(
         .build_int_add(curr_produced, i64_type.const_int(1, false), "new_produced")
         .unwrap();
     builder.build_store(produced_ptr, new_produced).unwrap();
-    builder.build_unconditional_branch(loop_cond).unwrap();
+
+    // if all of our inputs are scalar, then the next function will return true
+    // forever -- we need to jump to the exit after the first iteration.
+    if indexes_to_iter
+        .iter()
+        .map(|(_ty, idx)| idx)
+        .all(|idx| inputs[*idx].get().1)
+    {
+        builder.build_unconditional_branch(exit).unwrap();
+    } else {
+        builder.build_unconditional_branch(loop_cond).unwrap();
+    }
 
     builder.position_at_end(exit);
     writer.llvm_flush(ctx, &builder);

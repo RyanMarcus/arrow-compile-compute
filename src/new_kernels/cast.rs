@@ -14,13 +14,6 @@ use arrow_array::{
 use arrow_data::ArrayDataBuilder;
 use arrow_schema::DataType;
 
-pub struct CastKernel {
-    k: DSLKernel,
-    tar: DataType,
-}
-unsafe impl Sync for CastKernel {}
-unsafe impl Send for CastKernel {}
-
 pub fn coalesce_type(res: ArrayRef, tar: &DataType) -> Result<ArrayRef, ArrowKernelError> {
     if res.data_type() == tar {
         return Ok(res);
@@ -96,6 +89,13 @@ pub fn coalesce_type(res: ArrayRef, tar: &DataType) -> Result<ArrayRef, ArrowKer
         _ => todo!("unable to coalesce {} into {}", res.data_type(), tar),
     }
 }
+
+pub struct CastKernel {
+    k: DSLKernel,
+    tar: DataType,
+}
+unsafe impl Sync for CastKernel {}
+unsafe impl Send for CastKernel {}
 
 impl Kernel for CastKernel {
     type Key = (DataType, DataType);

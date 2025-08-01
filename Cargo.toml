@@ -18,6 +18,8 @@ itertools = "0.13.0"
 cardinality-estimator = "1.0.2"
 bytemuck = { version = "1.23", features = ["extern_crate_alloc"] }
 thiserror = "2.0.12"
+strum = "0.27.2"
+strum_macros = "0.27.2"
 
 [dev-dependencies]
 float-ord = "0.3.2"

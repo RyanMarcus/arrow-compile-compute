@@ -1,5 +1,6 @@
 mod aggregate;
 mod apply;
+mod arith;
 mod cast;
 mod cmp;
 mod concat;
@@ -17,6 +18,8 @@ pub use apply::FloatFuncCache;
 pub use apply::IntFuncCache;
 pub use apply::StrFuncCache;
 pub use apply::UIntFuncCache;
+pub use arith::BinOp;
+pub use arith::BinOpKernel;
 use arrow_schema::DataType;
 pub use cast::CastKernel;
 pub use cmp::ComparisonKernel;

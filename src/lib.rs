@@ -21,6 +21,7 @@ mod new_kernels;
 
 pub use arrow_interface::aggregate;
 pub use arrow_interface::apply;
+pub use arrow_interface::arith;
 pub use arrow_interface::cast;
 pub use arrow_interface::cmp;
 pub use arrow_interface::compute;

@@ -500,3 +500,37 @@ pub mod aggregate {
         Ok(CountAggregator::new(&[]))
     }
 }
+
+pub mod arith {
+    use std::sync::LazyLock;
+
+    use arrow_array::{ArrayRef, Datum};
+
+    use crate::{
+        new_kernels::{BinOp, BinOpKernel, KernelCache},
+        ArrowKernelError,
+    };
+
+    static BINOP_PROGRAM_CACHE: LazyLock<KernelCache<BinOpKernel>> =
+        LazyLock::new(KernelCache::new);
+
+    pub fn add(left: &dyn Datum, right: &dyn Datum) -> Result<ArrayRef, ArrowKernelError> {
+        BINOP_PROGRAM_CACHE.get((left, right), BinOp::Add)
+    }
+
+    pub fn sub_wrapping(left: &dyn Datum, right: &dyn Datum) -> Result<ArrayRef, ArrowKernelError> {
+        BINOP_PROGRAM_CACHE.get((left, right), BinOp::Sub)
+    }
+
+    pub fn mul_wrapping(left: &dyn Datum, right: &dyn Datum) -> Result<ArrayRef, ArrowKernelError> {
+        BINOP_PROGRAM_CACHE.get((left, right), BinOp::Mul)
+    }
+
+    pub fn div(left: &dyn Datum, right: &dyn Datum) -> Result<ArrayRef, ArrowKernelError> {
+        BINOP_PROGRAM_CACHE.get((left, right), BinOp::Div)
+    }
+
+    pub fn rem(left: &dyn Datum, right: &dyn Datum) -> Result<ArrayRef, ArrowKernelError> {
+        BINOP_PROGRAM_CACHE.get((left, right), BinOp::Rem)
+    }
+}
