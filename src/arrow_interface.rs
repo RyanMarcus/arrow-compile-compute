@@ -35,10 +35,10 @@ pub mod cmp {
     use arrow_array::Datum;
     use arrow_array::UInt32Array;
 
-    pub use crate::new_kernels::ComparisonKernel;
-    use crate::new_kernels::KernelCache;
-    use crate::new_kernels::SortKernel;
-    use crate::new_kernels::SortOptions;
+    pub use crate::compiled_kernels::ComparisonKernel;
+    use crate::compiled_kernels::KernelCache;
+    use crate::compiled_kernels::SortKernel;
+    use crate::compiled_kernels::SortOptions;
     use crate::ArrowKernelError;
     use crate::Predicate;
 
@@ -104,8 +104,8 @@ pub mod cast {
     use arrow_array::ArrayRef;
     use arrow_schema::DataType;
 
-    use crate::new_kernels::CastKernel;
-    use crate::new_kernels::KernelCache;
+    use crate::compiled_kernels::CastKernel;
+    use crate::compiled_kernels::KernelCache;
     use crate::ArrowKernelError;
 
     static CAST_PROGRAM_CACHE: LazyLock<KernelCache<CastKernel>> = LazyLock::new(KernelCache::new);
@@ -158,7 +158,7 @@ pub mod apply {
     use arrow_array::Array;
 
     use crate::{
-        new_kernels::{FloatFuncCache, IntFuncCache, StrFuncCache, UIntFuncCache},
+        compiled_kernels::{FloatFuncCache, IntFuncCache, StrFuncCache, UIntFuncCache},
         ArrowKernelError,
     };
 
@@ -247,7 +247,7 @@ pub mod select {
     use arrow_array::{make_array, Array, ArrayRef, BooleanArray};
 
     use crate::{
-        new_kernels::{ConcatKernel, FilterKernel, KernelCache, TakeKernel},
+        compiled_kernels::{ConcatKernel, FilterKernel, KernelCache, TakeKernel},
         ArrowKernelError,
     };
 
@@ -333,7 +333,7 @@ pub mod compute {
     use cardinality_estimator::CardinalityEstimator;
 
     use crate::{
-        new_kernels::{HashKernel, KernelCache},
+        compiled_kernels::{HashKernel, KernelCache},
         ArrowKernelError,
     };
 
@@ -476,7 +476,9 @@ pub mod compute {
 pub mod aggregate {
     use arrow_schema::DataType;
 
-    pub use crate::new_kernels::{CountAggregator, MaxAggregator, MinAggregator, SumAggregator};
+    pub use crate::compiled_kernels::{
+        CountAggregator, MaxAggregator, MinAggregator, SumAggregator,
+    };
     use crate::ArrowKernelError;
 
     /// Creates a new sum aggregator. Final results are 64-bit versions of their
@@ -507,7 +509,7 @@ pub mod arith {
     use arrow_array::{ArrayRef, Datum};
 
     use crate::{
-        new_kernels::{BinOp, BinOpKernel, KernelCache},
+        compiled_kernels::{BinOp, BinOpKernel, KernelCache},
         ArrowKernelError,
     };
 

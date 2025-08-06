@@ -16,8 +16,8 @@ use inkwell::{
 };
 
 mod arrow_interface;
-mod new_iter;
-mod new_kernels;
+mod compiled_iter;
+mod compiled_kernels;
 
 pub use arrow_interface::aggregate;
 pub use arrow_interface::apply;
@@ -27,9 +27,9 @@ pub use arrow_interface::cmp;
 pub use arrow_interface::compute;
 pub use arrow_interface::select;
 
-pub use new_kernels::ArrowKernelError;
-pub use new_kernels::Kernel;
-pub use new_kernels::SortOptions;
+pub use compiled_kernels::ArrowKernelError;
+pub use compiled_kernels::Kernel;
+pub use compiled_kernels::SortOptions;
 
 macro_rules! mark_load_invariant {
     ($ctx:expr, $instruction:expr) => {
