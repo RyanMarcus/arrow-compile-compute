@@ -16,8 +16,8 @@ use inkwell::{
     context::Context,
     execution_engine::JitFunction,
     module::{Linkage, Module},
-    types::BasicTypeEnum,
-    values::{BasicValue, BasicValueEnum, FunctionValue, PointerValue},
+    types::{BasicType, BasicTypeEnum},
+    values::{BasicValue, BasicValueEnum, FunctionValue, PointerValue, VectorValue},
     AddressSpace, OptimizationLevel,
 };
 use itertools::Itertools;
@@ -28,7 +28,8 @@ use thiserror::Error;
 use crate::{
     declare_blocks, increment_pointer,
     new_iter::{
-        array_to_setbit_iter, datum_to_iter, generate_next, generate_random_access, IteratorHolder,
+        array_to_setbit_iter, datum_to_iter, generate_next, generate_next_block,
+        generate_random_access, IteratorHolder,
     },
     new_kernels::{
         cmp::{add_float_vec_to_int_vec, add_memcmp},
@@ -42,6 +43,8 @@ use crate::{
 };
 
 use super::{writers::StringArrayWriter, ArrowKernelError};
+
+const VEC_SIZE: u32 = 32;
 
 #[derive(Debug, Error)]
 pub enum DSLError {
@@ -59,6 +62,8 @@ pub enum DSLError {
     UnsupportedDictionaryValueType(DataType),
     #[error("No iteration")]
     NoIteration,
+    #[error("Not vectorizable: {0}")]
+    NotVectorizable(&'static str),
 }
 
 #[derive(Clone)]
@@ -479,6 +484,228 @@ impl<'a> KernelExpression<'a> {
             | KernelExpression::Mul(lhs, _rhs)
             | KernelExpression::Div(lhs, _rhs)
             | KernelExpression::Rem(lhs, _rhs) => lhs.get_type(),
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn compile_block<'b>(
+        &self,
+        ctx: &'b Context,
+        llvm_mod: &Module<'b>,
+        build: &Builder<'b>,
+        vec_bufs: &HashMap<usize, PointerValue<'b>>,
+        iter_llvm_types: &HashMap<usize, BasicTypeEnum<'b>>,
+    ) -> Result<VectorValue<'b>, DSLError> {
+        match self {
+            KernelExpression::Item(kernel_input) => {
+                let buf = vec_bufs[&kernel_input.index()];
+                let llvm_type = iter_llvm_types[&kernel_input.index()];
+                Ok(build
+                    .build_load(llvm_type, buf, "load")
+                    .unwrap()
+                    .into_vector_value())
+            }
+            KernelExpression::IntConst(v, s) => {
+                let i64_type = ctx.i64_type();
+                let vec_type = i64_type.vec_type(VEC_SIZE);
+                let v = i64_type.const_int(*v, *s);
+                let v = build
+                    .build_insert_element(vec_type.const_zero(), v, i64_type.const_zero(), "v")
+                    .unwrap();
+                let v = build
+                    .build_shuffle_vector(
+                        v,
+                        vec_type.const_zero(),
+                        vec_type.const_zero(),
+                        "splatted",
+                    )
+                    .unwrap();
+                Ok(v)
+            }
+            KernelExpression::Truncate(_kernel_expression, _) => todo!(),
+            KernelExpression::And(lhs, rhs) => {
+                let lhs = lhs.compile_block(ctx, llvm_mod, build, vec_bufs, iter_llvm_types)?;
+                let rhs = rhs.compile_block(ctx, llvm_mod, build, vec_bufs, iter_llvm_types)?;
+                Ok(build.build_and(lhs, rhs, "and").unwrap())
+            }
+            KernelExpression::Or(lhs, rhs) => {
+                let lhs = lhs.compile_block(ctx, llvm_mod, build, vec_bufs, iter_llvm_types)?;
+                let rhs = rhs.compile_block(ctx, llvm_mod, build, vec_bufs, iter_llvm_types)?;
+                Ok(build.build_or(lhs, rhs, "or").unwrap())
+            }
+            KernelExpression::Not(c) => {
+                let c = c.compile_block(ctx, llvm_mod, build, vec_bufs, iter_llvm_types)?;
+                Ok(build.build_not(c, "not").unwrap())
+            }
+            KernelExpression::Select { cond, v1, v2 } => {
+                let cond = cond.compile_block(ctx, llvm_mod, build, vec_bufs, iter_llvm_types)?;
+                let v1 = v1.compile_block(ctx, llvm_mod, build, vec_bufs, iter_llvm_types)?;
+                let v2 = v2.compile_block(ctx, llvm_mod, build, vec_bufs, iter_llvm_types)?;
+                Ok(build
+                    .build_select(cond, v1, v2, "select")
+                    .unwrap()
+                    .into_vector_value())
+            }
+            KernelExpression::Convert(c, tar_pt) => {
+                let in_ty = PrimitiveType::for_arrow_type(&c.get_type());
+                let c = c.compile_block(ctx, llvm_mod, build, vec_bufs, iter_llvm_types)?;
+                Ok(gen_convert_numeric_vec(ctx, build, c, in_ty, *tar_pt))
+            }
+            KernelExpression::Add(lhs, rhs) => {
+                let pt = PrimitiveType::for_arrow_type(&lhs.get_type());
+                if pt != PrimitiveType::for_arrow_type(&rhs.get_type()) {
+                    return Err(DSLError::TypeMismatch(format!(
+                        "cannot add values of different types {} and {}",
+                        pt,
+                        PrimitiveType::for_arrow_type(&rhs.get_type())
+                    )));
+                }
+
+                let lhs = lhs.compile_block(ctx, llvm_mod, build, vec_bufs, iter_llvm_types)?;
+                let rhs = rhs.compile_block(ctx, llvm_mod, build, vec_bufs, iter_llvm_types)?;
+                match pt {
+                    PrimitiveType::I8
+                    | PrimitiveType::I16
+                    | PrimitiveType::I32
+                    | PrimitiveType::I64
+                    | PrimitiveType::U8
+                    | PrimitiveType::U16
+                    | PrimitiveType::U32
+                    | PrimitiveType::U64 => Ok(build.build_int_add(lhs, rhs, "add").unwrap()),
+                    PrimitiveType::F16 | PrimitiveType::F32 | PrimitiveType::F64 => {
+                        Ok(build.build_float_add(lhs, rhs, "add").unwrap())
+                    }
+                    PrimitiveType::P64x2 => Err(DSLError::TypeMismatch(
+                        "cannot add string types".to_string(),
+                    )),
+                }
+            }
+            KernelExpression::Sub(lhs, rhs) => {
+                let pt = PrimitiveType::for_arrow_type(&lhs.get_type());
+                if pt != PrimitiveType::for_arrow_type(&rhs.get_type()) {
+                    return Err(DSLError::TypeMismatch(format!(
+                        "cannot subtract values of different types {} and {}",
+                        pt,
+                        PrimitiveType::for_arrow_type(&rhs.get_type())
+                    )));
+                }
+
+                let lhs = lhs.compile_block(ctx, llvm_mod, build, vec_bufs, iter_llvm_types)?;
+                let rhs = rhs.compile_block(ctx, llvm_mod, build, vec_bufs, iter_llvm_types)?;
+                match pt {
+                    PrimitiveType::I8
+                    | PrimitiveType::I16
+                    | PrimitiveType::I32
+                    | PrimitiveType::I64
+                    | PrimitiveType::U8
+                    | PrimitiveType::U16
+                    | PrimitiveType::U32
+                    | PrimitiveType::U64 => Ok(build.build_int_sub(lhs, rhs, "add").unwrap()),
+                    PrimitiveType::F16 | PrimitiveType::F32 | PrimitiveType::F64 => {
+                        Ok(build.build_float_sub(lhs, rhs, "add").unwrap())
+                    }
+                    PrimitiveType::P64x2 => Err(DSLError::TypeMismatch(
+                        "cannot subtract string types".to_string(),
+                    )),
+                }
+            }
+            KernelExpression::Mul(lhs, rhs) => {
+                let pt = PrimitiveType::for_arrow_type(&lhs.get_type());
+                if pt != PrimitiveType::for_arrow_type(&rhs.get_type()) {
+                    return Err(DSLError::TypeMismatch(format!(
+                        "cannot multiply values of different types {} and {}",
+                        pt,
+                        PrimitiveType::for_arrow_type(&rhs.get_type())
+                    )));
+                }
+
+                let lhs = lhs.compile_block(ctx, llvm_mod, build, vec_bufs, iter_llvm_types)?;
+                let rhs = rhs.compile_block(ctx, llvm_mod, build, vec_bufs, iter_llvm_types)?;
+                match pt {
+                    PrimitiveType::I8
+                    | PrimitiveType::I16
+                    | PrimitiveType::I32
+                    | PrimitiveType::I64
+                    | PrimitiveType::U8
+                    | PrimitiveType::U16
+                    | PrimitiveType::U32
+                    | PrimitiveType::U64 => Ok(build.build_int_mul(lhs, rhs, "mul").unwrap()),
+                    PrimitiveType::F16 | PrimitiveType::F32 | PrimitiveType::F64 => {
+                        Ok(build.build_float_mul(lhs, rhs, "mul").unwrap())
+                    }
+                    PrimitiveType::P64x2 => Err(DSLError::TypeMismatch(
+                        "cannot multiply string types".to_string(),
+                    )),
+                }
+            }
+            KernelExpression::Div(lhs, rhs) => {
+                let pt = PrimitiveType::for_arrow_type(&lhs.get_type());
+                if pt != PrimitiveType::for_arrow_type(&rhs.get_type()) {
+                    return Err(DSLError::TypeMismatch(format!(
+                        "cannot divide values of different types {} and {}",
+                        pt,
+                        PrimitiveType::for_arrow_type(&rhs.get_type())
+                    )));
+                }
+
+                let lhs = lhs.compile_block(ctx, llvm_mod, build, vec_bufs, iter_llvm_types)?;
+                let rhs = rhs.compile_block(ctx, llvm_mod, build, vec_bufs, iter_llvm_types)?;
+                match pt {
+                    PrimitiveType::I8
+                    | PrimitiveType::I16
+                    | PrimitiveType::I32
+                    | PrimitiveType::I64 => {
+                        Ok(build.build_int_signed_div(lhs, rhs, "div").unwrap())
+                    }
+                    PrimitiveType::U8
+                    | PrimitiveType::U16
+                    | PrimitiveType::U32
+                    | PrimitiveType::U64 => {
+                        Ok(build.build_int_unsigned_div(lhs, rhs, "div").unwrap())
+                    }
+                    PrimitiveType::F16 | PrimitiveType::F32 | PrimitiveType::F64 => {
+                        Ok(build.build_float_div(lhs, rhs, "div").unwrap())
+                    }
+                    PrimitiveType::P64x2 => Err(DSLError::TypeMismatch(
+                        "cannot divide string types".to_string(),
+                    )),
+                }
+            }
+            KernelExpression::Rem(lhs, rhs) => {
+                let pt = PrimitiveType::for_arrow_type(&lhs.get_type());
+                if pt != PrimitiveType::for_arrow_type(&rhs.get_type()) {
+                    return Err(DSLError::TypeMismatch(format!(
+                        "cannot rem values of different types {} and {}",
+                        pt,
+                        PrimitiveType::for_arrow_type(&rhs.get_type())
+                    )));
+                }
+
+                let lhs = lhs.compile_block(ctx, llvm_mod, build, vec_bufs, iter_llvm_types)?;
+                let rhs = rhs.compile_block(ctx, llvm_mod, build, vec_bufs, iter_llvm_types)?;
+                match pt {
+                    PrimitiveType::I8
+                    | PrimitiveType::I16
+                    | PrimitiveType::I32
+                    | PrimitiveType::I64 => {
+                        Ok(build.build_int_signed_rem(lhs, rhs, "rem").unwrap())
+                    }
+                    PrimitiveType::U8
+                    | PrimitiveType::U16
+                    | PrimitiveType::U32
+                    | PrimitiveType::U64 => {
+                        Ok(build.build_int_unsigned_rem(lhs, rhs, "rem").unwrap())
+                    }
+                    PrimitiveType::F16 | PrimitiveType::F32 | PrimitiveType::F64 => {
+                        Ok(build.build_float_rem(lhs, rhs, "rem").unwrap())
+                    }
+                    PrimitiveType::P64x2 => Err(DSLError::TypeMismatch(
+                        "cannot rem string types".to_string(),
+                    )),
+                }
+            }
+            KernelExpression::Cmp(..) => Err(DSLError::NotVectorizable("cmp operator")),
+            KernelExpression::At { .. } => Err(DSLError::NotVectorizable("at operator")),
         }
     }
 
@@ -1724,6 +1951,11 @@ fn build_kernel_with_writer<'a, W: ArrayWriter<'a>>(
         return Err(DSLError::NoIteration);
     }
 
+    let all_inputs_scalar = indexes_to_iter
+        .iter()
+        .map(|(_ty, idx)| idx)
+        .all(|idx| inputs[*idx].get().1);
+
     let mut iter_llvm_types = HashMap::new();
     for (ty, idx) in indexes_to_iter.iter() {
         let ptype = match ty {
@@ -1753,6 +1985,28 @@ fn build_kernel_with_writer<'a, W: ArrayWriter<'a>>(
                     &ih,
                 )
                 .unwrap(),
+            )
+        })
+        .collect();
+
+    let next_block_funcs: HashMap<usize, Option<FunctionValue>> = indexes_to_iter
+        .iter()
+        .map(|(ty, idx)| {
+            let ih = match ty {
+                KernelInputType::Standard => datum_to_iter(inputs[*idx]).unwrap(),
+                KernelInputType::SetBit => {
+                    array_to_setbit_iter(inputs[*idx].get().0.as_boolean()).unwrap()
+                }
+            };
+            (
+                *idx,
+                generate_next_block::<32>(
+                    ctx,
+                    &llvm_mod,
+                    &format!("next_block{}", idx),
+                    inputs[*idx].get().0.data_type(),
+                    &ih,
+                ),
             )
         })
         .collect();
@@ -1817,7 +2071,114 @@ fn build_kernel_with_writer<'a, W: ArrayWriter<'a>>(
         .build_store(produced_ptr, i64_type.const_zero())
         .unwrap();
 
-    builder.build_unconditional_branch(loop_cond).unwrap();
+    // possibly add a block-iteration fast path TODO
+    let mut uses_blocks = false;
+    if next_block_funcs.values().all(|f| f.is_some())
+        && program.filter().is_none()
+        && !all_inputs_scalar
+    {
+        // potentially use block iteration, allocate buffers
+        let mut vec_bufs = HashMap::new();
+        let mut vec_types = HashMap::new();
+        for (ty, idx) in indexes_to_iter.iter() {
+            let ptype = match ty {
+                KernelInputType::Standard => {
+                    PrimitiveType::for_arrow_type(inputs[*idx].get().0.data_type())
+                }
+                KernelInputType::SetBit => PrimitiveType::U64,
+            };
+            let vec_buf = ptype
+                .llvm_vec_type(ctx, 32)
+                .map(|t| builder.build_alloca(t, &format!("vbuf{}", t)).unwrap());
+            vec_bufs.insert(idx, vec_buf);
+            vec_types.insert(idx, ptype.llvm_vec_type(ctx, 32));
+        }
+
+        if vec_bufs.values().all(|x| x.is_some()) {
+            let vec_bufs = vec_bufs
+                .into_iter()
+                .map(|(k, v)| (*k, v.unwrap()))
+                .collect();
+            let vec_types = vec_types
+                .into_iter()
+                .map(|(k, v)| (*k, v.unwrap().as_basic_type_enum()))
+                .collect();
+
+            // all our inputs support block iteration, see if our program does
+            declare_blocks!(ctx, func_inner, block_loop_cond, block_loop_body);
+            builder.position_at_end(block_loop_body);
+            let res = program
+                .expr()
+                .compile_block(ctx, &llvm_mod, &builder, &vec_bufs, &vec_types);
+            match res {
+                Ok(v) => {
+                    // send `v` to the writer, loop back
+                    writer.llvm_ingest_block(ctx, &builder, v);
+                    let curr_produced = builder
+                        .build_load(i64_type, produced_ptr, "curr_produced")
+                        .unwrap()
+                        .into_int_value();
+                    let new_produced = builder
+                        .build_int_add(
+                            curr_produced,
+                            i64_type.const_int(v.get_type().get_size() as u64, false),
+                            "new_produced",
+                        )
+                        .unwrap();
+                    builder.build_store(produced_ptr, new_produced).unwrap();
+                    builder.build_unconditional_branch(block_loop_cond).unwrap();
+
+                    builder.position_at_end(block_loop_cond);
+                    let mut had_nexts = Vec::new();
+                    // call next on each of the iterators that we care about
+                    for (_ty, param_idx) in indexes_to_iter.iter() {
+                        let buf = vec_bufs[param_idx];
+                        let next_func = next_block_funcs[param_idx].unwrap();
+                        let iter_ptr = iter_ptrs[*param_idx];
+                        had_nexts.push(
+                            builder
+                                .build_call(
+                                    next_func,
+                                    &[iter_ptr.into(), buf.into()],
+                                    &format!("next{}", param_idx),
+                                )
+                                .unwrap()
+                                .try_as_basic_value()
+                                .unwrap_left()
+                                .into_int_value(),
+                        );
+                    }
+
+                    // AND-together all has-nexts
+                    let mut accum = had_nexts.pop().unwrap();
+                    for val in had_nexts {
+                        accum = builder.build_and(accum, val, "accum").unwrap();
+                    }
+                    builder
+                        .build_conditional_branch(accum, block_loop_body, loop_cond)
+                        .unwrap();
+
+                    builder.position_at_end(entry);
+                    builder.build_unconditional_branch(block_loop_cond).unwrap();
+
+                    uses_blocks = true;
+                }
+                Err(e) => {
+                    println!("Unable to compile blocked version of kernel: {}", e);
+                    for buf in vec_bufs.into_values() {
+                        buf.as_instruction().unwrap().remove_from_basic_block();
+                    }
+                    block_loop_cond.remove_from_function().unwrap();
+                    block_loop_body.remove_from_function().unwrap();
+                }
+            }
+        }
+    }
+
+    if !uses_blocks {
+        builder.position_at_end(entry);
+        builder.build_unconditional_branch(loop_cond).unwrap();
+    }
 
     builder.position_at_end(loop_cond);
     let mut had_nexts = Vec::new();
@@ -1894,11 +2255,7 @@ fn build_kernel_with_writer<'a, W: ArrayWriter<'a>>(
 
     // if all of our inputs are scalar, then the next function will return true
     // forever -- we need to jump to the exit after the first iteration.
-    if indexes_to_iter
-        .iter()
-        .map(|(_ty, idx)| idx)
-        .all(|idx| inputs[*idx].get().1)
-    {
+    if all_inputs_scalar {
         builder.build_unconditional_branch(exit).unwrap();
     } else {
         builder.build_unconditional_branch(loop_cond).unwrap();

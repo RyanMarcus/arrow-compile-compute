@@ -300,7 +300,7 @@ pub fn generate_next_block<'a, const N: u32>(
     let iter_ptr = next.get_nth_param(0).unwrap().into_pointer_value();
     let out_ptr = next.get_nth_param(1).unwrap().into_pointer_value();
 
-    match ih {
+    let res = match ih {
         IteratorHolder::Primitive(primitive_iter) => {
             declare_blocks!(ctx, next, entry, none_left, get_next);
 
@@ -338,8 +338,8 @@ pub fn generate_next_block<'a, const N: u32>(
         }
         IteratorHolder::String(_) | IteratorHolder::LargeString(_) => None,
         IteratorHolder::View(_) => None,
-        IteratorHolder::Bitmap(_bitmap_iterator) => todo!(),
-        IteratorHolder::SetBit(_) => unimplemented!("No block iterator for setbit!"),
+        IteratorHolder::Bitmap(_bitmap_iterator) => None,
+        IteratorHolder::SetBit(_) => None,
         IteratorHolder::Dictionary { arr, keys, values } => match dt {
             DataType::Dictionary(k_dt, v_dt) => {
                 let key_block_next =
@@ -757,6 +757,14 @@ pub fn generate_next_block<'a, const N: u32>(
             Some(next)
         }
         IteratorHolder::ScalarString(_) => todo!(),
+    };
+
+    match res {
+        Some(x) => Some(x),
+        None => unsafe {
+            next.delete(); // safety: next is created and destroyed here
+            None
+        },
     }
 }
 

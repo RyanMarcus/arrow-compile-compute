@@ -6,7 +6,7 @@ use inkwell::{
     builder::Builder,
     context::Context,
     module::Module,
-    values::{BasicValueEnum, PointerValue},
+    values::{BasicValueEnum, PointerValue, VectorValue},
 };
 
 mod array_writer;
@@ -38,6 +38,20 @@ pub trait ArrayWriter<'a> {
     ) -> Self;
     fn llvm_ingest(&self, ctx: &'a Context, build: &Builder<'a>, val: BasicValueEnum<'a>);
     fn llvm_flush(&self, ctx: &'a Context, build: &Builder<'a>);
+
+    fn llvm_ingest_block(&self, ctx: &'a Context, build: &Builder<'a>, vals: VectorValue<'a>) {
+        let i64_type = ctx.i64_type();
+        for idx in 0..vals.get_type().get_size() {
+            let val = build
+                .build_extract_element(
+                    vals,
+                    i64_type.const_int(idx as u64, false),
+                    &format!("val{}", idx),
+                )
+                .unwrap();
+            self.llvm_ingest(ctx, build, val);
+        }
+    }
 }
 
 pub trait WriterAllocation {
