@@ -156,6 +156,7 @@ pub mod apply {
     use std::sync::LazyLock;
 
     use arrow_array::Array;
+    use arrow_schema::DataType;
 
     use crate::{
         compiled_kernels::{FloatFuncCache, IntFuncCache, StrFuncCache, UIntFuncCache},
@@ -166,6 +167,45 @@ pub mod apply {
     static INT_FUNC_CACHE: LazyLock<IntFuncCache> = LazyLock::new(IntFuncCache::default);
     static UINT_FUNC_CACHE: LazyLock<UIntFuncCache> = LazyLock::new(UIntFuncCache::default);
     static STRING_FUNC_CACHE: LazyLock<StrFuncCache> = LazyLock::new(StrFuncCache::default);
+
+    pub enum ApplyType {
+        U64,
+        I64,
+        F64,
+        Str,
+    }
+
+    impl ApplyType {
+        pub fn for_arrow_type(dt: &DataType) -> Option<Self> {
+            match dt {
+                DataType::Int8 | DataType::Int16 | DataType::Int32 | DataType::Int64 => {
+                    Some(ApplyType::I64)
+                }
+                DataType::UInt8 | DataType::UInt16 | DataType::UInt32 | DataType::UInt64 => {
+                    Some(ApplyType::U64)
+                }
+                DataType::Float16 | DataType::Float32 | DataType::Float64 => Some(ApplyType::F64),
+                DataType::Timestamp(..)
+                | DataType::Date64
+                | DataType::Time32(..)
+                | DataType::Time64(..)
+                | DataType::Duration(..)
+                | DataType::Interval(..) => Some(ApplyType::I64),
+                DataType::Binary
+                | DataType::FixedSizeBinary(_)
+                | DataType::LargeBinary
+                | DataType::BinaryView
+                | DataType::Utf8
+                | DataType::LargeUtf8
+                | DataType::Utf8View => Some(ApplyType::Str),
+                DataType::Dictionary(_keys, values) => ApplyType::for_arrow_type(values),
+                DataType::RunEndEncoded(_re_type, values) => {
+                    ApplyType::for_arrow_type(values.data_type())
+                }
+                _ => None,
+            }
+        }
+    }
 
     /// Iterate over data casted to `f64`.
     ///
