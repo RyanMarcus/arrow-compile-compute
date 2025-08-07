@@ -252,7 +252,7 @@ impl<R: RunEndIndexType + ArrowPrimitiveType> From<&RunArray<R>> for IteratorHol
             val_iter: values.get_ptr(),
             pos: first_idx as u64,
             len: re.len() as u64,
-            logical_pos: 0 as u64,
+            logical_pos: 0,
             logical_len: arr.len() as u64,
             remaining: first_remaining as u64,
         };

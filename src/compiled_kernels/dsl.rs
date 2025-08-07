@@ -490,7 +490,6 @@ impl<'a> KernelExpression<'a> {
     fn compile_block<'b>(
         &self,
         ctx: &'b Context,
-        llvm_mod: &Module<'b>,
         build: &Builder<'b>,
         vec_bufs: &HashMap<usize, PointerValue<'b>>,
         iter_llvm_types: &HashMap<usize, BasicTypeEnum<'b>>,
@@ -523,23 +522,23 @@ impl<'a> KernelExpression<'a> {
             }
             KernelExpression::Truncate(_kernel_expression, _) => todo!(),
             KernelExpression::And(lhs, rhs) => {
-                let lhs = lhs.compile_block(ctx, llvm_mod, build, vec_bufs, iter_llvm_types)?;
-                let rhs = rhs.compile_block(ctx, llvm_mod, build, vec_bufs, iter_llvm_types)?;
+                let lhs = lhs.compile_block(ctx, build, vec_bufs, iter_llvm_types)?;
+                let rhs = rhs.compile_block(ctx, build, vec_bufs, iter_llvm_types)?;
                 Ok(build.build_and(lhs, rhs, "and").unwrap())
             }
             KernelExpression::Or(lhs, rhs) => {
-                let lhs = lhs.compile_block(ctx, llvm_mod, build, vec_bufs, iter_llvm_types)?;
-                let rhs = rhs.compile_block(ctx, llvm_mod, build, vec_bufs, iter_llvm_types)?;
+                let lhs = lhs.compile_block(ctx, build, vec_bufs, iter_llvm_types)?;
+                let rhs = rhs.compile_block(ctx, build, vec_bufs, iter_llvm_types)?;
                 Ok(build.build_or(lhs, rhs, "or").unwrap())
             }
             KernelExpression::Not(c) => {
-                let c = c.compile_block(ctx, llvm_mod, build, vec_bufs, iter_llvm_types)?;
+                let c = c.compile_block(ctx, build, vec_bufs, iter_llvm_types)?;
                 Ok(build.build_not(c, "not").unwrap())
             }
             KernelExpression::Select { cond, v1, v2 } => {
-                let cond = cond.compile_block(ctx, llvm_mod, build, vec_bufs, iter_llvm_types)?;
-                let v1 = v1.compile_block(ctx, llvm_mod, build, vec_bufs, iter_llvm_types)?;
-                let v2 = v2.compile_block(ctx, llvm_mod, build, vec_bufs, iter_llvm_types)?;
+                let cond = cond.compile_block(ctx, build, vec_bufs, iter_llvm_types)?;
+                let v1 = v1.compile_block(ctx, build, vec_bufs, iter_llvm_types)?;
+                let v2 = v2.compile_block(ctx, build, vec_bufs, iter_llvm_types)?;
                 Ok(build
                     .build_select(cond, v1, v2, "select")
                     .unwrap()
@@ -547,7 +546,7 @@ impl<'a> KernelExpression<'a> {
             }
             KernelExpression::Convert(c, tar_pt) => {
                 let in_ty = PrimitiveType::for_arrow_type(&c.get_type());
-                let c = c.compile_block(ctx, llvm_mod, build, vec_bufs, iter_llvm_types)?;
+                let c = c.compile_block(ctx, build, vec_bufs, iter_llvm_types)?;
                 Ok(gen_convert_numeric_vec(ctx, build, c, in_ty, *tar_pt))
             }
             KernelExpression::Add(lhs, rhs) => {
@@ -560,8 +559,8 @@ impl<'a> KernelExpression<'a> {
                     )));
                 }
 
-                let lhs = lhs.compile_block(ctx, llvm_mod, build, vec_bufs, iter_llvm_types)?;
-                let rhs = rhs.compile_block(ctx, llvm_mod, build, vec_bufs, iter_llvm_types)?;
+                let lhs = lhs.compile_block(ctx, build, vec_bufs, iter_llvm_types)?;
+                let rhs = rhs.compile_block(ctx, build, vec_bufs, iter_llvm_types)?;
                 match pt {
                     PrimitiveType::I8
                     | PrimitiveType::I16
@@ -589,8 +588,8 @@ impl<'a> KernelExpression<'a> {
                     )));
                 }
 
-                let lhs = lhs.compile_block(ctx, llvm_mod, build, vec_bufs, iter_llvm_types)?;
-                let rhs = rhs.compile_block(ctx, llvm_mod, build, vec_bufs, iter_llvm_types)?;
+                let lhs = lhs.compile_block(ctx, build, vec_bufs, iter_llvm_types)?;
+                let rhs = rhs.compile_block(ctx, build, vec_bufs, iter_llvm_types)?;
                 match pt {
                     PrimitiveType::I8
                     | PrimitiveType::I16
@@ -618,8 +617,8 @@ impl<'a> KernelExpression<'a> {
                     )));
                 }
 
-                let lhs = lhs.compile_block(ctx, llvm_mod, build, vec_bufs, iter_llvm_types)?;
-                let rhs = rhs.compile_block(ctx, llvm_mod, build, vec_bufs, iter_llvm_types)?;
+                let lhs = lhs.compile_block(ctx, build, vec_bufs, iter_llvm_types)?;
+                let rhs = rhs.compile_block(ctx, build, vec_bufs, iter_llvm_types)?;
                 match pt {
                     PrimitiveType::I8
                     | PrimitiveType::I16
@@ -647,8 +646,8 @@ impl<'a> KernelExpression<'a> {
                     )));
                 }
 
-                let lhs = lhs.compile_block(ctx, llvm_mod, build, vec_bufs, iter_llvm_types)?;
-                let rhs = rhs.compile_block(ctx, llvm_mod, build, vec_bufs, iter_llvm_types)?;
+                let lhs = lhs.compile_block(ctx, build, vec_bufs, iter_llvm_types)?;
+                let rhs = rhs.compile_block(ctx, build, vec_bufs, iter_llvm_types)?;
                 match pt {
                     PrimitiveType::I8
                     | PrimitiveType::I16
@@ -680,8 +679,8 @@ impl<'a> KernelExpression<'a> {
                     )));
                 }
 
-                let lhs = lhs.compile_block(ctx, llvm_mod, build, vec_bufs, iter_llvm_types)?;
-                let rhs = rhs.compile_block(ctx, llvm_mod, build, vec_bufs, iter_llvm_types)?;
+                let lhs = lhs.compile_block(ctx, build, vec_bufs, iter_llvm_types)?;
+                let rhs = rhs.compile_block(ctx, build, vec_bufs, iter_llvm_types)?;
                 match pt {
                     PrimitiveType::I8
                     | PrimitiveType::I16
@@ -1061,11 +1060,9 @@ impl<'a> KernelExpression<'a> {
                         )
                         .unwrap()
                         .into()),
-                    PrimitiveType::P64x2 => {
-                        return Err(DSLError::TypeMismatch(
-                            "cannot add string types".to_string(),
-                        ))
-                    }
+                    PrimitiveType::P64x2 => Err(DSLError::TypeMismatch(
+                        "cannot add string types".to_string(),
+                    )),
                 }
             }
             KernelExpression::Div(lhs, rhs) => {
@@ -1129,11 +1126,9 @@ impl<'a> KernelExpression<'a> {
                         )
                         .unwrap()
                         .into()),
-                    PrimitiveType::P64x2 => {
-                        return Err(DSLError::TypeMismatch(
-                            "cannot divide string types".to_string(),
-                        ))
-                    }
+                    PrimitiveType::P64x2 => Err(DSLError::TypeMismatch(
+                        "cannot divide string types".to_string(),
+                    )),
                 }
             }
             KernelExpression::Mul(lhs, rhs) => {
@@ -1190,11 +1185,9 @@ impl<'a> KernelExpression<'a> {
                         )
                         .unwrap()
                         .into()),
-                    PrimitiveType::P64x2 => {
-                        return Err(DSLError::TypeMismatch(
-                            "cannot multiply string types".to_string(),
-                        ))
-                    }
+                    PrimitiveType::P64x2 => Err(DSLError::TypeMismatch(
+                        "cannot multiply string types".to_string(),
+                    )),
                 }
             }
             KernelExpression::Rem(lhs, rhs) => {
@@ -1258,11 +1251,9 @@ impl<'a> KernelExpression<'a> {
                         )
                         .unwrap()
                         .into()),
-                    PrimitiveType::P64x2 => {
-                        return Err(DSLError::TypeMismatch(
-                            "cannot compute remainder of string types".to_string(),
-                        ))
-                    }
+                    PrimitiveType::P64x2 => Err(DSLError::TypeMismatch(
+                        "cannot compute remainder of string types".to_string(),
+                    )),
                 }
             }
             KernelExpression::Sub(lhs, rhs) => {
@@ -1319,11 +1310,9 @@ impl<'a> KernelExpression<'a> {
                         )
                         .unwrap()
                         .into()),
-                    PrimitiveType::P64x2 => {
-                        return Err(DSLError::TypeMismatch(
-                            "cannot subtract string types".to_string(),
-                        ))
-                    }
+                    PrimitiveType::P64x2 => Err(DSLError::TypeMismatch(
+                        "cannot subtract string types".to_string(),
+                    )),
                 }
             }
         }
@@ -2108,7 +2097,7 @@ fn build_kernel_with_writer<'a, W: ArrayWriter<'a>>(
             builder.position_at_end(block_loop_body);
             let res = program
                 .expr()
-                .compile_block(ctx, &llvm_mod, &builder, &vec_bufs, &vec_types);
+                .compile_block(ctx, &builder, &vec_bufs, &vec_types);
             match res {
                 Ok(v) => {
                     // send `v` to the writer, loop back

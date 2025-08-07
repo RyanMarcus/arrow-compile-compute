@@ -1,5 +1,4 @@
 mod aggregate;
-mod apply;
 mod arith;
 mod cast;
 mod cmp;
@@ -8,16 +7,13 @@ pub mod dsl;
 mod filter;
 mod ht;
 mod llvm_utils;
+mod rust_iter;
 mod sort;
 mod take;
 mod writers;
 use std::{collections::HashMap, sync::RwLock};
 
 pub use aggregate::{CountAggregator, MaxAggregator, MinAggregator, SumAggregator};
-pub use apply::FloatFuncCache;
-pub use apply::IntFuncCache;
-pub use apply::StrFuncCache;
-pub use apply::UIntFuncCache;
 pub use arith::BinOp;
 pub use arith::BinOpKernel;
 use arrow_schema::DataType;
@@ -30,6 +26,7 @@ use inkwell::attributes::Attribute;
 use inkwell::attributes::AttributeLoc;
 use inkwell::execution_engine::ExecutionEngine;
 use llvm_utils::str_writer_append_bytes;
+pub use rust_iter::{ArrowIter, IterFuncHolder};
 pub use sort::{SortKernel, SortOptions};
 pub use take::TakeKernel;
 

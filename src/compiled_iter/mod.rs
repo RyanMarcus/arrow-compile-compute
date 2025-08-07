@@ -987,7 +987,7 @@ pub fn generate_next<'a>(
 
             let cttz_id = Intrinsic::find("llvm.cttz").expect("llvm.cttz not in Intrinsic list");
             cttz_id
-                .get_declaration(&llvm_mod, &[ctx.i64_type().into()])
+                .get_declaration(llvm_mod, &[ctx.i64_type().into()])
                 .expect("Couldn't declare llvm.cttz.i64");
 
             let cttz_i64 = llvm_mod

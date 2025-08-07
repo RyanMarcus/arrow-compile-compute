@@ -1,0 +1,318 @@
+use std::{ffi::c_void, marker::PhantomData, sync::Arc};
+
+use arrow_array::Array;
+use arrow_schema::DataType;
+use inkwell::{
+    context::Context, execution_engine::JitFunction, AddressSpace, IntPredicate, OptimizationLevel,
+};
+use ouroboros::self_referencing;
+
+use crate::{
+    compiled_iter::{datum_to_iter, generate_next, IteratorHolder},
+    compiled_kernels::{gen_convert_numeric_vec, optimize_module},
+    declare_blocks, increment_pointer, Kernel, PrimitiveType,
+};
+
+use super::ArrowKernelError;
+
+const BLOCK_SIZE: usize = 64;
+
+pub trait ApplyType: Copy {
+    fn primitive_type() -> PrimitiveType;
+
+    unsafe fn from_byte_slice(data: &[u8]) -> Self {
+        std::slice::from_raw_parts(data.as_ptr() as *const Self, 1)[0]
+    }
+}
+impl ApplyType for i64 {
+    fn primitive_type() -> PrimitiveType {
+        PrimitiveType::I64
+    }
+}
+impl ApplyType for f64 {
+    fn primitive_type() -> PrimitiveType {
+        PrimitiveType::F64
+    }
+}
+impl ApplyType for u64 {
+    fn primitive_type() -> PrimitiveType {
+        PrimitiveType::U64
+    }
+}
+impl ApplyType for &[u8] {
+    fn primitive_type() -> PrimitiveType {
+        PrimitiveType::P64x2
+    }
+
+    unsafe fn from_byte_slice(data: &[u8]) -> Self {
+        let nums = std::slice::from_raw_parts(data.as_ptr() as *const u64, 2);
+        let start = nums[0] as *const u8;
+        let end = nums[1] as *const u8;
+        let len = end.offset_from(start);
+        debug_assert!(len >= 0);
+        std::slice::from_raw_parts(start, len as usize)
+    }
+}
+
+#[self_referencing]
+pub struct IterFuncHolder {
+    context: Context,
+
+    #[borrows(context)]
+    #[covariant]
+    func: JitFunction<'this, unsafe extern "C" fn(*mut c_void, *mut u8) -> u64>,
+}
+unsafe impl Send for IterFuncHolder {}
+unsafe impl Sync for IterFuncHolder {}
+
+impl Kernel for Arc<IterFuncHolder> {
+    type Key = (DataType, PrimitiveType);
+
+    type Input<'a> = &'a dyn Array;
+
+    type Params = PrimitiveType;
+
+    type Output = Self;
+
+    fn call(&self, _inp: Self::Input<'_>) -> Result<Self::Output, ArrowKernelError> {
+        Ok(self.clone())
+    }
+
+    fn compile(inp: &Self::Input<'_>, params: Self::Params) -> Result<Self, ArrowKernelError> {
+        let ih = datum_to_iter(inp)?;
+        let func = IterFuncHolderTryBuilder {
+            context: Context::create(),
+            func_builder: |ctx| generate_call(ctx, inp.data_type(), &ih, params),
+        }
+        .try_build()?;
+        Ok(Arc::new(func))
+    }
+
+    fn get_key_for_input(
+        i: &Self::Input<'_>,
+        p: &Self::Params,
+    ) -> Result<Self::Key, ArrowKernelError> {
+        Ok((i.data_type().clone(), *p))
+    }
+}
+
+pub struct ArrowIter<T: ApplyType> {
+    buffer: [u8; 64 * PrimitiveType::max_width()],
+    buffer_idx: usize,
+    buffer_len: usize,
+    iter_holder: IteratorHolder,
+
+    next_func: Arc<IterFuncHolder>,
+    pd: PhantomData<T>,
+}
+
+impl<T: ApplyType> Iterator for ArrowIter<T> {
+    type Item = T;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        if self.buffer_idx < self.buffer_len {
+            let width = T::primitive_type().width();
+            let slice = &self.buffer[self.buffer_idx * width..(self.buffer_idx + 1) * width];
+            self.buffer_idx += 1;
+            Some(unsafe { T::from_byte_slice(slice) })
+        } else {
+            let num_returned = unsafe {
+                self.next_func
+                    .borrow_func()
+                    .call(self.iter_holder.get_mut_ptr(), self.buffer.as_mut_ptr())
+            };
+            if num_returned == 0 {
+                return None;
+            }
+
+            self.buffer_idx = 0;
+            self.buffer_len = num_returned as usize;
+            self.next()
+        }
+    }
+}
+
+impl<T: ApplyType> ArrowIter<T> {
+    pub fn new(data: &dyn Array, func: Arc<IterFuncHolder>) -> Result<Self, ArrowKernelError> {
+        let ih = datum_to_iter(&data)?;
+
+        Ok(ArrowIter {
+            buffer: [0; 1024],
+            buffer_idx: 0,
+            buffer_len: 0,
+            iter_holder: ih,
+            next_func: func,
+            pd: PhantomData,
+        })
+    }
+}
+
+fn generate_call<'a>(
+    ctx: &'a Context,
+    dt: &DataType,
+    ih: &IteratorHolder,
+    rust_expected_type: PrimitiveType,
+) -> Result<JitFunction<'a, unsafe extern "C" fn(*mut c_void, *mut u8) -> u64>, ArrowKernelError> {
+    let module = ctx.create_module("call");
+    let ptr_type = ctx.ptr_type(AddressSpace::default());
+    let i64_type = ctx.i64_type();
+    let input_prim_type = PrimitiveType::for_arrow_type(dt);
+    let rust_expected_llvm_type = rust_expected_type.llvm_type(ctx);
+    let input_type = input_prim_type.llvm_type(ctx);
+    let func = module.add_function(
+        "call_rust",
+        i64_type.fn_type(&[ptr_type.into(), ptr_type.into()], false),
+        None,
+    );
+
+    let next = generate_next(ctx, &module, "call", dt, ih).unwrap();
+
+    let build = ctx.create_builder();
+    declare_blocks!(ctx, func, entry, loop_cond, loop_body, exit);
+
+    build.position_at_end(entry);
+    let iter_ptr = func.get_nth_param(0).unwrap().into_pointer_value();
+    let rust_buf_ptr = func.get_nth_param(1).unwrap().into_pointer_value();
+    let offset_ptr = build.build_alloca(i64_type, "offset_ptr").unwrap();
+    let buf = build.build_alloca(input_type, "buf").unwrap();
+    build
+        .build_store(offset_ptr, i64_type.const_zero())
+        .unwrap();
+    build.build_unconditional_branch(loop_cond).unwrap();
+
+    build.position_at_end(loop_cond);
+    let res = build
+        .build_call(next, &[iter_ptr.into(), buf.into()], "had_next")
+        .unwrap()
+        .try_as_basic_value()
+        .unwrap_left()
+        .into_int_value();
+    build
+        .build_conditional_branch(res, loop_body, exit)
+        .unwrap();
+
+    build.position_at_end(loop_body);
+    let val = build.build_load(input_type, buf, "val").unwrap();
+
+    let val = match rust_expected_type {
+        PrimitiveType::P64x2 => val,
+        _ => {
+            let in_v_type = input_prim_type.llvm_vec_type(ctx, 1).unwrap();
+            let val = build
+                .build_bit_cast(val, in_v_type, "singleton_vec")
+                .unwrap()
+                .into_vector_value();
+            let r = gen_convert_numeric_vec(ctx, &build, val, input_prim_type, rust_expected_type);
+            build
+                .build_bit_cast(r, rust_expected_llvm_type, "vec_to_single")
+                .unwrap()
+        }
+    };
+
+    let curr_offset = build
+        .build_load(i64_type, offset_ptr, "curr_offset")
+        .unwrap()
+        .into_int_value();
+    build
+        .build_store(
+            increment_pointer!(
+                ctx,
+                build,
+                rust_buf_ptr,
+                rust_expected_type.width(),
+                curr_offset
+            ),
+            val,
+        )
+        .unwrap();
+    let next_offset = build
+        .build_int_add(curr_offset, i64_type.const_int(1, false), "next_offset")
+        .unwrap();
+    build.build_store(offset_ptr, next_offset).unwrap();
+
+    let cmp = build
+        .build_int_compare(
+            IntPredicate::UGE,
+            next_offset,
+            i64_type.const_int(BLOCK_SIZE as u64, false),
+            "buf_full",
+        )
+        .unwrap();
+
+    build
+        .build_conditional_branch(cmp, exit, loop_cond)
+        .unwrap();
+
+    build.position_at_end(exit);
+    let curr_buf_len = build
+        .build_load(i64_type, offset_ptr, "curr_buf_len")
+        .unwrap()
+        .into_int_value();
+    build.build_return(Some(&curr_buf_len)).unwrap();
+
+    module.verify().unwrap();
+    optimize_module(&module)?;
+    let ee = module
+        .create_jit_execution_engine(OptimizationLevel::Aggressive)
+        .unwrap();
+
+    Ok(unsafe {
+        ee.get_function::<unsafe extern "C" fn(*mut c_void, *mut u8) -> u64>(
+            func.get_name().to_str().unwrap(),
+        )
+        .unwrap()
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Arc;
+
+    use arrow_array::{Array, Float32Array, Int32Array, StringArray, UInt32Array};
+    use itertools::Itertools;
+
+    use crate::{
+        compiled_kernels::rust_iter::{ArrowIter, IterFuncHolder},
+        Kernel, PrimitiveType,
+    };
+
+    #[test]
+    fn test_iter_i32() {
+        let data = Int32Array::from((0..1000).collect_vec());
+        let ifh =
+            Arc::<IterFuncHolder>::compile(&(&data as &dyn Array), PrimitiveType::I64).unwrap();
+        let res = ArrowIter::<i64>::new(&data, ifh).unwrap().collect_vec();
+        assert_eq!(res, (0..1000).collect_vec());
+    }
+
+    #[test]
+    fn test_iter_u32() {
+        let data = UInt32Array::from((0..1000).collect_vec());
+        let ifh =
+            Arc::<IterFuncHolder>::compile(&(&data as &dyn Array), PrimitiveType::U64).unwrap();
+        let res = ArrowIter::<u64>::new(&data, ifh).unwrap().collect_vec();
+        assert_eq!(res, (0..1000).collect_vec());
+    }
+
+    #[test]
+    fn test_iter_f32() {
+        let data = Float32Array::from((0..1000).map(|x| x as f32).collect_vec());
+        let ifh =
+            Arc::<IterFuncHolder>::compile(&(&data as &dyn Array), PrimitiveType::F64).unwrap();
+        let res = ArrowIter::<f64>::new(&data, ifh).unwrap().collect_vec();
+        assert_eq!(res, (0..1000).map(|x| x as f64).collect_vec());
+    }
+
+    #[test]
+    fn test_iter_str() {
+        let vdata = (0..1000).map(|i| format!("string{}", i)).collect_vec();
+        let data = StringArray::from(vdata.clone());
+        let ifh =
+            Arc::<IterFuncHolder>::compile(&(&data as &dyn Array), PrimitiveType::P64x2).unwrap();
+        let res = ArrowIter::<&[u8]>::new(&data, ifh)
+            .unwrap()
+            .map(|x| String::from_utf8(x.to_vec()).unwrap())
+            .collect_vec();
+        assert_eq!(res, vdata);
+    }
+}

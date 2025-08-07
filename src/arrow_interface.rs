@@ -130,153 +130,74 @@ pub mod cast {
     }
 }
 
-/// Run closures over Arrow arrays.
-///
-/// Iterating over an Arrow [`arrow_array::Array`] requires handling each
-/// possible data type and data layout (e.g., a dictionary encoded array of
-/// 32-bit signed integers). These functions abstract over encoding and
-/// width-extend types.
-///
-/// **In general, you should prefer using a compute kernel instead of these
-/// functions**, such as [`cmp::lt`]. The functions here have
-/// function call overhead, while the other kernels do not.
-///
-/// Printing out all even numbers from an array:
-/// ```
-/// use arrow_array::Int32Array;
-/// use arrow_compile_compute::apply::apply_i64;
-///
-/// let arr = Int32Array::from(vec![1, 2, 3, 4, 5]);
-/// apply_i64(&arr, |i| if i % 2 == 0 {
-///     println!("{}", i);
-/// });
-/// ```
-pub mod apply {
-
-    use std::sync::LazyLock;
+pub mod iter {
+    use std::sync::{Arc, LazyLock};
 
     use arrow_array::Array;
-    use arrow_schema::DataType;
 
     use crate::{
-        compiled_kernels::{FloatFuncCache, IntFuncCache, StrFuncCache, UIntFuncCache},
-        ArrowKernelError,
+        compiled_kernels::{ArrowIter, IterFuncHolder, KernelCache},
+        ArrowKernelError, PrimitiveType,
     };
 
-    static FLOAT_FUNC_CACHE: LazyLock<FloatFuncCache> = LazyLock::new(FloatFuncCache::default);
-    static INT_FUNC_CACHE: LazyLock<IntFuncCache> = LazyLock::new(IntFuncCache::default);
-    static UINT_FUNC_CACHE: LazyLock<UIntFuncCache> = LazyLock::new(UIntFuncCache::default);
-    static STRING_FUNC_CACHE: LazyLock<StrFuncCache> = LazyLock::new(StrFuncCache::default);
+    static ITER_FUNC_CACHE: LazyLock<KernelCache<Arc<IterFuncHolder>>> =
+        LazyLock::new(KernelCache::new);
 
-    pub enum ApplyType {
-        U64,
-        I64,
-        F64,
-        Str,
-    }
-
-    impl ApplyType {
-        pub fn for_arrow_type(dt: &DataType) -> Option<Self> {
-            match dt {
-                DataType::Int8 | DataType::Int16 | DataType::Int32 | DataType::Int64 => {
-                    Some(ApplyType::I64)
-                }
-                DataType::UInt8 | DataType::UInt16 | DataType::UInt32 | DataType::UInt64 => {
-                    Some(ApplyType::U64)
-                }
-                DataType::Float16 | DataType::Float32 | DataType::Float64 => Some(ApplyType::F64),
-                DataType::Timestamp(..)
-                | DataType::Date64
-                | DataType::Time32(..)
-                | DataType::Time64(..)
-                | DataType::Duration(..)
-                | DataType::Interval(..) => Some(ApplyType::I64),
-                DataType::Binary
-                | DataType::FixedSizeBinary(_)
-                | DataType::LargeBinary
-                | DataType::BinaryView
-                | DataType::Utf8
-                | DataType::LargeUtf8
-                | DataType::Utf8View => Some(ApplyType::Str),
-                DataType::Dictionary(_keys, values) => ApplyType::for_arrow_type(values),
-                DataType::RunEndEncoded(_re_type, values) => {
-                    ApplyType::for_arrow_type(values.data_type())
-                }
-                _ => None,
-            }
-        }
-    }
-
-    /// Iterate over data casted to `f64`.
+    /// Iterates over an array, converting the array values to `i64`.
     ///
-    /// Works over any data type that can be casted to an `f64` (e.g., a
-    /// dictionary-encoded array of `i32`s.)
-    ///
+    /// # Example
     /// ```
     /// use arrow_array::Int32Array;
-    /// use arrow_compile_compute::apply::apply_f64;
+    /// use arrow_compile_compute::iter::iter_i64;
     ///
-    /// let data = Int32Array::from(vec![1, 2, 3]);
-    /// let mut res = 0.0;
-    /// apply_f64(&data, |i| res += i / 2.0);
-    /// assert_eq!(res, 3.0);
+    /// let arr = Int32Array::from(vec![1, 2, 3]);
+    /// let iter = iter_i64(&arr).unwrap();
+    /// assert_eq!(iter.collect::<Vec<_>>(), vec![1, 2, 3]);
     /// ```
-    pub fn apply_f64<F: FnMut(f64)>(data: &dyn Array, func: F) -> Result<(), ArrowKernelError> {
-        FLOAT_FUNC_CACHE.call(data, func)
+    pub fn iter_i64(array: &dyn Array) -> Result<impl Iterator<Item = i64>, ArrowKernelError> {
+        let ifh = ITER_FUNC_CACHE.get(array, PrimitiveType::I64)?;
+        let i = ArrowIter::<i64>::new(array, ifh)?;
+        Ok(i)
     }
 
-    /// Iterate over data casted to `i64`.
+    /// Iterates over an array, converting the array values to `u64`.
     ///
-    /// Works over any data type that can be casted to an `i64` (e.g., a
-    /// dictionary-encoded array of `i32`s.)
-    ///
+    /// # Example
     /// ```
     /// use arrow_array::Int32Array;
-    /// use arrow_compile_compute::apply::apply_i64;
+    /// use arrow_compile_compute::iter::iter_u64;
     ///
-    /// let data = Int32Array::from(vec![1, 2, 3]);
-    /// let mut res = 0;
-    /// apply_i64(&data, |i| res += i);
-    /// assert_eq!(res, 6);
+    /// let arr = Int32Array::from(vec![1, 2, 3]);
+    /// let iter = iter_u64(&arr).unwrap();
+    /// assert_eq!(iter.collect::<Vec<_>>(), vec![1, 2, 3]);
     /// ```
-    pub fn apply_i64<F: FnMut(i64)>(data: &dyn Array, func: F) -> Result<(), ArrowKernelError> {
-        INT_FUNC_CACHE.call(data, func)
+    pub fn iter_u64(array: &dyn Array) -> Result<impl Iterator<Item = u64>, ArrowKernelError> {
+        let ifh = ITER_FUNC_CACHE.get(array, PrimitiveType::U64)?;
+        let i = ArrowIter::<u64>::new(array, ifh)?;
+        Ok(i)
     }
 
-    /// Iterate over data casted to `u64`.
+    /// Iterates over an array, converting the array values to `f64`.
     ///
-    /// Works over any data type that can be casted to an `u64` (e.g., a
-    /// dictionary-encoded array of `u32`s.)
-    ///
+    /// # Example
     /// ```
-    /// use arrow_array::UInt32Array;
-    /// use arrow_compile_compute::apply::apply_u64;
+    /// use arrow_array::Int32Array;
+    /// use arrow_compile_compute::iter::iter_f64;
     ///
-    /// let data = UInt32Array::from(vec![1, 2, 3]);
-    /// let mut res = 0;
-    /// apply_u64(&data, |i| res += i);
-    /// assert_eq!(res, 6);
+    /// let arr = Int32Array::from(vec![1, 2, 3]);
+    /// let iter = iter_f64(&arr).unwrap();
+    /// assert_eq!(iter.collect::<Vec<_>>(), vec![1.0, 2.0, 3.0]);
     /// ```
-    pub fn apply_u64<F: FnMut(u64)>(data: &dyn Array, func: F) -> Result<(), ArrowKernelError> {
-        UINT_FUNC_CACHE.call(data, func)
+    pub fn iter_f64(array: &dyn Array) -> Result<impl Iterator<Item = f64>, ArrowKernelError> {
+        let ifh = ITER_FUNC_CACHE.get(array, PrimitiveType::F64)?;
+        let i = ArrowIter::<f64>::new(array, ifh)?;
+        Ok(i)
     }
 
-    /// Iterate over data casted to a byte slice.
-    ///
-    /// Works over any data type that can be casted to a byte slice (e.g., a
-    /// dictionary-encoded array of strings).
-    ///
-    /// ```
-    /// use arrow_array::StringArray;
-    /// use arrow_compile_compute::apply::apply_str;
-    ///
-    /// let data = StringArray::from(vec!["hello ", "world"]);
-    /// let mut res = Vec::new();
-    /// apply_str(&data, |i| res.extend_from_slice(i));
-    /// assert_eq!(std::str::from_utf8(&res).unwrap(), "hello world");
-    /// ```
-    pub fn apply_str<F: FnMut(&[u8])>(data: &dyn Array, func: F) -> Result<(), ArrowKernelError> {
-        STRING_FUNC_CACHE.call(data, func)
+    pub fn iter_bytes(array: &dyn Array) -> Result<impl Iterator<Item = &[u8]>, ArrowKernelError> {
+        let ifh = ITER_FUNC_CACHE.get(array, PrimitiveType::P64x2)?;
+        let i = ArrowIter::<&[u8]>::new(array, ifh)?;
+        Ok(i)
     }
 }
 
