@@ -143,58 +143,71 @@ pub mod iter {
     static ITER_FUNC_CACHE: LazyLock<KernelCache<Arc<IterFuncHolder>>> =
         LazyLock::new(KernelCache::new);
 
-    /// Iterates over an array, converting the array values to `i64`.
+    /// Iterates over the non-null values of an array, converting the array
+    /// values to `i64`.
     ///
     /// # Example
     /// ```
     /// use arrow_array::Int32Array;
-    /// use arrow_compile_compute::iter::iter_i64;
+    /// use arrow_compile_compute::iter::iter_nonnull_i64;
     ///
     /// let arr = Int32Array::from(vec![1, 2, 3]);
-    /// let iter = iter_i64(&arr).unwrap();
+    /// let iter = iter_nonnull_i64(&arr).unwrap();
     /// assert_eq!(iter.collect::<Vec<_>>(), vec![1, 2, 3]);
     /// ```
-    pub fn iter_i64(array: &dyn Array) -> Result<impl Iterator<Item = i64>, ArrowKernelError> {
+    pub fn iter_nonnull_i64(
+        array: &dyn Array,
+    ) -> Result<impl Iterator<Item = i64>, ArrowKernelError> {
         let ifh = ITER_FUNC_CACHE.get(array, PrimitiveType::I64)?;
         let i = ArrowIter::<i64>::new(array, ifh)?;
         Ok(i)
     }
 
-    /// Iterates over an array, converting the array values to `u64`.
+    /// Iterates over the non-null values of an array, converting the array
+    /// values to `u64`.
     ///
     /// # Example
     /// ```
     /// use arrow_array::Int32Array;
-    /// use arrow_compile_compute::iter::iter_u64;
+    /// use arrow_compile_compute::iter::iter_nonnull_u64;
     ///
     /// let arr = Int32Array::from(vec![1, 2, 3]);
-    /// let iter = iter_u64(&arr).unwrap();
+    /// let iter = iter_nonnull_u64(&arr).unwrap();
     /// assert_eq!(iter.collect::<Vec<_>>(), vec![1, 2, 3]);
     /// ```
-    pub fn iter_u64(array: &dyn Array) -> Result<impl Iterator<Item = u64>, ArrowKernelError> {
+    pub fn iter_nonnull_u64(
+        array: &dyn Array,
+    ) -> Result<impl Iterator<Item = u64>, ArrowKernelError> {
         let ifh = ITER_FUNC_CACHE.get(array, PrimitiveType::U64)?;
         let i = ArrowIter::<u64>::new(array, ifh)?;
         Ok(i)
     }
 
-    /// Iterates over an array, converting the array values to `f64`.
+    /// Iterates over the non-null values of an array, converting the array
+    /// values to `f64`.
     ///
     /// # Example
     /// ```
     /// use arrow_array::Int32Array;
-    /// use arrow_compile_compute::iter::iter_f64;
+    /// use arrow_compile_compute::iter::iter_nonnull_f64;
     ///
     /// let arr = Int32Array::from(vec![1, 2, 3]);
-    /// let iter = iter_f64(&arr).unwrap();
+    /// let iter = iter_nonnull_f64(&arr).unwrap();
     /// assert_eq!(iter.collect::<Vec<_>>(), vec![1.0, 2.0, 3.0]);
     /// ```
-    pub fn iter_f64(array: &dyn Array) -> Result<impl Iterator<Item = f64>, ArrowKernelError> {
+    pub fn iter_nonnull_f64(
+        array: &dyn Array,
+    ) -> Result<impl Iterator<Item = f64>, ArrowKernelError> {
         let ifh = ITER_FUNC_CACHE.get(array, PrimitiveType::F64)?;
         let i = ArrowIter::<f64>::new(array, ifh)?;
         Ok(i)
     }
 
-    pub fn iter_bytes(array: &dyn Array) -> Result<impl Iterator<Item = &[u8]>, ArrowKernelError> {
+    /// Iterates over the non-null values of an array, converting the array
+    /// values to byte slices.
+    pub fn iter_nonnull_bytes(
+        array: &dyn Array,
+    ) -> Result<impl Iterator<Item = &[u8]>, ArrowKernelError> {
         let ifh = ITER_FUNC_CACHE.get(array, PrimitiveType::P64x2)?;
         let i = ArrowIter::<&[u8]>::new(array, ifh)?;
         Ok(i)

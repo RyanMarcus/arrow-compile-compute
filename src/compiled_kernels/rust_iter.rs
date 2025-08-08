@@ -1,6 +1,6 @@
 use std::{ffi::c_void, marker::PhantomData, sync::Arc};
 
-use arrow_array::Array;
+use arrow_array::{Array, BooleanArray};
 use arrow_schema::DataType;
 use inkwell::{
     context::Context, execution_engine::JitFunction, AddressSpace, IntPredicate, OptimizationLevel,
@@ -8,7 +8,9 @@ use inkwell::{
 use ouroboros::self_referencing;
 
 use crate::{
-    compiled_iter::{datum_to_iter, generate_next, IteratorHolder},
+    compiled_iter::{
+        array_to_setbit_iter, datum_to_iter, generate_next, generate_random_access, IteratorHolder,
+    },
     compiled_kernels::{gen_convert_numeric_vec, optimize_module},
     declare_blocks, increment_pointer, Kernel, PrimitiveType,
 };
@@ -60,13 +62,13 @@ pub struct IterFuncHolder {
 
     #[borrows(context)]
     #[covariant]
-    func: JitFunction<'this, unsafe extern "C" fn(*mut c_void, *mut u8) -> u64>,
+    func: JitFunction<'this, unsafe extern "C" fn(*mut c_void, *mut c_void, *mut u8) -> u64>,
 }
 unsafe impl Send for IterFuncHolder {}
 unsafe impl Sync for IterFuncHolder {}
 
 impl Kernel for Arc<IterFuncHolder> {
-    type Key = (DataType, PrimitiveType);
+    type Key = (DataType, bool, PrimitiveType);
 
     type Input<'a> = &'a dyn Array;
 
@@ -80,9 +82,15 @@ impl Kernel for Arc<IterFuncHolder> {
 
     fn compile(inp: &Self::Input<'_>, params: Self::Params) -> Result<Self, ArrowKernelError> {
         let ih = datum_to_iter(inp)?;
+        let setbit_ih = inp
+            .nulls()
+            .map(|nulls| array_to_setbit_iter(&BooleanArray::from(nulls.clone().into_inner())))
+            .transpose()?;
         let func = IterFuncHolderTryBuilder {
             context: Context::create(),
-            func_builder: |ctx| generate_call(ctx, inp.data_type(), &ih, params),
+            func_builder: |ctx| {
+                generate_call(ctx, inp.data_type(), &ih, setbit_ih.as_ref(), params)
+            },
         }
         .try_build()?;
         Ok(Arc::new(func))
@@ -92,7 +100,7 @@ impl Kernel for Arc<IterFuncHolder> {
         i: &Self::Input<'_>,
         p: &Self::Params,
     ) -> Result<Self::Key, ArrowKernelError> {
-        Ok((i.data_type().clone(), *p))
+        Ok((i.data_type().clone(), i.nulls().is_some(), *p))
     }
 }
 
@@ -101,6 +109,7 @@ pub struct ArrowIter<T: ApplyType> {
     buffer_idx: usize,
     buffer_len: usize,
     iter_holder: IteratorHolder,
+    setbit_iter_holder: Option<IteratorHolder>,
 
     next_func: Arc<IterFuncHolder>,
     pd: PhantomData<T>,
@@ -117,9 +126,14 @@ impl<T: ApplyType> Iterator for ArrowIter<T> {
             Some(unsafe { T::from_byte_slice(slice) })
         } else {
             let num_returned = unsafe {
-                self.next_func
-                    .borrow_func()
-                    .call(self.iter_holder.get_mut_ptr(), self.buffer.as_mut_ptr())
+                self.next_func.borrow_func().call(
+                    self.iter_holder.get_mut_ptr(),
+                    self.setbit_iter_holder
+                        .as_mut()
+                        .map(|x| x.get_mut_ptr())
+                        .unwrap_or(std::ptr::null_mut()),
+                    self.buffer.as_mut_ptr(),
+                )
             };
             if num_returned == 0 {
                 return None;
@@ -135,12 +149,17 @@ impl<T: ApplyType> Iterator for ArrowIter<T> {
 impl<T: ApplyType> ArrowIter<T> {
     pub fn new(data: &dyn Array, func: Arc<IterFuncHolder>) -> Result<Self, ArrowKernelError> {
         let ih = datum_to_iter(&data)?;
+        let setbit_ih = data
+            .nulls()
+            .map(|nulls| array_to_setbit_iter(&BooleanArray::from(nulls.clone().into_inner())))
+            .transpose()?;
 
         Ok(ArrowIter {
             buffer: [0; 1024],
             buffer_idx: 0,
             buffer_len: 0,
             iter_holder: ih,
+            setbit_iter_holder: setbit_ih,
             next_func: func,
             pd: PhantomData,
         })
@@ -151,8 +170,12 @@ fn generate_call<'a>(
     ctx: &'a Context,
     dt: &DataType,
     ih: &IteratorHolder,
+    setbit_ih: Option<&IteratorHolder>,
     rust_expected_type: PrimitiveType,
-) -> Result<JitFunction<'a, unsafe extern "C" fn(*mut c_void, *mut u8) -> u64>, ArrowKernelError> {
+) -> Result<
+    JitFunction<'a, unsafe extern "C" fn(*mut c_void, *mut c_void, *mut u8) -> u64>,
+    ArrowKernelError,
+> {
     let module = ctx.create_module("call");
     let ptr_type = ctx.ptr_type(AddressSpace::default());
     let i64_type = ctx.i64_type();
@@ -161,38 +184,76 @@ fn generate_call<'a>(
     let input_type = input_prim_type.llvm_type(ctx);
     let func = module.add_function(
         "call_rust",
-        i64_type.fn_type(&[ptr_type.into(), ptr_type.into()], false),
+        i64_type.fn_type(&[ptr_type.into(), ptr_type.into(), ptr_type.into()], false),
         None,
     );
 
     let next = generate_next(ctx, &module, "call", dt, ih).unwrap();
+    let access = generate_random_access(ctx, &module, "call", dt, ih).unwrap();
+    let next_bit = setbit_ih
+        .map(|ih| generate_next(ctx, &module, "call_bit", &DataType::Boolean, ih).unwrap());
 
     let build = ctx.create_builder();
     declare_blocks!(ctx, func, entry, loop_cond, loop_body, exit);
 
     build.position_at_end(entry);
     let iter_ptr = func.get_nth_param(0).unwrap().into_pointer_value();
-    let rust_buf_ptr = func.get_nth_param(1).unwrap().into_pointer_value();
+    let bit_iter_ptr = func.get_nth_param(1).unwrap().into_pointer_value();
+    let rust_buf_ptr = func.get_nth_param(2).unwrap().into_pointer_value();
     let offset_ptr = build.build_alloca(i64_type, "offset_ptr").unwrap();
     let buf = build.build_alloca(input_type, "buf").unwrap();
     build
         .build_store(offset_ptr, i64_type.const_zero())
         .unwrap();
+    let next_bit_buf = next_bit.map(|_| {
+        let buf = build.build_alloca(i64_type, "next_bit_buf").unwrap();
+        build
+            .build_store(offset_ptr, i64_type.const_zero())
+            .unwrap();
+        buf
+    });
     build.build_unconditional_branch(loop_cond).unwrap();
 
     build.position_at_end(loop_cond);
-    let res = build
-        .build_call(next, &[iter_ptr.into(), buf.into()], "had_next")
-        .unwrap()
-        .try_as_basic_value()
-        .unwrap_left()
-        .into_int_value();
+    let res = if let Some(next_bit) = next_bit {
+        let next_bit_buf = next_bit_buf.unwrap();
+        build
+            .build_call(
+                next_bit,
+                &[bit_iter_ptr.into(), next_bit_buf.into()],
+                "had_next_setbit",
+            )
+            .unwrap()
+            .try_as_basic_value()
+            .unwrap_left()
+            .into_int_value()
+    } else {
+        build
+            .build_call(next, &[iter_ptr.into(), buf.into()], "had_next")
+            .unwrap()
+            .try_as_basic_value()
+            .unwrap_left()
+            .into_int_value()
+    };
+
     build
         .build_conditional_branch(res, loop_body, exit)
         .unwrap();
 
     build.position_at_end(loop_body);
-    let val = build.build_load(input_type, buf, "val").unwrap();
+    let val = if let Some(next_bit_buf) = next_bit_buf {
+        let next_bit = build
+            .build_load(i64_type, next_bit_buf, "next_bit")
+            .unwrap()
+            .into_int_value();
+        build
+            .build_call(access, &[iter_ptr.into(), next_bit.into()], "access_el")
+            .unwrap()
+            .try_as_basic_value()
+            .unwrap_left()
+    } else {
+        build.build_load(input_type, buf, "val").unwrap()
+    };
 
     let val = match rust_expected_type {
         PrimitiveType::P64x2 => val,
@@ -257,7 +318,7 @@ fn generate_call<'a>(
         .unwrap();
 
     Ok(unsafe {
-        ee.get_function::<unsafe extern "C" fn(*mut c_void, *mut u8) -> u64>(
+        ee.get_function::<unsafe extern "C" fn(*mut c_void, *mut c_void, *mut u8) -> u64>(
             func.get_name().to_str().unwrap(),
         )
         .unwrap()
@@ -283,6 +344,19 @@ mod tests {
             Arc::<IterFuncHolder>::compile(&(&data as &dyn Array), PrimitiveType::I64).unwrap();
         let res = ArrowIter::<i64>::new(&data, ifh).unwrap().collect_vec();
         assert_eq!(res, (0..1000).collect_vec());
+    }
+
+    #[test]
+    fn test_iter_i32_nulls() {
+        let data = Int32Array::from(
+            (0..1000)
+                .map(|x| if x % 2 == 0 { Some(x) } else { None })
+                .collect_vec(),
+        );
+        let ifh =
+            Arc::<IterFuncHolder>::compile(&(&data as &dyn Array), PrimitiveType::I64).unwrap();
+        let res = ArrowIter::<i64>::new(&data, ifh).unwrap().collect_vec();
+        assert_eq!(res, (0..1000).filter(|x| x % 2 == 0).collect_vec());
     }
 
     #[test]
