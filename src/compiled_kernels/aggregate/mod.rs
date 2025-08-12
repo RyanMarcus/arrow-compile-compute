@@ -60,6 +60,7 @@ pub enum AggType {
 pub trait AggAlloc {
     fn get_mut_ptr(&mut self) -> *mut c_void;
     fn ensure_capacity(&mut self, capacity: usize);
+    fn current_capacity(&self) -> usize;
 }
 
 pub trait Aggregation {
@@ -207,6 +208,10 @@ impl<T: Copy + Default> AggAlloc for Vec<T> {
         for _ in self.len()..capacity {
             self.push(T::default());
         }
+    }
+
+    fn current_capacity(&self) -> usize {
+        self.len()
     }
 }
 
@@ -394,6 +399,9 @@ impl<A: Aggregation> Aggregator<A> {
     }
 
     pub fn merge(self, other: Self) -> Self {
+        if self.alloc.current_capacity() < other.alloc.current_capacity() {
+            return other.merge(self);
+        }
         let alloc = self.agg.merge_allocs(self.alloc, other.alloc);
         Self {
             agg: self.agg,

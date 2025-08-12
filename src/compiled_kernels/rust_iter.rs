@@ -121,7 +121,11 @@ impl<T: ApplyType> Iterator for ArrowIter<T> {
     fn next(&mut self) -> Option<Self::Item> {
         if self.buffer_idx < self.buffer_len {
             let width = T::primitive_type().width();
-            let slice = &self.buffer[self.buffer_idx * width..(self.buffer_idx + 1) * width];
+            let slice = unsafe {
+                self.buffer
+                    .get_unchecked(self.buffer_idx * width..(self.buffer_idx + 1) * width)
+            };
+            //let slice = &self.buffer[self.buffer_idx * width..(self.buffer_idx + 1) * width];
             self.buffer_idx += 1;
             Some(unsafe { T::from_byte_slice(slice) })
         } else {

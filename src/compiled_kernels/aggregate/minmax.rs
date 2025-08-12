@@ -89,6 +89,16 @@ impl AggAlloc for MinMaxAlloc {
             }
         }
     }
+
+    fn current_capacity(&self) -> usize {
+        match self {
+            MinMaxAlloc::W8(coptions) => coptions.len(),
+            MinMaxAlloc::W16(coptions) => coptions.len(),
+            MinMaxAlloc::W32(coptions) => coptions.len(),
+            MinMaxAlloc::W64(coptions) => coptions.len(),
+            MinMaxAlloc::W128(_, items, _) => items.len(),
+        }
+    }
 }
 
 impl MinMaxAlloc {
