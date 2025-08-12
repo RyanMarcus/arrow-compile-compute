@@ -62,29 +62,19 @@ impl AggAlloc for MinMaxAlloc {
     fn ensure_capacity(&mut self, capacity: usize) {
         match self {
             MinMaxAlloc::W8(items) => {
-                for _ in items.len()..capacity {
-                    items.push(Default::default());
-                }
+                items.resize_with(capacity, Default::default);
             }
             MinMaxAlloc::W16(items) => {
-                for _ in items.len()..capacity {
-                    items.push(Default::default());
-                }
+                items.resize_with(capacity, Default::default);
             }
             MinMaxAlloc::W32(items) => {
-                for _ in items.len()..capacity {
-                    items.push(Default::default());
-                }
+                items.resize_with(capacity, Default::default);
             }
             MinMaxAlloc::W64(items) => {
-                for _ in items.len()..capacity {
-                    items.push(Default::default());
-                }
+                items.resize_with(capacity, Default::default);
             }
             MinMaxAlloc::W128(b, v, _ss) => {
-                for _ in v.len()..capacity {
-                    v.push(0);
-                }
+                v.resize_with(capacity, Default::default);
                 b.data_ptr = v.as_mut_ptr() as *mut c_void;
             }
         }

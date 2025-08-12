@@ -205,9 +205,7 @@ impl<T: Copy + Default> AggAlloc for Vec<T> {
     }
 
     fn ensure_capacity(&mut self, capacity: usize) {
-        for _ in self.len()..capacity {
-            self.push(T::default());
-        }
+        self.resize_with(capacity, Default::default);
     }
 
     fn current_capacity(&self) -> usize {
