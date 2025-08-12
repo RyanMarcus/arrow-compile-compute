@@ -410,43 +410,6 @@ pub mod compute {
 /// Aggregators can `ingest` data, `merge` with other aggregators (of the same
 /// type), and `finalize` to produce the final aggregation results.
 ///
-/// # Example
-///
-/// ```rust
-/// # use arrow_array::{Int32Array, Int64Array, cast::AsArray, types::Int64Type};
-/// # use arrow_schema::DataType;
-/// # use arrow_compile_compute::aggregate::SumAggregator;
-/// # use itertools::Itertools;
-///
-/// // thread 1:
-/// let mut agg1 = SumAggregator::new(&[&DataType::Int32]);
-/// agg1.ingest_grouped(
-///     &[0, 1, 0, 1, 0, 1],
-///     &Int32Array::from(vec![1, 2, 3, 4, 5, 6]),
-/// );
-/// // more calls to `ingest` here...
-///
-/// // thread 2:
-/// let mut agg2 = SumAggregator::new(&[&DataType::Int32]);
-/// agg2.ingest_grouped(
-///     &[0, 1, 0, 1, 0, 1],
-///     &Int32Array::from(vec![1, 2, 3, 4, 5, 6]),
-/// );
-/// // more calls to `ingest` here...
-///
-/// // join thread 1 and thread 2, merge results and get answer
-/// let agg = agg1.merge(agg2);
-/// let res = agg.finish();
-/// let res = res
-///     .as_primitive::<Int64Type>()
-///     .values()
-///     .iter()
-///     .copied()
-///     .collect_vec();
-/// assert_eq!(res, vec![18, 24]);
-/// ```
-///
-///
 pub mod aggregate {
     use arrow_schema::DataType;
 
@@ -457,23 +420,32 @@ pub mod aggregate {
 
     /// Creates a new sum aggregator. Final results are 64-bit versions of their
     /// inputs (e.g., `f32` is summed to `f64`).
-    pub fn sum(ty: &DataType) -> Result<SumAggregator, ArrowKernelError> {
-        Ok(SumAggregator::new(&[ty]))
+    pub fn sum(
+        ty: &DataType,
+        expected_unique: Option<usize>,
+    ) -> Result<SumAggregator, ArrowKernelError> {
+        Ok(SumAggregator::new(&[ty], expected_unique.unwrap_or(1024)))
     }
 
     /// Creates a new min aggregator. Final results will match the input type.
-    pub fn min(ty: &DataType) -> Result<MinAggregator, ArrowKernelError> {
-        Ok(MinAggregator::new(&[ty]))
+    pub fn min(
+        ty: &DataType,
+        expected_unique: Option<usize>,
+    ) -> Result<MinAggregator, ArrowKernelError> {
+        Ok(MinAggregator::new(&[ty], expected_unique.unwrap_or(1024)))
     }
 
     /// Creates a new max aggregator. Final results will match the input type.
-    pub fn max(ty: &DataType) -> Result<MaxAggregator, ArrowKernelError> {
-        Ok(MaxAggregator::new(&[ty]))
+    pub fn max(
+        ty: &DataType,
+        expected_unique: Option<usize>,
+    ) -> Result<MaxAggregator, ArrowKernelError> {
+        Ok(MaxAggregator::new(&[ty], expected_unique.unwrap_or(1024)))
     }
 
     /// Creates a new count aggregator. Final results will be `u64`.
-    pub fn count() -> Result<CountAggregator, ArrowKernelError> {
-        Ok(CountAggregator::new(&[]))
+    pub fn count(expected_unique: Option<usize>) -> Result<CountAggregator, ArrowKernelError> {
+        Ok(CountAggregator::new(&[], expected_unique.unwrap_or(1024)))
     }
 }
 

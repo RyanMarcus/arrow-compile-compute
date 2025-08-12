@@ -61,6 +61,7 @@ pub trait AggAlloc {
     fn get_mut_ptr(&mut self) -> *mut c_void;
     fn ensure_capacity(&mut self, capacity: usize);
     fn current_capacity(&self) -> usize;
+    fn preallocate_capacity(&mut self, expected_unique: usize);
 }
 
 pub trait Aggregation {
@@ -208,6 +209,10 @@ impl<T: Copy + Default> AggAlloc for Vec<T> {
         self.resize_with(capacity, Default::default);
     }
 
+    fn preallocate_capacity(&mut self, expected_unique: usize) {
+        self.reserve(expected_unique);
+    }
+
     fn current_capacity(&self) -> usize {
         self.len()
     }
@@ -307,13 +312,14 @@ pub struct Aggregator<A: Aggregation> {
 }
 
 impl<A: Aggregation> Aggregator<A> {
-    pub fn new(dts: &[&DataType]) -> Self {
+    pub fn new(dts: &[&DataType], expected_unique: usize) -> Self {
         let pts = dts
             .iter()
             .map(|dt| PrimitiveType::for_arrow_type(dt))
             .collect_vec();
         let agg = A::new(&pts);
-        let alloc = agg.allocate(1);
+        let mut alloc = agg.allocate(1);
+        alloc.preallocate_capacity(expected_unique);
         Self { agg, alloc }
     }
 
@@ -441,7 +447,7 @@ mod tests {
 
     #[test]
     fn test_count_aggregator() {
-        let mut agg = CountAggregator::new(&[]);
+        let mut agg = CountAggregator::new(&[], 1024);
         agg.ingest_grouped(
             &[0, 1, 0, 1, 0, 1],
             &Int32Array::from(vec![1, 2, 3, 4, 5, 6]),
@@ -456,12 +462,12 @@ mod tests {
 
     #[test]
     fn test_count_merge_aggregator() {
-        let mut agg1 = CountAggregator::new(&[]);
+        let mut agg1 = CountAggregator::new(&[], 1024);
         agg1.ingest_grouped(
             &[0, 1, 0, 1, 0, 1],
             &Int32Array::from(vec![1, 2, 3, 4, 5, 6]),
         );
-        let mut agg2 = CountAggregator::new(&[]);
+        let mut agg2 = CountAggregator::new(&[], 1024);
         agg2.ingest_grouped(
             &[0, 1, 0, 1, 0, 1],
             &Int32Array::from(vec![1, 2, 3, 4, 5, 6]),
@@ -473,7 +479,7 @@ mod tests {
 
     #[test]
     fn test_sum_aggregator() {
-        let mut agg = SumAggregator::new(&[&DataType::Int32]);
+        let mut agg = SumAggregator::new(&[&DataType::Int32], 1024);
         agg.ingest_grouped(
             &[0, 1, 0, 1, 0, 1],
             &Int32Array::from(vec![1, 2, 3, 4, 5, 6]),
@@ -494,13 +500,13 @@ mod tests {
 
     #[test]
     fn test_sum_merge_aggregator() {
-        let mut agg1 = SumAggregator::new(&[&DataType::Int32]);
+        let mut agg1 = SumAggregator::new(&[&DataType::Int32], 1024);
         agg1.ingest_grouped(
             &[0, 1, 0, 1, 0, 1],
             &Int32Array::from(vec![1, 2, 3, 4, 5, 6]),
         );
 
-        let mut agg2 = SumAggregator::new(&[&DataType::Int32]);
+        let mut agg2 = SumAggregator::new(&[&DataType::Int32], 1024);
         agg2.ingest_grouped(
             &[0, 1, 0, 1, 0, 1],
             &Int32Array::from(vec![1, 2, 3, 4, 5, 6]),
@@ -518,7 +524,7 @@ mod tests {
 
     #[test]
     fn test_min_aggregator() {
-        let mut agg = MinAggregator::new(&[&DataType::Int32]);
+        let mut agg = MinAggregator::new(&[&DataType::Int32], 1024);
         agg.ingest_grouped(
             &[0, 1, 0, 1, 0, 1],
             &Int32Array::from(vec![1, -2, 3, 4, 5, 6]),
@@ -539,12 +545,12 @@ mod tests {
 
     #[test]
     fn test_min_merge_aggregator() {
-        let mut agg1 = MinAggregator::new(&[&DataType::Int32]);
+        let mut agg1 = MinAggregator::new(&[&DataType::Int32], 1024);
         agg1.ingest_grouped(
             &[0, 1, 0, 1, 0, 1],
             &Int32Array::from(vec![1, -2, 3, 4, 5, 6]),
         );
-        let mut agg2 = MinAggregator::new(&[&DataType::Int32]);
+        let mut agg2 = MinAggregator::new(&[&DataType::Int32], 1024);
         agg2.ingest_grouped(
             &[0, 1, 0, 1, 0, 1],
             &Int32Array::from(vec![0, 2, 3000, 4, 50, 60]),
@@ -562,7 +568,7 @@ mod tests {
 
     #[test]
     fn test_max_aggregator() {
-        let mut agg = MaxAggregator::new(&[&DataType::Int32]);
+        let mut agg = MaxAggregator::new(&[&DataType::Int32], 1024);
         agg.ingest_grouped(
             &[0, 1, 0, 1, 0, 1],
             &Int32Array::from(vec![1, -2, 3, 4, 5, 6]),
@@ -583,12 +589,12 @@ mod tests {
 
     #[test]
     fn test_max_merge_aggregator() {
-        let mut agg1 = MaxAggregator::new(&[&DataType::Int32]);
+        let mut agg1 = MaxAggregator::new(&[&DataType::Int32], 1024);
         agg1.ingest_grouped(
             &[0, 1, 0, 1, 0, 1],
             &Int32Array::from(vec![1, -2, 3, 4, 5, 6]),
         );
-        let mut agg2 = MaxAggregator::new(&[&DataType::Int32]);
+        let mut agg2 = MaxAggregator::new(&[&DataType::Int32], 1024);
         agg2.ingest_grouped(
             &[0, 1, 0, 1, 0, 1],
             &Int32Array::from(vec![0, 2, 3000, 4, 50, 60]),
@@ -606,7 +612,7 @@ mod tests {
 
     #[test]
     fn test_min_str_aggregator() {
-        let mut agg = MinAggregator::new(&[&DataType::Utf8]);
+        let mut agg = MinAggregator::new(&[&DataType::Utf8], 1024);
         agg.ingest_grouped(
             &[0, 1, 0, 1, 0, 1],
             &StringArray::from(vec!["apple", "banana", "cherry", "date", "elder", "fig"]),
@@ -626,12 +632,12 @@ mod tests {
 
     #[test]
     fn test_min_str_merge_aggregator() {
-        let mut agg1 = MinAggregator::new(&[&DataType::Utf8]);
+        let mut agg1 = MinAggregator::new(&[&DataType::Utf8], 1024);
         agg1.ingest_grouped(
             &[0, 1, 0, 1, 0, 1],
             &StringArray::from(vec!["apple", "banana", "cherry", "date", "elder", "fig"]),
         );
-        let mut agg2 = MinAggregator::new(&[&DataType::Utf8]);
+        let mut agg2 = MinAggregator::new(&[&DataType::Utf8], 1024);
         agg2.ingest_grouped(
             &[0, 1, 0, 1, 0, 1],
             &StringArray::from(vec!["zeta", "gamma", "luma", "puma", "alpha", "mango"]),
@@ -647,7 +653,7 @@ mod tests {
 
     #[test]
     fn test_ungrouped_sum() {
-        let mut agg = SumAggregator::new(&[&DataType::Int32]);
+        let mut agg = SumAggregator::new(&[&DataType::Int32], 1024);
         agg.ingest_ungrouped(&Int32Array::from(vec![1, 2, 3, 4, 5, 6]));
         agg.ingest_ungrouped(&Int32Array::from(vec![1, 2, 3, 4, 5, 6]));
         let res = agg.finish();

@@ -5,7 +5,7 @@ use arrow_array::{
     UInt8Array,
 };
 use arrow_schema::DataType;
-use bytemuck::Pod;
+use bytemuck::{Pod, Zeroable};
 use inkwell::{
     context::Context,
     module::{Linkage, Module},
@@ -30,6 +30,7 @@ pub struct COption<T: Copy> {
     used: u8,
     value: T,
 }
+unsafe impl<T: Zeroable + Copy> Zeroable for COption<T> {}
 
 #[repr(C)]
 #[derive(ReprOffset)]
@@ -62,21 +63,39 @@ impl AggAlloc for MinMaxAlloc {
     fn ensure_capacity(&mut self, capacity: usize) {
         match self {
             MinMaxAlloc::W8(items) => {
-                items.resize_with(capacity, Default::default);
+                if capacity > items.len() {
+                    items.resize_with(capacity, Zeroable::zeroed);
+                }
             }
             MinMaxAlloc::W16(items) => {
-                items.resize_with(capacity, Default::default);
+                if capacity > items.len() {
+                    items.resize_with(capacity, Zeroable::zeroed);
+                }
             }
             MinMaxAlloc::W32(items) => {
-                items.resize_with(capacity, Default::default);
+                if capacity > items.len() {
+                    items.resize_with(capacity, Zeroable::zeroed);
+                }
             }
             MinMaxAlloc::W64(items) => {
-                items.resize_with(capacity, Default::default);
+                if capacity > items.len() {
+                    items.resize_with(capacity, Zeroable::zeroed);
+                }
             }
             MinMaxAlloc::W128(b, v, _ss) => {
-                v.resize_with(capacity, Default::default);
+                v.resize_with(capacity, Zeroable::zeroed);
                 b.data_ptr = v.as_mut_ptr() as *mut c_void;
             }
+        }
+    }
+
+    fn preallocate_capacity(&mut self, expected_unique: usize) {
+        match self {
+            MinMaxAlloc::W8(coptions) => coptions.reserve(expected_unique),
+            MinMaxAlloc::W16(coptions) => coptions.reserve(expected_unique),
+            MinMaxAlloc::W32(coptions) => coptions.reserve(expected_unique),
+            MinMaxAlloc::W64(coptions) => coptions.reserve(expected_unique),
+            MinMaxAlloc::W128(_, items, _) => items.reserve(expected_unique),
         }
     }
 
@@ -172,15 +191,15 @@ impl<const MIN: bool> Aggregation for MinMaxAgg<MIN> {
 
     fn allocate(&self, num_tickets: usize) -> Self::Allocation {
         let mut alloc = match self.pt {
-            PrimitiveType::U8 | PrimitiveType::I8 => MinMaxAlloc::W8(vec![]),
+            PrimitiveType::U8 | PrimitiveType::I8 => MinMaxAlloc::W8(Vec::with_capacity(1024)),
             PrimitiveType::F16 | PrimitiveType::U16 | PrimitiveType::I16 => {
-                MinMaxAlloc::W16(vec![])
+                MinMaxAlloc::W16(Vec::with_capacity(1024))
             }
             PrimitiveType::F32 | PrimitiveType::U32 | PrimitiveType::I32 => {
-                MinMaxAlloc::W32(vec![])
+                MinMaxAlloc::W32(Vec::with_capacity(1024))
             }
             PrimitiveType::F64 | PrimitiveType::U64 | PrimitiveType::I64 => {
-                MinMaxAlloc::W64(vec![])
+                MinMaxAlloc::W64(Vec::with_capacity(1024))
             }
             PrimitiveType::P64x2 => {
                 let mut data = vec![];

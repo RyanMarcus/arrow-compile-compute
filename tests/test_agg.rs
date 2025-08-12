@@ -12,7 +12,7 @@ proptest! {
         let sum = arr.iter().copied().map(|x| x as i64).sum::<i64>();
         let arr = Int32Array::from(arr);
 
-        let mut agg = aggregate::sum(arr.data_type()).unwrap();
+        let mut agg = aggregate::sum(arr.data_type(), None).unwrap();
         agg.ingest_ungrouped(&arr);
         let res = agg.finish();
         let res = res.as_primitive::<Int64Type>();
@@ -25,7 +25,7 @@ proptest! {
         let min = arr.iter().copied().min().unwrap_or(0);
         let arr = Int32Array::from(arr);
 
-        let mut agg = aggregate::min(arr.data_type()).unwrap();
+        let mut agg = aggregate::min(arr.data_type(), None).unwrap();
         agg.ingest_ungrouped(&arr);
         let res = agg.finish();
         let res = res.as_primitive::<Int32Type>();
