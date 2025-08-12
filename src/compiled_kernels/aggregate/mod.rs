@@ -1,4 +1,8 @@
-use std::{collections::HashMap, ffi::c_void};
+use std::{
+    collections::HashMap,
+    ffi::c_void,
+    sync::{LazyLock, RwLock},
+};
 
 use arrow_array::Array;
 use arrow_schema::DataType;
@@ -45,6 +49,14 @@ impl StringSaver {
     }
 }
 
+#[derive(Copy, Clone, PartialEq, Eq, Hash)]
+pub enum AggType {
+    Count,
+    Sum,
+    Min,
+    Max,
+}
+
 pub trait AggAlloc {
     fn get_mut_ptr(&mut self) -> *mut c_void;
     fn ensure_capacity(&mut self, capacity: usize);
@@ -58,6 +70,7 @@ pub trait Aggregation {
     fn allocate(&self, num_tickets: usize) -> Self::Allocation;
     fn ptype(&self) -> PrimitiveType;
     fn merge_allocs(&self, alloc1: Self::Allocation, alloc2: Self::Allocation) -> Self::Allocation;
+    fn agg_type() -> AggType;
 
     /// Returns the LLVM function that performs *ungrouped* aggregation. The
     /// function should take:
@@ -206,6 +219,7 @@ struct GroupedAggFunc {
     func: JitFunction<'this, unsafe extern "C" fn(*mut c_void, *const c_void, *mut c_void)>,
 }
 unsafe impl Send for GroupedAggFunc {}
+unsafe impl Sync for GroupedAggFunc {}
 
 fn compile_grouped_agg_func<A: Aggregation>(agg: &A, inp: &dyn Array) -> GroupedAggFunc {
     GroupedAggFuncBuilder {
@@ -246,6 +260,7 @@ struct UngroupedAggFunc {
     func: JitFunction<'this, unsafe extern "C" fn(*mut c_void, *mut c_void)>,
 }
 unsafe impl Send for UngroupedAggFunc {}
+unsafe impl Sync for UngroupedAggFunc {}
 
 fn compile_ungrouped_agg_func<A: Aggregation>(agg: &A, inp: &dyn Array) -> UngroupedAggFunc {
     UngroupedAggFuncBuilder {
@@ -277,11 +292,15 @@ fn compile_ungrouped_agg_func<A: Aggregation>(agg: &A, inp: &dyn Array) -> Ungro
     .build()
 }
 
+static GROUPED_AGG_CACHE: LazyLock<RwLock<HashMap<(DataType, AggType), GroupedAggFunc>>> =
+    LazyLock::new(|| RwLock::new(HashMap::new()));
+
+static UNGROUPED_AGG_CACHE: LazyLock<RwLock<HashMap<(DataType, AggType), UngroupedAggFunc>>> =
+    LazyLock::new(|| RwLock::new(HashMap::new()));
+
 pub struct Aggregator<A: Aggregation> {
     agg: A,
     alloc: A::Allocation,
-    grouped_funcs: HashMap<DataType, GroupedAggFunc>,
-    ungrouped_funcs: HashMap<DataType, UngroupedAggFunc>,
 }
 
 impl<A: Aggregation> Aggregator<A> {
@@ -292,12 +311,7 @@ impl<A: Aggregation> Aggregator<A> {
             .collect_vec();
         let agg = A::new(&pts);
         let alloc = agg.allocate(1);
-        Self {
-            agg,
-            alloc,
-            grouped_funcs: HashMap::new(),
-            ungrouped_funcs: HashMap::new(),
-        }
+        Self { agg, alloc }
     }
 
     /// Ingests new *ungrouped* data into the aggregator. This is equivalent to
@@ -308,17 +322,29 @@ impl<A: Aggregation> Aggregator<A> {
             return;
         }
         self.alloc.ensure_capacity(1);
-        let agg_func = self
-            .ungrouped_funcs
-            .entry(data.data_type().clone())
-            .or_insert_with(|| compile_ungrouped_agg_func(&self.agg, data));
 
+        let cache_key = (data.data_type().clone(), A::agg_type());
         let mut ih = datum_to_iter(&data).unwrap();
+        {
+            let hm = UNGROUPED_AGG_CACHE.read().unwrap();
+            if let Some(func) = hm.get(&cache_key) {
+                unsafe {
+                    func.borrow_func()
+                        .call(self.alloc.get_mut_ptr(), ih.get_mut_ptr());
+                }
+                return;
+            }
+        }
+
+        // same logic as KernelCache
+        let func = compile_ungrouped_agg_func(&self.agg, data);
         unsafe {
-            agg_func
-                .borrow_func()
+            func.borrow_func()
                 .call(self.alloc.get_mut_ptr(), ih.get_mut_ptr());
         }
+
+        let mut hm = UNGROUPED_AGG_CACHE.write().unwrap();
+        hm.entry(cache_key).or_insert(func);
     }
 
     /// Ingests new data into the aggregator. The `tickets` slice should be the
@@ -336,30 +362,42 @@ impl<A: Aggregation> Aggregator<A> {
         let max_ticket = tickets.iter().copied().max().unwrap_or(0) + 1;
         self.alloc.ensure_capacity(max_ticket as usize);
 
-        let agg_func = self
-            .grouped_funcs
-            .entry(data.data_type().clone())
-            .or_insert_with(|| compile_grouped_agg_func(&self.agg, data));
-
         let mut ih = datum_to_iter(&data).unwrap();
+
+        let cache_key = (data.data_type().clone(), A::agg_type());
+        {
+            let hm = GROUPED_AGG_CACHE.read().unwrap();
+            if let Some(func) = hm.get(&cache_key) {
+                unsafe {
+                    func.borrow_func().call(
+                        self.alloc.get_mut_ptr(),
+                        tickets.as_ptr() as *const c_void,
+                        ih.get_mut_ptr(),
+                    );
+                }
+                return;
+            }
+        }
+
+        // same logic as KernelCache
+        let func = compile_grouped_agg_func(&self.agg, data);
         unsafe {
-            agg_func.borrow_func().call(
+            func.borrow_func().call(
                 self.alloc.get_mut_ptr(),
                 tickets.as_ptr() as *const c_void,
                 ih.get_mut_ptr(),
             );
         }
+
+        let mut hm = GROUPED_AGG_CACHE.write().unwrap();
+        hm.entry(cache_key).or_insert(func);
     }
 
-    pub fn merge(mut self, other: Self) -> Self {
+    pub fn merge(self, other: Self) -> Self {
         let alloc = self.agg.merge_allocs(self.alloc, other.alloc);
-        self.grouped_funcs.extend(other.grouped_funcs);
-        self.ungrouped_funcs.extend(other.ungrouped_funcs);
         Self {
             agg: self.agg,
             alloc,
-            grouped_funcs: self.grouped_funcs,
-            ungrouped_funcs: self.ungrouped_funcs,
         }
     }
 

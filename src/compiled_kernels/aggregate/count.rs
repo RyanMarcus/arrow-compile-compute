@@ -1,7 +1,10 @@
 use arrow_array::UInt64Array;
 use inkwell::{context::Context, module::Module};
 
-use crate::{compiled_kernels::aggregate::Aggregation, increment_pointer, PrimitiveType};
+use crate::{
+    compiled_kernels::aggregate::{AggType, Aggregation},
+    increment_pointer, PrimitiveType,
+};
 
 #[derive(Default)]
 pub struct CountAgg {}
@@ -21,6 +24,10 @@ impl Aggregation for CountAgg {
 
     fn ptype(&self) -> PrimitiveType {
         PrimitiveType::max_width_type()
+    }
+
+    fn agg_type() -> AggType {
+        AggType::Count
     }
 
     fn merge_allocs(

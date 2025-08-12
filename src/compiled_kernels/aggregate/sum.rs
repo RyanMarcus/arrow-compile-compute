@@ -29,6 +29,10 @@ impl Aggregation for SumAgg {
         self.pt
     }
 
+    fn agg_type() -> super::AggType {
+        super::AggType::Sum
+    }
+
     fn merge_allocs(
         &self,
         mut alloc1: Self::Allocation,

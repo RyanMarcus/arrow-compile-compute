@@ -17,7 +17,7 @@ use repr_offset::ReprOffset;
 
 use crate::{
     compiled_kernels::{
-        aggregate::{AggAlloc, Aggregation, StringSaver},
+        aggregate::{AggAlloc, AggType, Aggregation, StringSaver},
         cmp::{add_float_to_int, add_memcmp},
     },
     declare_blocks, increment_pointer, mark_load_invariant, pointer_diff, PrimitiveType,
@@ -198,6 +198,14 @@ impl<const MIN: bool> Aggregation for MinMaxAgg<MIN> {
 
     fn ptype(&self) -> PrimitiveType {
         self.pt
+    }
+
+    fn agg_type() -> AggType {
+        if MIN {
+            AggType::Min
+        } else {
+            AggType::Max
+        }
     }
 
     fn merge_allocs(&self, alloc1: Self::Allocation, alloc2: Self::Allocation) -> Self::Allocation {
