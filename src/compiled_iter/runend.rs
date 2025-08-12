@@ -476,7 +476,6 @@ mod tests {
         let next_fname = next_func.get_name().to_str().unwrap();
 
         module.verify().unwrap();
-        module.print_to_stderr();
         let ee = module
             .create_jit_execution_engine(OptimizationLevel::None)
             .unwrap();
