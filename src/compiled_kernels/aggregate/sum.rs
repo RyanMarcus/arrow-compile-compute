@@ -91,25 +91,35 @@ impl Aggregation for SumAgg {
             ctx.f64_type().as_basic_type_enum()
         };
         let agg_ptr = increment_pointer!(ctx, b, alloc_ptr, 8, ticket);
-        let curr_sum = b.build_load(sum_type, agg_ptr, "curr_sum").unwrap();
-        let new_sum = if self.pt.is_int() {
-            let value = if self.pt.is_signed() {
+        let value = if self.pt.is_int() {
+            if self.pt.is_signed() {
                 b.build_int_s_extend_or_bit_cast(value.into_int_value(), ctx.i64_type(), "value")
                     .unwrap()
+                    .as_basic_value_enum()
             } else {
                 b.build_int_z_extend_or_bit_cast(value.into_int_value(), ctx.i64_type(), "value")
                     .unwrap()
-            };
-            b.build_int_add(curr_sum.into_int_value(), value, "new_sum")
+                    .as_basic_value_enum()
+            }
+        } else {
+            b.build_float_ext(value.into_float_value(), ctx.f64_type(), "value")
+                .unwrap()
+                .as_basic_value_enum()
+        };
+
+        let curr_sum = b.build_load(sum_type, agg_ptr, "curr_sum").unwrap();
+        let new_sum = if self.pt.is_int() {
+            b.build_int_add(curr_sum.into_int_value(), value.into_int_value(), "new_sum")
                 .unwrap()
                 .as_basic_value_enum()
         } else {
-            let value = b
-                .build_float_ext(value.into_float_value(), ctx.f64_type(), "value")
-                .unwrap();
-            b.build_float_add(curr_sum.into_float_value(), value, "new_sum")
-                .unwrap()
-                .as_basic_value_enum()
+            b.build_float_add(
+                curr_sum.into_float_value(),
+                value.into_float_value(),
+                "new_sum",
+            )
+            .unwrap()
+            .as_basic_value_enum()
         };
         b.build_store(agg_ptr, new_sum).unwrap();
     }

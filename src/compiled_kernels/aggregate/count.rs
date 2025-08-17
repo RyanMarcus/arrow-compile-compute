@@ -53,14 +53,14 @@ impl Aggregation for CountAgg {
         _value: inkwell::values::BasicValueEnum<'a>,
     ) {
         let i64_type = ctx.i64_type();
+        let one = ctx.i64_type().const_int(1, false);
         let agg_ptr = increment_pointer!(ctx, b, alloc_ptr, 8, ticket);
+
         let curr_count = b
             .build_load(i64_type, agg_ptr, "curr_count")
             .unwrap()
             .into_int_value();
-        let new_count = b
-            .build_int_add(curr_count, ctx.i64_type().const_int(1, false), "new_count")
-            .unwrap();
+        let new_count = b.build_int_add(curr_count, one, "new_count").unwrap();
         b.build_store(agg_ptr, new_count).unwrap();
     }
 }

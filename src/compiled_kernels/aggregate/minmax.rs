@@ -64,22 +64,50 @@ impl AggAlloc for MinMaxAlloc {
         match self {
             MinMaxAlloc::W8(items) => {
                 if capacity > items.len() {
-                    items.resize_with(capacity, Zeroable::zeroed);
+                    if items.capacity() < capacity {
+                        items.reserve(capacity - items.len());
+                    }
+                    unsafe {
+                        let start = items.as_mut_ptr().add(items.len());
+                        std::ptr::write_bytes(start, 0, capacity - items.len());
+                        items.set_len(capacity);
+                    }
                 }
             }
             MinMaxAlloc::W16(items) => {
                 if capacity > items.len() {
-                    items.resize_with(capacity, Zeroable::zeroed);
+                    if items.capacity() < capacity {
+                        items.reserve(capacity - items.len());
+                    }
+                    unsafe {
+                        let start = items.as_mut_ptr().add(items.len());
+                        std::ptr::write_bytes(start, 0, capacity - items.len());
+                        items.set_len(capacity);
+                    }
                 }
             }
             MinMaxAlloc::W32(items) => {
                 if capacity > items.len() {
-                    items.resize_with(capacity, Zeroable::zeroed);
+                    if items.capacity() < capacity {
+                        items.reserve(capacity - items.len());
+                    }
+                    unsafe {
+                        let start = items.as_mut_ptr().add(items.len());
+                        std::ptr::write_bytes(start, 0, capacity - items.len());
+                        items.set_len(capacity);
+                    }
                 }
             }
             MinMaxAlloc::W64(items) => {
                 if capacity > items.len() {
-                    items.resize_with(capacity, Zeroable::zeroed);
+                    if items.capacity() < capacity {
+                        items.reserve(capacity - items.len());
+                    }
+                    unsafe {
+                        let start = items.as_mut_ptr().add(items.len());
+                        std::ptr::write_bytes(start, 0, capacity - items.len());
+                        items.set_len(capacity);
+                    }
                 }
             }
             MinMaxAlloc::W128(b, v, _ss) => {
