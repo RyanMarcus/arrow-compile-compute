@@ -666,7 +666,8 @@ fn merge_coptions<T: Copy + Pod, V: PartialOrd + Pod, const MIN: bool>(
             continue;
         }
         if lhs.used == 0 {
-            lhs.value = rhs.value;
+            *lhs = rhs;
+            continue;
         }
         let lhs_v = bytemuck::cast::<T, V>(lhs.value);
         let rhs_v = bytemuck::cast::<T, V>(rhs.value);
@@ -688,7 +689,10 @@ mod tests {
     use crate::{
         compiled_iter::{datum_to_iter, generate_next},
         compiled_kernels::{
-            aggregate::{minmax::MinMaxAgg, AggAlloc, Aggregation},
+            aggregate::{
+                minmax::{COption, MinMaxAgg},
+                AggAlloc, Aggregation,
+            },
             link_req_helpers,
         },
         PrimitiveType,
@@ -733,5 +737,85 @@ mod tests {
         let res = res.as_binary_view();
         let res = res.iter().map(|x| x.unwrap()).collect_vec();
         assert_eq!(res, vec![b"a", b"a"]);
+    }
+
+    #[test]
+    fn test_merge_coptions() {
+        // MIN over i32 values stored in u32 slots
+        let mut v1_min: Vec<COption<u32>> = vec![
+            COption {
+                used: 1,
+                value: bytemuck::cast::<i32, u32>(5),
+            },
+            COption {
+                used: 0,
+                value: bytemuck::cast::<i32, u32>(0),
+            },
+            COption {
+                used: 1,
+                value: bytemuck::cast::<i32, u32>(-3),
+            },
+            COption {
+                used: 1,
+                value: bytemuck::cast::<i32, u32>(10),
+            },
+        ];
+        let v2_min: Vec<COption<u32>> = vec![
+            COption {
+                used: 1,
+                value: bytemuck::cast::<i32, u32>(7),
+            }, // min(5,7) -> 5
+            COption {
+                used: 1,
+                value: bytemuck::cast::<i32, u32>(8),
+            }, // lhs unused -> 8
+            COption {
+                used: 0,
+                value: bytemuck::cast::<i32, u32>(-2),
+            }, // rhs unused -> keep -3
+            COption {
+                used: 1,
+                value: bytemuck::cast::<i32, u32>(2),
+            }, // min(10,2) -> 2
+        ];
+        super::merge_coptions::<u32, i32, true>(&mut v1_min, v2_min);
+
+        assert_eq!(v1_min[0].used, 1);
+        assert_eq!(bytemuck::cast::<u32, i32>(v1_min[0].value), 5);
+        assert_eq!(v1_min[1].used, 1);
+        assert_eq!(bytemuck::cast::<u32, i32>(v1_min[1].value), 8);
+        assert_eq!(v1_min[2].used, 1);
+        assert_eq!(bytemuck::cast::<u32, i32>(v1_min[2].value), -3);
+        assert_eq!(v1_min[3].used, 1);
+        assert_eq!(bytemuck::cast::<u32, i32>(v1_min[3].value), 2);
+
+        // MAX over u16 values
+        let mut v1_max: Vec<COption<u16>> = vec![
+            COption {
+                used: 1,
+                value: 250,
+            },
+            COption { used: 1, value: 5 },
+            COption { used: 0, value: 0 },
+        ];
+        let v2_max: Vec<COption<u16>> = vec![
+            COption {
+                used: 1,
+                value: 100,
+            }, // max(250,100) -> 250
+            COption {
+                used: 1,
+                value: 200,
+            }, // max(5,200) -> 200
+            COption { used: 1, value: 7 }, // lhs unused -> 7
+        ];
+        super::merge_coptions::<u16, u16, false>(&mut v1_max, v2_max);
+
+        assert_eq!(v1_max[0].used, 1);
+        assert_eq!(v1_max[0].value, 250);
+        assert_eq!(v1_max[1].used, 1);
+        assert_eq!(v1_max[1].value, 200);
+        assert_eq!(v1_max[2].used, 1);
+        assert_eq!(v1_max[2].value, 7);
     }
 }
