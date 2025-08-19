@@ -348,7 +348,6 @@ fn build_partition<'a, W: ArrayWriter<'a>>(
     b.build_return(None).unwrap();
 
     set_noalias_params(&func);
-    llvm_mod.print_to_stderr();
     llvm_mod.verify().unwrap();
     optimize_module(&llvm_mod)?;
     let ee = llvm_mod
