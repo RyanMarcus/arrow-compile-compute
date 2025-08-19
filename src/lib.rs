@@ -10,8 +10,10 @@ use arrow_array::{
 };
 use arrow_schema::{DataType, Field};
 use inkwell::{
+    attributes::{Attribute, AttributeLoc},
     context::Context,
     types::{BasicTypeEnum, VectorType},
+    values::FunctionValue,
     AddressSpace, IntPredicate,
 };
 
@@ -109,6 +111,17 @@ macro_rules! increment_pointer {
     };
 }
 pub(crate) use increment_pointer;
+
+/// Mark each parameter of the given function as noalias for LLVM IR
+/// optimizations.
+fn set_noalias_params(func: &FunctionValue) {
+    let context = func.get_type().get_context();
+    let noalias_kind_id = Attribute::get_named_enum_kind_id("noalias");
+    for i in 0..func.count_params() {
+        let attr = context.create_enum_attribute(noalias_kind_id, 0);
+        func.add_attribute(AttributeLoc::Param(i), attr);
+    }
+}
 
 #[cfg(test)]
 unsafe fn pointers_to_str(ptrs: u128) -> String {

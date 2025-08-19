@@ -22,11 +22,12 @@ use arrow_schema::DataType;
 use bitmap::BitmapIterator;
 use dictionary::DictionaryIterator;
 use inkwell::{
+    builder::Builder,
     context::Context,
     intrinsics::Intrinsic,
     module::{Linkage, Module},
     types::BasicType,
-    values::{BasicValue, FunctionValue},
+    values::{BasicValue, FunctionValue, PointerValue},
     AddressSpace, IntPredicate,
 };
 use primitive::PrimitiveIterator;
@@ -36,8 +37,8 @@ use setbit::SetBitIterator;
 use string::{LargeStringIterator, StringIterator};
 
 use crate::{
-    compiled_iter::view::ViewIterator, declare_blocks, increment_pointer, ArrowKernelError,
-    PrimitiveType,
+    compiled_iter::view::ViewIterator, declare_blocks, increment_pointer, set_noalias_params,
+    ArrowKernelError, PrimitiveType,
 };
 
 pub fn array_to_setbit_iter(arr: &BooleanArray) -> Result<IteratorHolder, ArrowKernelError> {
@@ -260,6 +261,20 @@ impl IteratorHolder {
             IteratorHolder::RunEnd { arr: iter, .. } => &**iter as *const _ as *const c_void,
             IteratorHolder::ScalarPrimitive(iter) => &**iter as *const _ as *const c_void,
             IteratorHolder::ScalarString(iter) => &**iter as *const _ as *const c_void,
+        }
+    }
+
+    /// Potentially copy the iterator into the current stack frame, allowing
+    /// better LLVM optimizations.
+    pub fn localize_struct<'a, 'b>(
+        &self,
+        ctx: &'a Context,
+        b: &'b Builder<'a>,
+        ptr: PointerValue<'a>,
+    ) -> PointerValue<'a> {
+        match self {
+            IteratorHolder::Primitive(i) => i.localize_struct(ctx, b, ptr),
+            _ => ptr,
         }
     }
 }
@@ -800,7 +815,7 @@ pub fn generate_next<'a>(
     );
     let iter_ptr = next.get_nth_param(0).unwrap().into_pointer_value();
     let out_ptr = next.get_nth_param(1).unwrap().into_pointer_value();
-
+    set_noalias_params(&next);
     match ih {
         IteratorHolder::Primitive(primitive_iter) => {
             declare_blocks!(ctx, next, entry, none_left, get_next);

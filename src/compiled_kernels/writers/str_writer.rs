@@ -1,11 +1,12 @@
 use std::ffi::c_void;
 use std::marker::PhantomData;
+use std::sync::Arc;
 
 use crate::{
     declare_blocks, declare_global_pointer, increment_pointer, pointer_diff, PrimitiveType,
 };
 
-use arrow_array::{GenericBinaryArray, GenericByteArray, OffsetSizeTrait};
+use arrow_array::{ArrayRef, GenericBinaryArray, GenericByteArray, OffsetSizeTrait};
 use arrow_buffer::{Buffer, OffsetBuffer, ScalarBuffer};
 use inkwell::values::BasicValue;
 use inkwell::{
@@ -55,6 +56,10 @@ impl<T: OffsetSizeTrait> WriterAllocation for StringAllocation<T> {
 
         let offsets = unsafe { OffsetBuffer::new_unchecked(offsets) };
         GenericByteArray::new(offsets, data, nulls)
+    }
+
+    fn to_array_ref(self, len: usize, nulls: Option<arrow_buffer::NullBuffer>) -> ArrayRef {
+        Arc::new(self.to_array(len, nulls))
     }
 }
 

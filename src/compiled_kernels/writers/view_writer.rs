@@ -1,6 +1,6 @@
-use std::ffi::c_void;
+use std::{ffi::c_void, sync::Arc};
 
-use arrow_array::{types::BinaryViewType, GenericByteViewArray};
+use arrow_array::{types::BinaryViewType, ArrayRef, GenericByteViewArray};
 use arrow_buffer::{Buffer, NullBuffer};
 use inkwell::{
     intrinsics::Intrinsic, module::Linkage, values::FunctionValue, AddressSpace, IntPredicate,
@@ -82,6 +82,10 @@ impl WriterAllocation for StringViewAllocation {
         }
         unsafe { GenericByteViewArray::new_unchecked(self.views.into(), buffers, nulls) }
     }
+
+    fn to_array_ref(self, len: usize, nulls: Option<arrow_buffer::NullBuffer>) -> ArrayRef {
+        Arc::new(self.to_array(len, nulls))
+    }
 }
 
 /// Writer for view arrays (utf8 or bytes)
@@ -157,7 +161,7 @@ impl<'a> ArrayWriter<'a> for StringViewWriter<'a> {
 
         // Create or retrieve the ingest function:
         let ingest_func_name = "ingest_str_view";
-        let ingest_func = llvm_mod.get_function(ingest_func_name).unwrap_or_else(|| {
+        let ingest_func = {
             let b2 = ctx.create_builder();
             let fn_type = ctx
                 .void_type()
@@ -237,7 +241,7 @@ impl<'a> ArrayWriter<'a> for StringViewWriter<'a> {
             b2.build_return(None).unwrap();
 
             func
-        });
+        };
 
         StringViewWriter { ingest_func }
     }

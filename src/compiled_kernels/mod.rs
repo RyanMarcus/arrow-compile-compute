@@ -7,6 +7,7 @@ pub mod dsl;
 mod filter;
 mod ht;
 mod llvm_utils;
+mod partition;
 mod rust_iter;
 mod sort;
 mod take;
@@ -22,10 +23,9 @@ pub use cmp::ComparisonKernel;
 pub use concat::ConcatKernel;
 pub use filter::FilterKernel;
 pub use ht::HashKernel;
-use inkwell::attributes::Attribute;
-use inkwell::attributes::AttributeLoc;
 use inkwell::execution_engine::ExecutionEngine;
 use llvm_utils::str_writer_append_bytes;
+pub use partition::PartitionKernel;
 pub use rust_iter::{ArrowIter, IterFuncHolder};
 pub use sort::{SortKernel, SortOptions};
 pub use take::TakeKernel;
@@ -37,7 +37,7 @@ use inkwell::{
     module::Module,
     passes::PassBuilderOptions,
     targets::{CodeModel, RelocMode, Target, TargetMachine},
-    values::{FunctionValue, VectorValue},
+    values::VectorValue,
     OptimizationLevel,
 };
 use thiserror::Error;
@@ -157,17 +157,6 @@ fn link_req_helpers(module: &Module, ee: &ExecutionEngine) -> Result<(), ArrowKe
     }
 
     Ok(())
-}
-
-/// Mark each parameter of the given function as noalias for LLVM IR
-/// optimizations.
-fn set_noalias_params(func: &FunctionValue) {
-    let context = func.get_type().get_context();
-    let noalias_kind_id = Attribute::get_named_enum_kind_id("noalias");
-    for i in 0..func.count_params() {
-        let attr = context.create_enum_attribute(noalias_kind_id, 0);
-        func.add_attribute(AttributeLoc::Param(i), attr);
-    }
 }
 
 fn optimize_module(module: &Module) -> Result<(), ArrowKernelError> {

@@ -221,7 +221,7 @@ pub mod select {
     use arrow_array::{make_array, Array, ArrayRef, BooleanArray};
 
     use crate::{
-        compiled_kernels::{ConcatKernel, FilterKernel, KernelCache, TakeKernel},
+        compiled_kernels::{ConcatKernel, FilterKernel, KernelCache, PartitionKernel, TakeKernel},
         ArrowKernelError,
     };
 
@@ -229,6 +229,8 @@ pub mod select {
     static FILTER_PROGRAM_CACHE: LazyLock<KernelCache<FilterKernel>> =
         LazyLock::new(KernelCache::new);
     static CONCAT_PROGRAM_CACHE: LazyLock<KernelCache<ConcatKernel>> =
+        LazyLock::new(KernelCache::new);
+    static PARTITION_PROGRAM_CACHE: LazyLock<KernelCache<PartitionKernel>> =
         LazyLock::new(KernelCache::new);
 
     /// Extract the elements in `data` at the indices specified in `idxes`.
@@ -296,6 +298,45 @@ pub mod select {
             return Ok(make_array(data[0].to_data()));
         }
         CONCAT_PROGRAM_CACHE.get(data, ())
+    }
+
+    /// Partitions an array into multiple arrays based on the partition indexes.
+    ///
+    /// The partition indexes must be non-null and castable to unsigned
+    /// integers. Null values in the input array are skipped (not placed into
+    /// any partition), and the corresponding partition index is ignored.
+    ///
+    /// ```
+    /// use arrow_array::cast::AsArray;
+    /// use arrow_array::types::Int32Type;
+    /// use arrow_array::Int32Array;
+    ///
+    /// let data = Int32Array::from(vec![Some(1), Some(2), None, Some(3)]);
+    /// let pidxes = Int32Array::from(vec![0, 1, 0, 1]);
+    /// let res = arrow_compile_compute::select::partition(&data, &pidxes, Some(2)).unwrap();
+    ///
+    /// assert_eq!(res.len(), 2);
+    /// assert_eq!(res[0].as_primitive::<Int32Type>().values(), &[1]); // nulls are skipped
+    /// assert_eq!(res[1].as_primitive::<Int32Type>().values(), &[2, 3]);
+    /// ```
+    pub fn partition(
+        data: &dyn Array,
+        partition_indexes: &dyn Array,
+        nparts: Option<usize>,
+    ) -> Result<Vec<ArrayRef>, ArrowKernelError> {
+        let nparts = match nparts {
+            Some(x) => x,
+            None => crate::iter::iter_nonnull_u64(partition_indexes)?
+                .max()
+                .map(|x| x as usize)
+                .unwrap_or(0),
+        };
+
+        if nparts == 0 {
+            return Ok(vec![]);
+        }
+
+        PARTITION_PROGRAM_CACHE.get((data, partition_indexes), nparts)
     }
 }
 

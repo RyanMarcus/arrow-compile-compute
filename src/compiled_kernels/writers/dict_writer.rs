@@ -1,7 +1,7 @@
-use std::{ffi::c_void, marker::PhantomData};
+use std::{ffi::c_void, marker::PhantomData, sync::Arc};
 
 use arrow_array::{
-    cast::AsArray, make_array, types::ArrowDictionaryKeyType, Array, DictionaryArray,
+    cast::AsArray, make_array, types::ArrowDictionaryKeyType, Array, ArrayRef, DictionaryArray,
 };
 
 use inkwell::{
@@ -47,6 +47,10 @@ impl<'a, K: ArrowDictionaryKeyType, VW: ArrayWriter<'a>> WriterAllocation
         let keys = keys.as_primitive::<K>().clone();
         let values = make_array(self.values.to_array(self.tt.len(), None).to_data());
         unsafe { DictionaryArray::<K>::new_unchecked(keys, values) }
+    }
+
+    fn to_array_ref(self, len: usize, nulls: Option<arrow_buffer::NullBuffer>) -> ArrayRef {
+        Arc::new(self.to_array(len, nulls))
     }
 }
 

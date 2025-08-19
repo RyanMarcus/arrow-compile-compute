@@ -1,8 +1,9 @@
 use std::ffi::c_void;
+use std::sync::Arc;
 
 use super::{ArrayWriter, WriterAllocation};
 use crate::{declare_blocks, increment_pointer, PrimitiveType};
-use arrow_array::BooleanArray;
+use arrow_array::{ArrayRef, BooleanArray};
 use arrow_buffer::{BooleanBuffer, Buffer};
 use inkwell::builder::Builder;
 use inkwell::context::Context;
@@ -40,6 +41,10 @@ impl WriterAllocation for BooleanAllocation {
         let buf = Buffer::from(self.data);
         let bb = BooleanBuffer::new(buf, 0, len);
         BooleanArray::new(bb, nulls)
+    }
+
+    fn to_array_ref(self, len: usize, nulls: Option<arrow_buffer::NullBuffer>) -> ArrayRef {
+        Arc::new(self.to_array(len, nulls))
     }
 }
 

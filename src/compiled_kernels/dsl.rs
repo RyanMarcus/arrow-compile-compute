@@ -32,13 +32,14 @@ use crate::{
     },
     compiled_kernels::{
         cmp::{add_float_vec_to_int_vec, add_memcmp},
-        gen_convert_numeric_vec, link_req_helpers, optimize_module, set_noalias_params,
+        gen_convert_numeric_vec, link_req_helpers, optimize_module,
         writers::{
             ArrayWriter, BooleanWriter, DictWriter, PrimitiveArrayWriter, REEWriter,
             StringViewWriter, WriterAllocation,
         },
     },
-    declare_blocks, increment_pointer, ComparisonType, Predicate, PrimitiveType,
+    declare_blocks, increment_pointer, set_noalias_params, ComparisonType, Predicate,
+    PrimitiveType,
 };
 
 use super::{writers::StringArrayWriter, ArrowKernelError};
@@ -71,7 +72,7 @@ pub enum KernelInput<'a> {
     SetBits(usize, &'a BooleanArray),
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
 enum KernelInputType {
     Standard,
     SetBit,
@@ -273,7 +274,7 @@ impl KernelOutputType {
     }
 }
 
-fn base_type(dt: &DataType) -> DataType {
+pub fn base_type(dt: &DataType) -> DataType {
     match dt {
         DataType::Binary
         | DataType::LargeBinary
@@ -1939,6 +1940,29 @@ fn build_kernel_with_writer<'a, W: ArrayWriter<'a>>(
         return Err(DSLError::NoIteration);
     }
 
+    let ihs: Vec<IteratorHolder> = {
+        let idx_to_type: HashMap<usize, KernelInputType> = indexes_to_iter
+            .iter()
+            .map(|(ty, idx)| (*idx, *ty))
+            .collect();
+
+        inputs
+            .iter()
+            .enumerate()
+            .map(|(idx, inp)| {
+                if let Some(ty) = idx_to_type.get(&idx) {
+                    match ty {
+                        KernelInputType::Standard => datum_to_iter(*inp),
+                        KernelInputType::SetBit => array_to_setbit_iter(inp.get().0.as_boolean()),
+                    }
+                } else {
+                    datum_to_iter(*inp)
+                }
+            })
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap()
+    };
+
     let all_inputs_scalar = indexes_to_iter
         .iter()
         .map(|(_ty, idx)| idx)
@@ -1956,13 +1980,7 @@ fn build_kernel_with_writer<'a, W: ArrayWriter<'a>>(
     }
     let next_funcs: HashMap<usize, FunctionValue> = indexes_to_iter
         .iter()
-        .map(|(ty, idx)| {
-            let ih = match ty {
-                KernelInputType::Standard => datum_to_iter(inputs[*idx]).unwrap(),
-                KernelInputType::SetBit => {
-                    array_to_setbit_iter(inputs[*idx].get().0.as_boolean()).unwrap()
-                }
-            };
+        .map(|(_ty, idx)| {
             (
                 *idx,
                 generate_next(
@@ -1970,7 +1988,7 @@ fn build_kernel_with_writer<'a, W: ArrayWriter<'a>>(
                     &llvm_mod,
                     &format!("next{}", idx),
                     inputs[*idx].get().0.data_type(),
-                    &ih,
+                    &ihs[*idx],
                 )
                 .unwrap(),
             )
@@ -1979,13 +1997,7 @@ fn build_kernel_with_writer<'a, W: ArrayWriter<'a>>(
 
     let next_block_funcs: HashMap<usize, Option<FunctionValue>> = indexes_to_iter
         .iter()
-        .map(|(ty, idx)| {
-            let ih = match ty {
-                KernelInputType::Standard => datum_to_iter(inputs[*idx]).unwrap(),
-                KernelInputType::SetBit => {
-                    array_to_setbit_iter(inputs[*idx].get().0.as_boolean()).unwrap()
-                }
-            };
+        .map(|(_ty, idx)| {
             (
                 *idx,
                 generate_next_block::<32>(
@@ -1993,7 +2005,7 @@ fn build_kernel_with_writer<'a, W: ArrayWriter<'a>>(
                     &llvm_mod,
                     &format!("next_block{}", idx),
                     inputs[*idx].get().0.data_type(),
-                    &ih,
+                    &ihs[*idx],
                 ),
             )
         })
@@ -2003,7 +2015,6 @@ fn build_kernel_with_writer<'a, W: ArrayWriter<'a>>(
         .accessed_indexes()
         .iter()
         .map(|idx| {
-            let ih = datum_to_iter(inputs[*idx]).unwrap();
             (
                 *idx,
                 generate_random_access(
@@ -2011,7 +2022,7 @@ fn build_kernel_with_writer<'a, W: ArrayWriter<'a>>(
                     &llvm_mod,
                     &format!("get{}", idx),
                     inputs[*idx].get().0.data_type(),
-                    &ih,
+                    &ihs[*idx],
                 )
                 .unwrap(),
             )
@@ -2028,14 +2039,15 @@ fn build_kernel_with_writer<'a, W: ArrayWriter<'a>>(
         exit
     );
     builder.position_at_end(entry);
-    let iter_ptrs = (0..inputs.len())
-        .map(|i| {
-            func_inner
-                .get_nth_param(i as u32)
-                .unwrap()
-                .into_pointer_value()
-        })
-        .collect_vec();
+    let mut iter_ptrs = Vec::new();
+    for i in 0..inputs.len() {
+        let ptr = func_inner
+            .get_nth_param(i as u32)
+            .unwrap()
+            .into_pointer_value();
+        iter_ptrs.push(ihs[i].localize_struct(ctx, &builder, ptr));
+    }
+
     let out_ptr = func_inner
         .get_nth_param(inputs.len() as u32)
         .unwrap()

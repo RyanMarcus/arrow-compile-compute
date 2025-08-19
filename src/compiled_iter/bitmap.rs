@@ -2,12 +2,12 @@ use arrow_array::{Array, BooleanArray};
 use inkwell::{
     builder::Builder,
     context::Context,
-    values::{IntValue, PointerValue},
+    values::{BasicValue, IntValue, PointerValue},
     AddressSpace,
 };
 use repr_offset::ReprOffset;
 
-use crate::increment_pointer;
+use crate::{increment_pointer, mark_load_invariant};
 
 /// An iterator for bitmap data. Contains a pointer to the bitmap buffer and the
 /// data buffer, along with a `pos` and `len` just like primitive iterators.
@@ -30,14 +30,15 @@ impl BitmapIterator {
         ptr: PointerValue<'a>,
     ) -> PointerValue<'a> {
         let data_ptr_ptr = increment_pointer!(ctx, build, ptr, BitmapIterator::OFFSET_DATA);
-        build
+        let data_ptr = build
             .build_load(
                 ctx.ptr_type(AddressSpace::default()),
                 data_ptr_ptr,
                 "data_ptr",
             )
-            .unwrap()
-            .into_pointer_value()
+            .unwrap();
+        mark_load_invariant!(ctx, data_ptr);
+        data_ptr.into_pointer_value()
     }
 
     pub fn llvm_slice_offset<'a>(
@@ -74,10 +75,9 @@ impl BitmapIterator {
         ptr: PointerValue<'a>,
     ) -> IntValue<'a> {
         let len_ptr = increment_pointer!(ctx, build, ptr, BitmapIterator::OFFSET_LEN);
-        build
-            .build_load(ctx.i64_type(), len_ptr, "len")
-            .unwrap()
-            .into_int_value()
+        let len = build.build_load(ctx.i64_type(), len_ptr, "len").unwrap();
+        mark_load_invariant!(ctx, len);
+        len.into_int_value()
     }
 
     pub fn llvm_increment_pos<'a>(

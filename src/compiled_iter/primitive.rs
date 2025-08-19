@@ -107,6 +107,35 @@ impl PrimitiveIterator {
         let new_pos = builder.build_int_add(pos, amt, "new_pos").unwrap();
         builder.build_store(pos_ptr, new_pos).unwrap();
     }
+
+    pub fn localize_struct<'a, 'b>(
+        &self,
+        ctx: &'a Context,
+        b: &'b Builder<'a>,
+        ptr: PointerValue<'a>,
+    ) -> PointerValue<'a> {
+        let stype = ctx.struct_type(
+            &[
+                ctx.ptr_type(AddressSpace::default()).into(),
+                ctx.i64_type().into(),
+                ctx.i64_type().into(),
+            ],
+            false,
+        );
+        let new_ptr = b.build_alloca(stype, "local_struct").unwrap();
+        b.build_store(new_ptr, self.llvm_data(ctx, b, ptr)).unwrap();
+        b.build_store(
+            increment_pointer!(ctx, b, new_ptr, 8),
+            self.llvm_pos(ctx, b, ptr),
+        )
+        .unwrap();
+        b.build_store(
+            increment_pointer!(ctx, b, new_ptr, 16),
+            self.llvm_len(ctx, b, ptr),
+        )
+        .unwrap();
+        new_ptr
+    }
 }
 
 #[cfg(test)]

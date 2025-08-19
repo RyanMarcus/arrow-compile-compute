@@ -198,6 +198,8 @@ fn generate_llvm_cmp_kernel<'a>(
     declare_blocks!(ctx, cmp, entry, block_cond, block_body, exit);
 
     build.position_at_end(entry);
+    let lhs_ptr = lhs_iter.localize_struct(ctx, &build, lhs_ptr.into_pointer_value());
+    let rhs_ptr = rhs_iter.localize_struct(ctx, &build, rhs_ptr.into_pointer_value());
     let lhs_buf = build.build_alloca(lhs_llvm, "lhs_single_buf").unwrap();
     let rhs_buf = build.build_alloca(rhs_llvm, "rhs_single_buf").unwrap();
     let bool_writer = BooleanWriter::llvm_init(ctx, &module, &build, PrimitiveType::U8, out_ptr);

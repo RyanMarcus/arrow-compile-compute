@@ -47,6 +47,10 @@ impl WriterAllocation for ArrayOutput {
         };
         make_array(ad)
     }
+
+    fn to_array_ref(self, len: usize, nulls: Option<arrow_buffer::NullBuffer>) -> ArrayRef {
+        self.to_array(len, nulls)
+    }
 }
 
 impl ArrayOutput {

@@ -1,6 +1,6 @@
 use std::{ffi::c_void, marker::PhantomData, sync::Arc};
 
-use arrow_array::{cast::AsArray, types::RunEndIndexType, Array, RunArray};
+use arrow_array::{cast::AsArray, types::RunEndIndexType, Array, ArrayRef, RunArray};
 use arrow_data::ArrayDataBuilder;
 use arrow_schema::{DataType, Field};
 use inkwell::{
@@ -60,6 +60,10 @@ impl<'a, K: RunEndIndexType, VW: ArrayWriter<'a>> WriterAllocation for REEAlloca
 
         let array_data = unsafe { builder.build_unchecked() };
         array_data.into()
+    }
+
+    fn to_array_ref(self, len: usize, nulls: Option<arrow_buffer::NullBuffer>) -> ArrayRef {
+        Arc::new(self.to_array(len, nulls))
     }
 }
 

@@ -1,6 +1,6 @@
 use std::ffi::c_void;
 
-use arrow_array::Array;
+use arrow_array::{Array, ArrayRef};
 use arrow_buffer::NullBuffer;
 use inkwell::{
     builder::Builder,
@@ -58,4 +58,5 @@ pub trait WriterAllocation {
     type Output: Array;
     fn get_ptr(&mut self) -> *mut c_void;
     fn to_array(self, len: usize, nulls: Option<NullBuffer>) -> Self::Output;
+    fn to_array_ref(self, len: usize, nulls: Option<NullBuffer>) -> ArrayRef;
 }
