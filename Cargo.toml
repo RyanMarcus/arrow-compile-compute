@@ -15,7 +15,6 @@ half = { version = "2.4", features = ["bytemuck"] }
 enum-as-inner = "0.6.1"
 repr_offset = { version = "0.2.2", features = ["derive"] }
 itertools = "0.13.0"
-cardinality-estimator = "1.0.2"
 bytemuck = { version = "1.23", features = ["extern_crate_alloc"] }
 thiserror = "2.0.12"
 strum = "0.27.2"

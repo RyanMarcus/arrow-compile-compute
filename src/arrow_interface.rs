@@ -345,7 +345,6 @@ pub mod compute {
     use std::sync::LazyLock;
 
     use arrow_array::{Array, Datum, UInt64Array};
-    use cardinality_estimator::CardinalityEstimator;
 
     use crate::{
         compiled_kernels::{HashKernel, KernelCache},
@@ -414,35 +413,6 @@ pub mod compute {
         }
 
         Ok(max_run + 1)
-    }
-
-    /// Compute an approximation of the percentage of values that are distinct.
-    /// Runs in constant time.
-    ///
-    /// # Example
-    ///
-    /// ```
-    /// use arrow_array::{Int32Array, Datum, UInt64Array};
-    /// use arrow_compile_compute::compute::approx_perc_distinct;
-    /// let arr = Int32Array::from(vec![10, 20, 20, 20, 30, 10, 10, 1, 2, 3]);
-    /// let pdist = approx_perc_distinct(&arr).unwrap();
-    /// assert!(pdist > 0.5 && pdist < 0.7);
-    /// ```
-    pub fn approx_perc_distinct(data: &dyn Array) -> Result<f32, ArrowKernelError> {
-        if data.len() <= 1 {
-            return Ok(1.0);
-        }
-
-        let data = if data.len() > 8192 {
-            data.slice(0, 8192)
-        } else {
-            data.slice(0, data.len())
-        };
-
-        let hashed = hash(&data)?;
-        let mut ce = CardinalityEstimator::<u64>::new();
-        hashed.iter().flatten().for_each(|x| ce.insert_hash(x));
-        Ok(ce.estimate() as f32 / data.len() as f32)
     }
 }
 
