@@ -1,7 +1,10 @@
 use std::sync::Arc;
 
 use arrow_array::{ArrayRef, Float64Array, Int64Array, UInt64Array};
-use inkwell::{context::Context, module::Module, types::BasicType, values::BasicValue};
+use inkwell::{
+    context::Context, module::Module, types::BasicType, values::BasicValue, AtomicOrdering,
+    AtomicRMWBinOp,
+};
 
 use crate::{compiled_kernels::aggregate::Aggregation, increment_pointer, PrimitiveType};
 
@@ -123,6 +126,39 @@ impl Aggregation for SumAgg {
         };
         b.build_store(agg_ptr, new_sum).unwrap();
     }
+
+    fn llvm_agg_one_atomic<'a>(
+        &self,
+        ctx: &'a Context,
+        _llvm_mod: &Module<'a>,
+        b: &inkwell::builder::Builder<'a>,
+        alloc_ptr: inkwell::values::PointerValue<'a>,
+        ticket: inkwell::values::IntValue<'a>,
+        value: inkwell::values::BasicValueEnum<'a>,
+    ) -> bool {
+        if !self.pt.is_int() {
+            // TODO incl floats once inkwell adds support
+            return false;
+        }
+
+        let agg_ptr = increment_pointer!(ctx, b, alloc_ptr, 8, ticket);
+        let value = if self.pt.is_signed() {
+            b.build_int_s_extend_or_bit_cast(value.into_int_value(), ctx.i64_type(), "value")
+                .unwrap()
+        } else {
+            b.build_int_z_extend_or_bit_cast(value.into_int_value(), ctx.i64_type(), "value")
+                .unwrap()
+        };
+        b.build_atomicrmw(
+            AtomicRMWBinOp::Add,
+            agg_ptr,
+            value,
+            AtomicOrdering::Monotonic,
+        )
+        .unwrap();
+
+        true
+    }
 }
 
 #[cfg(test)]
@@ -155,7 +191,9 @@ mod tests {
         let llvm_mod = ctx.create_module("sum_agg");
         let mut ih = datum_to_iter(&data).unwrap();
         let next_func = generate_next(&ctx, &llvm_mod, "next", &DataType::Int32, &ih).unwrap();
-        let func = agg.llvm_agg_func(&ctx, &llvm_mod, next_func);
+        let func = agg
+            .llvm_agg_func(&ctx, &llvm_mod, next_func, false)
+            .unwrap();
 
         llvm_mod.verify().unwrap();
         let ee = llvm_mod

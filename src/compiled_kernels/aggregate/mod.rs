@@ -1,7 +1,7 @@
 use std::{
-    collections::HashMap,
+    cell::UnsafeCell,
     ffi::c_void,
-    sync::{LazyLock, RwLock},
+    sync::{LazyLock, Mutex},
 };
 
 use arrow_array::Array;
@@ -19,8 +19,10 @@ use ouroboros::self_referencing;
 
 use crate::{
     compiled_iter::{datum_to_iter, generate_next},
-    compiled_kernels::{aggregate::minmax::MinMaxAgg, link_req_helpers, optimize_module},
-    declare_blocks, increment_pointer, PrimitiveType,
+    compiled_kernels::{
+        aggregate::minmax::MinMaxAgg, link_req_helpers, optimize_module, KernelCache,
+    },
+    declare_blocks, increment_pointer, ArrowKernelError, Kernel, PrimitiveType,
 };
 
 mod count;
@@ -59,9 +61,35 @@ pub enum AggType {
 
 pub trait AggAlloc {
     fn get_mut_ptr(&mut self) -> *mut c_void;
+
+    /// Ensure that the allocator is ready to get a ticket up to `capacity`.
+    /// Only call this function when you know that such a ticket will be ingested.
     fn ensure_capacity(&mut self, capacity: usize);
+
+    /// The current maximum ticket value that can be aggregated
     fn current_capacity(&self) -> usize;
+
+    /// Preallocate -- but do not create slots for -- an expected number of
+    /// unique values.
     fn preallocate_capacity(&mut self, expected_unique: usize);
+}
+
+impl<T: Copy + Default> AggAlloc for Vec<T> {
+    fn get_mut_ptr(&mut self) -> *mut c_void {
+        self.as_mut_ptr() as *mut c_void
+    }
+
+    fn ensure_capacity(&mut self, capacity: usize) {
+        self.resize_with(capacity, Default::default);
+    }
+
+    fn preallocate_capacity(&mut self, expected_unique: usize) {
+        self.reserve(expected_unique);
+    }
+
+    fn current_capacity(&self) -> usize {
+        self.len()
+    }
 }
 
 pub trait Aggregation {
@@ -135,7 +163,8 @@ pub trait Aggregation {
         ctx: &'a Context,
         llvm_mod: &Module<'a>,
         next_func: FunctionValue<'a>,
-    ) -> FunctionValue<'a> {
+        atomic: bool,
+    ) -> Option<FunctionValue<'a>> {
         let ptr_type = ctx.ptr_type(AddressSpace::default());
         let i64_type = ctx.i64_type();
         let fn_type = ctx
@@ -178,14 +207,21 @@ pub trait Aggregation {
         let value = b
             .build_load(self.ptype().llvm_type(ctx), buf_ptr, "value")
             .unwrap();
-        self.llvm_agg_one(ctx, llvm_mod, &b, agg_ptr, ticket, value);
+
+        if atomic {
+            if !self.llvm_agg_one_atomic(ctx, llvm_mod, &b, agg_ptr, ticket, value) {
+                return None;
+            }
+        } else {
+            self.llvm_agg_one(ctx, llvm_mod, &b, agg_ptr, ticket, value);
+        }
         let new_ticket_ptr = increment_pointer!(ctx, b, ticket_ptr, 8);
         b.build_store(ticket_ptr_ptr, new_ticket_ptr).unwrap();
         b.build_unconditional_branch(loop_cond).unwrap();
 
         b.position_at_end(exit);
         b.build_return(None).unwrap();
-        func
+        Some(func)
     }
 
     fn llvm_agg_one<'a>(
@@ -197,25 +233,21 @@ pub trait Aggregation {
         ticket: IntValue<'a>,
         value: BasicValueEnum<'a>,
     );
+
+    /// Returns true if supported, false otherwise.
+    fn llvm_agg_one_atomic<'a>(
+        &self,
+        _ctx: &'a Context,
+        _llvm_mod: &Module<'a>,
+        _b: &Builder<'a>,
+        _alloc_ptr: PointerValue<'a>,
+        _ticket: IntValue<'a>,
+        _value: BasicValueEnum<'a>,
+    ) -> bool {
+        false
+    }
+
     fn finalize(&self, alloc: Self::Allocation) -> Self::Output;
-}
-
-impl<T: Copy + Default> AggAlloc for Vec<T> {
-    fn get_mut_ptr(&mut self) -> *mut c_void {
-        self.as_mut_ptr() as *mut c_void
-    }
-
-    fn ensure_capacity(&mut self, capacity: usize) {
-        self.resize_with(capacity, Default::default);
-    }
-
-    fn preallocate_capacity(&mut self, expected_unique: usize) {
-        self.reserve(expected_unique);
-    }
-
-    fn current_capacity(&self) -> usize {
-        self.len()
-    }
 }
 
 #[self_referencing]
@@ -229,15 +261,69 @@ struct GroupedAggFunc {
 unsafe impl Send for GroupedAggFunc {}
 unsafe impl Sync for GroupedAggFunc {}
 
-fn compile_grouped_agg_func<A: Aggregation>(agg: &A, inp: &dyn Array) -> GroupedAggFunc {
-    GroupedAggFuncBuilder {
+impl Kernel for GroupedAggFunc {
+    type Key = (Vec<DataType>, AggType, bool);
+
+    type Input<'a> = (&'a [&'a dyn Array], &'a [u64], *mut c_void);
+
+    type Params = (AggType, bool);
+
+    type Output = ();
+
+    fn call(&self, inp: Self::Input<'_>) -> Result<Self::Output, super::ArrowKernelError> {
+        let (data, tickets, alloc_ptr) = inp;
+        let mut ih = datum_to_iter(&data[0]).unwrap();
+
+        unsafe {
+            self.borrow_func().call(
+                alloc_ptr,
+                tickets.as_ptr() as *const c_void,
+                ih.get_mut_ptr(),
+            )
+        };
+
+        Ok(())
+    }
+
+    fn compile(
+        inp: &Self::Input<'_>,
+        params: Self::Params,
+    ) -> Result<Self, super::ArrowKernelError> {
+        let (data, _tickets, _alloc_ptr) = inp;
+        let (agg_type, atomic) = params;
+        match agg_type {
+            AggType::Count => compile_grouped_agg_func::<CountAgg>(data[0], atomic),
+            AggType::Sum => compile_grouped_agg_func::<SumAgg>(data[0], atomic),
+            AggType::Min => compile_grouped_agg_func::<MinMaxAgg<true>>(data[0], atomic),
+            AggType::Max => compile_grouped_agg_func::<MinMaxAgg<false>>(data[0], atomic),
+        }
+    }
+
+    fn get_key_for_input(
+        i: &Self::Input<'_>,
+        p: &Self::Params,
+    ) -> Result<Self::Key, super::ArrowKernelError> {
+        let dts = i.0.iter().map(|arr| arr.data_type().clone()).collect_vec();
+        Ok((dts, p.0, p.1))
+    }
+}
+
+fn compile_grouped_agg_func<A: Aggregation>(
+    inp: &dyn Array,
+    atomic: bool,
+) -> Result<GroupedAggFunc, ArrowKernelError> {
+    let dts = vec![PrimitiveType::for_arrow_type(inp.data_type())];
+    let agg = A::new(&dts);
+    GroupedAggFuncTryBuilder {
         ctx: Context::create(),
         func_builder: |ctx| {
             let llvm_mod = ctx.create_module("grouped_agg_func");
             let ih = datum_to_iter(&inp).unwrap();
             let next_func =
                 generate_next(ctx, &llvm_mod, "agg_next", inp.data_type(), &ih).unwrap();
-            let func = agg.llvm_agg_func(ctx, &llvm_mod, next_func);
+            let func = agg
+                .llvm_agg_func(ctx, &llvm_mod, next_func, atomic)
+                .ok_or(ArrowKernelError::AtomicAggNotSupported)?;
 
             llvm_mod.verify().unwrap();
             optimize_module(&llvm_mod).unwrap();
@@ -253,10 +339,10 @@ fn compile_grouped_agg_func<A: Aggregation>(agg: &A, inp: &dyn Array) -> Grouped
                 .unwrap()
             };
 
-            agg_func
+            Ok(agg_func)
         },
     }
-    .build()
+    .try_build()
 }
 
 #[self_referencing]
@@ -270,7 +356,49 @@ struct UngroupedAggFunc {
 unsafe impl Send for UngroupedAggFunc {}
 unsafe impl Sync for UngroupedAggFunc {}
 
-fn compile_ungrouped_agg_func<A: Aggregation>(agg: &A, inp: &dyn Array) -> UngroupedAggFunc {
+impl Kernel for UngroupedAggFunc {
+    type Key = (Vec<DataType>, AggType);
+
+    type Input<'a> = (&'a [&'a dyn Array], *mut c_void);
+
+    type Params = AggType;
+
+    type Output = ();
+
+    fn call(&self, inp: Self::Input<'_>) -> Result<Self::Output, super::ArrowKernelError> {
+        let (data, alloc_ptr) = inp;
+        let mut ih = datum_to_iter(&data[0]).unwrap();
+
+        unsafe { self.borrow_func().call(alloc_ptr, ih.get_mut_ptr()) };
+
+        Ok(())
+    }
+
+    fn compile(
+        inp: &Self::Input<'_>,
+        params: Self::Params,
+    ) -> Result<Self, super::ArrowKernelError> {
+        let (data, _alloc_ptr) = inp;
+        Ok(match params {
+            AggType::Count => compile_ungrouped_agg_func::<CountAgg>(data[0]),
+            AggType::Sum => compile_ungrouped_agg_func::<SumAgg>(data[0]),
+            AggType::Min => compile_ungrouped_agg_func::<MinMaxAgg<true>>(data[0]),
+            AggType::Max => compile_ungrouped_agg_func::<MinMaxAgg<false>>(data[0]),
+        })
+    }
+
+    fn get_key_for_input(
+        i: &Self::Input<'_>,
+        p: &Self::Params,
+    ) -> Result<Self::Key, super::ArrowKernelError> {
+        let dts = i.0.iter().map(|arr| arr.data_type().clone()).collect_vec();
+        Ok((dts, *p))
+    }
+}
+
+fn compile_ungrouped_agg_func<A: Aggregation>(inp: &dyn Array) -> UngroupedAggFunc {
+    let dts = vec![PrimitiveType::for_arrow_type(inp.data_type())];
+    let agg = A::new(&dts);
     UngroupedAggFuncBuilder {
         ctx: Context::create(),
         func_builder: |ctx| {
@@ -300,15 +428,16 @@ fn compile_ungrouped_agg_func<A: Aggregation>(agg: &A, inp: &dyn Array) -> Ungro
     .build()
 }
 
-static GROUPED_AGG_CACHE: LazyLock<RwLock<HashMap<(DataType, AggType), GroupedAggFunc>>> =
-    LazyLock::new(|| RwLock::new(HashMap::new()));
+static GROUPED_AGG_CACHE: LazyLock<KernelCache<GroupedAggFunc>> =
+    LazyLock::new(|| KernelCache::new());
 
-static UNGROUPED_AGG_CACHE: LazyLock<RwLock<HashMap<(DataType, AggType), UngroupedAggFunc>>> =
-    LazyLock::new(|| RwLock::new(HashMap::new()));
+static UNGROUPED_AGG_CACHE: LazyLock<KernelCache<UngroupedAggFunc>> =
+    LazyLock::new(|| KernelCache::new());
 
 pub struct Aggregator<A: Aggregation> {
     agg: A,
-    alloc: A::Allocation,
+    alloc: UnsafeCell<A::Allocation>,
+    resize_lock: Mutex<()>,
 }
 
 impl<A: Aggregation> Aggregator<A> {
@@ -318,9 +447,13 @@ impl<A: Aggregation> Aggregator<A> {
             .map(|dt| PrimitiveType::for_arrow_type(dt))
             .collect_vec();
         let agg = A::new(&pts);
-        let mut alloc = agg.allocate(1);
+        let mut alloc = agg.allocate(0);
         alloc.preallocate_capacity(expected_unique);
-        Self { agg, alloc }
+        Self {
+            agg,
+            alloc: UnsafeCell::new(alloc),
+            resize_lock: Mutex::new(()),
+        }
     }
 
     /// Ingests new *ungrouped* data into the aggregator. This is equivalent to
@@ -330,30 +463,12 @@ impl<A: Aggregation> Aggregator<A> {
         if data.is_empty() {
             return;
         }
-        self.alloc.ensure_capacity(1);
-
-        let cache_key = (data.data_type().clone(), A::agg_type());
-        let mut ih = datum_to_iter(&data).unwrap();
-        {
-            let hm = UNGROUPED_AGG_CACHE.read().unwrap();
-            if let Some(func) = hm.get(&cache_key) {
-                unsafe {
-                    func.borrow_func()
-                        .call(self.alloc.get_mut_ptr(), ih.get_mut_ptr());
-                }
-                return;
-            }
+        if self.alloc.get_mut().current_capacity() < 1 {
+            self.alloc.get_mut().ensure_capacity(1);
         }
-
-        // same logic as KernelCache
-        let func = compile_ungrouped_agg_func(&self.agg, data);
-        unsafe {
-            func.borrow_func()
-                .call(self.alloc.get_mut_ptr(), ih.get_mut_ptr());
-        }
-
-        let mut hm = UNGROUPED_AGG_CACHE.write().unwrap();
-        hm.entry(cache_key).or_insert(func);
+        UNGROUPED_AGG_CACHE
+            .get((&[data], self.alloc.get_mut().get_mut_ptr()), A::agg_type())
+            .unwrap();
     }
 
     /// Ingests new data into the aggregator. The `tickets` slice should be the
@@ -368,53 +483,65 @@ impl<A: Aggregation> Aggregator<A> {
         if tickets.is_empty() {
             return;
         }
-        let max_ticket = tickets.iter().copied().max().unwrap_or(0) + 1;
-        self.alloc.ensure_capacity(max_ticket as usize);
-
-        let mut ih = datum_to_iter(&data).unwrap();
-
-        let cache_key = (data.data_type().clone(), A::agg_type());
-        {
-            let hm = GROUPED_AGG_CACHE.read().unwrap();
-            if let Some(func) = hm.get(&cache_key) {
-                unsafe {
-                    func.borrow_func().call(
-                        self.alloc.get_mut_ptr(),
-                        tickets.as_ptr() as *const c_void,
-                        ih.get_mut_ptr(),
-                    );
-                }
-                return;
-            }
-        }
-
-        // same logic as KernelCache
-        let func = compile_grouped_agg_func(&self.agg, data);
-        unsafe {
-            func.borrow_func().call(
-                self.alloc.get_mut_ptr(),
-                tickets.as_ptr() as *const c_void,
-                ih.get_mut_ptr(),
-            );
-        }
-
-        let mut hm = GROUPED_AGG_CACHE.write().unwrap();
-        hm.entry(cache_key).or_insert(func);
+        let max_ticket = tickets.iter().copied().max().unwrap_or(0) as usize + 1;
+        self.alloc.get_mut().ensure_capacity(max_ticket);
+        GROUPED_AGG_CACHE
+            .get(
+                (&[data], tickets, self.alloc.get_mut().get_mut_ptr()),
+                (A::agg_type(), false),
+            )
+            .unwrap();
     }
 
-    pub fn merge(self, other: Self) -> Self {
-        if self.alloc.current_capacity() < other.alloc.current_capacity() {
+    /// Ingests new data into the aggregator atomically, if possible. The
+    /// `tickets` slice should be the group IDs of the corresponding elements in
+    /// `data`.
+    ///
+    /// Note that the return value may be `Ok` for an empty array even if that
+    /// data type cannot be aggregated atomically.
+    pub fn ingest_grouped_atomic(
+        &self,
+        tickets: &[u64],
+        data: &dyn Array,
+    ) -> Result<(), ArrowKernelError> {
+        assert!(!data.is_nullable(), "can only aggregate non-nullable data");
+        assert_eq!(
+            tickets.len(),
+            data.len(),
+            "tickets and data must have the same length"
+        );
+        if tickets.is_empty() {
+            return Ok(());
+        }
+        let max_ticket = tickets.iter().copied().max().unwrap_or(0) as usize + 1;
+        let alloc = unsafe { &mut *self.alloc.get() };
+        if alloc.current_capacity() <= max_ticket {
+            let lock = self.resize_lock.lock().unwrap();
+            alloc.ensure_capacity(max_ticket);
+            std::mem::drop(lock);
+        }
+        GROUPED_AGG_CACHE.get(
+            (&[data], tickets, alloc.get_mut_ptr()),
+            (A::agg_type(), true),
+        )
+    }
+
+    pub fn merge(mut self, mut other: Self) -> Self {
+        if self.alloc.get_mut().current_capacity() < other.alloc.get_mut().current_capacity() {
             return other.merge(self);
         }
-        let alloc = self.agg.merge_allocs(self.alloc, other.alloc);
+        let alloc = self
+            .agg
+            .merge_allocs(self.alloc.into_inner(), other.alloc.into_inner());
         Self {
             agg: self.agg,
-            alloc,
+            alloc: UnsafeCell::new(alloc),
+            resize_lock: self.resize_lock,
         }
     }
 
     pub fn finish(self) -> A::Output {
-        self.agg.finalize(self.alloc)
+        self.agg.finalize(self.alloc.into_inner())
     }
 }
 
@@ -461,6 +588,30 @@ mod tests {
     }
 
     #[test]
+    fn test_count_empty() {
+        let agg = CountAggregator::new(&[], 1024);
+        let res = agg.finish().values().iter().copied().collect_vec();
+        assert_eq!(res, vec![]);
+    }
+
+    #[test]
+    fn test_count_aggregator_atomic() {
+        let agg = CountAggregator::new(&[], 1024);
+        agg.ingest_grouped_atomic(
+            &[0, 1, 0, 1, 0, 1],
+            &Int32Array::from(vec![1, 2, 3, 4, 5, 6]),
+        )
+        .unwrap();
+        agg.ingest_grouped_atomic(
+            &[0, 1, 0, 1, 0, 1],
+            &Int32Array::from(vec![1, 2, 3, 4, 5, 6]),
+        )
+        .unwrap();
+        let res = agg.finish().values().iter().copied().collect_vec();
+        assert_eq!(res, vec![6, 6]);
+    }
+
+    #[test]
     fn test_count_merge_aggregator() {
         let mut agg1 = CountAggregator::new(&[], 1024);
         agg1.ingest_grouped(
@@ -488,6 +639,29 @@ mod tests {
             &[0, 1, 0, 1, 0, 1],
             &Int32Array::from(vec![1, 2, 3, 4, 5, 6]),
         );
+        let res = agg.finish();
+        let res = res
+            .as_primitive::<Int64Type>()
+            .values()
+            .iter()
+            .copied()
+            .collect_vec();
+        assert_eq!(res, vec![18, 24]);
+    }
+
+    #[test]
+    fn test_sum_aggregator_atomic() {
+        let agg = SumAggregator::new(&[&DataType::Int32], 1024);
+        agg.ingest_grouped_atomic(
+            &[0, 1, 0, 1, 0, 1],
+            &Int32Array::from(vec![1, 2, 3, 4, 5, 6]),
+        )
+        .unwrap();
+        agg.ingest_grouped_atomic(
+            &[0, 1, 0, 1, 0, 1],
+            &Int32Array::from(vec![1, 2, 3, 4, 5, 6]),
+        )
+        .unwrap();
         let res = agg.finish();
         let res = res
             .as_primitive::<Int64Type>()

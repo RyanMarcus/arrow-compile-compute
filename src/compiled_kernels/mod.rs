@@ -74,6 +74,9 @@ pub enum ArrowKernelError {
     #[error("Type mismatch: expected {0:?}, got {1:?}")]
     TypeMismatch(PrimitiveType, PrimitiveType),
 
+    #[error("Atomic aggregation not supported")]
+    AtomicAggNotSupported,
+
     #[error("dsl error")]
     DSLError(#[from] DSLError),
 }

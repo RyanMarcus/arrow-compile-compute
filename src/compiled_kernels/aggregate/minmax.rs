@@ -67,10 +67,8 @@ impl AggAlloc for MinMaxAlloc {
                     if items.capacity() < capacity {
                         items.reserve(capacity - items.len());
                     }
-                    unsafe {
-                        let start = items.as_mut_ptr().add(items.len());
-                        std::ptr::write_bytes(start, 0, capacity - items.len());
-                        items.set_len(capacity);
+                    while items.len() < capacity {
+                        items.push(Default::default());
                     }
                 }
             }
@@ -79,10 +77,8 @@ impl AggAlloc for MinMaxAlloc {
                     if items.capacity() < capacity {
                         items.reserve(capacity - items.len());
                     }
-                    unsafe {
-                        let start = items.as_mut_ptr().add(items.len());
-                        std::ptr::write_bytes(start, 0, capacity - items.len());
-                        items.set_len(capacity);
+                    while items.len() < capacity {
+                        items.push(Default::default());
                     }
                 }
             }
@@ -91,10 +87,8 @@ impl AggAlloc for MinMaxAlloc {
                     if items.capacity() < capacity {
                         items.reserve(capacity - items.len());
                     }
-                    unsafe {
-                        let start = items.as_mut_ptr().add(items.len());
-                        std::ptr::write_bytes(start, 0, capacity - items.len());
-                        items.set_len(capacity);
+                    while items.len() < capacity {
+                        items.push(Default::default());
                     }
                 }
             }
@@ -103,10 +97,8 @@ impl AggAlloc for MinMaxAlloc {
                     if items.capacity() < capacity {
                         items.reserve(capacity - items.len());
                     }
-                    unsafe {
-                        let start = items.as_mut_ptr().add(items.len());
-                        std::ptr::write_bytes(start, 0, capacity - items.len());
-                        items.set_len(capacity);
+                    while items.len() < capacity {
+                        items.push(Default::default());
                     }
                 }
             }
@@ -710,7 +702,9 @@ mod tests {
         let llvm_mod = ctx.create_module("min_str_agg");
         let mut ih = datum_to_iter(&data).unwrap();
         let next_func = generate_next(&ctx, &llvm_mod, "next", &DataType::Utf8, &ih).unwrap();
-        let func = agg.llvm_agg_func(&ctx, &llvm_mod, next_func);
+        let func = agg
+            .llvm_agg_func(&ctx, &llvm_mod, next_func, false)
+            .unwrap();
 
         llvm_mod.verify().unwrap();
         let ee = llvm_mod

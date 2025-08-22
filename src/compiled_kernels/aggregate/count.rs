@@ -1,5 +1,5 @@
 use arrow_array::UInt64Array;
-use inkwell::{context::Context, module::Module};
+use inkwell::{context::Context, module::Module, AtomicOrdering, AtomicRMWBinOp};
 
 use crate::{
     compiled_kernels::aggregate::{AggType, Aggregation},
@@ -53,7 +53,7 @@ impl Aggregation for CountAgg {
         _value: inkwell::values::BasicValueEnum<'a>,
     ) {
         let i64_type = ctx.i64_type();
-        let one = ctx.i64_type().const_int(1, false);
+        let one = i64_type.const_int(1, false);
         let agg_ptr = increment_pointer!(ctx, b, alloc_ptr, 8, ticket);
 
         let curr_count = b
@@ -62,6 +62,22 @@ impl Aggregation for CountAgg {
             .into_int_value();
         let new_count = b.build_int_add(curr_count, one, "new_count").unwrap();
         b.build_store(agg_ptr, new_count).unwrap();
+    }
+
+    fn llvm_agg_one_atomic<'a>(
+        &self,
+        ctx: &'a Context,
+        _llvm_mod: &Module<'a>,
+        b: &inkwell::builder::Builder<'a>,
+        alloc_ptr: inkwell::values::PointerValue<'a>,
+        ticket: inkwell::values::IntValue<'a>,
+        _value: inkwell::values::BasicValueEnum<'a>,
+    ) -> bool {
+        let one = ctx.i64_type().const_int(1, false);
+        let agg_ptr = increment_pointer!(ctx, b, alloc_ptr, 8, ticket);
+        b.build_atomicrmw(AtomicRMWBinOp::Add, agg_ptr, one, AtomicOrdering::Monotonic)
+            .unwrap();
+        true
     }
 }
 
@@ -94,7 +110,9 @@ mod tests {
         let llvm_mod = ctx.create_module("count_agg");
         let mut ih = datum_to_iter(&data).unwrap();
         let next_func = generate_next(&ctx, &llvm_mod, "next", &DataType::Int32, &ih).unwrap();
-        let func = agg.llvm_agg_func(&ctx, &llvm_mod, next_func);
+        let func = agg
+            .llvm_agg_func(&ctx, &llvm_mod, next_func, false)
+            .unwrap();
 
         llvm_mod.verify().unwrap();
         let ee = llvm_mod
