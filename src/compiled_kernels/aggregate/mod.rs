@@ -1,7 +1,6 @@
 use std::{
-    cell::UnsafeCell,
     ffi::c_void,
-    sync::{LazyLock, Mutex},
+    sync::{LazyLock, RwLock},
 };
 
 use arrow_array::Array;
@@ -60,7 +59,10 @@ pub enum AggType {
 }
 
 pub trait AggAlloc {
-    fn get_mut_ptr(&mut self) -> *mut c_void;
+    fn get_ptr(&self) -> *const c_void;
+    fn get_mut_ptr(&mut self) -> *mut c_void {
+        self.get_ptr() as *mut c_void
+    }
 
     /// Ensure that the allocator is ready to get a ticket up to `capacity`.
     /// Only call this function when you know that such a ticket will be ingested.
@@ -75,8 +77,8 @@ pub trait AggAlloc {
 }
 
 impl<T: Copy + Default> AggAlloc for Vec<T> {
-    fn get_mut_ptr(&mut self) -> *mut c_void {
-        self.as_mut_ptr() as *mut c_void
+    fn get_ptr(&self) -> *const c_void {
+        self.as_ptr() as *const c_void
     }
 
     fn ensure_capacity(&mut self, capacity: usize) {
@@ -436,8 +438,7 @@ static UNGROUPED_AGG_CACHE: LazyLock<KernelCache<UngroupedAggFunc>> =
 
 pub struct Aggregator<A: Aggregation> {
     agg: A,
-    alloc: UnsafeCell<A::Allocation>,
-    resize_lock: Mutex<()>,
+    alloc: RwLock<A::Allocation>,
 }
 
 impl<A: Aggregation> Aggregator<A> {
@@ -451,8 +452,7 @@ impl<A: Aggregation> Aggregator<A> {
         alloc.preallocate_capacity(expected_unique);
         Self {
             agg,
-            alloc: UnsafeCell::new(alloc),
-            resize_lock: Mutex::new(()),
+            alloc: RwLock::new(alloc),
         }
     }
 
@@ -463,11 +463,14 @@ impl<A: Aggregation> Aggregator<A> {
         if data.is_empty() {
             return;
         }
-        if self.alloc.get_mut().current_capacity() < 1 {
-            self.alloc.get_mut().ensure_capacity(1);
+        if self.alloc.get_mut().unwrap().current_capacity() < 1 {
+            self.alloc.get_mut().unwrap().ensure_capacity(1);
         }
         UNGROUPED_AGG_CACHE
-            .get((&[data], self.alloc.get_mut().get_mut_ptr()), A::agg_type())
+            .get(
+                (&[data], self.alloc.get_mut().unwrap().get_mut_ptr()),
+                A::agg_type(),
+            )
             .unwrap();
     }
 
@@ -484,10 +487,14 @@ impl<A: Aggregation> Aggregator<A> {
             return;
         }
         let max_ticket = tickets.iter().copied().max().unwrap_or(0) as usize + 1;
-        self.alloc.get_mut().ensure_capacity(max_ticket);
+        self.alloc.get_mut().unwrap().ensure_capacity(max_ticket);
         GROUPED_AGG_CACHE
             .get(
-                (&[data], tickets, self.alloc.get_mut().get_mut_ptr()),
+                (
+                    &[data],
+                    tickets,
+                    self.alloc.get_mut().unwrap().get_mut_ptr(),
+                ),
                 (A::agg_type(), false),
             )
             .unwrap();
@@ -514,34 +521,41 @@ impl<A: Aggregation> Aggregator<A> {
             return Ok(());
         }
         let max_ticket = tickets.iter().copied().max().unwrap_or(0) as usize + 1;
-        let alloc = unsafe { &mut *self.alloc.get() };
-        if alloc.current_capacity() <= max_ticket {
-            let lock = self.resize_lock.lock().unwrap();
+        let alloc = self.alloc.read().unwrap();
+        let alloc = if alloc.current_capacity() <= max_ticket {
+            std::mem::drop(alloc);
+            let mut alloc = self.alloc.write().unwrap();
             alloc.ensure_capacity(max_ticket);
-            std::mem::drop(lock);
-        }
+            std::mem::drop(alloc);
+            self.alloc.read().unwrap()
+        } else {
+            alloc
+        };
+
         GROUPED_AGG_CACHE.get(
-            (&[data], tickets, alloc.get_mut_ptr()),
+            (&[data], tickets, alloc.get_ptr() as *mut c_void),
             (A::agg_type(), true),
         )
     }
 
     pub fn merge(mut self, mut other: Self) -> Self {
-        if self.alloc.get_mut().current_capacity() < other.alloc.get_mut().current_capacity() {
+        if self.alloc.get_mut().unwrap().current_capacity()
+            < other.alloc.get_mut().unwrap().current_capacity()
+        {
             return other.merge(self);
         }
-        let alloc = self
-            .agg
-            .merge_allocs(self.alloc.into_inner(), other.alloc.into_inner());
+        let alloc = self.agg.merge_allocs(
+            self.alloc.into_inner().unwrap(),
+            other.alloc.into_inner().unwrap(),
+        );
         Self {
             agg: self.agg,
-            alloc: UnsafeCell::new(alloc),
-            resize_lock: self.resize_lock,
+            alloc: RwLock::new(alloc),
         }
     }
 
     pub fn finish(self) -> A::Output {
-        self.agg.finalize(self.alloc.into_inner())
+        self.agg.finalize(self.alloc.into_inner().unwrap())
     }
 }
 

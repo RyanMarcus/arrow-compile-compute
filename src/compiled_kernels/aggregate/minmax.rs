@@ -50,13 +50,13 @@ pub enum MinMaxAlloc {
 }
 
 impl AggAlloc for MinMaxAlloc {
-    fn get_mut_ptr(&mut self) -> *mut c_void {
+    fn get_ptr(&self) -> *const c_void {
         match self {
-            MinMaxAlloc::W8(items) => items.as_mut_ptr() as *mut c_void,
-            MinMaxAlloc::W16(items) => items.as_mut_ptr() as *mut c_void,
-            MinMaxAlloc::W32(items) => items.as_mut_ptr() as *mut c_void,
-            MinMaxAlloc::W64(items) => items.as_mut_ptr() as *mut c_void,
-            MinMaxAlloc::W128(b, _, _) => b as *mut StringAlloc as *mut c_void,
+            MinMaxAlloc::W8(items) => items.as_ptr() as *const c_void,
+            MinMaxAlloc::W16(items) => items.as_ptr() as *const c_void,
+            MinMaxAlloc::W32(items) => items.as_ptr() as *const c_void,
+            MinMaxAlloc::W64(items) => items.as_ptr() as *const c_void,
+            MinMaxAlloc::W128(b, _, _) => b as *const StringAlloc as *const c_void,
         }
     }
 
