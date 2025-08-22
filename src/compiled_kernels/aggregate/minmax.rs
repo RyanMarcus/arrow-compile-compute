@@ -40,6 +40,7 @@ pub struct StringAlloc {
     saver_ptr: *mut StringSaver,
 }
 unsafe impl Send for StringAlloc {}
+unsafe impl Sync for StringAlloc {}
 
 pub enum MinMaxAlloc {
     W8(Vec<COption<u8>>),
