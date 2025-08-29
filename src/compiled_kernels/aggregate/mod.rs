@@ -732,6 +732,29 @@ mod tests {
     }
 
     #[test]
+    fn test_min_aggregator_atomic() {
+        let agg = MinAggregator::new(&[&DataType::Int32], 1024);
+        agg.ingest_grouped_atomic(
+            &[0, 1, 0, 1, 0, 1],
+            &Int32Array::from(vec![1, -2, 3, 4, 5, 6]),
+        )
+        .unwrap();
+        agg.ingest_grouped_atomic(
+            &[0, 1, 0, 1, 0, 1],
+            &Int32Array::from(vec![0, 2, 3000, 4, 50, 60]),
+        )
+        .unwrap();
+        let res = agg.finish();
+        let res = res
+            .as_primitive::<Int32Type>()
+            .values()
+            .iter()
+            .copied()
+            .collect_vec();
+        assert_eq!(res, vec![0, -2]);
+    }
+
+    #[test]
     fn test_min_merge_aggregator() {
         let mut agg1 = MinAggregator::new(&[&DataType::Int32], 1024);
         agg1.ingest_grouped(
@@ -765,6 +788,29 @@ mod tests {
             &[0, 1, 0, 1, 0, 1],
             &Int32Array::from(vec![0, 2, 3000, 4, 50, 60]),
         );
+        let res = agg.finish();
+        let res = res
+            .as_primitive::<Int32Type>()
+            .values()
+            .iter()
+            .copied()
+            .collect_vec();
+        assert_eq!(res, vec![3000, 60]);
+    }
+
+    #[test]
+    fn test_max_aggregator_atomic() {
+        let agg = MaxAggregator::new(&[&DataType::Int32], 1024);
+        agg.ingest_grouped_atomic(
+            &[0, 1, 0, 1, 0, 1],
+            &Int32Array::from(vec![1, -2, 3, 4, 5, 6]),
+        )
+        .unwrap();
+        agg.ingest_grouped_atomic(
+            &[0, 1, 0, 1, 0, 1],
+            &Int32Array::from(vec![0, 2, 3000, 4, 50, 60]),
+        )
+        .unwrap();
         let res = agg.finish();
         let res = res
             .as_primitive::<Int32Type>()

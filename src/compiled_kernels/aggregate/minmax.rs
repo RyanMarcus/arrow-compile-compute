@@ -4,13 +4,12 @@ use arrow_array::{
     builder::BinaryViewBuilder, make_array, ArrayRef, UInt16Array, UInt32Array, UInt64Array,
     UInt8Array,
 };
-use arrow_schema::DataType;
 use bytemuck::{Pod, Zeroable};
 use inkwell::{
     context::Context,
     module::{Linkage, Module},
     values::BasicValue,
-    AddressSpace, IntPredicate,
+    AddressSpace, AtomicOrdering, AtomicRMWBinOp, IntPredicate,
 };
 
 use repr_offset::ReprOffset;
@@ -32,6 +31,12 @@ pub struct COption<T: Copy> {
 }
 unsafe impl<T: Zeroable + Copy> Zeroable for COption<T> {}
 
+impl<T: Copy> COption<T> {
+    pub fn new(value: T) -> Self {
+        COption { used: 0, value }
+    }
+}
+
 #[repr(C)]
 #[derive(ReprOffset)]
 #[roff(usize_offsets)]
@@ -43,63 +48,63 @@ unsafe impl Send for StringAlloc {}
 unsafe impl Sync for StringAlloc {}
 
 pub enum MinMaxAlloc {
-    W8(Vec<COption<u8>>),
-    W16(Vec<COption<u16>>),
-    W32(Vec<COption<u32>>),
-    W64(Vec<COption<u64>>),
+    W8(u8, Vec<COption<u8>>),
+    W16(u16, Vec<COption<u16>>),
+    W32(u32, Vec<COption<u32>>),
+    W64(u64, Vec<COption<u64>>),
     W128(StringAlloc, Vec<u128>, Box<StringSaver>),
 }
 
 impl AggAlloc for MinMaxAlloc {
     fn get_ptr(&self) -> *const c_void {
         match self {
-            MinMaxAlloc::W8(items) => items.as_ptr() as *const c_void,
-            MinMaxAlloc::W16(items) => items.as_ptr() as *const c_void,
-            MinMaxAlloc::W32(items) => items.as_ptr() as *const c_void,
-            MinMaxAlloc::W64(items) => items.as_ptr() as *const c_void,
+            MinMaxAlloc::W8(_, items) => items.as_ptr() as *const c_void,
+            MinMaxAlloc::W16(_, items) => items.as_ptr() as *const c_void,
+            MinMaxAlloc::W32(_, items) => items.as_ptr() as *const c_void,
+            MinMaxAlloc::W64(_, items) => items.as_ptr() as *const c_void,
             MinMaxAlloc::W128(b, _, _) => b as *const StringAlloc as *const c_void,
         }
     }
 
     fn ensure_capacity(&mut self, capacity: usize) {
         match self {
-            MinMaxAlloc::W8(items) => {
+            MinMaxAlloc::W8(def, items) => {
                 if capacity > items.len() {
                     if items.capacity() < capacity {
                         items.reserve(capacity - items.len());
                     }
                     while items.len() < capacity {
-                        items.push(Default::default());
+                        items.push(COption::<u8>::new(*def));
                     }
                 }
             }
-            MinMaxAlloc::W16(items) => {
+            MinMaxAlloc::W16(def, items) => {
                 if capacity > items.len() {
                     if items.capacity() < capacity {
                         items.reserve(capacity - items.len());
                     }
                     while items.len() < capacity {
-                        items.push(Default::default());
+                        items.push(COption::<u16>::new(*def));
                     }
                 }
             }
-            MinMaxAlloc::W32(items) => {
+            MinMaxAlloc::W32(def, items) => {
                 if capacity > items.len() {
                     if items.capacity() < capacity {
                         items.reserve(capacity - items.len());
                     }
                     while items.len() < capacity {
-                        items.push(Default::default());
+                        items.push(COption::<u32>::new(*def));
                     }
                 }
             }
-            MinMaxAlloc::W64(items) => {
+            MinMaxAlloc::W64(def, items) => {
                 if capacity > items.len() {
                     if items.capacity() < capacity {
                         items.reserve(capacity - items.len());
                     }
                     while items.len() < capacity {
-                        items.push(Default::default());
+                        items.push(COption::<u64>::new(*def));
                     }
                 }
             }
@@ -112,20 +117,20 @@ impl AggAlloc for MinMaxAlloc {
 
     fn preallocate_capacity(&mut self, expected_unique: usize) {
         match self {
-            MinMaxAlloc::W8(coptions) => coptions.reserve(expected_unique),
-            MinMaxAlloc::W16(coptions) => coptions.reserve(expected_unique),
-            MinMaxAlloc::W32(coptions) => coptions.reserve(expected_unique),
-            MinMaxAlloc::W64(coptions) => coptions.reserve(expected_unique),
+            MinMaxAlloc::W8(_, coptions) => coptions.reserve(expected_unique),
+            MinMaxAlloc::W16(_, coptions) => coptions.reserve(expected_unique),
+            MinMaxAlloc::W32(_, coptions) => coptions.reserve(expected_unique),
+            MinMaxAlloc::W64(_, coptions) => coptions.reserve(expected_unique),
             MinMaxAlloc::W128(_, items, _) => items.reserve(expected_unique),
         }
     }
 
     fn current_capacity(&self) -> usize {
         match self {
-            MinMaxAlloc::W8(coptions) => coptions.len(),
-            MinMaxAlloc::W16(coptions) => coptions.len(),
-            MinMaxAlloc::W32(coptions) => coptions.len(),
-            MinMaxAlloc::W64(coptions) => coptions.len(),
+            MinMaxAlloc::W8(_, coptions) => coptions.len(),
+            MinMaxAlloc::W16(_, coptions) => coptions.len(),
+            MinMaxAlloc::W32(_, coptions) => coptions.len(),
+            MinMaxAlloc::W64(_, coptions) => coptions.len(),
             MinMaxAlloc::W128(_, items, _) => items.len(),
         }
     }
@@ -134,7 +139,7 @@ impl AggAlloc for MinMaxAlloc {
 impl MinMaxAlloc {
     fn finalize(self) -> ArrayRef {
         match self {
-            MinMaxAlloc::W8(coptions) => {
+            MinMaxAlloc::W8(_, coptions) => {
                 Arc::new(UInt8Array::from_iter(coptions.into_iter().map(|x| {
                     if x.used != 0 {
                         Some(x.value)
@@ -143,7 +148,7 @@ impl MinMaxAlloc {
                     }
                 })))
             }
-            MinMaxAlloc::W16(coptions) => {
+            MinMaxAlloc::W16(_, coptions) => {
                 Arc::new(UInt16Array::from_iter(coptions.into_iter().map(|x| {
                     if x.used != 0 {
                         Some(x.value)
@@ -152,7 +157,7 @@ impl MinMaxAlloc {
                     }
                 })))
             }
-            MinMaxAlloc::W32(coptions) => {
+            MinMaxAlloc::W32(_, coptions) => {
                 Arc::new(UInt32Array::from_iter(coptions.into_iter().map(|x| {
                     if x.used != 0 {
                         Some(x.value)
@@ -161,7 +166,7 @@ impl MinMaxAlloc {
                     }
                 })))
             }
-            MinMaxAlloc::W64(coptions) => {
+            MinMaxAlloc::W64(_, coptions) => {
                 Arc::new(UInt64Array::from_iter(coptions.into_iter().map(|x| {
                     if x.used != 0 {
                         Some(x.value)
@@ -212,16 +217,55 @@ impl<const MIN: bool> Aggregation for MinMaxAgg<MIN> {
 
     fn allocate(&self, num_tickets: usize) -> Self::Allocation {
         let mut alloc = match self.pt {
-            PrimitiveType::U8 | PrimitiveType::I8 => MinMaxAlloc::W8(Vec::with_capacity(1024)),
-            PrimitiveType::F16 | PrimitiveType::U16 | PrimitiveType::I16 => {
-                MinMaxAlloc::W16(Vec::with_capacity(1024))
+            PrimitiveType::U8 => MinMaxAlloc::W8(if MIN { u8::MAX } else { u8::MIN }, Vec::new()),
+            PrimitiveType::I8 => {
+                MinMaxAlloc::W8(if MIN { i8::MAX as u8 } else { i8::MIN as u8 }, Vec::new())
             }
-            PrimitiveType::F32 | PrimitiveType::U32 | PrimitiveType::I32 => {
-                MinMaxAlloc::W32(Vec::with_capacity(1024))
+            PrimitiveType::F16 => MinMaxAlloc::W16(
+                bytemuck::cast::<half::f16, u16>(if MIN { half::f16::MAX } else { half::f16::MIN }),
+                Vec::new(),
+            ),
+            PrimitiveType::U16 => {
+                MinMaxAlloc::W16(if MIN { u16::MAX } else { u16::MIN }, Vec::new())
             }
-            PrimitiveType::F64 | PrimitiveType::U64 | PrimitiveType::I64 => {
-                MinMaxAlloc::W64(Vec::with_capacity(1024))
+            PrimitiveType::I16 => MinMaxAlloc::W16(
+                if MIN {
+                    i16::MAX as u16
+                } else {
+                    i16::MIN as u16
+                },
+                Vec::new(),
+            ),
+            PrimitiveType::F32 => MinMaxAlloc::W32(
+                bytemuck::cast::<f32, u32>(if MIN { f32::MAX } else { f32::MIN }),
+                Vec::new(),
+            ),
+            PrimitiveType::U32 => {
+                MinMaxAlloc::W32(if MIN { u32::MAX } else { u32::MIN }, Vec::new())
             }
+            PrimitiveType::I32 => MinMaxAlloc::W32(
+                if MIN {
+                    i32::MAX as u32
+                } else {
+                    i32::MIN as u32
+                },
+                Vec::new(),
+            ),
+            PrimitiveType::F64 => MinMaxAlloc::W64(
+                bytemuck::cast::<f64, u64>(if MIN { f64::MAX } else { f64::MIN }),
+                Vec::new(),
+            ),
+            PrimitiveType::U64 => {
+                MinMaxAlloc::W64(if MIN { u64::MAX } else { u64::MIN }, Vec::new())
+            }
+            PrimitiveType::I64 => MinMaxAlloc::W64(
+                if MIN {
+                    i64::MAX as u64
+                } else {
+                    i64::MAX as u64
+                },
+                Vec::new(),
+            ),
             PrimitiveType::P64x2 => {
                 let mut data = vec![];
                 let mut ss = Box::new(StringSaver::default());
@@ -250,40 +294,40 @@ impl<const MIN: bool> Aggregation for MinMaxAgg<MIN> {
 
     fn merge_allocs(&self, alloc1: Self::Allocation, alloc2: Self::Allocation) -> Self::Allocation {
         match (alloc1, alloc2) {
-            (MinMaxAlloc::W8(mut lhs), MinMaxAlloc::W8(rhs)) => {
+            (MinMaxAlloc::W8(def, mut lhs), MinMaxAlloc::W8(_, rhs)) => {
                 match self.pt {
                     PrimitiveType::I8 => merge_coptions::<u8, i8, MIN>(&mut lhs, rhs),
                     PrimitiveType::U8 => merge_coptions::<u8, u8, MIN>(&mut lhs, rhs),
                     _ => unreachable!(),
                 }
-                MinMaxAlloc::W8(lhs)
+                MinMaxAlloc::W8(def, lhs)
             }
-            (MinMaxAlloc::W16(mut lhs), MinMaxAlloc::W16(rhs)) => {
+            (MinMaxAlloc::W16(def, mut lhs), MinMaxAlloc::W16(_, rhs)) => {
                 match self.pt {
                     PrimitiveType::I16 => merge_coptions::<u16, i16, MIN>(&mut lhs, rhs),
                     PrimitiveType::U16 => merge_coptions::<u16, u16, MIN>(&mut lhs, rhs),
                     PrimitiveType::F16 => merge_coptions::<u16, half::f16, MIN>(&mut lhs, rhs),
                     _ => unreachable!(),
                 }
-                MinMaxAlloc::W16(lhs)
+                MinMaxAlloc::W16(def, lhs)
             }
-            (MinMaxAlloc::W32(mut lhs), MinMaxAlloc::W32(rhs)) => {
+            (MinMaxAlloc::W32(def, mut lhs), MinMaxAlloc::W32(_, rhs)) => {
                 match self.pt {
                     PrimitiveType::I32 => merge_coptions::<u32, i32, MIN>(&mut lhs, rhs),
                     PrimitiveType::U32 => merge_coptions::<u32, u32, MIN>(&mut lhs, rhs),
                     PrimitiveType::F32 => merge_coptions::<u32, f32, MIN>(&mut lhs, rhs),
                     _ => unreachable!(),
                 }
-                MinMaxAlloc::W32(lhs)
+                MinMaxAlloc::W32(def, lhs)
             }
-            (MinMaxAlloc::W64(mut lhs), MinMaxAlloc::W64(rhs)) => {
+            (MinMaxAlloc::W64(def, mut lhs), MinMaxAlloc::W64(_, rhs)) => {
                 match self.pt {
                     PrimitiveType::I64 => merge_coptions::<u64, i64, MIN>(&mut lhs, rhs),
                     PrimitiveType::U64 => merge_coptions::<u64, u64, MIN>(&mut lhs, rhs),
                     PrimitiveType::F64 => merge_coptions::<u64, f64, MIN>(&mut lhs, rhs),
                     _ => unreachable!(),
                 }
-                MinMaxAlloc::W64(lhs)
+                MinMaxAlloc::W64(def, lhs)
             }
             (MinMaxAlloc::W128(_, lhs_i, _lhs_ss), MinMaxAlloc::W128(_, rhs_i, _rhs_ss)) => {
                 let mut new_ss = StringSaver::default();
@@ -337,58 +381,16 @@ impl<const MIN: bool> Aggregation for MinMaxAgg<MIN> {
 
     fn finalize(&self, alloc: Self::Allocation) -> Self::Output {
         let res = alloc.finalize();
-        match self.pt {
-            PrimitiveType::I8 => make_array(
-                res.to_data()
-                    .into_builder()
-                    .data_type(DataType::Int8)
-                    .build()
-                    .unwrap(),
-            ),
-            PrimitiveType::I16 => make_array(
-                res.to_data()
-                    .into_builder()
-                    .data_type(DataType::Int16)
-                    .build()
-                    .unwrap(),
-            ),
-            PrimitiveType::I32 => make_array(
-                res.to_data()
-                    .into_builder()
-                    .data_type(DataType::Int32)
-                    .build()
-                    .unwrap(),
-            ),
-            PrimitiveType::I64 => make_array(
-                res.to_data()
-                    .into_builder()
-                    .data_type(DataType::Int64)
-                    .build()
-                    .unwrap(),
-            ),
-            PrimitiveType::F16 => make_array(
-                res.to_data()
-                    .into_builder()
-                    .data_type(DataType::Float16)
-                    .build()
-                    .unwrap(),
-            ),
-            PrimitiveType::F32 => make_array(
-                res.to_data()
-                    .into_builder()
-                    .data_type(DataType::Float32)
-                    .build()
-                    .unwrap(),
-            ),
-            PrimitiveType::F64 => make_array(
-                res.to_data()
-                    .into_builder()
-                    .data_type(DataType::Float64)
-                    .build()
-                    .unwrap(),
-            ),
-            _ => res,
+        if self.pt == PrimitiveType::P64x2 {
+            return res;
         }
+        make_array(
+            res.to_data()
+                .into_builder()
+                .data_type(self.pt.as_arrow_type())
+                .build()
+                .unwrap(),
+        )
     }
 
     fn llvm_agg_one<'a>(
@@ -647,6 +649,71 @@ impl<const MIN: bool> Aggregation for MinMaxAgg<MIN> {
             )
             .unwrap();
         }
+    }
+
+    fn llvm_agg_one_atomic<'a>(
+        &self,
+        ctx: &'a Context,
+        _llvm_mod: &Module<'a>,
+        b: &inkwell::builder::Builder<'a>,
+        alloc_ptr: inkwell::values::PointerValue<'a>,
+        ticket: inkwell::values::IntValue<'a>,
+        value: inkwell::values::BasicValueEnum<'a>,
+    ) -> bool {
+        let holder_width = match self.pt.width() {
+            1 => std::mem::size_of::<COption<u8>>(),
+            2 => std::mem::size_of::<COption<u16>>(),
+            4 => std::mem::size_of::<COption<u32>>(),
+            8 => std::mem::size_of::<COption<u64>>(),
+            16 => return false,
+            _ => unreachable!(),
+        };
+        if !self.pt.is_int() {
+            return false; // TODO when inkwell supports float atomics
+        }
+
+        let i8_type = ctx.i8_type();
+        let holder_ptr = increment_pointer!(ctx, b, alloc_ptr, holder_width, ticket);
+        let used_offset = match self.pt.width() {
+            1 => COption::<u8>::OFFSET_USED,
+            2 => COption::<u16>::OFFSET_USED,
+            4 => COption::<u32>::OFFSET_USED,
+            8 => COption::<u64>::OFFSET_USED,
+            _ => unreachable!(),
+        };
+        let value_offset = match self.pt.width() {
+            1 => COption::<u8>::OFFSET_VALUE,
+            2 => COption::<u16>::OFFSET_VALUE,
+            4 => COption::<u32>::OFFSET_VALUE,
+            8 => COption::<u64>::OFFSET_VALUE,
+            _ => unreachable!(),
+        };
+
+        let used_ptr = increment_pointer!(ctx, b, holder_ptr, used_offset);
+        let value_ptr = increment_pointer!(ctx, b, holder_ptr, value_offset);
+        let op = if MIN {
+            if self.pt.is_signed() {
+                AtomicRMWBinOp::Min
+            } else {
+                AtomicRMWBinOp::UMin
+            }
+        } else {
+            if self.pt.is_signed() {
+                AtomicRMWBinOp::Max
+            } else {
+                AtomicRMWBinOp::UMax
+            }
+        };
+        b.build_atomicrmw(
+            op,
+            value_ptr,
+            value.into_int_value(),
+            AtomicOrdering::Monotonic,
+        )
+        .unwrap();
+        b.build_store(used_ptr, i8_type.const_int(1, false))
+            .unwrap();
+        true
     }
 }
 
