@@ -244,7 +244,11 @@ impl<R: RunEndIndexType + ArrowPrimitiveType> From<&RunArray<R>> for IteratorHol
         } else {
             re.value(first_idx - 1).as_usize()
         };
-        let first_partition_size = re.value(first_idx).as_usize() - prev_end;
+        let first_partition_size = if re.is_empty() {
+            0
+        } else {
+            re.value(first_idx).as_usize() - prev_end
+        };
         let first_remaining = first_partition_size - (arr.offset() - prev_end);
 
         let iter = RunEndIterator {

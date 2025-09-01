@@ -1,5 +1,5 @@
 use arrow_array::{
-    BooleanArray, Float32Array, Float64Array, Int32Array, Int64Array, RunArray, StringArray,
+    Array, BooleanArray, Float32Array, Float64Array, Int32Array, Int64Array, RunArray, StringArray,
 };
 use arrow_compile_compute::dictionary_data_type;
 use arrow_schema::DataType;
@@ -79,6 +79,7 @@ proptest! {
 
         let result = BooleanArray::from(result);
 
+        assert_eq!(result.len(), ree.len());
         let our_res = arrow_compile_compute::cmp::eq(&ree, &arr2).unwrap();
         assert_eq!(our_res, result);
     }
