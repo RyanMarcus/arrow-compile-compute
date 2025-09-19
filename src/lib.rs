@@ -139,7 +139,7 @@ unsafe fn pointers_to_str(ptrs: u128) -> String {
 
 /// Utility function to create the appropriate `DataType` for a dictionary array
 pub fn dictionary_data_type(key_type: DataType, val_type: DataType) -> DataType {
-    DataType::Dictionary(Box::new(key_type.clone()), Box::new(val_type.clone()))
+    DataType::Dictionary(Box::new(key_type), Box::new(val_type))
 }
 
 /// Utility function to create the appropriate `DataType` for a run-end encoded
@@ -352,7 +352,7 @@ impl PrimitiveType {
             4 => PrimitiveType::I32,
             2 => PrimitiveType::I16,
             1 => PrimitiveType::I8,
-            _ => unreachable!("width must be 8, 4, 2, or 1"),
+            _ => unreachable!("width must be 16, 8, 4, 2, or 1"),
         }
     }
 
