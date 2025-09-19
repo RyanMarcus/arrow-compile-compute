@@ -22,7 +22,7 @@ const BLOCK_SIZE: usize = 64;
 pub trait ApplyType: Copy {
     fn primitive_type() -> PrimitiveType;
 
-    unsafe fn from_byte_slice(data: &[u8]) -> Self {
+    unsafe fn from_byte_slice<'a>(data: &[u8]) -> Self {
         std::slice::from_raw_parts(data.as_ptr() as *const Self, 1)[0]
     }
 }
@@ -46,8 +46,8 @@ impl ApplyType for &[u8] {
         PrimitiveType::P64x2
     }
 
-    unsafe fn from_byte_slice(data: &[u8]) -> Self {
-        let nums = std::slice::from_raw_parts(data.as_ptr() as *const u64, 2);
+    unsafe fn from_byte_slice<'a>(data: &[u8]) -> Self {
+        let nums = std::slice::from_raw_parts::<'a>(data.as_ptr() as *const u64, 2);
         let start = nums[0] as *const u8;
         let end = nums[1] as *const u8;
         let len = end.offset_from(start);
