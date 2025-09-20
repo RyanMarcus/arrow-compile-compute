@@ -108,10 +108,10 @@ impl PrimitiveIterator {
         builder.build_store(pos_ptr, new_pos).unwrap();
     }
 
-    pub fn localize_struct<'a, 'b>(
+    pub fn localize_struct<'a>(
         &self,
         ctx: &'a Context,
-        b: &'b Builder<'a>,
+        b: &Builder<'a>,
         ptr: PointerValue<'a>,
     ) -> PointerValue<'a> {
         let stype = ctx.struct_type(

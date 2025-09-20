@@ -430,11 +430,10 @@ fn compile_ungrouped_agg_func<A: Aggregation>(inp: &dyn Array) -> UngroupedAggFu
     .build()
 }
 
-static GROUPED_AGG_CACHE: LazyLock<KernelCache<GroupedAggFunc>> =
-    LazyLock::new(|| KernelCache::new());
+static GROUPED_AGG_CACHE: LazyLock<KernelCache<GroupedAggFunc>> = LazyLock::new(KernelCache::new);
 
 static UNGROUPED_AGG_CACHE: LazyLock<KernelCache<UngroupedAggFunc>> =
-    LazyLock::new(|| KernelCache::new());
+    LazyLock::new(KernelCache::new);
 
 pub struct Aggregator<A: Aggregation> {
     agg: A,

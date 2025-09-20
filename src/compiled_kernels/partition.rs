@@ -202,7 +202,7 @@ fn call_kernel_with_writer<'a, W: ArrayWriter<'a>>(
     }
     Ok(allocs
         .into_iter()
-        .zip(part_sizes.into_iter())
+        .zip(part_sizes)
         .map(|(a, size)| a.to_array_ref(size, None))
         .collect_vec())
 }
@@ -241,12 +241,12 @@ fn build_partition<'a, W: ArrayWriter<'a>>(
     let idx_ih = datum_to_iter(&partition_idxes)?;
     let null_ih = nulls.map(|nulls| datum_to_iter(&&nulls)).transpose()?;
 
-    let arr_next = generate_next(ctx, &llvm_mod, "arr", &arr.data_type(), &arr_ih).unwrap();
+    let arr_next = generate_next(ctx, &llvm_mod, "arr", arr.data_type(), &arr_ih).unwrap();
     let idx_next =
         generate_next(ctx, &llvm_mod, "idx", partition_idxes.data_type(), &idx_ih).unwrap();
     let null_next = null_ih
         .as_ref()
-        .map(|ih| generate_next(ctx, &llvm_mod, "null", &DataType::Boolean, &ih).unwrap());
+        .map(|ih| generate_next(ctx, &llvm_mod, "null", &DataType::Boolean, ih).unwrap());
     let arr_iter_ptr = func.get_nth_param(0).unwrap().into_pointer_value();
     let null_iter_ptr = func.get_nth_param(1).unwrap().into_pointer_value();
     let idx_iter_ptr = func.get_nth_param(2).unwrap().into_pointer_value();

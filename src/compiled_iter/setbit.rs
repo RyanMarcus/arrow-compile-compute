@@ -25,7 +25,6 @@ struct Segments {
 /// - `total_bits`: total number of bits in the underlying bit array (for bounds checking).
 /// - `offset`: starting bit index into the array.
 /// - `len`: length of the span in bits.
-///:
 ///
 /// Returns `Err` if the (offset, len) span is out of bounds.
 fn split_bit_span(offset: usize, len: usize) -> Result<Segments, &'static str> {
@@ -116,7 +115,6 @@ impl From<&BooleanArray> for SetBitIterator {
             }
             None => (header_buf, 0),
         };
-        println!("header: {:?}, header_len: {}", header, header_len);
 
         let mut tail_buf = [0_u64; 64];
         let (tail, tail_len) = match &segments.tail {
@@ -131,17 +129,11 @@ impl From<&BooleanArray> for SetBitIterator {
             }
             None => (tail_buf, 0),
         };
-        println!("tail: {:?}, tail_len: {}", tail, tail_len);
 
         let (first_full_segment_idx, last_full_segment_idx) = match segments.body {
             Some(range) => (range.start / 64, range.end / 64),
             None => (0, 0),
         };
-
-        println!(
-            "body: {} to {}",
-            first_full_segment_idx, last_full_segment_idx
-        );
 
         SetBitIterator {
             bitmap: array.values().values().as_ptr(),
@@ -303,7 +295,7 @@ impl SetBitIterator {
             )
             .unwrap();
         b.build_store(segment_ptr, new_segment_pos).unwrap();
-        return new_segment_pos;
+        new_segment_pos
     }
 
     pub fn llvm_set_current_u64<'a>(
@@ -487,7 +479,6 @@ mod tests {
         let func = generate_next(&ctx, &module, "setbit_iter", data.data_type(), &iter).unwrap();
         let fname = func.get_name().to_str().unwrap();
 
-        module.print_to_stderr();
         module.verify().unwrap();
 
         let ee = module

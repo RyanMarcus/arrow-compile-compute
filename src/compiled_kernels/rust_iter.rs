@@ -11,10 +11,7 @@ use crate::{
     compiled_iter::{
         array_to_setbit_iter, datum_to_iter, generate_next, generate_random_access, IteratorHolder,
     },
-    compiled_kernels::{
-        gen_convert_numeric_vec, link_req_helpers, llvm_utils::get_or_add_debug_i64,
-        optimize_module,
-    },
+    compiled_kernels::{gen_convert_numeric_vec, link_req_helpers, optimize_module},
     declare_blocks, increment_pointer, Kernel, PrimitiveType,
 };
 
@@ -25,7 +22,7 @@ const BLOCK_SIZE: usize = 64;
 pub trait ApplyType: Copy {
     fn primitive_type() -> PrimitiveType;
 
-    unsafe fn from_byte_slice<'a>(data: &[u8]) -> Self {
+    unsafe fn from_byte_slice(data: &[u8]) -> Self {
         std::slice::from_raw_parts(data.as_ptr() as *const Self, 1)[0]
     }
 }
@@ -49,8 +46,8 @@ impl ApplyType for &[u8] {
         PrimitiveType::P64x2
     }
 
-    unsafe fn from_byte_slice<'a>(data: &[u8]) -> Self {
-        let nums = std::slice::from_raw_parts::<'a>(data.as_ptr() as *const u64, 2);
+    unsafe fn from_byte_slice(data: &[u8]) -> Self {
+        let nums = std::slice::from_raw_parts(data.as_ptr() as *const u64, 2);
         let start = nums[0] as *const u8;
         let end = nums[1] as *const u8;
         let len = end.offset_from(start);
@@ -160,7 +157,6 @@ impl<T: ApplyType> ArrowIter<T> {
             .nulls()
             .map(|nulls| array_to_setbit_iter(&BooleanArray::from(nulls.clone().into_inner())))
             .transpose()?;
-        println!("set bit ih: {:?}", setbit_ih);
 
         Ok(ArrowIter {
             buffer: [0; 1024],
@@ -254,10 +250,6 @@ fn generate_call<'a>(
             .build_load(i64_type, next_bit_buf, "next_bit")
             .unwrap()
             .into_int_value();
-        let debug = get_or_add_debug_i64(ctx, &module);
-        build
-            .build_call(debug, &[next_bit.into()], "debug")
-            .unwrap();
         build
             .build_call(access, &[iter_ptr.into(), next_bit.into()], "access_el")
             .unwrap()

@@ -266,10 +266,10 @@ impl IteratorHolder {
 
     /// Potentially copy the iterator into the current stack frame, allowing
     /// better LLVM optimizations.
-    pub fn localize_struct<'a, 'b>(
+    pub fn localize_struct<'a>(
         &self,
         ctx: &'a Context,
-        b: &'b Builder<'a>,
+        b: &Builder<'a>,
         ptr: PointerValue<'a>,
     ) -> PointerValue<'a> {
         match self {

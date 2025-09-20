@@ -261,7 +261,7 @@ impl<const MIN: bool> Aggregation for MinMaxAgg<MIN> {
                 if MIN {
                     i64::MAX as u64
                 } else {
-                    i64::MAX as u64
+                    i64::MIN as u64
                 },
                 Vec::new(),
             ),
@@ -696,12 +696,10 @@ impl<const MIN: bool> Aggregation for MinMaxAgg<MIN> {
             } else {
                 AtomicRMWBinOp::UMin
             }
+        } else if self.pt.is_signed() {
+            AtomicRMWBinOp::Max
         } else {
-            if self.pt.is_signed() {
-                AtomicRMWBinOp::Max
-            } else {
-                AtomicRMWBinOp::UMax
-            }
+            AtomicRMWBinOp::UMax
         };
         b.build_atomicrmw(
             op,

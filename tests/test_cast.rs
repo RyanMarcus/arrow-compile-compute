@@ -86,7 +86,6 @@ proptest! {
         let as_view = as_view.as_string_view();
 
         assert_eq!(as_view.len(), arr.len());
-        println!("{:?}", arr);
         let view_res = as_view.iter().map(|x| x.unwrap()).collect_vec();
         assert_eq!(arr, view_res);
     }
