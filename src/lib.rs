@@ -34,13 +34,14 @@ pub use compiled_kernels::Kernel;
 pub use compiled_kernels::SortOptions;
 
 macro_rules! mark_load_invariant {
-    ($ctx:expr, $instruction:expr) => {
+    ($ctx:expr, $instruction:expr) => {{
+        use inkwell::values::BasicValue;
         $instruction
             .as_instruction_value()
             .unwrap()
             .set_metadata($ctx.metadata_node(&[]), $ctx.get_kind_id("invariant.load"))
             .unwrap();
-    };
+    }};
 }
 pub(crate) use mark_load_invariant;
 

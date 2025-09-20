@@ -42,7 +42,7 @@ use crate::{
 };
 
 pub fn array_to_setbit_iter(arr: &BooleanArray) -> Result<IteratorHolder, ArrowKernelError> {
-    Ok(IteratorHolder::SetBit((arr).into()))
+    Ok(IteratorHolder::SetBit(Box::new(SetBitIterator::from(arr))))
 }
 
 /// Convert an Arrow Array into an IteratorHolder, which contains the C-style
@@ -986,135 +986,165 @@ pub fn generate_next<'a>(
 
             Some(next)
         }
-        IteratorHolder::SetBit(setbit_iterator) => {
+        IteratorHolder::SetBit(it) => {
             declare_blocks!(
                 ctx,
                 next,
                 entry,
-                while_loop,
-                get_next_long_loop,
-                none_left,
-                get_next,
-                get_next_intermediate,
-                get_next_end,
-                use_long
+                head_cond,
+                head_body,
+                main_cond,
+                main_body,
+                fetch_next_segment,
+                use_curr_segment,
+                increment_and_return_from_segment,
+                return_from_segment,
+                tail_cond,
+                tail_body,
+                exit
             );
 
             let cttz_id = Intrinsic::find("llvm.cttz").expect("llvm.cttz not in Intrinsic list");
-            cttz_id
+            let cttz_i64 = cttz_id
                 .get_declaration(llvm_mod, &[ctx.i64_type().into()])
                 .expect("Couldn't declare llvm.cttz.i64");
 
-            let cttz_i64 = llvm_mod
-                .get_function("llvm.cttz.i64")
-                .expect("llvm.cttz.i64 should have been declared");
-
             build.position_at_end(entry);
-            build.build_unconditional_branch(while_loop).unwrap();
+            build.build_unconditional_branch(head_cond).unwrap();
 
-            build.position_at_end(while_loop);
-            let index = setbit_iterator.llvm_get_index(ctx, &build, iter_ptr);
-            let curr_long = setbit_iterator.llvm_get_long(ctx, &build, iter_ptr);
-            let cmp_to_zero = build
+            build.position_at_end(head_cond);
+            let (header_ptr, header_pos, header_len) = it.llvm_header_info(ctx, &build, iter_ptr);
+            let have_header = build
+                .build_int_compare(IntPredicate::ULT, header_pos, header_len, "have_header")
+                .unwrap();
+            build
+                .build_conditional_branch(have_header, head_body, main_cond)
+                .unwrap();
+
+            build.position_at_end(head_body);
+            let res = build
+                .build_load(
+                    i64_type,
+                    increment_pointer!(ctx, build, header_ptr, 8, header_pos),
+                    "head_val",
+                )
+                .unwrap()
+                .into_int_value();
+            it.llvm_inc_header_pos(ctx, &build, iter_ptr);
+            build.build_store(out_ptr, res).unwrap();
+
+            build
+                .build_return(Some(&bool_type.const_int(1, false)))
+                .unwrap();
+
+            // check if the current segment is zero or not
+            build.position_at_end(main_cond);
+            let curr_segment = it.llvm_get_current_u64(ctx, &build, iter_ptr);
+            let is_zero = build
                 .build_int_compare(
                     IntPredicate::EQ,
-                    curr_long,
-                    ctx.i64_type().const_int(0, false),
-                    "cmp_long_to_zero",
+                    curr_segment,
+                    i64_type.const_zero(),
+                    "is_curr_zero",
                 )
                 .unwrap();
             build
-                .build_conditional_branch(cmp_to_zero, get_next_long_loop, use_long)
+                .build_conditional_branch(is_zero, main_body, use_curr_segment)
                 .unwrap();
 
-            build.position_at_end(get_next_long_loop);
-            let end_index = setbit_iterator.llvm_get_end_index(ctx, &build, iter_ptr);
-            let cmp_index_to_end_index = build
-                .build_int_compare(IntPredicate::EQ, index, end_index, "cmp_index_to_end_index")
+            // check if we still have segments left to read
+            build.position_at_end(main_body);
+            let curr_segment_idx = it.llvm_get_curr_segment_pos(ctx, &build, iter_ptr);
+            let segment_len = it.llvm_get_num_segments(ctx, &build, iter_ptr);
+            let cmp = build
+                .build_int_compare(IntPredicate::ULT, curr_segment_idx, segment_len, "cmp")
                 .unwrap();
             build
-                .build_conditional_branch(cmp_index_to_end_index, none_left, get_next)
+                .build_conditional_branch(cmp, fetch_next_segment, tail_cond)
                 .unwrap();
 
-            build.position_at_end(none_left);
-            build
-                .build_return(Some(&bool_type.const_int(0, false)))
-                .unwrap();
+            build.position_at_end(fetch_next_segment);
+            let new_segment = it.llvm_get_segment(ctx, &build, curr_segment_idx, iter_ptr);
+            it.llvm_set_current_u64(ctx, &build, new_segment, iter_ptr);
+            it.llvm_inc_curr_segment(ctx, &build, iter_ptr);
+            build.build_unconditional_branch(main_cond).unwrap();
 
-            build.position_at_end(get_next);
-            let end_index_minus_one = build
-                .build_int_sub(end_index, i64_type.const_int(1, false), "end_index_minus_1")
-                .unwrap();
-            let cmp_index_to_end_index_minus_1 = build
+            build.position_at_end(use_curr_segment);
+            let num_trailing = build
+                .build_call(
+                    cttz_i64,
+                    &[curr_segment.into(), bool_type.const_all_ones().into()],
+                    "num_trailing",
+                )
+                .unwrap()
+                .try_as_basic_value()
+                .unwrap_left()
+                .into_int_value();
+            it.llvm_clear_last(ctx, &build, iter_ptr);
+            let res =
+                it.llvm_add_and_get_current_bit_idx(ctx, &build, iter_ptr, num_trailing, false);
+            build.build_store(out_ptr, res).unwrap();
+            let is_now_zero = build
                 .build_int_compare(
                     IntPredicate::EQ,
-                    index,
-                    end_index_minus_one,
-                    "cmp_index_to_end_index_minus_1",
+                    it.llvm_get_current_u64(ctx, &build, iter_ptr),
+                    i64_type.const_zero(),
+                    "is_now_zero",
                 )
                 .unwrap();
             build
                 .build_conditional_branch(
-                    cmp_index_to_end_index_minus_1,
-                    get_next_end,
-                    get_next_intermediate,
+                    is_now_zero,
+                    increment_and_return_from_segment,
+                    return_from_segment,
                 )
                 .unwrap();
 
-            build.position_at_end(get_next_end);
-            setbit_iterator.llvm_load_last_long(ctx, &build, iter_ptr);
-            setbit_iterator.llvm_increment_index(
+            build.position_at_end(increment_and_return_from_segment);
+            it.llvm_add_and_get_current_bit_idx(
                 ctx,
                 &build,
                 iter_ptr,
-                i64_type.const_int(1, false),
+                i64_type.const_int(64, false),
+                true,
             );
-            build.build_unconditional_branch(while_loop).unwrap();
-
-            build.position_at_end(get_next_intermediate);
-            setbit_iterator.llvm_load_long_at_index(ctx, &build, iter_ptr);
-            setbit_iterator.llvm_increment_index(
-                ctx,
-                &build,
-                iter_ptr,
-                i64_type.const_int(1, false),
-            );
-            build.build_unconditional_branch(while_loop).unwrap();
-
-            build.position_at_end(use_long);
-            let is_zero_undef = ctx.bool_type().const_int(0, false);
-            let tz_i64 = build
-                .build_call(
-                    cttz_i64,
-                    &[curr_long.into(), is_zero_undef.into()],
-                    "cttz_i64",
-                )
-                .unwrap()
-                .try_as_basic_value()
-                .left()
-                .expect("cttz should return a value")
-                .into_int_value();
-            setbit_iterator.llvm_clear_trailing_bit(ctx, &build, iter_ptr);
-            let setbit_position = build
-                .build_int_sub(index, i64_type.const_int(1, false), "pos_sub_1")
-                .unwrap();
-            let setbit_position = build
-                .build_int_mul(setbit_position, i64_type.const_int(64, false), "pos_mul_64")
-                .unwrap();
-            let setbit_position = build
-                .build_int_add(setbit_position, tz_i64, "pos_add_tz")
-                .unwrap();
-            let slice_offset = setbit_iterator.llvm_get_slice_offset(ctx, &build, iter_ptr);
-            let final_position = build
-                .build_int_sub(
-                    setbit_position,
-                    slice_offset,
-                    "setbit_position_minus_slice_offset",
-                )
-                .unwrap();
-            build.build_store(out_ptr, final_position).unwrap();
             build
                 .build_return(Some(&bool_type.const_int(1, false)))
+                .unwrap();
+
+            build.position_at_end(return_from_segment);
+            build
+                .build_return(Some(&bool_type.const_int(1, false)))
+                .unwrap();
+
+            build.position_at_end(tail_cond);
+            let (tail_ptr, tail_pos, tail_len) = it.llvm_tail_info(ctx, &build, iter_ptr);
+            let have_tail = build
+                .build_int_compare(IntPredicate::ULT, tail_pos, tail_len, "have_tail")
+                .unwrap();
+            build
+                .build_conditional_branch(have_tail, tail_body, exit)
+                .unwrap();
+
+            build.position_at_end(tail_body);
+            let res = build
+                .build_load(
+                    i64_type,
+                    increment_pointer!(ctx, build, tail_ptr, 8, tail_pos),
+                    "tail_val",
+                )
+                .unwrap()
+                .into_int_value();
+            it.llvm_inc_tail_pos(ctx, &build, iter_ptr);
+            let res = it.llvm_add_and_get_current_bit_idx(ctx, &build, iter_ptr, res, false);
+            build.build_store(out_ptr, res).unwrap();
+            build
+                .build_return(Some(&bool_type.const_int(1, false)))
+                .unwrap();
+
+            build.position_at_end(exit);
+            build
+                .build_return(Some(&bool_type.const_int(0, false)))
                 .unwrap();
 
             Some(next)

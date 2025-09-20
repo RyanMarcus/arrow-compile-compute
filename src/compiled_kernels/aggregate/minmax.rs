@@ -8,7 +8,6 @@ use bytemuck::{Pod, Zeroable};
 use inkwell::{
     context::Context,
     module::{Linkage, Module},
-    values::BasicValue,
     AddressSpace, AtomicOrdering, AtomicRMWBinOp, IntPredicate,
 };
 

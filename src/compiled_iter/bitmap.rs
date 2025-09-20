@@ -2,7 +2,7 @@ use arrow_array::{Array, BooleanArray};
 use inkwell::{
     builder::Builder,
     context::Context,
-    values::{BasicValue, IntValue, PointerValue},
+    values::{IntValue, PointerValue},
     AddressSpace,
 };
 use repr_offset::ReprOffset;

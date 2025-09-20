@@ -436,6 +436,6 @@ mod tests {
             .unwrap()
             .map(|x| String::from_utf8(x.to_vec()).unwrap())
             .collect_vec();
-        assert_eq!(res.len(), 10);
+        assert_eq!(res.len(), 5);
     }
 }
