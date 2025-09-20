@@ -819,6 +819,48 @@ mod tests {
     }
 
     #[test]
+    fn test_setbit_slice6() {
+        let data = BooleanArray::from((0..1000).map(|x| x % 2 == 0).collect_vec());
+        let data2 = data.slice(100, 10);
+
+        array_to_setbit_iter(&data).unwrap();
+        let mut iter = array_to_setbit_iter(&data2).unwrap();
+
+        let ctx = Context::create();
+        let module = ctx.create_module("setbit_test");
+        let func = generate_next(&ctx, &module, "setbit_iter", data.data_type(), &iter).unwrap();
+        let fname = func.get_name().to_str().unwrap();
+
+        module.verify().unwrap();
+
+        let ee = module
+            .create_jit_execution_engine(OptimizationLevel::None)
+            .unwrap();
+
+        let next_func = unsafe {
+            ee.get_function::<unsafe extern "C" fn(*mut c_void, *mut u64) -> bool>(fname)
+                .unwrap()
+        };
+
+        let mut buf: u64 = 0;
+        unsafe {
+            for i in (0..10).step_by(2) {
+                assert_eq!(
+                    next_func.call(iter.get_mut_ptr(), &mut buf as *mut u64),
+                    true
+                );
+                assert_eq!(buf, i);
+            }
+            assert_eq!(
+                next_func.call(iter.get_mut_ptr(), &mut buf as *mut u64),
+                false,
+                "read value out of slice ({})",
+                buf
+            );
+        }
+    }
+
+    #[test]
     fn test_setbit_iter() {
         let data = BooleanArray::from(vec![
             true, true, false, true, false, false, false, false, true, true,

@@ -11,7 +11,10 @@ use crate::{
     compiled_iter::{
         array_to_setbit_iter, datum_to_iter, generate_next, generate_random_access, IteratorHolder,
     },
-    compiled_kernels::{gen_convert_numeric_vec, optimize_module},
+    compiled_kernels::{
+        gen_convert_numeric_vec, link_req_helpers, llvm_utils::get_or_add_debug_i64,
+        optimize_module,
+    },
     declare_blocks, increment_pointer, Kernel, PrimitiveType,
 };
 
@@ -157,6 +160,7 @@ impl<T: ApplyType> ArrowIter<T> {
             .nulls()
             .map(|nulls| array_to_setbit_iter(&BooleanArray::from(nulls.clone().into_inner())))
             .transpose()?;
+        println!("set bit ih: {:?}", setbit_ih);
 
         Ok(ArrowIter {
             buffer: [0; 1024],
@@ -250,6 +254,10 @@ fn generate_call<'a>(
             .build_load(i64_type, next_bit_buf, "next_bit")
             .unwrap()
             .into_int_value();
+        let debug = get_or_add_debug_i64(ctx, &module);
+        build
+            .build_call(debug, &[next_bit.into()], "debug")
+            .unwrap();
         build
             .build_call(access, &[iter_ptr.into(), next_bit.into()], "access_el")
             .unwrap()
@@ -320,6 +328,7 @@ fn generate_call<'a>(
     let ee = module
         .create_jit_execution_engine(OptimizationLevel::Aggressive)
         .unwrap();
+    link_req_helpers(&module, &ee)?;
 
     Ok(unsafe {
         ee.get_function::<unsafe extern "C" fn(*mut c_void, *mut c_void, *mut u8) -> u64>(
@@ -392,5 +401,41 @@ mod tests {
             .map(|x| String::from_utf8(x.to_vec()).unwrap())
             .collect_vec();
         assert_eq!(res, vdata);
+    }
+
+    #[test]
+    fn test_iter_str_sliced() {
+        let vdata = (0..1000).map(|i| format!("string{}", i)).collect_vec();
+        let data = StringArray::from(vdata.clone());
+        let data = data.slice(100, 200);
+        let ifh =
+            Arc::<IterFuncHolder>::compile(&(&data as &dyn Array), PrimitiveType::P64x2).unwrap();
+        let res = ArrowIter::<&[u8]>::new(&data, ifh)
+            .unwrap()
+            .map(|x| String::from_utf8(x.to_vec()).unwrap())
+            .collect_vec();
+        assert_eq!(res, vdata[100..300]);
+    }
+
+    #[test]
+    fn test_iter_str_sliced_null() {
+        let vdata = (0..1000)
+            .map(|i| {
+                if i % 2 == 0 {
+                    Some(format!("string{}", i))
+                } else {
+                    None
+                }
+            })
+            .collect_vec();
+        let data = StringArray::from(vdata.clone());
+        let data = data.slice(100, 10);
+        let ifh =
+            Arc::<IterFuncHolder>::compile(&(&data as &dyn Array), PrimitiveType::P64x2).unwrap();
+        let res = ArrowIter::<&[u8]>::new(&data, ifh)
+            .unwrap()
+            .map(|x| String::from_utf8(x.to_vec()).unwrap())
+            .collect_vec();
+        assert_eq!(res.len(), 10);
     }
 }
