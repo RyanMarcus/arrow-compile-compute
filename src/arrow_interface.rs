@@ -133,10 +133,10 @@ pub mod cast {
 pub mod iter {
     use std::sync::{Arc, LazyLock};
 
-    use arrow_array::Array;
+    use arrow_array::{Array, BooleanArray};
 
     use crate::{
-        compiled_kernels::{ArrowIter, IterFuncHolder, KernelCache},
+        compiled_kernels::{ArrowIter, ArrowNullableIter, IterFuncHolder, KernelCache},
         ArrowKernelError, PrimitiveType,
     };
 
@@ -158,9 +158,37 @@ pub mod iter {
     pub fn iter_nonnull_i64(
         array: &dyn Array,
     ) -> Result<impl Iterator<Item = i64>, ArrowKernelError> {
-        let ifh = ITER_FUNC_CACHE.get(array, PrimitiveType::I64)?;
+        let ifh = ITER_FUNC_CACHE.get(array, (PrimitiveType::I64, false))?;
         let i = ArrowIter::<i64>::new(array, ifh)?;
         Ok(i)
+    }
+
+    /// Iterates over the values of an array, converting the array
+    /// values to `i64`. Values returned are `Option<i64>`.
+    ///
+    /// # Example
+    /// ```
+    /// use arrow_array::Int32Array;
+    /// use arrow_compile_compute::iter::iter_i64;
+    ///
+    /// let arr = Int32Array::from(vec![Some(1), None, Some(3)]);
+    /// let iter = iter_i64(&arr).unwrap();
+    /// assert_eq!(iter.collect::<Vec<_>>(), vec![Some(1), None, Some(3)]);
+    /// ```
+    pub fn iter_i64(
+        array: &dyn Array,
+    ) -> Result<impl Iterator<Item = Option<i64>>, ArrowKernelError> {
+        let data_ifh = ITER_FUNC_CACHE.get(array, (PrimitiveType::I64, true))?;
+        let data_iter = ArrowIter::<i64>::new(array, data_ifh)?;
+
+        if let Some(nulls) = array.logical_nulls() {
+            let ba = BooleanArray::new(nulls.into_inner(), None);
+            let null_ifh = ITER_FUNC_CACHE.get(&ba, (PrimitiveType::U8, true))?;
+            let null_iter = ArrowIter::<u8>::new(&ba, null_ifh)?;
+            Ok(ArrowNullableIter::new(data_iter, Some(null_iter)))
+        } else {
+            Ok(ArrowNullableIter::new(data_iter, None))
+        }
     }
 
     /// Iterates over the non-null values of an array, converting the array
@@ -178,9 +206,65 @@ pub mod iter {
     pub fn iter_nonnull_u64(
         array: &dyn Array,
     ) -> Result<impl Iterator<Item = u64>, ArrowKernelError> {
-        let ifh = ITER_FUNC_CACHE.get(array, PrimitiveType::U64)?;
+        let ifh = ITER_FUNC_CACHE.get(array, (PrimitiveType::U64, false))?;
         let i = ArrowIter::<u64>::new(array, ifh)?;
         Ok(i)
+    }
+
+    /// Iterates over the values of an array, converting the array
+    /// values to `u64`. Values returned are `Option<u64>`.
+    pub fn iter_u64(
+        array: &dyn Array,
+    ) -> Result<impl Iterator<Item = Option<u64>>, ArrowKernelError> {
+        let data_ifh = ITER_FUNC_CACHE.get(array, (PrimitiveType::U64, true))?;
+        let data_iter = ArrowIter::<u64>::new(array, data_ifh)?;
+
+        if let Some(nulls) = array.logical_nulls() {
+            let ba = BooleanArray::new(nulls.into_inner(), None);
+            let null_ifh = ITER_FUNC_CACHE.get(&ba, (PrimitiveType::U8, true))?;
+            let null_iter = ArrowIter::<u8>::new(&ba, null_ifh)?;
+            Ok(ArrowNullableIter::new(data_iter, Some(null_iter)))
+        } else {
+            Ok(ArrowNullableIter::new(data_iter, None))
+        }
+    }
+
+    /// Iterates over the non-null values of an array, converting the array
+    /// values to `u8`.
+    ///
+    /// # Example
+    /// ```
+    /// use arrow_array::Int32Array;
+    /// use arrow_compile_compute::iter::iter_nonnull_u64;
+    ///
+    /// let arr = Int32Array::from(vec![1, 2, 3]);
+    /// let iter = iter_nonnull_u64(&arr).unwrap();
+    /// assert_eq!(iter.collect::<Vec<_>>(), vec![1, 2, 3]);
+    /// ```
+    pub fn iter_nonnull_u8(
+        array: &dyn Array,
+    ) -> Result<impl Iterator<Item = u8>, ArrowKernelError> {
+        let ifh = ITER_FUNC_CACHE.get(array, (PrimitiveType::U8, false))?;
+        let i = ArrowIter::<u8>::new(array, ifh)?;
+        Ok(i)
+    }
+
+    /// Iterates over the values of an array, converting the array
+    /// values to `u8`. Values returned are `Option<u8>`.
+    pub fn iter_u8(
+        array: &dyn Array,
+    ) -> Result<impl Iterator<Item = Option<u8>>, ArrowKernelError> {
+        let data_ifh = ITER_FUNC_CACHE.get(array, (PrimitiveType::U8, true))?;
+        let data_iter = ArrowIter::<u8>::new(array, data_ifh)?;
+
+        if let Some(nulls) = array.logical_nulls() {
+            let ba = BooleanArray::new(nulls.into_inner(), None);
+            let null_ifh = ITER_FUNC_CACHE.get(&ba, (PrimitiveType::U8, true))?;
+            let null_iter = ArrowIter::<u8>::new(&ba, null_ifh)?;
+            Ok(ArrowNullableIter::new(data_iter, Some(null_iter)))
+        } else {
+            Ok(ArrowNullableIter::new(data_iter, None))
+        }
     }
 
     /// Iterates over the non-null values of an array, converting the array
@@ -198,9 +282,27 @@ pub mod iter {
     pub fn iter_nonnull_f64(
         array: &dyn Array,
     ) -> Result<impl Iterator<Item = f64>, ArrowKernelError> {
-        let ifh = ITER_FUNC_CACHE.get(array, PrimitiveType::F64)?;
+        let ifh = ITER_FUNC_CACHE.get(array, (PrimitiveType::F64, false))?;
         let i = ArrowIter::<f64>::new(array, ifh)?;
         Ok(i)
+    }
+
+    /// Iterates over the values of an array, converting the array
+    /// values to `f64`. Values returned are `Option<f64>`.
+    pub fn iter_f64(
+        array: &dyn Array,
+    ) -> Result<impl Iterator<Item = Option<f64>>, ArrowKernelError> {
+        let data_ifh = ITER_FUNC_CACHE.get(array, (PrimitiveType::F64, true))?;
+        let data_iter = ArrowIter::<f64>::new(array, data_ifh)?;
+
+        if let Some(nulls) = array.logical_nulls() {
+            let ba = BooleanArray::new(nulls.into_inner(), None);
+            let null_ifh = ITER_FUNC_CACHE.get(&ba, (PrimitiveType::U8, true))?;
+            let null_iter = ArrowIter::<u8>::new(&ba, null_ifh)?;
+            Ok(ArrowNullableIter::new(data_iter, Some(null_iter)))
+        } else {
+            Ok(ArrowNullableIter::new(data_iter, None))
+        }
     }
 
     /// Iterates over the non-null values of an array, converting the array
@@ -208,9 +310,27 @@ pub mod iter {
     pub fn iter_nonnull_bytes(
         array: &dyn Array,
     ) -> Result<impl Iterator<Item = &[u8]>, ArrowKernelError> {
-        let ifh = ITER_FUNC_CACHE.get(array, PrimitiveType::P64x2)?;
+        let ifh = ITER_FUNC_CACHE.get(array, (PrimitiveType::P64x2, false))?;
         let i = ArrowIter::<&[u8]>::new(array, ifh)?;
         Ok(i)
+    }
+
+    /// Iterates over the values of an array, converting the array
+    /// values to `&[u8]`. Values returned are `Option<&[u8]>`.
+    pub fn iter_bytes(
+        array: &dyn Array,
+    ) -> Result<impl Iterator<Item = Option<&[u8]>>, ArrowKernelError> {
+        let data_ifh = ITER_FUNC_CACHE.get(array, (PrimitiveType::P64x2, true))?;
+        let data_iter = ArrowIter::<&[u8]>::new(array, data_ifh)?;
+
+        if let Some(nulls) = array.logical_nulls() {
+            let ba = BooleanArray::new(nulls.into_inner(), None);
+            let null_ifh = ITER_FUNC_CACHE.get(&ba, (PrimitiveType::U8, true))?;
+            let null_iter = ArrowIter::<u8>::new(&ba, null_ifh)?;
+            Ok(ArrowNullableIter::new(data_iter, Some(null_iter)))
+        } else {
+            Ok(ArrowNullableIter::new(data_iter, None))
+        }
     }
 }
 

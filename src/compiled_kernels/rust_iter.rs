@@ -41,6 +41,11 @@ impl ApplyType for u64 {
         PrimitiveType::U64
     }
 }
+impl ApplyType for u8 {
+    fn primitive_type() -> PrimitiveType {
+        PrimitiveType::U8
+    }
+}
 impl ApplyType for &[u8] {
     fn primitive_type() -> PrimitiveType {
         PrimitiveType::P64x2
@@ -72,7 +77,7 @@ impl Kernel for Arc<IterFuncHolder> {
 
     type Input<'a> = &'a dyn Array;
 
-    type Params = PrimitiveType;
+    type Params = (PrimitiveType, bool);
 
     type Output = Self;
 
@@ -82,14 +87,20 @@ impl Kernel for Arc<IterFuncHolder> {
 
     fn compile(inp: &Self::Input<'_>, params: Self::Params) -> Result<Self, ArrowKernelError> {
         let ih = datum_to_iter(inp)?;
-        let setbit_ih = inp
-            .logical_nulls()
-            .map(|nulls| array_to_setbit_iter(&BooleanArray::from(nulls.clone().into_inner())))
+        let (target_type, ignore_nulls) = params;
+        let setbit_ih = (!ignore_nulls)
+            .then(|| {
+                inp.logical_nulls().map(|nulls| {
+                    array_to_setbit_iter(&BooleanArray::from(nulls.clone().into_inner()))
+                })
+            })
+            .flatten()
             .transpose()?;
+
         let func = IterFuncHolderTryBuilder {
             context: Context::create(),
             func_builder: |ctx| {
-                generate_call(ctx, inp.data_type(), &ih, setbit_ih.as_ref(), params)
+                generate_call(ctx, inp.data_type(), &ih, setbit_ih.as_ref(), target_type)
             },
         }
         .try_build()?;
@@ -100,7 +111,12 @@ impl Kernel for Arc<IterFuncHolder> {
         i: &Self::Input<'_>,
         p: &Self::Params,
     ) -> Result<Self::Key, ArrowKernelError> {
-        Ok((i.data_type().clone(), i.nulls().is_some(), *p))
+        let (target_dt, ignore_nulls) = p;
+        Ok((
+            i.data_type().clone(),
+            i.logical_nulls().is_some() && !ignore_nulls,
+            *target_dt,
+        ))
     }
 }
 
@@ -167,6 +183,38 @@ impl<T: ApplyType> ArrowIter<T> {
             next_func: func,
             pd: PhantomData,
         })
+    }
+}
+
+pub struct ArrowNullableIter<T: ApplyType> {
+    data_iter: ArrowIter<T>,
+    null_iter: Option<ArrowIter<u8>>,
+}
+
+impl<T: ApplyType> ArrowNullableIter<T> {
+    pub fn new(data_iter: ArrowIter<T>, null_iter: Option<ArrowIter<u8>>) -> Self {
+        ArrowNullableIter {
+            data_iter,
+            null_iter,
+        }
+    }
+}
+
+impl<T: ApplyType> Iterator for ArrowNullableIter<T> {
+    type Item = Option<T>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        match (
+            self.data_iter.next(),
+            self.null_iter
+                .as_mut()
+                .and_then(|iter| iter.next())
+                .or(Some(1)),
+        ) {
+            (Some(data), Some(1)) => Some(Some(data)),
+            (Some(_), Some(0)) => Some(None),
+            _ => None,
+        }
     }
 }
 
@@ -335,13 +383,16 @@ mod tests {
     use std::sync::Arc;
 
     use arrow_array::{
-        types::Int64Type, Array, Float32Array, Int32Array, Int64Array, RunArray, StringArray,
-        UInt32Array,
+        types::Int64Type, Array, BooleanArray, Float32Array, Int32Array, Int64Array, RunArray,
+        StringArray, UInt32Array,
     };
     use itertools::Itertools;
 
     use crate::{
-        compiled_kernels::rust_iter::{ArrowIter, IterFuncHolder},
+        compiled_kernels::{
+            rust_iter::{ArrowIter, IterFuncHolder},
+            ArrowNullableIter,
+        },
         Kernel, PrimitiveType,
     };
 
@@ -349,7 +400,8 @@ mod tests {
     fn test_iter_i32() {
         let data = Int32Array::from((0..1000).collect_vec());
         let ifh =
-            Arc::<IterFuncHolder>::compile(&(&data as &dyn Array), PrimitiveType::I64).unwrap();
+            Arc::<IterFuncHolder>::compile(&(&data as &dyn Array), (PrimitiveType::I64, false))
+                .unwrap();
         let res = ArrowIter::<i64>::new(&data, ifh).unwrap().collect_vec();
         assert_eq!(res, (0..1000).collect_vec());
     }
@@ -362,7 +414,8 @@ mod tests {
                 .collect_vec(),
         );
         let ifh =
-            Arc::<IterFuncHolder>::compile(&(&data as &dyn Array), PrimitiveType::I64).unwrap();
+            Arc::<IterFuncHolder>::compile(&(&data as &dyn Array), (PrimitiveType::I64, false))
+                .unwrap();
         let res = ArrowIter::<i64>::new(&data, ifh).unwrap().collect_vec();
         assert_eq!(res, (0..1000).filter(|x| x % 2 == 0).collect_vec());
     }
@@ -371,7 +424,8 @@ mod tests {
     fn test_iter_u32() {
         let data = UInt32Array::from((0..1000).collect_vec());
         let ifh =
-            Arc::<IterFuncHolder>::compile(&(&data as &dyn Array), PrimitiveType::U64).unwrap();
+            Arc::<IterFuncHolder>::compile(&(&data as &dyn Array), (PrimitiveType::U64, false))
+                .unwrap();
         let res = ArrowIter::<u64>::new(&data, ifh).unwrap().collect_vec();
         assert_eq!(res, (0..1000).collect_vec());
     }
@@ -380,7 +434,8 @@ mod tests {
     fn test_iter_f32() {
         let data = Float32Array::from((0..1000).map(|x| x as f32).collect_vec());
         let ifh =
-            Arc::<IterFuncHolder>::compile(&(&data as &dyn Array), PrimitiveType::F64).unwrap();
+            Arc::<IterFuncHolder>::compile(&(&data as &dyn Array), (PrimitiveType::F64, false))
+                .unwrap();
         let res = ArrowIter::<f64>::new(&data, ifh).unwrap().collect_vec();
         assert_eq!(res, (0..1000).map(|x| x as f64).collect_vec());
     }
@@ -390,7 +445,8 @@ mod tests {
         let vdata = (0..1000).map(|i| format!("string{}", i)).collect_vec();
         let data = StringArray::from(vdata.clone());
         let ifh =
-            Arc::<IterFuncHolder>::compile(&(&data as &dyn Array), PrimitiveType::P64x2).unwrap();
+            Arc::<IterFuncHolder>::compile(&(&data as &dyn Array), (PrimitiveType::P64x2, false))
+                .unwrap();
         let res = ArrowIter::<&[u8]>::new(&data, ifh)
             .unwrap()
             .map(|x| String::from_utf8(x.to_vec()).unwrap())
@@ -404,7 +460,8 @@ mod tests {
         let data = StringArray::from(vdata.clone());
         let data = data.slice(100, 200);
         let ifh =
-            Arc::<IterFuncHolder>::compile(&(&data as &dyn Array), PrimitiveType::P64x2).unwrap();
+            Arc::<IterFuncHolder>::compile(&(&data as &dyn Array), (PrimitiveType::P64x2, false))
+                .unwrap();
         let res = ArrowIter::<&[u8]>::new(&data, ifh)
             .unwrap()
             .map(|x| String::from_utf8(x.to_vec()).unwrap())
@@ -426,7 +483,8 @@ mod tests {
         let data = StringArray::from(vdata.clone());
         let data = data.slice(100, 10);
         let ifh =
-            Arc::<IterFuncHolder>::compile(&(&data as &dyn Array), PrimitiveType::P64x2).unwrap();
+            Arc::<IterFuncHolder>::compile(&(&data as &dyn Array), (PrimitiveType::P64x2, false))
+                .unwrap();
         let res = ArrowIter::<&[u8]>::new(&data, ifh)
             .unwrap()
             .map(|x| String::from_utf8(x.to_vec()).unwrap())
@@ -443,8 +501,53 @@ mod tests {
         .unwrap();
 
         let ifh =
-            Arc::<IterFuncHolder>::compile(&(&arr as &dyn Array), PrimitiveType::U64).unwrap();
+            Arc::<IterFuncHolder>::compile(&(&arr as &dyn Array), (PrimitiveType::U64, false))
+                .unwrap();
         let res = ArrowIter::<u64>::new(&arr, ifh).unwrap().collect_vec();
         assert_eq!(res.len(), 15);
+    }
+
+    #[test]
+    fn test_iter_bool() {
+        let arr = BooleanArray::from(vec![true, false, true, false, true]);
+        let ifh = Arc::<IterFuncHolder>::compile(&(&arr as &dyn Array), (PrimitiveType::U8, false))
+            .unwrap();
+        let res = ArrowIter::<u8>::new(&arr, ifh).unwrap().collect_vec();
+        assert_eq!(res, vec![1, 0, 1, 0, 1]);
+    }
+
+    #[test]
+    fn test_nullable_iter_ree() {
+        let arr = RunArray::<Int64Type>::try_new(
+            &Int64Array::from(vec![2, 4, 6, 8]),
+            &UInt32Array::from(vec![Some(1), Some(2), None, Some(4)]),
+        )
+        .unwrap();
+
+        let data_ifh =
+            Arc::<IterFuncHolder>::compile(&(&arr as &dyn Array), (PrimitiveType::U64, true))
+                .unwrap();
+        let data_iter = ArrowIter::<u64>::new(&arr, data_ifh).unwrap();
+
+        let ba = BooleanArray::new(arr.logical_nulls().unwrap().inner().clone(), None);
+        let null_ifh =
+            Arc::<IterFuncHolder>::compile(&(&ba as &dyn Array), (PrimitiveType::U8, true))
+                .unwrap();
+        let null_iter = ArrowIter::<u8>::new(&ba, null_ifh).unwrap();
+
+        let res = ArrowNullableIter::new(data_iter, Some(null_iter)).collect_vec();
+        assert_eq!(
+            res,
+            vec![
+                Some(1),
+                Some(1),
+                Some(2),
+                Some(2),
+                None,
+                None,
+                Some(4),
+                Some(4)
+            ]
+        );
     }
 }

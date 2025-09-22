@@ -23,6 +23,13 @@ proptest! {
     }
 
     #[test]
+    fn test_iter_i32_nulls_option(arr: Vec<Option<i32>>) {
+        let arr1 = Int32Array::from(arr.clone());
+        let v = arrow_compile_compute::iter::iter_i64(&arr1).unwrap().collect_vec();
+        assert_eq!(v, arr.iter().map(|x| x.map(|x| x as i64)).collect_vec())
+    }
+
+    #[test]
     fn test_iter_i64(arr: Vec<i64>) {
         let arr1 = Int64Array::from(arr.clone());
         let v = arrow_compile_compute::iter::iter_nonnull_i64(&arr1).unwrap().collect_vec();

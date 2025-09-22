@@ -26,7 +26,7 @@ pub use ht::HashKernel;
 use inkwell::execution_engine::ExecutionEngine;
 use llvm_utils::str_writer_append_bytes;
 pub use partition::PartitionKernel;
-pub use rust_iter::{ArrowIter, IterFuncHolder};
+pub use rust_iter::{ArrowIter, ArrowNullableIter, IterFuncHolder};
 pub use sort::{SortKernel, SortOptions};
 pub use take::TakeKernel;
 
