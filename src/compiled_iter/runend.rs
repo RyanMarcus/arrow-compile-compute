@@ -1,4 +1,4 @@
-use std::ffi::c_void;
+use std::{ffi::c_void, sync::Arc};
 
 use arrow_array::{types::RunEndIndexType, Array, ArrowPrimitiveType, PrimitiveArray, RunArray};
 use arrow_buffer::ArrowNativeType;
@@ -41,6 +41,50 @@ pub struct RunEndIterator {
 
     /// the remaining number of values in the current run
     remaining: u64,
+
+    array_ref: Arc<dyn Array>,
+}
+
+impl<R: RunEndIndexType + ArrowPrimitiveType> From<&RunArray<R>> for IteratorHolder {
+    fn from(arr: &RunArray<R>) -> Self {
+        let re = arr.run_ends().inner().clone(); // note: .inner() removes slicing offset
+        let re: PrimitiveArray<R> = PrimitiveArray::new(re, None);
+        let run_ends = Box::new(array_to_iter(&re));
+        let values = Box::new(array_to_iter(arr.values()));
+
+        let first_idx = re
+            .values()
+            .partition_point(|x| x.as_usize() <= arr.offset());
+
+        let prev_end = if first_idx == 0 {
+            0
+        } else {
+            re.value(first_idx - 1).as_usize()
+        };
+        let first_partition_size = if re.is_empty() {
+            0
+        } else {
+            re.value(first_idx).as_usize() - prev_end
+        };
+        let first_remaining = first_partition_size - (arr.offset() - prev_end);
+
+        let iter = RunEndIterator {
+            run_ends: run_ends.get_ptr(),
+            val_iter: values.get_ptr(),
+            pos: first_idx as u64,
+            len: re.len() as u64,
+            logical_pos: 0,
+            logical_len: arr.len() as u64,
+            remaining: first_remaining as u64,
+            array_ref: Arc::new(arr.clone()),
+        };
+
+        IteratorHolder::RunEnd {
+            arr: Box::new(iter),
+            run_ends,
+            values,
+        }
+    }
 }
 
 impl RunEndIterator {
@@ -225,47 +269,6 @@ impl RunEndIterator {
     ) {
         let remaining_ptr = increment_pointer!(ctx, builder, ptr, RunEndIterator::OFFSET_REMAINING);
         builder.build_store(remaining_ptr, amt).unwrap();
-    }
-}
-
-impl<R: RunEndIndexType + ArrowPrimitiveType> From<&RunArray<R>> for IteratorHolder {
-    fn from(arr: &RunArray<R>) -> Self {
-        let re = arr.run_ends().inner().clone(); // note: .inner() removes slicing offset
-        let re: PrimitiveArray<R> = PrimitiveArray::new(re, None);
-        let run_ends = Box::new(array_to_iter(&re));
-        let values = Box::new(array_to_iter(arr.values()));
-
-        let first_idx = re
-            .values()
-            .partition_point(|x| x.as_usize() <= arr.offset());
-
-        let prev_end = if first_idx == 0 {
-            0
-        } else {
-            re.value(first_idx - 1).as_usize()
-        };
-        let first_partition_size = if re.is_empty() {
-            0
-        } else {
-            re.value(first_idx).as_usize() - prev_end
-        };
-        let first_remaining = first_partition_size - (arr.offset() - prev_end);
-
-        let iter = RunEndIterator {
-            run_ends: run_ends.get_ptr(),
-            val_iter: values.get_ptr(),
-            pos: first_idx as u64,
-            len: re.len() as u64,
-            logical_pos: 0,
-            logical_len: arr.len() as u64,
-            remaining: first_remaining as u64,
-        };
-
-        IteratorHolder::RunEnd {
-            arr: Box::new(iter),
-            run_ends,
-            values,
-        }
     }
 }
 

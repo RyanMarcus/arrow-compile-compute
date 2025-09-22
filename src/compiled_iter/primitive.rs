@@ -1,4 +1,4 @@
-use std::ffi::c_void;
+use std::{ffi::c_void, sync::Arc};
 
 use crate::increment_pointer;
 use arrow_array::{Array, ArrowPrimitiveType, PrimitiveArray};
@@ -26,6 +26,7 @@ pub struct PrimitiveIterator {
     data: *const c_void,
     pos: u64,
     len: u64,
+    array_ref: Arc<dyn Array>,
 }
 
 impl<K: ArrowPrimitiveType> From<&PrimitiveArray<K>> for Box<PrimitiveIterator> {
@@ -34,6 +35,7 @@ impl<K: ArrowPrimitiveType> From<&PrimitiveArray<K>> for Box<PrimitiveIterator> 
             data: value.values().as_ptr() as *const c_void,
             pos: value.offset() as u64, // always zero
             len: (value.len() + value.offset()) as u64,
+            array_ref: Arc::new(value.clone()),
         })
     }
 }

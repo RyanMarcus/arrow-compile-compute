@@ -1,6 +1,6 @@
-use std::ffi::c_void;
+use std::{ffi::c_void, sync::Arc};
 
-use arrow_array::{types::ArrowDictionaryKeyType, DictionaryArray};
+use arrow_array::{types::ArrowDictionaryKeyType, Array, DictionaryArray};
 use inkwell::{builder::Builder, context::Context, values::PointerValue, AddressSpace};
 use repr_offset::ReprOffset;
 
@@ -18,6 +18,25 @@ use super::{array_to_iter, IteratorHolder};
 pub struct DictionaryIterator {
     key_iter: *const c_void,
     val_iter: *const c_void,
+    array_ref: Arc<dyn Array>,
+}
+
+impl<K: ArrowDictionaryKeyType> From<&DictionaryArray<K>> for IteratorHolder {
+    fn from(arr: &DictionaryArray<K>) -> Self {
+        let arr = Arc::new(arr.clone());
+        let keys = Box::new(array_to_iter(arr.keys()));
+        let values = Box::new(array_to_iter(arr.values()));
+        let iter = DictionaryIterator {
+            key_iter: keys.get_ptr(),
+            val_iter: values.get_ptr(),
+            array_ref: arr,
+        };
+        IteratorHolder::Dictionary {
+            arr: Box::new(iter),
+            keys,
+            values,
+        }
+    }
 }
 
 impl DictionaryIterator {
@@ -45,22 +64,6 @@ impl DictionaryIterator {
             .build_load(ctx.ptr_type(AddressSpace::default()), ptr_ptr, "val_iter")
             .unwrap()
             .into_pointer_value()
-    }
-}
-
-impl<K: ArrowDictionaryKeyType> From<&DictionaryArray<K>> for IteratorHolder {
-    fn from(arr: &DictionaryArray<K>) -> Self {
-        let keys = Box::new(array_to_iter(arr.keys()));
-        let values = Box::new(array_to_iter(arr.values()));
-        let iter = DictionaryIterator {
-            key_iter: keys.get_ptr(),
-            val_iter: values.get_ptr(),
-        };
-        IteratorHolder::Dictionary {
-            arr: Box::new(iter),
-            keys,
-            values,
-        }
     }
 }
 

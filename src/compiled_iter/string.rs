@@ -1,3 +1,5 @@
+use std::sync::Arc;
+
 use arrow_array::{Array, GenericStringArray, StringArray};
 use inkwell::{
     builder::Builder,
@@ -19,6 +21,7 @@ pub struct StringIterator {
     data: *const u8,
     pos: u64,
     len: u64,
+    array_ref: Arc<dyn Array>,
 }
 
 impl From<&StringArray> for Box<StringIterator> {
@@ -28,6 +31,7 @@ impl From<&StringArray> for Box<StringIterator> {
             data: value.values().as_ptr(),
             pos: value.offset() as u64,
             len: (value.len() + value.offset()) as u64,
+            array_ref: Arc::new(value.clone()),
         })
     }
 }

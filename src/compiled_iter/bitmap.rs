@@ -20,6 +20,19 @@ pub struct BitmapIterator {
     slice_offset: u64,
     pos: u64,
     len: u64,
+    array_ref: BooleanArray,
+}
+
+impl From<&BooleanArray> for Box<BitmapIterator> {
+    fn from(value: &BooleanArray) -> Self {
+        Box::new(BitmapIterator {
+            data: value.values().values().as_ptr(),
+            slice_offset: value.offset() as u64,
+            pos: 0,
+            len: value.len() as u64,
+            array_ref: value.clone(),
+        })
+    }
 }
 
 impl BitmapIterator {
@@ -94,17 +107,6 @@ impl BitmapIterator {
             .into_int_value();
         let new_pos = builder.build_int_add(pos, amt, "new_pos").unwrap();
         builder.build_store(pos_ptr, new_pos).unwrap();
-    }
-}
-
-impl From<&BooleanArray> for Box<BitmapIterator> {
-    fn from(value: &BooleanArray) -> Self {
-        Box::new(BitmapIterator {
-            data: value.values().values().as_ptr(),
-            slice_offset: value.offset() as u64,
-            pos: 0,
-            len: value.len() as u64,
-        })
     }
 }
 

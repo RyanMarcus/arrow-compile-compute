@@ -91,6 +91,7 @@ pub struct SetBitIterator {
     curr_setbit_idx: u64,
     segment_pos: u64,
     segment_len: u64,
+    array_ref: BooleanArray,
 }
 
 impl From<&BooleanArray> for SetBitIterator {
@@ -147,6 +148,7 @@ impl From<&BooleanArray> for SetBitIterator {
             curr_setbit_idx: segments.head.map(|r| r.len()).unwrap_or(0) as u64,
             segment_pos: first_full_segment_idx as u64,
             segment_len: last_full_segment_idx as u64 - first_full_segment_idx as u64,
+            array_ref: array.clone(),
         }
     }
 }

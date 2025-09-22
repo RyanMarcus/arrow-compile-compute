@@ -1,3 +1,5 @@
+use std::sync::Arc;
+
 use arrow_array::{types::ByteViewType, Array, GenericByteViewArray};
 use arrow_buffer::Buffer;
 use inkwell::{
@@ -29,6 +31,8 @@ pub struct ViewIterator {
 
     pos: u64,
     len: u64,
+
+    array_ref: Arc<dyn Array>,
 }
 
 impl<T: ByteViewType> From<&GenericByteViewArray<T>> for Box<ViewIterator> {
@@ -46,6 +50,7 @@ impl<T: ByteViewType> From<&GenericByteViewArray<T>> for Box<ViewIterator> {
             data_buffers,
             pos: 0,
             len: value.len() as u64,
+            array_ref: Arc::new(value.clone()),
         })
     }
 }
