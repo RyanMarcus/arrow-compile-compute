@@ -83,7 +83,7 @@ impl Kernel for Arc<IterFuncHolder> {
     fn compile(inp: &Self::Input<'_>, params: Self::Params) -> Result<Self, ArrowKernelError> {
         let ih = datum_to_iter(inp)?;
         let setbit_ih = inp
-            .nulls()
+            .logical_nulls()
             .map(|nulls| array_to_setbit_iter(&BooleanArray::from(nulls.clone().into_inner())))
             .transpose()?;
         let func = IterFuncHolderTryBuilder {
@@ -154,7 +154,7 @@ impl<T: ApplyType> ArrowIter<T> {
     pub fn new(data: &dyn Array, func: Arc<IterFuncHolder>) -> Result<Self, ArrowKernelError> {
         let ih = datum_to_iter(&data)?;
         let setbit_ih = data
-            .nulls()
+            .logical_nulls()
             .map(|nulls| array_to_setbit_iter(&BooleanArray::from(nulls.clone().into_inner())))
             .transpose()?;
 
@@ -334,7 +334,10 @@ fn generate_call<'a>(
 mod tests {
     use std::sync::Arc;
 
-    use arrow_array::{Array, Float32Array, Int32Array, StringArray, UInt32Array};
+    use arrow_array::{
+        types::Int64Type, Array, Float32Array, Int32Array, Int64Array, RunArray, StringArray,
+        UInt32Array,
+    };
     use itertools::Itertools;
 
     use crate::{
@@ -429,5 +432,19 @@ mod tests {
             .map(|x| String::from_utf8(x.to_vec()).unwrap())
             .collect_vec();
         assert_eq!(res.len(), 5);
+    }
+
+    #[test]
+    fn test_iter_ree() {
+        let arr = RunArray::<Int64Type>::try_new(
+            &Int64Array::from(vec![5, 10, 15, 20]),
+            &UInt32Array::from(vec![Some(1), Some(2), None, Some(4)]),
+        )
+        .unwrap();
+
+        let ifh =
+            Arc::<IterFuncHolder>::compile(&(&arr as &dyn Array), PrimitiveType::U64).unwrap();
+        let res = ArrowIter::<u64>::new(&arr, ifh).unwrap().collect_vec();
+        assert_eq!(res.len(), 15);
     }
 }
