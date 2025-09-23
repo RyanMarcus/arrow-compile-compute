@@ -51,6 +51,10 @@ impl WriterAllocation for ArrayOutput {
     fn to_array_ref(self, len: usize, nulls: Option<arrow_buffer::NullBuffer>) -> ArrayRef {
         self.to_array(len, nulls)
     }
+
+    fn add_last_written_offset(&mut self, offset: usize) {
+        self.out_ptr = self.out_ptr.wrapping_add(self.pt.width() * offset);
+    }
 }
 
 impl ArrayOutput {
@@ -105,7 +109,6 @@ impl<'a> ArrayWriter<'a> for PrimitiveArrayWriter<'a> {
         let width = ty.width();
         let func_name = format!("ingest_prim_{}b", width);
 
-        // Create or retrieve the ingest function:
         let ingest_func = {
             let b2 = ctx.create_builder();
             let fn_type = ctx.void_type().fn_type(&[ty.llvm_type(ctx).into()], false);
@@ -136,7 +139,7 @@ impl<'a> ArrayWriter<'a> for PrimitiveArrayWriter<'a> {
     }
 
     fn llvm_flush(&self, _ctx: &'a Context, _build: &Builder<'a>) {
-        // No-op for primitive arrays
+        // no-op
     }
 }
 

@@ -341,14 +341,12 @@ pub mod select {
     use arrow_array::{make_array, Array, ArrayRef, BooleanArray};
 
     use crate::{
-        compiled_kernels::{ConcatKernel, FilterKernel, KernelCache, PartitionKernel, TakeKernel},
+        compiled_kernels::{concat_all, FilterKernel, KernelCache, PartitionKernel, TakeKernel},
         ArrowKernelError,
     };
 
     static TAKE_PROGRAM_CACHE: LazyLock<KernelCache<TakeKernel>> = LazyLock::new(KernelCache::new);
     static FILTER_PROGRAM_CACHE: LazyLock<KernelCache<FilterKernel>> =
-        LazyLock::new(KernelCache::new);
-    static CONCAT_PROGRAM_CACHE: LazyLock<KernelCache<ConcatKernel>> =
         LazyLock::new(KernelCache::new);
     static PARTITION_PROGRAM_CACHE: LazyLock<KernelCache<PartitionKernel>> =
         LazyLock::new(KernelCache::new);
@@ -414,10 +412,15 @@ pub mod select {
     /// assert_eq!(res.len(), 8);
     /// ```
     pub fn concat(data: &[&dyn Array]) -> Result<ArrayRef, ArrowKernelError> {
+        if data.is_empty() {
+            return Err(ArrowKernelError::UnsupportedArguments(
+                "Cannot concat empty array".to_string(),
+            ));
+        }
         if data.len() == 1 {
             return Ok(make_array(data[0].to_data()));
         }
-        CONCAT_PROGRAM_CACHE.get(data, ())
+        concat_all(data)
     }
 
     /// Partitions an array into multiple arrays based on the partition indexes.

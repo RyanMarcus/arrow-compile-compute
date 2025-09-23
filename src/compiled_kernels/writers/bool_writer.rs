@@ -46,6 +46,10 @@ impl WriterAllocation for BooleanAllocation {
     fn to_array_ref(self, len: usize, nulls: Option<arrow_buffer::NullBuffer>) -> ArrayRef {
         Arc::new(self.to_array(len, nulls))
     }
+
+    fn add_last_written_offset(&mut self, _offset: usize) {
+        unimplemented!("cannot add to offset of boolean writer")
+    }
 }
 
 impl<'a> ArrayWriter<'a> for BooleanWriter<'a> {

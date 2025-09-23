@@ -57,6 +57,11 @@ pub trait ArrayWriter<'a> {
 pub trait WriterAllocation {
     type Output: Array;
     fn get_ptr(&mut self) -> *mut c_void;
+
+    /// Progresses the allocation so that future writes will go after the last
+    /// write. The behavior of reusing a writer without calling this function is
+    /// undefined.
+    fn add_last_written_offset(&mut self, offset: usize);
     fn to_array(self, len: usize, nulls: Option<NullBuffer>) -> Self::Output;
     fn to_array_ref(self, len: usize, nulls: Option<NullBuffer>) -> ArrayRef;
 }

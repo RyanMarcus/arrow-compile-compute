@@ -20,7 +20,7 @@ pub use arith::BinOpKernel;
 use arrow_schema::DataType;
 pub use cast::CastKernel;
 pub use cmp::ComparisonKernel;
-pub use concat::ConcatKernel;
+pub use concat::concat_all;
 pub use filter::FilterKernel;
 pub use ht::HashKernel;
 use inkwell::execution_engine::ExecutionEngine;

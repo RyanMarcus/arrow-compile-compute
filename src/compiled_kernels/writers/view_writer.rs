@@ -86,6 +86,10 @@ impl WriterAllocation for StringViewAllocation {
     fn to_array_ref(self, len: usize, nulls: Option<arrow_buffer::NullBuffer>) -> ArrayRef {
         Arc::new(self.to_array(len, nulls))
     }
+
+    fn add_last_written_offset(&mut self, _offset: usize) {
+        // do nothing -- pointed updated by LLVM gen'd code
+    }
 }
 
 /// Writer for view arrays (utf8 or bytes)

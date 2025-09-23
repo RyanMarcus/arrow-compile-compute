@@ -52,6 +52,10 @@ impl<'a, K: ArrowDictionaryKeyType, VW: ArrayWriter<'a>> WriterAllocation
     fn to_array_ref(self, len: usize, nulls: Option<arrow_buffer::NullBuffer>) -> ArrayRef {
         Arc::new(self.to_array(len, nulls))
     }
+
+    fn add_last_written_offset(&mut self, _offset: usize) {
+        unimplemented!("cannot add to offset of dictionary writer")
+    }
 }
 
 pub struct DictWriter<'a, K: ArrowDictionaryKeyType, VW: ArrayWriter<'a>> {

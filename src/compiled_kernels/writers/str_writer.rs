@@ -61,6 +61,10 @@ impl<T: OffsetSizeTrait> WriterAllocation for StringAllocation<T> {
     fn to_array_ref(self, len: usize, nulls: Option<arrow_buffer::NullBuffer>) -> ArrayRef {
         Arc::new(self.to_array(len, nulls))
     }
+
+    fn add_last_written_offset(&mut self, _offset: usize) {
+        unimplemented!("cannot add to offset of str writer")
+    }
 }
 
 impl<'a, T: OffsetSizeTrait> ArrayWriter<'a> for StringArrayWriter<'a, T> {

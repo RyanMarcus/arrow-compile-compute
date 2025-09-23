@@ -65,6 +65,10 @@ impl<'a, K: RunEndIndexType, VW: ArrayWriter<'a>> WriterAllocation for REEAlloca
     fn to_array_ref(self, len: usize, nulls: Option<arrow_buffer::NullBuffer>) -> ArrayRef {
         Arc::new(self.to_array(len, nulls))
     }
+
+    fn add_last_written_offset(&mut self, _offset: usize) {
+        unimplemented!("cannot add to offset of run-end encoded writer")
+    }
 }
 
 pub struct REEWriter<'a, K: RunEndIndexType, VW: ArrayWriter<'a>> {
