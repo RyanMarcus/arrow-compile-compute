@@ -1,6 +1,6 @@
 use std::ffi::c_void;
 
-use crate::{declare_blocks, increment_pointer, PrimitiveType};
+use crate::{declare_blocks, declare_global_pointer, increment_pointer, PrimitiveType};
 use arrow_array::{make_array, ArrayRef, ArrowPrimitiveType, PrimitiveArray};
 use arrow_buffer::{Buffer, NullBuffer};
 use arrow_data::ArrayDataBuilder;
@@ -99,10 +99,8 @@ impl<'a> ArrayWriter<'a> for PrimitiveArrayWriter<'a> {
     ) -> Self {
         let ptr_type = ctx.ptr_type(AddressSpace::default());
 
-        let global_alloc_ptr = llvm_mod.add_global(ptr_type, None, "ARRAY_WRITER_ALLOC_PTR");
-        global_alloc_ptr.set_initializer(&ptr_type.const_null());
-        global_alloc_ptr.set_linkage(Linkage::Private);
-        let global_alloc_ptr_ptr = global_alloc_ptr.as_pointer_value();
+        let global_alloc_ptr_ptr =
+            declare_global_pointer!(llvm_mod, ARRAY_WRITER_ALLOC_PTR).as_pointer_value();
 
         build.build_store(global_alloc_ptr_ptr, alloc_ptr).unwrap();
 
