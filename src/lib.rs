@@ -49,6 +49,7 @@ macro_rules! declare_global_pointer {
     ($module:expr, $label:ident) => {{
         let ptr_type = $module.get_context().ptr_type(AddressSpace::default());
         let global_var = $module.add_global(ptr_type, None, stringify!($label));
+        global_var.set_thread_local(true);
         global_var.set_initializer(&ptr_type.const_null());
         global_var.set_linkage(inkwell::module::Linkage::Private);
         global_var
