@@ -13,7 +13,7 @@ use std::ffi::c_void;
 
 use crate::compiled_iter::{datum_to_iter, generate_next, generate_next_block, IteratorHolder};
 use crate::compiled_kernels::writers::{ArrayWriter, BooleanWriter, WriterAllocation};
-use crate::compiled_kernels::{gen_convert_numeric_vec, optimize_module};
+use crate::compiled_kernels::{gen_convert_numeric_vec, link_req_helpers, optimize_module};
 use crate::{
     declare_blocks, increment_pointer, pointer_diff, ComparisonType, Predicate, PrimitiveType,
 };
@@ -480,6 +480,7 @@ fn generate_block_llvm_cmp_kernel<'a>(
     let ee = module
         .create_jit_execution_engine(OptimizationLevel::Aggressive)
         .unwrap();
+    link_req_helpers(&module, &ee).unwrap();
 
     Ok(unsafe {
         ee.get_function::<unsafe extern "C" fn(*mut c_void, *mut c_void, *mut c_void)>(
@@ -790,6 +791,50 @@ mod tests {
         let k = ComparisonKernel::compile(&(&a, &b), Predicate::Lt).unwrap();
         let r = k.call((&a, &b)).unwrap();
         assert_eq!(r, BooleanArray::from(vec![true; 100]))
+    }
+
+    #[test]
+    fn test_i32_dict_ree_eq() {
+        let n = 100_000usize;
+
+        // Build a logical sequence of i32 values with small run lengths (1..=8)
+        let mut values: Vec<i32> = Vec::with_capacity(n);
+        let mut run_ends: Vec<i32> = Vec::new();
+        let mut run_vals: Vec<i32> = Vec::new();
+
+        let mut idx = 0usize;
+        let mut cum_end = 0i32;
+        while idx < n {
+            let remaining = n - idx;
+            let len = std::cmp::min(1 + (idx % 8), remaining); // run lengths in 1..=8
+            let val = ((idx * 31) % 997) as i32; // deterministic varied values within a small domain
+
+            values.extend(std::iter::repeat(val).take(len));
+            cum_end += len as i32;
+            run_ends.push(cum_end);
+            run_vals.push(val);
+            idx += len;
+        }
+
+        // Dictionary array from the full logical values
+        let dict_logical = Int32Array::from(values.clone());
+        let dict_arr = arrow_cast::cast(
+            &dict_logical,
+            &dictionary_data_type(DataType::Int16, DataType::Int32),
+        )
+        .unwrap();
+
+        // Run-end encoded array from the runs
+        let run_ends_arr = Int32Array::from(run_ends);
+        let run_vals_arr = Int32Array::from(run_vals);
+        let ree = arrow_array::RunArray::try_new(&run_ends_arr, &run_vals_arr).unwrap();
+        let ree: arrow_array::ArrayRef = std::sync::Arc::new(ree);
+
+        // Compare equality
+        let k = ComparisonKernel::compile(&(&dict_arr, &ree), Predicate::Eq).unwrap();
+        let r = k.call((&dict_arr, &ree)).unwrap();
+
+        assert_eq!(r, BooleanArray::from(vec![true; n]));
     }
 
     #[test]

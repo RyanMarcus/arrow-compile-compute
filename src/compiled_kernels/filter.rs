@@ -128,4 +128,23 @@ mod tests {
 
         assert_eq!(res.as_primitive::<Int32Type>().values(), &[1, 1, 3, 3]);
     }
+
+    #[test]
+    fn stress_test_filter_i32() {
+        let data = Int32Array::from(vec![10; 256]);
+
+        std::thread::scope(|s| {
+            for tid in 0..16 {
+                let ptid = tid;
+                let pdata = data.clone();
+                s.spawn(move || {
+                    let mut rng = fastrand::Rng::with_seed(ptid);
+                    for _ in 0..1000000 {
+                        let filt = BooleanArray::from((0..256).map(|_| rng.bool()).collect_vec());
+                        crate::arrow_interface::select::filter(&pdata, &filt).unwrap();
+                    }
+                });
+            }
+        });
+    }
 }

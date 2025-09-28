@@ -370,16 +370,7 @@ pub fn generate_next_block<'a, const N: u32>(
                 )
                 .unwrap();
 
-                declare_blocks!(
-                    ctx,
-                    next,
-                    entry,
-                    none_left,
-                    get_next,
-                    loop_cond_block,
-                    loop_body_block,
-                    after_loop_block
-                );
+                declare_blocks!(ctx, next, entry, none_left, get_next);
 
                 build.position_at_end(entry);
                 let key_prim_type = PrimitiveType::for_arrow_type(k_dt);
@@ -406,65 +397,35 @@ pub fn generate_next_block<'a, const N: u32>(
                     .unwrap();
 
                 build.position_at_end(get_next);
-                let loop_counter_type = ctx.i64_type();
-                let loop_counter = build
-                    .build_alloca(loop_counter_type, "loop_counter")
-                    .unwrap();
-                build
-                    .build_store(loop_counter, loop_counter_type.const_int(0, false))
-                    .unwrap();
-                build.build_unconditional_branch(loop_cond_block).unwrap();
-
-                build.position_at_end(loop_cond_block);
-                let loop_index = build
-                    .build_load(loop_counter_type, loop_counter, "loop_index")
-                    .unwrap()
-                    .into_int_value();
-                let loop_cond = build
-                    .build_int_compare(
-                        IntPredicate::ULT,
-                        loop_index,
-                        loop_counter_type.const_int(N as u64, false),
-                        "loop_cond",
-                    )
-                    .unwrap();
-                build
-                    .build_conditional_branch(loop_cond, loop_body_block, after_loop_block)
-                    .unwrap();
-
-                build.position_at_end(loop_body_block);
                 let key_vec = build
                     .build_load(key_vec_type, key_buf, "key_vec")
                     .unwrap()
                     .into_vector_value();
-                let key_uncast = build
-                    .build_extract_element(key_vec, loop_index, "key")
-                    .unwrap()
-                    .into_int_value();
-                let key = build
-                    .build_int_cast(key_uncast, i64_type, "key_cast")
+                let key_vec = build
+                    .build_int_cast(key_vec, i64_type.vec_type(N), "key_vec_cast")
                     .unwrap();
-                let val_iter = arr.llvm_val_iter_ptr(ctx, &build, iter_ptr);
-                let value = build
-                    .build_call(value_access, &[val_iter.into(), key.into()], "value")
-                    .unwrap()
-                    .try_as_basic_value()
-                    .unwrap_left();
-                let val_prim_type = PrimitiveType::for_arrow_type(v_dt);
-                let elem_ptr =
-                    increment_pointer!(ctx, &build, out_ptr, val_prim_type.width(), loop_index);
-                build.build_store(elem_ptr, value).unwrap();
-                let new_index = build
-                    .build_int_add(
-                        loop_index,
-                        loop_counter_type.const_int(1, false),
-                        "new_index",
-                    )
-                    .unwrap();
-                build.build_store(loop_counter, new_index).unwrap();
-                build.build_unconditional_branch(loop_cond_block).unwrap();
-
-                build.position_at_end(after_loop_block);
+                let mut out_vec = vec_type.const_zero();
+                for idx in 0..N as u64 {
+                    let key = build
+                        .build_extract_element(key_vec, i64_type.const_int(idx, false), "key")
+                        .unwrap()
+                        .into_int_value();
+                    let val_iter = arr.llvm_val_iter_ptr(ctx, &build, iter_ptr);
+                    let value = build
+                        .build_call(value_access, &[val_iter.into(), key.into()], "value")
+                        .unwrap()
+                        .try_as_basic_value()
+                        .unwrap_left();
+                    out_vec = build
+                        .build_insert_element(
+                            out_vec,
+                            value,
+                            i64_type.const_int(idx, false),
+                            &format!("insert{}", idx),
+                        )
+                        .unwrap();
+                }
+                build.build_store(out_ptr, out_vec).unwrap();
                 build
                     .build_return(Some(&bool_type.const_int(1, false)))
                     .unwrap();
@@ -585,6 +546,7 @@ pub fn generate_next_block<'a, const N: u32>(
                     .try_as_basic_value()
                     .unwrap_left()
                     .into_int_value();
+
                 let pr_end = build
                     .build_call(
                         access_ends,
@@ -602,6 +564,9 @@ pub fn generate_next_block<'a, const N: u32>(
                     .unwrap_left()
                     .into_int_value();
                 let remaining = build.build_int_sub(my_end, pr_end, "remaining").unwrap();
+                let remaining = build
+                    .build_int_cast(remaining, i64_type, "remaining_cast")
+                    .unwrap();
                 arr.llvm_set_remaining(ctx, &build, iter_ptr, remaining);
                 build.build_unconditional_branch(loop_cond).unwrap();
 
@@ -1323,7 +1288,10 @@ pub fn generate_next<'a>(
                 let new_remaining = build
                     .build_int_sub(my_end, prev_end, "new_remaining")
                     .unwrap();
-                arr.llvm_set_remaining(ctx, &build, iter_ptr, new_remaining);
+                let new_remaining_cast = build
+                    .build_int_cast(new_remaining, i64_type, "new_remaining_cast")
+                    .unwrap();
+                arr.llvm_set_remaining(ctx, &build, iter_ptr, new_remaining_cast);
                 build.build_unconditional_branch(check_remaining).unwrap();
 
                 build.position_at_end(exhausted);

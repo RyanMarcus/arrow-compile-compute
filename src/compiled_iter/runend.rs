@@ -267,6 +267,7 @@ impl RunEndIterator {
         ptr: PointerValue<'a>,
         amt: IntValue<'a>,
     ) {
+        assert_eq!(amt.get_type().get_bit_width(), 64);
         let remaining_ptr = increment_pointer!(ctx, builder, ptr, RunEndIterator::OFFSET_REMAINING);
         builder.build_store(remaining_ptr, amt).unwrap();
     }

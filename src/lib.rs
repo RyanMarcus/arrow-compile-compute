@@ -20,6 +20,7 @@ use inkwell::{
 mod arrow_interface;
 mod compiled_iter;
 mod compiled_kernels;
+mod llvm_debug;
 
 pub use arrow_interface::aggregate;
 pub use arrow_interface::arith;

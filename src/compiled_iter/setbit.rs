@@ -427,7 +427,6 @@ mod tests {
         let func = generate_next(&ctx, &module, "setbit_iter", data.data_type(), &iter).unwrap();
         let fname = func.get_name().to_str().unwrap();
 
-        module.print_to_stderr();
         module.verify().unwrap();
 
         let ee = module
@@ -454,7 +453,6 @@ mod tests {
         let func = generate_next(&ctx, &module, "setbit_iter", data.data_type(), &iter).unwrap();
         let fname = func.get_name().to_str().unwrap();
 
-        module.print_to_stderr();
         module.verify().unwrap();
 
         let ee = module
@@ -554,5 +552,55 @@ mod tests {
         assert_eq!(s.head, None);
         assert_eq!(s.body, Some(128..192));
         assert_eq!(s.tail, Some(192..228));
+    }
+
+    #[test]
+    fn test_setbit_repr_offsets() {
+        use std::mem::offset_of;
+
+        assert_eq!(
+            SetBitIterator::OFFSET_HEADER,
+            offset_of!(SetBitIterator, header)
+        );
+        assert_eq!(
+            SetBitIterator::OFFSET_HEADER_IDX,
+            offset_of!(SetBitIterator, header_idx)
+        );
+        assert_eq!(
+            SetBitIterator::OFFSET_HEADER_LEN,
+            offset_of!(SetBitIterator, header_len)
+        );
+        assert_eq!(
+            SetBitIterator::OFFSET_TAIL,
+            offset_of!(SetBitIterator, tail)
+        );
+        assert_eq!(
+            SetBitIterator::OFFSET_TAIL_IDX,
+            offset_of!(SetBitIterator, tail_idx)
+        );
+        assert_eq!(
+            SetBitIterator::OFFSET_TAIL_LEN,
+            offset_of!(SetBitIterator, tail_len)
+        );
+        assert_eq!(
+            SetBitIterator::OFFSET_CURRENT_U64,
+            offset_of!(SetBitIterator, current_u64)
+        );
+        assert_eq!(
+            SetBitIterator::OFFSET_CURR_SETBIT_IDX,
+            offset_of!(SetBitIterator, curr_setbit_idx)
+        );
+        assert_eq!(
+            SetBitIterator::OFFSET_SEGMENT_POS,
+            offset_of!(SetBitIterator, segment_pos)
+        );
+        assert_eq!(
+            SetBitIterator::OFFSET_SEGMENT_LEN,
+            offset_of!(SetBitIterator, segment_len)
+        );
+        assert_eq!(
+            SetBitIterator::OFFSET_BITMAP,
+            offset_of!(SetBitIterator, bitmap)
+        );
     }
 }

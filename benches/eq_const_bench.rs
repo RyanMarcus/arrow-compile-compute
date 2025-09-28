@@ -1,7 +1,11 @@
-use arrow_array::{types::Int64Type, Float32Array, Int32Array, Int64Array, RunArray, StringArray};
+use arrow_array::{
+    types::{Int32Type, Int64Type},
+    ArrayRef, Float32Array, Int32Array, Int64Array, RunArray, StringArray,
+};
 use arrow_schema::DataType;
 use criterion::{criterion_group, criterion_main, Criterion};
 use itertools::Itertools;
+use std::sync::Arc;
 
 fn generate_random_ree_array(num_run_ends: usize) -> RunArray<Int64Type> {
     let mut rng = fastrand::Rng::with_seed(42 + num_run_ends as u64);
@@ -151,6 +155,53 @@ pub fn criterion_benchmark(c: &mut Criterion) {
         });
         c.bench_function("strlt/execute llvm", |b| {
             b.iter(|| arrow_compile_compute::cmp::lt(&data, &scalar).unwrap())
+        });
+    }
+
+    {
+        let num_runs = 200_000;
+        let mut run_ends = Vec::with_capacity(num_runs);
+        let mut run_values = Vec::with_capacity(num_runs);
+        let mut expanded = Vec::with_capacity(num_runs * 4);
+        let mut total_len = 0;
+
+        for _ in 0..num_runs {
+            // Sample run lengths in 0..=8, retrying until we get a valid length > 0.
+            let run_length = loop {
+                let candidate = rng.usize(0..=8);
+                if candidate > 0 {
+                    break candidate;
+                }
+            };
+            let value = rng.i32(-1024..1024);
+            total_len += run_length;
+            run_ends.push(total_len as i32);
+            run_values.push(value);
+            expanded.extend(std::iter::repeat(value).take(run_length));
+        }
+
+        let run_ends_array = Int32Array::from(run_ends);
+        let run_values_array = Int32Array::from(run_values);
+        let ree_array: ArrayRef =
+            Arc::new(RunArray::<Int32Type>::try_new(&run_ends_array, &run_values_array).unwrap());
+
+        let expanded_array: ArrayRef = Arc::new(Int32Array::from(expanded));
+        let dict_type = DataType::Dictionary(Box::new(DataType::Int32), Box::new(DataType::Int32));
+        let dict_array = arrow_cast::cast(&expanded_array, &dict_type).unwrap();
+        // Convert both arrays to their logical representation for the Arrow baseline, as
+        // dictionary vs. REE comparisons are not currently supported there.
+        let dict_as_primitive = arrow_cast::cast(&dict_array, &DataType::Int32).unwrap();
+        let ree_as_primitive = expanded_array.clone();
+
+        let llvm_answer = arrow_compile_compute::cmp::eq(&dict_array, &ree_array).unwrap();
+        let arrow_answer = arrow_ord::cmp::eq(&dict_as_primitive, &ree_as_primitive).unwrap();
+        assert_eq!(arrow_answer, llvm_answer);
+
+        c.bench_function("dict_eq_ree_i32/execute arrow", |b| {
+            b.iter(|| arrow_ord::cmp::eq(&dict_as_primitive, &ree_as_primitive).unwrap())
+        });
+        c.bench_function("dict_eq_ree_i32/execute llvm", |b| {
+            b.iter(|| arrow_compile_compute::cmp::eq(&dict_array, &ree_array).unwrap())
         });
     }
 

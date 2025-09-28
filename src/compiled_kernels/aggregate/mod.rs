@@ -604,7 +604,7 @@ mod tests {
     fn test_count_empty() {
         let agg = CountAggregator::new(&[], 1024);
         let res = agg.finish().values().iter().copied().collect_vec();
-        assert_eq!(res, vec![]);
+        assert!(res.is_empty());
     }
 
     #[test]
