@@ -71,3 +71,7 @@ harness = false
 [[bench]]
 name = "concat_bench"
 harness = false
+
+[[bench]]
+name = "hash_bench"
+harness = false

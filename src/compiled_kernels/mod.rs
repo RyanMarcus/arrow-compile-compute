@@ -22,7 +22,7 @@ pub use cast::CastKernel;
 pub use cmp::ComparisonKernel;
 pub use concat::concat_all;
 pub use filter::FilterKernel;
-pub use ht::HashKernel;
+pub use ht::{HashFunction, HashKernel};
 use inkwell::execution_engine::ExecutionEngine;
 use llvm_utils::str_writer_append_bytes;
 pub use partition::PartitionKernel;

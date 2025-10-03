@@ -470,16 +470,17 @@ pub mod compute {
     use arrow_array::{Array, Datum, UInt64Array};
 
     use crate::{
-        compiled_kernels::{HashKernel, KernelCache},
+        compiled_kernels::{HashFunction, HashKernel, KernelCache},
         ArrowKernelError,
     };
 
     static HASH_PROGRAM_CACHE: LazyLock<KernelCache<HashKernel>> = LazyLock::new(KernelCache::new);
 
-    /// Compute a 64-bit hash for each element in `data`.
+    /// Compute a 64-bit modified murmurhash for each element in `data`.
     ///
     /// This function computes a hash of the input, returning a `UInt64Array`
     /// where each value is the hash of the corresponding element in the input.
+    /// Uses a modified murmur hash.
     ///
     /// # Example
     ///
@@ -495,7 +496,39 @@ pub mod compute {
     /// assert_eq!(hashes.value(0), hashes.value(2));
     /// ```
     pub fn hash(data: &dyn Datum) -> Result<UInt64Array, ArrowKernelError> {
-        HASH_PROGRAM_CACHE.get(data, ())
+        HASH_PROGRAM_CACHE.get(data, HashFunction::Murmur)
+    }
+
+    /// Compute a 64-bit mixed-CRC hash for each element in `data`. Only
+    /// supports 32 and 64-bit base types.
+    ///
+    /// This function computes a hash of the input, returning a `UInt64Array`
+    /// where each value is the hash of the corresponding element in the input.
+    /// These hash functions are especially good for hash joins, as presented
+    /// in:
+    ///
+    /// > Altan Birler, Tobias Schmidt, Philipp Fent, and Thomas Neumann. 2024.
+    /// Simple, Efficient, and Robust Hash Tables for Join Processing. In 20th
+    /// International Workshop on Data Management on New Hardware (DaMoN ’24),
+    /// June 10, 2024, Santiago, AA, Chile. ACM, New York, NY, USA, 9 pages.
+    /// https://doi.org/10.1145/3662010.3663442
+    ///
+    ///
+    /// # Example
+    ///
+    /// ```
+    /// use arrow_array::{Int32Array, Datum, UInt64Array};
+    /// use arrow_compile_compute::compute::hash_unchained;
+    ///
+    /// let arr = Int32Array::from(vec![10, 20, 10]);
+    /// let hashes: UInt64Array = hash_unchained(&arr).unwrap();
+    /// assert_eq!(hashes.len(), arr.len());
+    ///
+    /// // The same input produces the same hash
+    /// assert_eq!(hashes.value(0), hashes.value(2));
+    /// ```
+    pub fn hash_unchained(data: &dyn Datum) -> Result<UInt64Array, ArrowKernelError> {
+        HASH_PROGRAM_CACHE.get(data, HashFunction::Unchained)
     }
 
     /// Compute an approximation of the maximum run length inside of an array.

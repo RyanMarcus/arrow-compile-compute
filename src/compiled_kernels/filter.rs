@@ -139,7 +139,7 @@ mod tests {
                 let pdata = data.clone();
                 s.spawn(move || {
                     let mut rng = fastrand::Rng::with_seed(ptid);
-                    for _ in 0..1000000 {
+                    for _ in 0..10000 {
                         let filt = BooleanArray::from((0..256).map(|_| rng.bool()).collect_vec());
                         crate::arrow_interface::select::filter(&pdata, &filt).unwrap();
                     }

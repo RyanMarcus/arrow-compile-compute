@@ -1,5 +1,6 @@
 use arrow_array::{Datum, UInt64Array};
 use arrow_schema::DataType;
+use inkwell::attributes::AttributeLoc;
 use inkwell::execution_engine::JitFunction;
 use inkwell::values::BasicValue;
 use inkwell::OptimizationLevel;
@@ -557,6 +558,125 @@ pub fn generate_hash_func<'a>(
     func
 }
 
+fn generate_unchained_hash32<'a>(ctx: &'a Context, llvm_mod: &Module<'a>) -> FunctionValue<'a> {
+    let i64_type = ctx.i64_type();
+    let i32_type = ctx.i32_type();
+    let crc32 = Intrinsic::find("llvm.x86.sse42.crc32.32.32").unwrap();
+
+    let func = llvm_mod.add_function(
+        "uc_hash32",
+        i64_type.fn_type(&[i32_type.into()], false),
+        None,
+    );
+    let feat = ctx.create_string_attribute("target-features", "+crc32");
+    func.add_attribute(AttributeLoc::Function, feat);
+
+    let input = func.get_nth_param(0).unwrap().into_int_value();
+
+    let crc_f = crc32.get_declaration(llvm_mod, &[]).unwrap();
+
+    declare_blocks!(ctx, func, entry);
+    let build = ctx.create_builder();
+    build.position_at_end(entry);
+    let k = i64_type.const_int((0x8648DBDB << 32) + 1, false);
+    let seed = i32_type.const_int(0x243F6A88, false);
+
+    let crc = build
+        .build_call(crc_f, &[seed.into(), input.into()], "crc")
+        .unwrap()
+        .try_as_basic_value()
+        .unwrap_left()
+        .into_int_value();
+    let crc = build
+        .build_int_z_extend(crc, i64_type, "extended_crc")
+        .unwrap();
+    let res = build.build_int_mul(crc, k, "result").unwrap();
+    build.build_return(Some(&res)).unwrap();
+    func
+}
+
+fn generate_unchained_hash64<'a>(ctx: &'a Context, llvm_mod: &Module<'a>) -> FunctionValue<'a> {
+    let i64_type = ctx.i64_type();
+    let crc32 = Intrinsic::find("llvm.x86.sse42.crc32.64.64").unwrap();
+
+    let func = llvm_mod.add_function(
+        "uc_hash64",
+        i64_type.fn_type(&[i64_type.into()], false),
+        None,
+    );
+    let feat = ctx.create_string_attribute("target-features", "+crc32");
+    func.add_attribute(AttributeLoc::Function, feat);
+    let input = func.get_nth_param(0).unwrap().into_int_value();
+
+    let crc_f = crc32.get_declaration(llvm_mod, &[]).unwrap();
+
+    declare_blocks!(ctx, func, entry);
+    let build = ctx.create_builder();
+    build.position_at_end(entry);
+    let k = i64_type.const_int(0x2545F4914F6CDD1D, false);
+    let seed1 = i64_type.const_int(0xBF58476D1CE4E5B9, false);
+    let seed2 = i64_type.const_int(0x94D049BB133111EB, false);
+
+    let crc1 = build
+        .build_call(crc_f, &[seed1.into(), input.into()], "crc1")
+        .unwrap()
+        .try_as_basic_value()
+        .unwrap_left()
+        .into_int_value();
+
+    let crc2 = build
+        .build_call(crc_f, &[seed2.into(), input.into()], "crc2")
+        .unwrap()
+        .try_as_basic_value()
+        .unwrap_left()
+        .into_int_value();
+
+    let combined = build
+        .build_or(
+            crc1,
+            build
+                .build_left_shift(crc2, i64_type.const_int(32, false), "upper")
+                .unwrap(),
+            "combined",
+        )
+        .unwrap();
+
+    let res = build.build_int_mul(combined, k, "result").unwrap();
+    build.build_return(Some(&res)).unwrap();
+    func
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, Hash)]
+pub enum HashFunction {
+    Murmur,
+    Unchained,
+}
+
+impl HashFunction {
+    pub fn generate_hf<'a>(
+        &self,
+        ctx: &'a Context,
+        llvm_mod: &Module<'a>,
+        pt: PrimitiveType,
+    ) -> Result<FunctionValue<'a>, ArrowKernelError> {
+        match self {
+            HashFunction::Murmur => Ok(generate_hash_func(ctx, llvm_mod, pt)),
+            HashFunction::Unchained => match pt {
+                PrimitiveType::I32 | PrimitiveType::U32 | PrimitiveType::F32 => {
+                    Ok(generate_unchained_hash32(ctx, llvm_mod))
+                }
+                PrimitiveType::I64 | PrimitiveType::U64 => {
+                    Ok(generate_unchained_hash64(ctx, llvm_mod))
+                }
+                _ => Err(ArrowKernelError::UnsupportedArguments(format!(
+                    "unchained hash only available for 32 and 64 bit types (found {})",
+                    pt
+                ))),
+            },
+        }
+    }
+}
+
 #[self_referencing]
 pub struct HashKernel {
     dt: DataType,
@@ -570,11 +690,11 @@ unsafe impl Send for HashKernel {}
 unsafe impl Sync for HashKernel {}
 
 impl Kernel for HashKernel {
-    type Key = DataType;
+    type Key = (DataType, HashFunction);
 
     type Input<'a> = &'a dyn Datum;
 
-    type Params = ();
+    type Params = HashFunction;
 
     type Output = UInt64Array;
 
@@ -596,10 +716,7 @@ impl Kernel for HashKernel {
         Ok(alloc.into_primitive_array(arr.len(), arr.nulls().cloned()))
     }
 
-    fn compile(
-        inp: &Self::Input<'_>,
-        _params: Self::Params,
-    ) -> Result<Self, super::ArrowKernelError> {
+    fn compile(inp: &Self::Input<'_>, hf: Self::Params) -> Result<Self, super::ArrowKernelError> {
         let ctx = Context::create();
 
         HashKernelTryBuilder {
@@ -616,7 +733,7 @@ impl Kernel for HashKernel {
                 let next_func =
                     generate_next(ctx, &llvm_mod, "hash_next", inp.get().0.data_type(), &iter)
                         .unwrap();
-                let hash_func = generate_hash_func(ctx, &llvm_mod, p_type);
+                let hash_func = hf.generate_hf(ctx, &llvm_mod, p_type)?;
 
                 let func_ty = ctx
                     .void_type()
@@ -683,22 +800,22 @@ impl Kernel for HashKernel {
 
     fn get_key_for_input(
         i: &Self::Input<'_>,
-        _p: &Self::Params,
+        hf: &Self::Params,
     ) -> Result<Self::Key, super::ArrowKernelError> {
-        Ok(i.get().0.data_type().clone())
+        Ok((i.get().0.data_type().clone(), *hf))
     }
 }
 
 #[cfg(test)]
 mod tests {
 
-    use arrow_array::{Datum, Int32Array};
+    use arrow_array::{Datum, Int16Array, Int32Array, Int64Array};
     use arrow_schema::DataType;
     use inkwell::{context::Context, OptimizationLevel};
     use itertools::Itertools;
 
     use crate::{
-        compiled_kernels::{link_req_helpers, Kernel},
+        compiled_kernels::{ht::HashFunction, link_req_helpers, Kernel},
         PrimitiveType,
     };
 
@@ -951,10 +1068,32 @@ mod tests {
     }
 
     #[test]
-    fn test_hash_kernel() {
+    fn test_hash_murmur_kernel() {
         let data = Int32Array::from(vec![-1, -2, 0, 1, 2]);
-        let k = HashKernel::compile(&(&data as &dyn Datum), ()).unwrap();
+        let k = HashKernel::compile(&(&data as &dyn Datum), HashFunction::Murmur).unwrap();
         let res = k.call(&data).unwrap();
         assert_eq!(res.values().iter().unique().count(), 5);
+    }
+
+    #[test]
+    fn test_hash_kernel_unchained32() {
+        let data = Int32Array::from(vec![-1, -2, 0, 1, 2]);
+        let k = HashKernel::compile(&(&data as &dyn Datum), HashFunction::Unchained).unwrap();
+        let res = k.call(&data).unwrap();
+        assert_eq!(res.values().iter().unique().count(), 5);
+    }
+
+    #[test]
+    fn test_hash_kernel_unchained64() {
+        let data = Int64Array::from(vec![-1, -2, 0, 1, 2]);
+        let k = HashKernel::compile(&(&data as &dyn Datum), HashFunction::Unchained).unwrap();
+        let res = k.call(&data).unwrap();
+        assert_eq!(res.values().iter().unique().count(), 5);
+    }
+
+    #[test]
+    fn test_hash_kernel_unchained16_unsupported() {
+        let data = Int16Array::from(vec![-1, -2, 0, 1, 2]);
+        assert!(HashKernel::compile(&(&data as &dyn Datum), HashFunction::Unchained).is_err());
     }
 }

@@ -197,6 +197,13 @@ pub fn criterion_benchmark(c: &mut Criterion) {
         let arrow_answer = arrow_ord::cmp::eq(&dict_as_primitive, &ree_as_primitive).unwrap();
         assert_eq!(arrow_answer, llvm_answer);
 
+        c.bench_function("dict_eq_ree_cast_i32/execute llvm", |b| {
+            b.iter(|| {
+                let lhs = arrow_compile_compute::cast::cast(&dict_array, &DataType::Int32).unwrap();
+                let rhs = arrow_compile_compute::cast::cast(&ree_array, &DataType::Int32).unwrap();
+                arrow_compile_compute::cmp::eq(&lhs, &rhs).unwrap()
+            })
+        });
         c.bench_function("dict_eq_ree_i32/execute arrow", |b| {
             b.iter(|| arrow_ord::cmp::eq(&dict_as_primitive, &ree_as_primitive).unwrap())
         });

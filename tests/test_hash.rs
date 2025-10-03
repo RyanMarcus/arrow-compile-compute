@@ -30,6 +30,17 @@ proptest! {
     }
 
     #[test]
+    fn test_hash_i32_dict_unchained(input: Vec<i32>) {
+        let input = Int32Array::from(input);
+        let input = arrow_compile_compute::cast::cast(
+            &input,
+            &dictionary_data_type(DataType::Int64, DataType::Int32)
+        ).unwrap();
+        let hashed = arrow_compile_compute::compute::hash_unchained(&input).unwrap();
+        assert_eq!(hashed.len(), input.len());
+    }
+
+    #[test]
     fn test_hash_str(input: Vec<String>) {
         let input = StringArray::from(input);
         let hashed = arrow_compile_compute::compute::hash(&input).unwrap();
