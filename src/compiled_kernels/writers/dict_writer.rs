@@ -61,6 +61,7 @@ impl<'a, K: ArrowDictionaryKeyType, VW: ArrayWriter<'a>> WriterAllocation
 pub struct DictWriter<'a, K: ArrowDictionaryKeyType, VW: ArrayWriter<'a>> {
     ht_ptr: PointerValue<'a>,
     ingest_func: FunctionValue<'a>,
+    pt: PrimitiveType,
     _phantom1: std::marker::PhantomData<K>,
     _phantom2: std::marker::PhantomData<VW>,
 }
@@ -205,9 +206,17 @@ impl<'a, K: ArrowDictionaryKeyType, VW: ArrayWriter<'a>> ArrayWriter<'a> for Dic
         DictWriter {
             ht_ptr,
             ingest_func,
+            pt: ty,
             _phantom1: std::marker::PhantomData,
             _phantom2: std::marker::PhantomData,
         }
+    }
+
+    fn llvm_ingest_type(
+        &self,
+        ctx: &'a inkwell::context::Context,
+    ) -> inkwell::types::BasicTypeEnum<'a> {
+        self.pt.llvm_type(ctx)
     }
 
     fn llvm_ingest(

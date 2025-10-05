@@ -210,6 +210,10 @@ impl<'a, T: OffsetSizeTrait> ArrayWriter<'a> for StringArrayWriter<'a, T> {
         }
     }
 
+    fn llvm_ingest_type(&self, ctx: &'a Context) -> inkwell::types::BasicTypeEnum<'a> {
+        PrimitiveType::P64x2.llvm_type(ctx)
+    }
+
     fn llvm_ingest(&self, _ctx: &'a Context, build: &Builder<'a>, val: BasicValueEnum<'a>) {
         build
             .build_call(self.ingest_func, &[val.into()], "ingest")

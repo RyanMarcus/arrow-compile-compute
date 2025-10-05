@@ -1,10 +1,12 @@
+use arrow_array::cast::AsArray;
 use arrow_array::{Array, ArrayRef, BooleanArray};
+use arrow_buffer::NullBuffer;
 use arrow_schema::DataType;
 
 use crate::compiled_kernels::dsl::{DSLKernel, KernelOutputType};
 use crate::{ArrowKernelError, PrimitiveType};
 
-use crate::compiled_kernels::Kernel;
+use crate::compiled_kernels::{replace_nulls, Kernel};
 
 pub struct FilterKernel(DSLKernel);
 unsafe impl Sync for FilterKernel {}
@@ -23,14 +25,25 @@ impl Kernel for FilterKernel {
     type Output = ArrayRef;
 
     fn call(&self, inp: Self::Input<'_>) -> Result<Self::Output, ArrowKernelError> {
-        self.0.call(&[&inp.0, &inp.1])
+        let mut res = self.0.call(&[&inp.0, &inp.1])?;
+        if let Some(nulls) = inp.0.logical_nulls() {
+            let ba = BooleanArray::new(nulls.into_inner(), None);
+            let filtered_nulls = crate::arrow_interface::select::filter(&ba, &inp.1)?;
+            let filtered_nulls = filtered_nulls.as_boolean();
+            let filtered_nulls = NullBuffer::new(filtered_nulls.clone().into_parts().0);
+            res = replace_nulls(res, Some(filtered_nulls));
+        }
+        Ok(res)
     }
 
     fn compile(inp: &Self::Input<'_>, _params: Self::Params) -> Result<Self, ArrowKernelError> {
         let (arr, filt) = inp;
 
+        // TODO more robust output type selecction
         let out_type = if PrimitiveType::for_arrow_type(arr.data_type()) == PrimitiveType::P64x2 {
             KernelOutputType::String
+        } else if arr.data_type() == &DataType::Boolean {
+            KernelOutputType::Boolean
         } else {
             KernelOutputType::Array
         };
@@ -88,6 +101,20 @@ mod tests {
         let res = k.call((&data, &filt)).unwrap();
 
         assert_eq!(res.as_primitive::<Int32Type>().values(), &[1, 2, 5, 6]);
+    }
+
+    #[test]
+    fn test_filter_i32nullable() {
+        let data = Int32Array::from(vec![Some(1), None, Some(3), Some(4), Some(5), Some(6)]);
+        let filt = BooleanArray::from(vec![true, true, false, false, true, true]);
+
+        let k = FilterKernel::compile(&(&data, &filt), ()).unwrap();
+        let res = k.call((&data, &filt)).unwrap();
+
+        assert_eq!(
+            res.as_primitive::<Int32Type>().iter().collect_vec(),
+            vec![Some(1), None, Some(5), Some(6)]
+        )
     }
 
     #[test]

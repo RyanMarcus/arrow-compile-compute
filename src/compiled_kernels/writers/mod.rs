@@ -6,6 +6,7 @@ use inkwell::{
     builder::Builder,
     context::Context,
     module::Module,
+    types::BasicTypeEnum,
     values::{BasicValueEnum, PointerValue, VectorValue},
 };
 
@@ -36,6 +37,8 @@ pub trait ArrayWriter<'a> {
         ty: PrimitiveType,
         alloc_ptr: PointerValue<'a>,
     ) -> Self;
+
+    fn llvm_ingest_type(&self, ctx: &'a Context) -> BasicTypeEnum<'a>;
     fn llvm_ingest(&self, ctx: &'a Context, build: &Builder<'a>, val: BasicValueEnum<'a>);
     fn llvm_flush(&self, ctx: &'a Context, build: &Builder<'a>);
 

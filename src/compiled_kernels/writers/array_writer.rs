@@ -18,6 +18,7 @@ use super::{ArrayWriter, WriterAllocation};
 /// Writer for primitive arrays (ints and floats).
 pub struct PrimitiveArrayWriter<'a> {
     ingest_func: FunctionValue<'a>,
+    pt: PrimitiveType,
 }
 
 #[repr(C)]
@@ -127,7 +128,14 @@ impl<'a> ArrayWriter<'a> for PrimitiveArrayWriter<'a> {
             func
         };
 
-        PrimitiveArrayWriter { ingest_func }
+        PrimitiveArrayWriter {
+            ingest_func,
+            pt: ty,
+        }
+    }
+
+    fn llvm_ingest_type(&self, ctx: &'a Context) -> inkwell::types::BasicTypeEnum<'a> {
+        self.pt.llvm_type(ctx)
     }
 
     fn llvm_ingest(&self, _ctx: &'a Context, build: &Builder<'a>, val: BasicValueEnum<'a>) {

@@ -21,6 +21,15 @@ proptest! {
     }
 
     #[test]
+    fn test_prim_i32_nullable_cast_prim_i64(arr: Vec<Option<i32>>) {
+        let arr1 = Int32Array::from(arr.clone());
+
+        let our_res = arrow_compile_compute::cast::cast(&arr1, &DataType::Int64).unwrap();
+        let arrow_res = arrow_cast::cast(&arr1, &DataType::Int64).unwrap();
+        assert_eq!(our_res.len(), arrow_res.len());
+    }
+
+    #[test]
     fn test_dict_i32_cast_prim_i64(arr: Vec<i32>) {
         let arr1 = Int32Array::from(arr.clone());
         let dt = dictionary_data_type(DataType::Int64, DataType::Int32);

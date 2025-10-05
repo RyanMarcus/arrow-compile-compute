@@ -74,6 +74,7 @@ impl<'a, K: RunEndIndexType, VW: ArrayWriter<'a>> WriterAllocation for REEAlloca
 pub struct REEWriter<'a, K: RunEndIndexType, VW: ArrayWriter<'a>> {
     ingest_func: FunctionValue<'a>,
     flush_func: FunctionValue<'a>,
+    pt: PrimitiveType,
     _phantom1: PhantomData<K>,
     _phantom2: PhantomData<VW>,
 }
@@ -326,9 +327,17 @@ impl<'a, K: RunEndIndexType, VW: ArrayWriter<'a>> ArrayWriter<'a> for REEWriter<
         Self {
             ingest_func,
             flush_func,
+            pt: ty,
             _phantom1: PhantomData,
             _phantom2: PhantomData,
         }
+    }
+
+    fn llvm_ingest_type(
+        &self,
+        ctx: &'a inkwell::context::Context,
+    ) -> inkwell::types::BasicTypeEnum<'a> {
+        self.pt.llvm_type(ctx)
     }
 
     fn llvm_ingest(

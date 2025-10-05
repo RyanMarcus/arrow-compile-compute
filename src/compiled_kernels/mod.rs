@@ -12,11 +12,16 @@ mod rust_iter;
 mod sort;
 mod take;
 mod writers;
+use std::sync::Arc;
 use std::{collections::HashMap, sync::RwLock};
 
 pub use aggregate::{CountAggregator, MaxAggregator, MinAggregator, SumAggregator};
 pub use arith::BinOp;
 pub use arith::BinOpKernel;
+use arrow_array::make_array;
+use arrow_array::Array;
+use arrow_array::ArrayRef;
+use arrow_buffer::NullBuffer;
 use arrow_schema::DataType;
 pub use cast::CastKernel;
 pub use cmp::ComparisonKernel;
@@ -243,6 +248,11 @@ fn gen_convert_numeric_vec<'ctx>(
             }
         }
     }
+}
+
+pub fn replace_nulls(arr: Arc<dyn Array>, nulls: Option<NullBuffer>) -> ArrayRef {
+    let data = arr.into_data().into_builder().nulls(nulls);
+    make_array(unsafe { data.build_unchecked() })
 }
 
 #[cfg(test)]

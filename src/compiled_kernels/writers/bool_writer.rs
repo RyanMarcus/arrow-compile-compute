@@ -8,6 +8,7 @@ use arrow_buffer::{BooleanBuffer, Buffer};
 use inkwell::builder::Builder;
 use inkwell::context::Context;
 use inkwell::module::{Linkage, Module};
+use inkwell::types::BasicTypeEnum;
 use inkwell::values::{BasicValueEnum, FunctionValue, PointerValue};
 use inkwell::AddressSpace;
 use inkwell::IntPredicate;
@@ -269,6 +270,11 @@ impl<'a> ArrayWriter<'a> for BooleanWriter<'a> {
             flush_func,
         }
     }
+
+    fn llvm_ingest_type(&self, ctx: &'a Context) -> inkwell::types::BasicTypeEnum<'a> {
+        BasicTypeEnum::IntType(ctx.bool_type())
+    }
+
     fn llvm_ingest(&self, _ctx: &'a Context, build: &Builder<'a>, val: BasicValueEnum<'a>) {
         let val = val.into_int_value();
         build

@@ -3,7 +3,8 @@ use std::{ffi::c_void, sync::Arc};
 use arrow_array::{types::BinaryViewType, ArrayRef, GenericByteViewArray};
 use arrow_buffer::{Buffer, NullBuffer};
 use inkwell::{
-    intrinsics::Intrinsic, module::Linkage, values::FunctionValue, AddressSpace, IntPredicate,
+    context::Context, intrinsics::Intrinsic, module::Linkage, values::FunctionValue, AddressSpace,
+    IntPredicate,
 };
 use repr_offset::ReprOffset;
 
@@ -248,6 +249,10 @@ impl<'a> ArrayWriter<'a> for StringViewWriter<'a> {
         };
 
         StringViewWriter { ingest_func }
+    }
+
+    fn llvm_ingest_type(&self, ctx: &'a Context) -> inkwell::types::BasicTypeEnum<'a> {
+        PrimitiveType::P64x2.llvm_type(ctx)
     }
 
     fn llvm_ingest(

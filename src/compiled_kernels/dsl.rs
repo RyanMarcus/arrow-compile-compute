@@ -18,7 +18,7 @@ use inkwell::{
     module::{Linkage, Module},
     types::{BasicType, BasicTypeEnum},
     values::{BasicValue, BasicValueEnum, FunctionValue, PointerValue, VectorValue},
-    AddressSpace, OptimizationLevel,
+    AddressSpace, IntPredicate, OptimizationLevel,
 };
 use itertools::Itertools;
 use ouroboros::self_referencing;
@@ -2234,7 +2234,7 @@ fn build_kernel_with_writer<'a, W: ArrayWriter<'a>>(
     }
 
     builder.position_at_end(loop_body);
-    let result = program.expr().compile(
+    let mut result = program.expr().compile(
         ctx,
         &llvm_mod,
         &builder,
@@ -2243,6 +2243,19 @@ fn build_kernel_with_writer<'a, W: ArrayWriter<'a>>(
         &iter_ptrs,
         &iter_llvm_types,
     )?;
+
+    if writer.llvm_ingest_type(ctx) == ctx.bool_type().as_basic_type_enum() {
+        result = builder
+            .build_int_compare(
+                IntPredicate::NE,
+                result.into_int_value(),
+                result.get_type().const_zero().into_int_value(),
+                "not_zero",
+            )
+            .unwrap()
+            .as_basic_value_enum();
+    }
+
     writer.llvm_ingest(ctx, &builder, result);
     let curr_produced = builder
         .build_load(i64_type, produced_ptr, "curr_produced")

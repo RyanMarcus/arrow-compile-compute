@@ -713,7 +713,7 @@ impl Kernel for HashKernel {
 
         unsafe { self.borrow_func().call(iter.get_mut_ptr(), alloc.get_ptr()) };
 
-        Ok(alloc.into_primitive_array(arr.len(), arr.nulls().cloned()))
+        Ok(alloc.into_primitive_array(arr.len(), arr.logical_nulls()))
     }
 
     fn compile(inp: &Self::Input<'_>, hf: Self::Params) -> Result<Self, super::ArrowKernelError> {

@@ -2,7 +2,10 @@ use std::sync::Arc;
 
 use super::{ArrowKernelError, Kernel};
 use crate::{
-    compiled_kernels::dsl::{DSLKernel, KernelOutputType},
+    compiled_kernels::{
+        dsl::{DSLKernel, KernelOutputType},
+        replace_nulls,
+    },
     PrimitiveType,
 };
 use arrow_array::{
@@ -111,6 +114,14 @@ impl Kernel for CastKernel {
 
     fn call(&self, inp: Self::Input<'_>) -> Result<Self::Output, ArrowKernelError> {
         let res = self.k.call(&[&inp])?;
+        assert_eq!(
+            inp.len(),
+            res.len(),
+            "cast result had different lengths (expected: {} got: {})",
+            inp.len(),
+            res.len()
+        );
+        let res = replace_nulls(res, inp.logical_nulls());
         coalesce_type(res, &self.tar)
     }
 
@@ -169,6 +180,23 @@ mod tests {
     fn test_i32_to_i64_block() {
         let data = Int32Array::from((0..200).collect_vec());
         let expected: ArrayRef = Arc::new(Int64Array::from((0..200).collect_vec()));
+        let k = CastKernel::compile(&(&data as &dyn Array), DataType::Int64).unwrap();
+        let res = k.call(&data).unwrap();
+        assert_eq!(&res, &expected);
+    }
+
+    #[test]
+    fn test_i32nullable_to_i64_block() {
+        let data = Int32Array::from(
+            (0..50)
+                .map(|x| if x % 2 == 0 { Some(x) } else { None })
+                .collect_vec(),
+        );
+        let expected: ArrayRef = Arc::new(Int64Array::from(
+            (0..50)
+                .map(|x| if x % 2 == 0 { Some(x as i64) } else { None })
+                .collect_vec(),
+        ));
         let k = CastKernel::compile(&(&data as &dyn Array), DataType::Int64).unwrap();
         let res = k.call(&data).unwrap();
         assert_eq!(&res, &expected);
