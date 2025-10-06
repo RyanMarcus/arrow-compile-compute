@@ -155,9 +155,7 @@ pub mod iter {
     /// let iter = iter_nonnull_i64(&arr).unwrap();
     /// assert_eq!(iter.collect::<Vec<_>>(), vec![1, 2, 3]);
     /// ```
-    pub fn iter_nonnull_i64(
-        array: &dyn Array,
-    ) -> Result<impl Iterator<Item = i64>, ArrowKernelError> {
+    pub fn iter_nonnull_i64(array: &dyn Array) -> Result<ArrowIter<i64>, ArrowKernelError> {
         let ifh = ITER_FUNC_CACHE.get(array, (PrimitiveType::I64, false))?;
         let i = ArrowIter::<i64>::new(array, ifh)?;
         Ok(i)
@@ -203,9 +201,7 @@ pub mod iter {
     /// let iter = iter_nonnull_u64(&arr).unwrap();
     /// assert_eq!(iter.collect::<Vec<_>>(), vec![1, 2, 3]);
     /// ```
-    pub fn iter_nonnull_u64(
-        array: &dyn Array,
-    ) -> Result<impl Iterator<Item = u64>, ArrowKernelError> {
+    pub fn iter_nonnull_u64(array: &dyn Array) -> Result<ArrowIter<u64>, ArrowKernelError> {
         let ifh = ITER_FUNC_CACHE.get(array, (PrimitiveType::U64, false))?;
         let i = ArrowIter::<u64>::new(array, ifh)?;
         Ok(i)
@@ -241,9 +237,7 @@ pub mod iter {
     /// let iter = iter_nonnull_u64(&arr).unwrap();
     /// assert_eq!(iter.collect::<Vec<_>>(), vec![1, 2, 3]);
     /// ```
-    pub fn iter_nonnull_u8(
-        array: &dyn Array,
-    ) -> Result<impl Iterator<Item = u8>, ArrowKernelError> {
+    pub fn iter_nonnull_u8(array: &dyn Array) -> Result<ArrowIter<u8>, ArrowKernelError> {
         let ifh = ITER_FUNC_CACHE.get(array, (PrimitiveType::U8, false))?;
         let i = ArrowIter::<u8>::new(array, ifh)?;
         Ok(i)
@@ -279,9 +273,7 @@ pub mod iter {
     /// let iter = iter_nonnull_f64(&arr).unwrap();
     /// assert_eq!(iter.collect::<Vec<_>>(), vec![1.0, 2.0, 3.0]);
     /// ```
-    pub fn iter_nonnull_f64(
-        array: &dyn Array,
-    ) -> Result<impl Iterator<Item = f64>, ArrowKernelError> {
+    pub fn iter_nonnull_f64(array: &dyn Array) -> Result<ArrowIter<f64>, ArrowKernelError> {
         let ifh = ITER_FUNC_CACHE.get(array, (PrimitiveType::F64, false))?;
         let i = ArrowIter::<f64>::new(array, ifh)?;
         Ok(i)
@@ -307,9 +299,7 @@ pub mod iter {
 
     /// Iterates over the non-null values of an array, converting the array
     /// values to byte slices.
-    pub fn iter_nonnull_bytes(
-        array: &dyn Array,
-    ) -> Result<impl Iterator<Item = &[u8]>, ArrowKernelError> {
+    pub fn iter_nonnull_bytes(array: &dyn Array) -> Result<ArrowIter<&[u8]>, ArrowKernelError> {
         let ifh = ITER_FUNC_CACHE.get(array, (PrimitiveType::P64x2, false))?;
         let i = ArrowIter::<&[u8]>::new(array, ifh)?;
         Ok(i)

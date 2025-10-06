@@ -67,7 +67,10 @@ pub struct IterFuncHolder {
 
     #[borrows(context)]
     #[covariant]
-    func: JitFunction<'this, unsafe extern "C" fn(*mut c_void, *mut c_void, *mut u8) -> u64>,
+    func: JitFunction<
+        'this,
+        unsafe extern "C" fn(*mut c_void, *mut c_void, *mut u8, *mut u64) -> u64,
+    >,
 }
 unsafe impl Send for IterFuncHolder {}
 unsafe impl Sync for IterFuncHolder {}
@@ -122,6 +125,7 @@ impl Kernel for Arc<IterFuncHolder> {
 
 pub struct ArrowIter<T: ApplyType> {
     buffer: [u8; 64 * PrimitiveType::max_width()],
+    ibuffer: [u64; 64],
     buffer_idx: usize,
     buffer_len: usize,
     iter_holder: IteratorHolder,
@@ -129,6 +133,46 @@ pub struct ArrowIter<T: ApplyType> {
 
     next_func: Arc<IterFuncHolder>,
     pd: PhantomData<T>,
+}
+
+impl<T: ApplyType> ArrowIter<T> {
+    /// Causes this iterator to additionally return the index of each element.
+    /// Note this is different from `enumerate`, as this function returns the
+    /// indexes of non-null elements only.
+    /// # Example
+    /// ```
+    /// use arrow_array::Int32Array;
+    /// use arrow_compile_compute::iter::iter_nonnull_i64;
+    ///
+    /// let arr = Int32Array::from(vec![Some(1), None, Some(3)]);
+    /// let iter = iter_nonnull_i64(&arr).unwrap().indexed();
+    /// assert_eq!(iter.collect::<Vec<_>>(), vec![(0, 1), (2, 3)]);
+    /// ```
+    pub fn indexed(self) -> IndexedArrowIter<T> {
+        IndexedArrowIter { iter: self }
+    }
+
+    fn load_next(&mut self) -> bool {
+        let num_returned = unsafe {
+            self.next_func.borrow_func().call(
+                self.iter_holder.get_mut_ptr(),
+                self.setbit_iter_holder
+                    .as_mut()
+                    .map(|x| x.get_mut_ptr())
+                    .unwrap_or(std::ptr::null_mut()),
+                self.buffer.as_mut_ptr(),
+                self.ibuffer.as_mut_ptr(),
+            )
+        };
+
+        if num_returned == 0 {
+            return false;
+        }
+
+        self.buffer_idx = 0;
+        self.buffer_len = num_returned as usize;
+        return true;
+    }
 }
 
 impl<T: ApplyType> Iterator for ArrowIter<T> {
@@ -141,26 +185,12 @@ impl<T: ApplyType> Iterator for ArrowIter<T> {
                 self.buffer
                     .get_unchecked(self.buffer_idx * width..(self.buffer_idx + 1) * width)
             };
-            //let slice = &self.buffer[self.buffer_idx * width..(self.buffer_idx + 1) * width];
             self.buffer_idx += 1;
             Some(unsafe { T::from_byte_slice(slice) })
         } else {
-            let num_returned = unsafe {
-                self.next_func.borrow_func().call(
-                    self.iter_holder.get_mut_ptr(),
-                    self.setbit_iter_holder
-                        .as_mut()
-                        .map(|x| x.get_mut_ptr())
-                        .unwrap_or(std::ptr::null_mut()),
-                    self.buffer.as_mut_ptr(),
-                )
-            };
-            if num_returned == 0 {
+            if !self.load_next() {
                 return None;
             }
-
-            self.buffer_idx = 0;
-            self.buffer_len = num_returned as usize;
             self.next()
         }
     }
@@ -176,6 +206,7 @@ impl<T: ApplyType> ArrowIter<T> {
 
         Ok(ArrowIter {
             buffer: [0; 1024],
+            ibuffer: [0; 64],
             buffer_idx: 0,
             buffer_len: 0,
             iter_holder: ih,
@@ -183,6 +214,33 @@ impl<T: ApplyType> ArrowIter<T> {
             next_func: func,
             pd: PhantomData,
         })
+    }
+}
+
+pub struct IndexedArrowIter<T: ApplyType> {
+    iter: ArrowIter<T>,
+}
+
+impl<T: ApplyType> Iterator for IndexedArrowIter<T> {
+    type Item = (usize, T);
+
+    fn next(&mut self) -> Option<Self::Item> {
+        if self.iter.buffer_idx < self.iter.buffer_len {
+            let width = T::primitive_type().width();
+            let slice = unsafe {
+                self.iter
+                    .buffer
+                    .get_unchecked(self.iter.buffer_idx * width..(self.iter.buffer_idx + 1) * width)
+            };
+            let idx = self.iter.ibuffer[self.iter.buffer_idx];
+            self.iter.buffer_idx += 1;
+            Some((idx as usize, unsafe { T::from_byte_slice(slice) }))
+        } else {
+            if !self.iter.load_next() {
+                return None;
+            }
+            self.next()
+        }
     }
 }
 
@@ -225,7 +283,7 @@ fn generate_call<'a>(
     setbit_ih: Option<&IteratorHolder>,
     rust_expected_type: PrimitiveType,
 ) -> Result<
-    JitFunction<'a, unsafe extern "C" fn(*mut c_void, *mut c_void, *mut u8) -> u64>,
+    JitFunction<'a, unsafe extern "C" fn(*mut c_void, *mut c_void, *mut u8, *mut u64) -> u64>,
     ArrowKernelError,
 > {
     let module = ctx.create_module("call");
@@ -236,7 +294,15 @@ fn generate_call<'a>(
     let input_type = input_prim_type.llvm_type(ctx);
     let func = module.add_function(
         "call_rust",
-        i64_type.fn_type(&[ptr_type.into(), ptr_type.into(), ptr_type.into()], false),
+        i64_type.fn_type(
+            &[
+                ptr_type.into(),
+                ptr_type.into(),
+                ptr_type.into(),
+                ptr_type.into(),
+            ],
+            false,
+        ),
         None,
     );
 
@@ -252,6 +318,7 @@ fn generate_call<'a>(
     let iter_ptr = func.get_nth_param(0).unwrap().into_pointer_value();
     let bit_iter_ptr = func.get_nth_param(1).unwrap().into_pointer_value();
     let rust_buf_ptr = func.get_nth_param(2).unwrap().into_pointer_value();
+    let rust_idx_ptr = func.get_nth_param(3).unwrap().into_pointer_value();
     let offset_ptr = build.build_alloca(i64_type, "offset_ptr").unwrap();
     let buf = build.build_alloca(input_type, "buf").unwrap();
     build
@@ -298,6 +365,17 @@ fn generate_call<'a>(
             .build_load(i64_type, next_bit_buf, "next_bit")
             .unwrap()
             .into_int_value();
+
+        let curr_offset = build
+            .build_load(i64_type, offset_ptr, "curr_offset")
+            .unwrap()
+            .into_int_value();
+        build
+            .build_store(
+                increment_pointer!(ctx, build, rust_idx_ptr, 8, curr_offset),
+                next_bit,
+            )
+            .unwrap();
         build
             .build_call(access, &[iter_ptr.into(), next_bit.into()], "access_el")
             .unwrap()
@@ -371,7 +449,7 @@ fn generate_call<'a>(
     link_req_helpers(&module, &ee)?;
 
     Ok(unsafe {
-        ee.get_function::<unsafe extern "C" fn(*mut c_void, *mut c_void, *mut u8) -> u64>(
+        ee.get_function::<unsafe extern "C" fn(*mut c_void, *mut c_void, *mut u8, *mut u64) -> u64>(
             func.get_name().to_str().unwrap(),
         )
         .unwrap()
@@ -418,6 +496,20 @@ mod tests {
                 .unwrap();
         let res = ArrowIter::<i64>::new(&data, ifh).unwrap().collect_vec();
         assert_eq!(res, (0..1000).filter(|x| x % 2 == 0).collect_vec());
+    }
+
+    #[test]
+    fn test_iter_i32_nulls_indexed() {
+        let data = Int32Array::from(
+            (0..1000)
+                .map(|x| if x % 2 == 0 { Some(x) } else { None })
+                .collect_vec(),
+        );
+        let ifh =
+            Arc::<IterFuncHolder>::compile(&(&data as &dyn Array), (PrimitiveType::I64, false))
+                .unwrap();
+        let res = ArrowIter::<i64>::new(&data, ifh).unwrap().indexed().collect_vec();
+        assert_eq!(res, (0..1000).enumerate().filter(|(_idx, x)| x % 2 == 0).collect_vec());
     }
 
     #[test]
