@@ -257,11 +257,64 @@ pub fn replace_nulls(arr: Arc<dyn Array>, nulls: Option<NullBuffer>) -> ArrayRef
 
 #[cfg(test)]
 mod tests {
-    use arrow_array::{BooleanArray, Int32Array, Scalar};
+    use std::sync::Arc;
 
-    use crate::Predicate;
+    use arrow_array::{
+        cast::AsArray, types::Int32Type, BooleanArray, DictionaryArray, Int32Array, Scalar,
+    };
+    use arrow_buffer::NullBuffer;
+    use itertools::Itertools;
+
+    use crate::{compiled_kernels::replace_nulls, Predicate};
 
     use super::{ComparisonKernel, KernelCache};
+
+    #[test]
+    fn test_replace_nulls() {
+        let arr = Arc::new(Int32Array::from(vec![0, 1, 2, 3, 4]));
+        let with_nulls = replace_nulls(
+            arr,
+            Some(NullBuffer::from(vec![true, false, true, true, true])),
+        );
+        let with_nulls = with_nulls.as_primitive::<Int32Type>();
+        assert_eq!(
+            with_nulls.iter().collect_vec(),
+            vec![Some(0), None, Some(2), Some(3), Some(4)]
+        );
+    }
+
+    #[test]
+    fn test_replace_nulls_dict() {
+        let arr = Arc::new(DictionaryArray::<Int32Type>::new(
+            Int32Array::from(vec![0, 0, 1, 1, 2, 2]),
+            Arc::new(Int32Array::from(vec![10, 20, 30])),
+        ));
+        let with_nulls = replace_nulls(
+            arr,
+            Some(NullBuffer::from(vec![true, false, true, true, true, false])),
+        );
+        let with_nulls = with_nulls.as_dictionary::<Int32Type>();
+        let with_nulls = with_nulls.downcast_dict::<Int32Array>().unwrap();
+        assert_eq!(
+            with_nulls.into_iter().collect_vec(),
+            vec![Some(10), None, Some(20), Some(20), Some(30), None]
+        );
+
+        let arr = Arc::new(DictionaryArray::<Int32Type>::new(
+            Int32Array::from(vec![0, 0, 1, 1, 2, 2]),
+            Arc::new(Int32Array::from(vec![Some(10), None, Some(30)])),
+        ));
+        let with_nulls = replace_nulls(
+            arr,
+            Some(NullBuffer::from(vec![true, false, true, true, true, false])),
+        );
+        let with_nulls = with_nulls.as_dictionary::<Int32Type>();
+        let with_nulls = with_nulls.downcast_dict::<Int32Array>().unwrap();
+        assert_eq!(
+            with_nulls.into_iter().collect_vec(),
+            vec![Some(10), None, None, None, Some(30), None]
+        );
+    }
 
     #[test]
     fn test_kernel_cache_cmp() {
