@@ -86,7 +86,8 @@ mod tests {
     use arrow_array::{
         cast::AsArray,
         types::{Int32Type, Int64Type},
-        Int32Array, Int64Array, RunArray, StringArray, UInt16Array, UInt8Array,
+        BooleanArray, Int32Array, Int64Array, RunArray, StringArray, UInt16Array, UInt32Array,
+        UInt8Array,
     };
     use itertools::Itertools;
 
@@ -180,5 +181,15 @@ mod tests {
         let res = k.call((&data, &idxes)).unwrap();
         let res = res.as_primitive::<Int32Type>();
         assert_eq!(res.values(), &[1, 1, 2, 2, 3, 4, 5]);
+    }
+
+    #[test]
+    fn test_take_bool() {
+        let data = BooleanArray::from(vec![true, false, true, false, false, false]);
+        let idxes = UInt32Array::from(vec![0, 2, 5]);
+        let k = TakeKernel::compile(&(&data, &idxes), ()).unwrap();
+        let res = k.call((&data, &idxes)).unwrap();
+        let res = res.as_boolean();
+        assert_eq!(res.values().iter().collect_vec(), &[true, true, false]);
     }
 }

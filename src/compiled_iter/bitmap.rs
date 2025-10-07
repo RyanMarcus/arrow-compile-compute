@@ -62,10 +62,12 @@ impl BitmapIterator {
     ) -> IntValue<'a> {
         let slice_offset_ptr =
             increment_pointer!(ctx, build, ptr, BitmapIterator::OFFSET_SLICE_OFFSET);
-        build
+        let val = build
             .build_load(ctx.i64_type(), slice_offset_ptr, "slice_offset")
             .unwrap()
-            .into_int_value()
+            .into_int_value();
+        mark_load_invariant!(ctx, val);
+        val
     }
 
     pub fn llvm_pos<'a>(
