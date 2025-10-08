@@ -18,6 +18,7 @@ use inkwell::{
     builder::Builder,
     context::Context,
     execution_engine::JitFunction,
+    intrinsics::Intrinsic,
     module::{Linkage, Module},
     types::{BasicType, BasicTypeEnum},
     values::{BasicValue, BasicValueEnum, FunctionValue, PointerValue, VectorValue},
@@ -30,8 +31,8 @@ use thiserror::Error;
 
 use crate::{
     compiled_iter::{
-        array_to_setbit_iter, datum_to_iter, generate_next, generate_next_block,
-        generate_random_access, IteratorHolder,
+        array_to_setbit_iter, datum_to_iter, generate_get_base_ptr, generate_next,
+        generate_next_block, generate_random_access, IteratorHolder,
     },
     compiled_kernels::{
         cmp::{add_float_vec_to_int_vec, add_memcmp},
@@ -502,9 +503,12 @@ impl<'a> KernelExpression<'a> {
     fn compile_block<'b>(
         &self,
         ctx: &'b Context,
+        llvm_mod: &Module<'b>,
         build: &Builder<'b>,
         vec_bufs: &HashMap<usize, PointerValue<'b>>,
         iter_llvm_types: &HashMap<usize, BasicTypeEnum<'b>>,
+        iter_ptrs: &[PointerValue<'b>],
+        base_ptr_funcs: &HashMap<usize, FunctionValue<'b>>,
     ) -> Result<VectorValue<'b>, DSLError> {
         match self {
             KernelExpression::Item(kernel_input) => {
@@ -534,23 +538,87 @@ impl<'a> KernelExpression<'a> {
             }
             KernelExpression::Truncate(_kernel_expression, _) => todo!(),
             KernelExpression::And(lhs, rhs) => {
-                let lhs = lhs.compile_block(ctx, build, vec_bufs, iter_llvm_types)?;
-                let rhs = rhs.compile_block(ctx, build, vec_bufs, iter_llvm_types)?;
+                let lhs = lhs.compile_block(
+                    ctx,
+                    llvm_mod,
+                    build,
+                    vec_bufs,
+                    iter_llvm_types,
+                    iter_ptrs,
+                    base_ptr_funcs,
+                )?;
+                let rhs = rhs.compile_block(
+                    ctx,
+                    llvm_mod,
+                    build,
+                    vec_bufs,
+                    iter_llvm_types,
+                    iter_ptrs,
+                    base_ptr_funcs,
+                )?;
                 Ok(build.build_and(lhs, rhs, "and").unwrap())
             }
             KernelExpression::Or(lhs, rhs) => {
-                let lhs = lhs.compile_block(ctx, build, vec_bufs, iter_llvm_types)?;
-                let rhs = rhs.compile_block(ctx, build, vec_bufs, iter_llvm_types)?;
+                let lhs = lhs.compile_block(
+                    ctx,
+                    llvm_mod,
+                    build,
+                    vec_bufs,
+                    iter_llvm_types,
+                    iter_ptrs,
+                    base_ptr_funcs,
+                )?;
+                let rhs = rhs.compile_block(
+                    ctx,
+                    llvm_mod,
+                    build,
+                    vec_bufs,
+                    iter_llvm_types,
+                    iter_ptrs,
+                    base_ptr_funcs,
+                )?;
                 Ok(build.build_or(lhs, rhs, "or").unwrap())
             }
             KernelExpression::Not(c) => {
-                let c = c.compile_block(ctx, build, vec_bufs, iter_llvm_types)?;
+                let c = c.compile_block(
+                    ctx,
+                    llvm_mod,
+                    build,
+                    vec_bufs,
+                    iter_llvm_types,
+                    iter_ptrs,
+                    base_ptr_funcs,
+                )?;
                 Ok(build.build_not(c, "not").unwrap())
             }
             KernelExpression::Select { cond, v1, v2 } => {
-                let cond = cond.compile_block(ctx, build, vec_bufs, iter_llvm_types)?;
-                let v1 = v1.compile_block(ctx, build, vec_bufs, iter_llvm_types)?;
-                let v2 = v2.compile_block(ctx, build, vec_bufs, iter_llvm_types)?;
+                let cond = cond.compile_block(
+                    ctx,
+                    llvm_mod,
+                    build,
+                    vec_bufs,
+                    iter_llvm_types,
+                    iter_ptrs,
+                    base_ptr_funcs,
+                )?;
+                let v1 = v1.compile_block(
+                    ctx,
+                    llvm_mod,
+                    build,
+                    vec_bufs,
+                    iter_llvm_types,
+                    iter_ptrs,
+                    base_ptr_funcs,
+                )?;
+                let v2 = v2.compile_block(
+                    ctx,
+                    llvm_mod,
+                    build,
+                    vec_bufs,
+                    iter_llvm_types,
+                    iter_ptrs,
+                    base_ptr_funcs,
+                )?;
                 Ok(build
                     .build_select(cond, v1, v2, "select")
                     .unwrap()
@@ -558,7 +626,15 @@ impl<'a> KernelExpression<'a> {
             }
             KernelExpression::Convert(c, tar_pt) => {
                 let in_ty = PrimitiveType::for_arrow_type(&c.get_type());
-                let c = c.compile_block(ctx, build, vec_bufs, iter_llvm_types)?;
+                let c = c.compile_block(
+                    ctx,
+                    llvm_mod,
+                    build,
+                    vec_bufs,
+                    iter_llvm_types,
+                    iter_ptrs,
+                    base_ptr_funcs,
+                )?;
                 Ok(gen_convert_numeric_vec(ctx, build, c, in_ty, *tar_pt))
             }
             KernelExpression::Add(lhs, rhs) => {
@@ -571,8 +647,24 @@ impl<'a> KernelExpression<'a> {
                     )));
                 }
 
-                let lhs = lhs.compile_block(ctx, build, vec_bufs, iter_llvm_types)?;
-                let rhs = rhs.compile_block(ctx, build, vec_bufs, iter_llvm_types)?;
+                let lhs = lhs.compile_block(
+                    ctx,
+                    llvm_mod,
+                    build,
+                    vec_bufs,
+                    iter_llvm_types,
+                    iter_ptrs,
+                    base_ptr_funcs,
+                )?;
+                let rhs = rhs.compile_block(
+                    ctx,
+                    llvm_mod,
+                    build,
+                    vec_bufs,
+                    iter_llvm_types,
+                    iter_ptrs,
+                    base_ptr_funcs,
+                )?;
                 match pt {
                     PrimitiveType::I8
                     | PrimitiveType::I16
@@ -600,8 +692,24 @@ impl<'a> KernelExpression<'a> {
                     )));
                 }
 
-                let lhs = lhs.compile_block(ctx, build, vec_bufs, iter_llvm_types)?;
-                let rhs = rhs.compile_block(ctx, build, vec_bufs, iter_llvm_types)?;
+                let lhs = lhs.compile_block(
+                    ctx,
+                    llvm_mod,
+                    build,
+                    vec_bufs,
+                    iter_llvm_types,
+                    iter_ptrs,
+                    base_ptr_funcs,
+                )?;
+                let rhs = rhs.compile_block(
+                    ctx,
+                    llvm_mod,
+                    build,
+                    vec_bufs,
+                    iter_llvm_types,
+                    iter_ptrs,
+                    base_ptr_funcs,
+                )?;
                 match pt {
                     PrimitiveType::I8
                     | PrimitiveType::I16
@@ -629,8 +737,24 @@ impl<'a> KernelExpression<'a> {
                     )));
                 }
 
-                let lhs = lhs.compile_block(ctx, build, vec_bufs, iter_llvm_types)?;
-                let rhs = rhs.compile_block(ctx, build, vec_bufs, iter_llvm_types)?;
+                let lhs = lhs.compile_block(
+                    ctx,
+                    llvm_mod,
+                    build,
+                    vec_bufs,
+                    iter_llvm_types,
+                    iter_ptrs,
+                    base_ptr_funcs,
+                )?;
+                let rhs = rhs.compile_block(
+                    ctx,
+                    llvm_mod,
+                    build,
+                    vec_bufs,
+                    iter_llvm_types,
+                    iter_ptrs,
+                    base_ptr_funcs,
+                )?;
                 match pt {
                     PrimitiveType::I8
                     | PrimitiveType::I16
@@ -658,8 +782,24 @@ impl<'a> KernelExpression<'a> {
                     )));
                 }
 
-                let lhs = lhs.compile_block(ctx, build, vec_bufs, iter_llvm_types)?;
-                let rhs = rhs.compile_block(ctx, build, vec_bufs, iter_llvm_types)?;
+                let lhs = lhs.compile_block(
+                    ctx,
+                    llvm_mod,
+                    build,
+                    vec_bufs,
+                    iter_llvm_types,
+                    iter_ptrs,
+                    base_ptr_funcs,
+                )?;
+                let rhs = rhs.compile_block(
+                    ctx,
+                    llvm_mod,
+                    build,
+                    vec_bufs,
+                    iter_llvm_types,
+                    iter_ptrs,
+                    base_ptr_funcs,
+                )?;
                 match pt {
                     PrimitiveType::I8
                     | PrimitiveType::I16
@@ -691,8 +831,24 @@ impl<'a> KernelExpression<'a> {
                     )));
                 }
 
-                let lhs = lhs.compile_block(ctx, build, vec_bufs, iter_llvm_types)?;
-                let rhs = rhs.compile_block(ctx, build, vec_bufs, iter_llvm_types)?;
+                let lhs = lhs.compile_block(
+                    ctx,
+                    llvm_mod,
+                    build,
+                    vec_bufs,
+                    iter_llvm_types,
+                    iter_ptrs,
+                    base_ptr_funcs,
+                )?;
+                let rhs = rhs.compile_block(
+                    ctx,
+                    llvm_mod,
+                    build,
+                    vec_bufs,
+                    iter_llvm_types,
+                    iter_ptrs,
+                    base_ptr_funcs,
+                )?;
                 match pt {
                     PrimitiveType::I8
                     | PrimitiveType::I16
@@ -715,7 +871,150 @@ impl<'a> KernelExpression<'a> {
                 }
             }
             KernelExpression::Cmp(..) => Err(DSLError::NotVectorizable("cmp operator")),
-            KernelExpression::At { .. } => Err(DSLError::NotVectorizable("at operator")),
+            KernelExpression::At { iter, idx } => {
+                if !idx.get_type().is_integer() {
+                    return Err(DSLError::TypeMismatch(format!(
+                        "at parameter must be integer, got {}",
+                        idx.get_type()
+                    )));
+                }
+
+                let base_fn = match base_ptr_funcs.get(&iter.index()) {
+                    Some(f) => *f,
+                    None => {
+                        return Err(DSLError::NotVectorizable(
+                            "at operator requires gather support",
+                        ))
+                    }
+                };
+
+                let elem_pt = PrimitiveType::for_arrow_type(&iter.data_type());
+
+                let iter_ptr = *iter_ptrs
+                    .get(iter.index())
+                    .ok_or(DSLError::InvalidInputIndex(iter.index()))?;
+                let base_ptr = build
+                    .build_call(base_fn, &[iter_ptr.into()], "base_ptr")
+                    .unwrap()
+                    .try_as_basic_value()
+                    .unwrap_left()
+                    .into_pointer_value();
+
+                let idx_vec = idx.compile_block(
+                    ctx,
+                    llvm_mod,
+                    build,
+                    vec_bufs,
+                    iter_llvm_types,
+                    iter_ptrs,
+                    base_ptr_funcs,
+                )?;
+
+                let i64_type = ctx.i64_type();
+                let lane_count = idx_vec.get_type().get_size();
+                let vec_i64_type = i64_type.vec_type(lane_count);
+                let idx_vec = if idx_vec.get_type() == vec_i64_type {
+                    idx_vec
+                } else {
+                    build
+                        .build_int_cast(idx_vec, vec_i64_type, "idx_to_i64")
+                        .unwrap()
+                };
+
+                let vec_type =
+                    elem_pt
+                        .llvm_vec_type(ctx, lane_count)
+                        .ok_or(DSLError::NotVectorizable(
+                            "at operator requires primitive element type",
+                        ))?;
+
+                let stride = i64_type.const_int(elem_pt.width() as u64, false);
+                let stride_insert = build
+                    .build_insert_element(
+                        vec_i64_type.const_zero(),
+                        stride,
+                        i64_type.const_zero(),
+                        "stride_insert",
+                    )
+                    .unwrap();
+                let stride_vec = build
+                    .build_shuffle_vector(
+                        stride_insert,
+                        vec_i64_type.const_zero(),
+                        vec_i64_type.const_zero(),
+                        "stride_splat",
+                    )
+                    .unwrap();
+                let byte_offsets = build
+                    .build_int_mul(idx_vec, stride_vec, "byte_offsets")
+                    .unwrap();
+
+                let base_ptr_int = build
+                    .build_ptr_to_int(base_ptr, i64_type, "base_ptr_int")
+                    .unwrap();
+                let base_insert = build
+                    .build_insert_element(
+                        vec_i64_type.const_zero(),
+                        base_ptr_int,
+                        i64_type.const_zero(),
+                        "base_insert",
+                    )
+                    .unwrap();
+                let base_vec = build
+                    .build_shuffle_vector(
+                        base_insert,
+                        vec_i64_type.const_zero(),
+                        vec_i64_type.const_zero(),
+                        "base_splat",
+                    )
+                    .unwrap();
+
+                let ptr_ints = build
+                    .build_int_add(base_vec, byte_offsets, "ptr_ints")
+                    .unwrap();
+                let ptr_vec_type = ctx.ptr_type(AddressSpace::default()).vec_type(lane_count);
+                let ptr_vec = build
+                    .build_int_to_ptr(ptr_ints, ptr_vec_type, "ptr_vec")
+                    .unwrap();
+
+                let gather = Intrinsic::find("llvm.masked.gather").unwrap();
+                let gather_fn = gather
+                    .get_declaration(
+                        llvm_mod,
+                        &[
+                            vec_type.as_basic_type_enum(),
+                            ptr_vec_type.as_basic_type_enum(),
+                        ],
+                    )
+                    .ok_or(DSLError::NotVectorizable(
+                        "at operator requires gather intrinsic",
+                    ))?;
+
+                let passthru = vec_type.const_zero();
+                let mask_bits = ctx.custom_width_int_type(lane_count).const_all_ones();
+                let mask_vec = build
+                    .build_bit_cast(mask_bits, ctx.bool_type().vec_type(lane_count), "mask")
+                    .unwrap()
+                    .into_vector_value();
+
+                let gathered = build
+                    .build_call(
+                        gather_fn,
+                        &[
+                            ptr_vec.into(),
+                            ctx.i32_type().const_zero().into(),
+                            mask_vec.into(),
+                            passthru.into(),
+                        ],
+                        "gather",
+                    )
+                    .unwrap()
+                    .try_as_basic_value()
+                    .unwrap_left()
+                    .into_vector_value();
+
+                Ok(gathered)
+            }
         }
     }
 
@@ -2056,6 +2355,21 @@ fn build_kernel_with_writer<'a, W: ArrayWriter<'a>>(
         })
         .collect();
 
+    let base_ptr_funcs: HashMap<usize, FunctionValue> = program
+        .accessed_indexes()
+        .iter()
+        .filter_map(|idx| {
+            generate_get_base_ptr(
+                ctx,
+                &llvm_mod,
+                &format!("base_ptr{}", idx),
+                inputs[*idx].get().0.data_type(),
+                &ihs[*idx],
+            )
+            .map(|func| (*idx, func))
+        })
+        .collect();
+
     declare_blocks!(
         ctx,
         func_inner,
@@ -2134,9 +2448,15 @@ fn build_kernel_with_writer<'a, W: ArrayWriter<'a>>(
             // all our inputs support block iteration, see if our program does
             declare_blocks!(ctx, func_inner, block_loop_cond, block_loop_body);
             builder.position_at_end(block_loop_body);
-            let res = program
-                .expr()
-                .compile_block(ctx, &builder, &vec_bufs, &vec_types);
+            let res = program.expr().compile_block(
+                ctx,
+                &llvm_mod,
+                &builder,
+                &vec_bufs,
+                &vec_types,
+                &iter_ptrs,
+                &base_ptr_funcs,
+            );
             match res {
                 Ok(mut v) => {
                     // send `v` to the writer, loop back
@@ -2320,6 +2640,7 @@ fn build_kernel_with_writer<'a, W: ArrayWriter<'a>>(
         .into_int_value();
     builder.build_return(Some(&produced)).unwrap();
 
+    llvm_mod.print_to_stderr();
     llvm_mod.verify().unwrap();
     optimize_module(&llvm_mod).unwrap();
     let ee = llvm_mod

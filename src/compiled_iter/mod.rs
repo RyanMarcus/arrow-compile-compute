@@ -1398,6 +1398,52 @@ pub fn generate_next<'a>(
     }
 }
 
+pub fn generate_get_base_ptr<'a>(
+    ctx: &'a Context,
+    llvm_mod: &Module<'a>,
+    label: &str,
+    _dt: &DataType,
+    ih: &IteratorHolder,
+) -> Option<FunctionValue<'a>> {
+    let build = ctx.create_builder();
+    let ptr_type = ctx.ptr_type(AddressSpace::default());
+
+    let fn_type = ptr_type.fn_type(&[ptr_type.into()], false);
+    let func = llvm_mod.add_function(
+        &format!("{}_base_ptr", label),
+        fn_type,
+        Some(
+            #[cfg(test)]
+            Linkage::External,
+            #[cfg(not(test))]
+            Linkage::Private,
+        ),
+    );
+
+    let iter_ptr = func.get_nth_param(0).unwrap().into_pointer_value();
+
+    let res = match ih {
+        IteratorHolder::Primitive(primitive_iter) => {
+            declare_blocks!(ctx, func, entry);
+
+            build.position_at_end(entry);
+            let data_ptr = primitive_iter.llvm_data(ctx, &build, iter_ptr);
+            build.build_return(Some(&data_ptr)).unwrap();
+
+            Some(func)
+        }
+        _ => None,
+    };
+
+    match res {
+        Some(f) => Some(f),
+        None => unsafe {
+            func.delete();
+            None
+        },
+    }
+}
+
 /// This adds an `access` function to the module for the given iterator. When
 /// called, this `access` function will fetch an element from the iterator at
 /// the position given by the 2nd parameter, *without* advancing the iterator's
@@ -1766,5 +1812,46 @@ pub fn generate_random_access<'a>(
         },
         IteratorHolder::ScalarPrimitive(_s) => todo!(),
         IteratorHolder::ScalarString(_) => todo!(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use arrow_array::{Array, Int32Array};
+    use inkwell::OptimizationLevel;
+
+    #[test]
+    fn test_get_base_ptr_primitive_iterator() {
+        let data = Int32Array::from(vec![1, 2, 3, 4, 5, 6, 7, 8]);
+        let mut iter = array_to_iter(&data);
+
+        let ctx = Context::create();
+        let module = ctx.create_module("get_base_ptr_test");
+
+        let func = generate_get_base_ptr(&ctx, &module, "prim", data.data_type(), &iter)
+            .expect("primitive iterator should expose a base pointer");
+
+        module.verify().unwrap();
+        let engine = module
+            .create_jit_execution_engine(OptimizationLevel::None)
+            .unwrap();
+        let fn_name = func.get_name().to_str().unwrap();
+        let base_fn = unsafe {
+            engine
+                .get_function::<unsafe extern "C" fn(*mut c_void) -> *const i8>(fn_name)
+                .unwrap()
+        };
+
+        let returned_ptr = unsafe { base_fn.call(iter.get_mut_ptr()) };
+        let expected_ptr = data.values().as_ptr() as *const i8;
+
+        assert_eq!(returned_ptr, expected_ptr);
+
+        // also ensure the pointer aliases to the original values by reading one element
+        unsafe {
+            let first = *(returned_ptr as *const i32);
+            assert_eq!(first, data.value(0));
+        }
     }
 }
