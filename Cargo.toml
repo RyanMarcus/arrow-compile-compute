@@ -75,3 +75,7 @@ harness = false
 [[bench]]
 name = "hash_bench"
 harness = false
+
+[[bench]]
+name = "lognull_bench"
+harness = false

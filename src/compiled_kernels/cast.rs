@@ -113,6 +113,11 @@ impl Kernel for CastKernel {
     type Output = ArrayRef;
 
     fn call(&self, inp: Self::Input<'_>) -> Result<Self::Output, ArrowKernelError> {
+        if matches!(self.tar, DataType::RunEndEncoded(_, _)) && inp.is_nullable() {
+            return Err(ArrowKernelError::UnsupportedArguments(
+                "Cannot cast nullable array to run-end encoded array".to_string(),
+            ));
+        }
         let res = self.k.call(&[&inp])?;
         assert_eq!(
             inp.len(),
@@ -155,9 +160,9 @@ mod tests {
 
     use arrow_array::{
         cast::AsArray,
-        types::{Int32Type, Int8Type},
-        Array, ArrayRef, DictionaryArray, Int32Array, Int64Array, RunArray, StringArray,
-        UInt8Array,
+        types::{Int16Type, Int32Type, Int8Type},
+        Array, ArrayRef, DictionaryArray, Int16Array, Int32Array, Int64Array, RunArray,
+        StringArray, UInt8Array,
     };
     use arrow_schema::DataType;
     use itertools::Itertools;
@@ -343,5 +348,44 @@ mod tests {
         for (ours, orig) in res.into_iter().zip(data.iter()) {
             assert_eq!(ours, orig);
         }
+    }
+
+    #[test]
+    fn test_ree_bool_to_bool() {
+        use arrow_array::BooleanArray;
+
+        let data = BooleanArray::from(vec![true, false, true]);
+        let res = Int16Array::from(vec![2, 4, 800]);
+        let re = RunArray::<Int16Type>::try_new(&res, &data).unwrap();
+
+        let k = CastKernel::compile(&(&re as &dyn Array), DataType::Boolean).unwrap();
+        let res = k.call(&re).unwrap();
+        let res = res.as_boolean();
+
+        let re = re.downcast::<BooleanArray>().unwrap();
+        assert_eq!(res.len(), re.len());
+        for (ours, orig) in res.iter().zip(re.into_iter()) {
+            assert_eq!(ours, orig);
+        }
+    }
+
+    #[test]
+    fn test_to_ree_nulls() {
+        let data = Int32Array::from(vec![
+            Some(1),
+            Some(1),
+            None,
+            None,
+            Some(2),
+            Some(2),
+            Some(2),
+        ]);
+
+        let k = CastKernel::compile(
+            &(&data as &dyn Array),
+            run_end_data_type(&DataType::Int32, &DataType::Int32),
+        )
+        .unwrap();
+        assert!(k.call(&data).is_err());
     }
 }

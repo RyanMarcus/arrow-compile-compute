@@ -508,8 +508,17 @@ mod tests {
         let ifh =
             Arc::<IterFuncHolder>::compile(&(&data as &dyn Array), (PrimitiveType::I64, false))
                 .unwrap();
-        let res = ArrowIter::<i64>::new(&data, ifh).unwrap().indexed().collect_vec();
-        assert_eq!(res, (0..1000).enumerate().filter(|(_idx, x)| x % 2 == 0).collect_vec());
+        let res = ArrowIter::<i64>::new(&data, ifh)
+            .unwrap()
+            .indexed()
+            .collect_vec();
+        assert_eq!(
+            res,
+            (0..1000)
+                .enumerate()
+                .filter(|(_idx, x)| x % 2 == 0)
+                .collect_vec()
+        );
     }
 
     #[test]

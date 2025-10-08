@@ -7,7 +7,10 @@ use std::{
 
 use arrow_array::{
     cast::AsArray,
-    types::{ArrowDictionaryKeyType, Int16Type, Int32Type, Int64Type, Int8Type, RunEndIndexType},
+    types::{
+        ArrowDictionaryKeyType, Int16Type, Int32Type, Int64Type, Int8Type, RunEndIndexType,
+        UInt16Type, UInt32Type, UInt64Type, UInt8Type,
+    },
     Array, ArrayRef, BooleanArray, Datum, DictionaryArray, RunArray, StringArray,
 };
 use arrow_schema::DataType;
@@ -151,6 +154,10 @@ pub enum DictKeyType {
     Int16,
     Int32,
     Int64,
+    UInt8,
+    UInt16,
+    UInt32,
+    UInt64,
 }
 
 #[derive(Debug, Copy, Clone, PartialEq, Eq)]
@@ -210,8 +217,12 @@ impl KernelOutputType {
                 DataType::Int16 => Ok(KernelOutputType::Dictionary(DictKeyType::Int16)),
                 DataType::Int32 => Ok(KernelOutputType::Dictionary(DictKeyType::Int32)),
                 DataType::Int64 => Ok(KernelOutputType::Dictionary(DictKeyType::Int64)),
+                DataType::UInt8 => Ok(KernelOutputType::Dictionary(DictKeyType::UInt8)),
+                DataType::UInt16 => Ok(KernelOutputType::Dictionary(DictKeyType::UInt16)),
+                DataType::UInt32 => Ok(KernelOutputType::Dictionary(DictKeyType::UInt32)),
+                DataType::UInt64 => Ok(KernelOutputType::Dictionary(DictKeyType::UInt64)),
                 _ => Err(DSLError::TypeMismatch(format!(
-                    "dictionary key type must be signed int, but has type {}",
+                    "dictionary key type must be an int, but has type {}",
                     dt
                 ))),
             },
@@ -251,7 +262,7 @@ impl KernelOutputType {
                 }
             }
             KernelOutputType::Boolean => {
-                if dt != &DataType::Boolean {
+                if dt != &DataType::Boolean && dt != &DataType::UInt8 {
                     return Err(DSLError::TypeMismatch(format!(
                         "cannot collect type {} into boolean",
                         dt
@@ -1722,6 +1733,18 @@ impl DSLKernel {
                 DictKeyType::Int64 => {
                     Arc::new(self.exec_to_dict::<Int64Type>(ptrs, max_len, p_out_type))
                 }
+                DictKeyType::UInt8 => {
+                    Arc::new(self.exec_to_dict::<UInt8Type>(ptrs, max_len, p_out_type))
+                }
+                DictKeyType::UInt16 => {
+                    Arc::new(self.exec_to_dict::<UInt16Type>(ptrs, max_len, p_out_type))
+                }
+                DictKeyType::UInt32 => {
+                    Arc::new(self.exec_to_dict::<UInt32Type>(ptrs, max_len, p_out_type))
+                }
+                DictKeyType::UInt64 => {
+                    Arc::new(self.exec_to_dict::<UInt64Type>(ptrs, max_len, p_out_type))
+                }
             }),
             KernelOutputType::RunEnd(re_type) => Ok(match re_type {
                 RunEndType::Int16 => {
@@ -1819,6 +1842,10 @@ fn build_kernel<'a>(
             DictKeyType::Int16 => build_dict_kernel::<Int16Type>(ctx, inputs, program),
             DictKeyType::Int32 => build_dict_kernel::<Int32Type>(ctx, inputs, program),
             DictKeyType::Int64 => build_dict_kernel::<Int64Type>(ctx, inputs, program),
+            DictKeyType::UInt8 => build_dict_kernel::<UInt8Type>(ctx, inputs, program),
+            DictKeyType::UInt16 => build_dict_kernel::<UInt16Type>(ctx, inputs, program),
+            DictKeyType::UInt32 => build_dict_kernel::<UInt32Type>(ctx, inputs, program),
+            DictKeyType::UInt64 => build_dict_kernel::<UInt64Type>(ctx, inputs, program),
         },
         KernelOutputType::RunEnd(key) => match key {
             RunEndType::Int16 => build_ree_kernel::<Int16Type>(ctx, inputs, program),
@@ -2000,7 +2027,7 @@ fn build_kernel_with_writer<'a, W: ArrayWriter<'a>>(
         .map(|(_ty, idx)| {
             (
                 *idx,
-                generate_next_block::<32>(
+                generate_next_block::<64>(
                     ctx,
                     &llvm_mod,
                     &format!("next_block{}", idx),
@@ -2088,10 +2115,10 @@ fn build_kernel_with_writer<'a, W: ArrayWriter<'a>>(
                 KernelInputType::SetBit => PrimitiveType::U64,
             };
             let vec_buf = ptype
-                .llvm_vec_type(ctx, 32)
+                .llvm_vec_type(ctx, 64)
                 .map(|t| builder.build_alloca(t, &format!("vbuf{}", t)).unwrap());
             vec_bufs.insert(idx, vec_buf);
-            vec_types.insert(idx, ptype.llvm_vec_type(ctx, 32));
+            vec_types.insert(idx, ptype.llvm_vec_type(ctx, 64));
         }
 
         if vec_bufs.values().all(|x| x.is_some()) {
@@ -2111,8 +2138,19 @@ fn build_kernel_with_writer<'a, W: ArrayWriter<'a>>(
                 .expr()
                 .compile_block(ctx, &builder, &vec_bufs, &vec_types);
             match res {
-                Ok(v) => {
+                Ok(mut v) => {
                     // send `v` to the writer, loop back
+                    if writer.llvm_ingest_type(ctx) == ctx.bool_type().as_basic_type_enum() {
+                        v = builder
+                            .build_int_compare(
+                                IntPredicate::NE,
+                                v,
+                                v.get_type().const_zero(),
+                                "to_bool",
+                            )
+                            .unwrap();
+                    }
+
                     writer.llvm_ingest_block(ctx, &builder, v);
                     let curr_produced = builder
                         .build_load(i64_type, produced_ptr, "curr_produced")

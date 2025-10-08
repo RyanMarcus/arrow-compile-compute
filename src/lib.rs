@@ -3,11 +3,16 @@
 use std::sync::Arc;
 
 use arrow_array::{
-    ArrayRef, BinaryArray, BinaryViewArray, BooleanArray, Date32Array, Date64Array,
+    cast::AsArray,
+    make_array,
+    types::{Int16Type, Int32Type, Int64Type, RunEndIndexType},
+    Array, ArrayRef, BinaryArray, BinaryViewArray, BooleanArray, Date32Array, Date64Array,
     FixedSizeBinaryArray, Float16Array, Float32Array, Float64Array, Int16Array, Int32Array,
-    Int64Array, Int8Array, LargeBinaryArray, LargeStringArray, NullArray, StringArray,
-    StringViewArray, UInt16Array, UInt32Array, UInt64Array, UInt8Array,
+    Int64Array, Int8Array, LargeBinaryArray, LargeStringArray, NullArray, PrimitiveArray,
+    StringArray, StringViewArray, UInt16Array, UInt32Array, UInt64Array, UInt8Array,
 };
+use arrow_buffer::NullBuffer;
+use arrow_data::ArrayDataBuilder;
 use arrow_schema::{DataType, Field};
 use inkwell::{
     attributes::{Attribute, AttributeLoc},
@@ -463,5 +468,158 @@ impl Predicate {
             Predicate::Gt => Predicate::Lt,
             Predicate::Gte => Predicate::Lte,
         }
+    }
+}
+
+fn make_ree_unchecked(res: &dyn Array, data: &dyn Array, len: usize) -> ArrayRef {
+    let ree_array_type = DataType::RunEndEncoded(
+        Arc::new(Field::new(
+            "run_ends",
+            res.data_type().clone(),
+            res.is_nullable(),
+        )),
+        Arc::new(Field::new(
+            "values",
+            data.data_type().clone(),
+            data.is_nullable(),
+        )),
+    );
+    let builder = ArrayDataBuilder::new(ree_array_type)
+        .len(len)
+        .add_child_data(res.to_data())
+        .add_child_data(data.to_data());
+
+    let array_data = unsafe { builder.build_unchecked() };
+    make_array(array_data)
+}
+
+fn ree_logical_nulls<K: RunEndIndexType>(
+    arr: &dyn Array,
+) -> Result<Option<NullBuffer>, ArrowKernelError> {
+    let arr = arr.as_run::<K>();
+    let res = PrimitiveArray::<K>::new(arr.run_ends().inner().clone(), None);
+    if let Some(re_nulls) = arr.values().logical_nulls() {
+        let re_nulls = BooleanArray::new(re_nulls.into_inner(), None);
+        let re_nulls = make_ree_unchecked(&res, &re_nulls, arr.len());
+        let re_nulls = crate::arrow_interface::cast::cast(&re_nulls, &DataType::Boolean)?;
+        let re_nulls = re_nulls.as_boolean().clone().into_parts().0;
+        let re_nulls = NullBuffer::new(re_nulls);
+        Ok(Some(re_nulls))
+    } else {
+        Ok(None)
+    }
+}
+
+pub fn logical_nulls(arr: &dyn Array) -> Result<Option<NullBuffer>, ArrowKernelError> {
+    match arr.data_type() {
+        DataType::Dictionary(_k_dt, _v_dt) => {
+            let arr = arr.as_any_dictionary();
+
+            match (arr.keys().is_nullable(), arr.values().is_nullable()) {
+                (false, false) => Ok(None),
+                (false, true) => {
+                    let v_nulls = arr.values().logical_nulls().unwrap();
+                    let ba = BooleanArray::new(v_nulls.inner().clone(), None);
+                    let nulls = crate::arrow_interface::select::take(&ba, arr.keys())?;
+                    let nulls = nulls.as_boolean().clone();
+                    let nb = NullBuffer::new(nulls.into_parts().0);
+                    Ok(Some(nb))
+                }
+                (true, false) => Ok(arr.keys().logical_nulls()),
+                (true, true) => Ok(arr.logical_nulls()),
+            }
+        }
+        DataType::RunEndEncoded(f_re, _f_val) => match f_re.data_type() {
+            DataType::Int16 => ree_logical_nulls::<Int16Type>(arr),
+            DataType::Int32 => ree_logical_nulls::<Int32Type>(arr),
+            DataType::Int64 => ree_logical_nulls::<Int64Type>(arr),
+            _ => unreachable!("invalide run end type"),
+        },
+        _ => Ok(arr.logical_nulls()),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+
+    use super::*;
+    use arrow_array::{
+        types::Int8Type, Array, DictionaryArray, Int16Array, Int32Array, Int8Array, RunArray,
+        StringArray,
+    };
+    use arrow_buffer::NullBuffer;
+    use arrow_data::ArrayDataBuilder;
+    use arrow_schema::{DataType, Field};
+    use std::sync::Arc;
+
+    fn assert_nullbuffers_equal(a: Option<NullBuffer>, b: Option<NullBuffer>) {
+        match (a, b) {
+            (None, None) => {}
+            (Some(a), Some(b)) => {
+                let ab = BooleanArray::new(a.inner().clone(), None);
+                let bb = BooleanArray::new(b.inner().clone(), None);
+                assert_eq!(ab, bb);
+            }
+            (a, b) => panic!(
+                "Null buffer mismatch: left={:?}, right={:?}",
+                a.is_some(),
+                b.is_some()
+            ),
+        }
+    }
+
+    #[test]
+    fn logical_nulls_dictionary_matches_arrow() {
+        // a dictionary with null values but no null keys
+        let values = StringArray::from(vec![Some("hello"), None, Some("world")]);
+        let keys = Int8Array::from(vec![0, 1, 2, 2, 1, 0]);
+        let dict = DictionaryArray::<Int8Type>::try_new(keys, Arc::new(values)).unwrap();
+
+        let arr = &dict as &dyn Array;
+        let expected = arr.logical_nulls();
+        let actual = super::logical_nulls(arr).unwrap();
+        assert_nullbuffers_equal(actual, expected);
+
+        // a dictionary with null values and null keys
+        let values = StringArray::from(vec![Some("hello"), None, Some("world")]);
+        let keys = Int8Array::from(vec![Some(0), Some(1), Some(2), None, None, Some(0)]);
+        let dict = DictionaryArray::<Int8Type>::try_new(keys, Arc::new(values)).unwrap();
+
+        let arr = &dict as &dyn Array;
+        let expected = arr.logical_nulls();
+        let actual = super::logical_nulls(arr).unwrap();
+        assert_nullbuffers_equal(actual, expected);
+    }
+
+    #[test]
+    fn logical_nulls_run_end_matches_arrow() {
+        // Build a RunEndEncoded<Int16, Int32> array with runs:
+        // run_ends: [2, 5, 6, 9] => length 9 with runs [0..2], [2..5], [5..6], [6..9]
+        // values:   [10, null, 30, null] => validities per run: [T, F, T, F]
+        // So overall nulls for positions:
+        // 0..1 => valid, 2..4 => null, 5 => valid, 6..8 => null
+        let run_ends = Int16Array::from(vec![2i16, 5, 6, 9]);
+        let values = Int32Array::from(vec![Some(10), None, Some(30), None]);
+
+        let ree_array_type = DataType::RunEndEncoded(
+            Arc::new(Field::new("run_ends", DataType::Int16, false)),
+            Arc::new(Field::new("values", DataType::Int32, true)),
+        );
+
+        let data = unsafe {
+            ArrayDataBuilder::new(ree_array_type)
+                .len(9)
+                .add_child_data(run_ends.to_data())
+                .add_child_data(values.to_data())
+                .build_unchecked()
+        };
+
+        let run_arr: RunArray<Int16Type> = RunArray::from(data);
+
+        let arr = &run_arr as &dyn Array;
+        let expected = arr.logical_nulls();
+        let actual = super::logical_nulls(arr).unwrap();
+
+        assert_nullbuffers_equal(actual, expected);
     }
 }
