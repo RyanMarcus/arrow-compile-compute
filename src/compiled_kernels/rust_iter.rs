@@ -12,7 +12,7 @@ use crate::{
         array_to_setbit_iter, datum_to_iter, generate_next, generate_random_access, IteratorHolder,
     },
     compiled_kernels::{gen_convert_numeric_vec, link_req_helpers, optimize_module},
-    declare_blocks, increment_pointer, Kernel, PrimitiveType,
+    declare_blocks, increment_pointer, logical_nulls, Kernel, PrimitiveType,
 };
 
 use super::ArrowKernelError;
@@ -117,7 +117,7 @@ impl Kernel for Arc<IterFuncHolder> {
         let (target_dt, ignore_nulls) = p;
         Ok((
             i.data_type().clone(),
-            i.logical_nulls().is_some() && !ignore_nulls,
+            i.is_nullable() && !ignore_nulls,
             *target_dt,
         ))
     }
@@ -199,8 +199,7 @@ impl<T: ApplyType> Iterator for ArrowIter<T> {
 impl<T: ApplyType> ArrowIter<T> {
     pub fn new(data: &dyn Array, func: Arc<IterFuncHolder>) -> Result<Self, ArrowKernelError> {
         let ih = datum_to_iter(&data)?;
-        let setbit_ih = data
-            .logical_nulls()
+        let setbit_ih = logical_nulls(data)?
             .map(|nulls| array_to_setbit_iter(&BooleanArray::from(nulls.clone().into_inner())))
             .transpose()?;
 
