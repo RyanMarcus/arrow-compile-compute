@@ -1398,19 +1398,26 @@ pub fn generate_next<'a>(
     }
 }
 
-pub fn generate_get_base_ptr<'a>(
+pub fn generate_blocked_random_access<'a>(
     ctx: &'a Context,
     llvm_mod: &Module<'a>,
     label: &str,
-    _dt: &DataType,
+    dt: &DataType,
     ih: &IteratorHolder,
 ) -> Option<FunctionValue<'a>> {
-    let build = ctx.create_builder();
-    let ptr_type = ctx.ptr_type(AddressSpace::default());
+    const LANES: u32 = 64;
+    let lanes = LANES;
 
-    let fn_type = ptr_type.fn_type(&[ptr_type.into()], false);
+    let build = ctx.create_builder();
+    let ptype = PrimitiveType::for_arrow_type(dt);
+    let vec_type = ptype.llvm_vec_type(ctx, lanes)?;
+    let ptr_type = ctx.ptr_type(AddressSpace::default());
+    let i64_type = ctx.i64_type();
+    let idx_vec_type = i64_type.vec_type(lanes);
+
+    let fn_type = vec_type.fn_type(&[ptr_type.into(), idx_vec_type.into()], false);
     let func = llvm_mod.add_function(
-        &format!("{}_base_ptr", label),
+        &format!("{}_blocked_access_{}", label, lanes),
         fn_type,
         Some(
             #[cfg(test)]
@@ -1419,8 +1426,8 @@ pub fn generate_get_base_ptr<'a>(
             Linkage::Private,
         ),
     );
-
     let iter_ptr = func.get_nth_param(0).unwrap().into_pointer_value();
+    let idx_vec = func.get_nth_param(1).unwrap().into_vector_value();
 
     let res = match ih {
         IteratorHolder::Primitive(primitive_iter) => {
@@ -1428,8 +1435,171 @@ pub fn generate_get_base_ptr<'a>(
 
             build.position_at_end(entry);
             let data_ptr = primitive_iter.llvm_data(ctx, &build, iter_ptr);
-            build.build_return(Some(&data_ptr)).unwrap();
 
+            let vec_i64_type = i64_type.vec_type(lanes);
+
+            let base_ptr_int = build
+                .build_ptr_to_int(data_ptr, i64_type, "base_ptr_int")
+                .unwrap();
+            let base_insert = build
+                .build_insert_element(
+                    vec_i64_type.const_zero(),
+                    base_ptr_int,
+                    i64_type.const_zero(),
+                    "base_insert",
+                )
+                .unwrap();
+            let base_vec = build
+                .build_shuffle_vector(
+                    base_insert,
+                    vec_i64_type.const_zero(),
+                    vec_i64_type.const_zero(),
+                    "base_splat",
+                )
+                .unwrap();
+
+            let stride = i64_type.const_int(ptype.width() as u64, false);
+            let stride_insert = build
+                .build_insert_element(
+                    vec_i64_type.const_zero(),
+                    stride,
+                    i64_type.const_zero(),
+                    "stride_insert",
+                )
+                .unwrap();
+            let stride_vec = build
+                .build_shuffle_vector(
+                    stride_insert,
+                    vec_i64_type.const_zero(),
+                    vec_i64_type.const_zero(),
+                    "stride_splat",
+                )
+                .unwrap();
+            let byte_offsets = build
+                .build_int_mul(idx_vec, stride_vec, "byte_offsets")
+                .unwrap();
+
+            let ptr_ints = build
+                .build_int_add(base_vec, byte_offsets, "ptr_ints")
+                .unwrap();
+            let ptr_vec_type = ctx.ptr_type(AddressSpace::default()).vec_type(lanes);
+            let ptr_vec = build
+                .build_int_to_ptr(ptr_ints, ptr_vec_type, "ptr_vec")
+                .unwrap();
+
+            let gather = Intrinsic::find("llvm.masked.gather").unwrap();
+            let gather_fn = gather
+                .get_declaration(
+                    llvm_mod,
+                    &[
+                        vec_type.as_basic_type_enum(),
+                        ptr_vec_type.as_basic_type_enum(),
+                    ],
+                )
+                .unwrap();
+
+            let passthru = vec_type.const_zero();
+            let mask_bits = ctx.custom_width_int_type(lanes).const_all_ones();
+            let mask_vec = build
+                .build_bit_cast(mask_bits, ctx.bool_type().vec_type(lanes), "mask")
+                .unwrap()
+                .into_vector_value();
+
+            let result = build
+                .build_call(
+                    gather_fn,
+                    &[
+                        ptr_vec.into(),
+                        ctx.i32_type().const_zero().into(),
+                        mask_vec.into(),
+                        passthru.into(),
+                    ],
+                    "gather",
+                )
+                .unwrap()
+                .try_as_basic_value()
+                .unwrap_left()
+                .into_vector_value();
+            build.build_return(Some(&result)).unwrap();
+            Some(func)
+        }
+        IteratorHolder::Bitmap(bitmap_iterator) => {
+            declare_blocks!(ctx, func, entry);
+
+            build.position_at_end(entry);
+            let slice_offset = bitmap_iterator.llvm_slice_offset(ctx, &build, iter_ptr);
+            let data_ptr = bitmap_iterator.llvm_get_data_ptr(ctx, &build, iter_ptr);
+
+            let mut result = vec_type.const_zero();
+            let byte_ptr_type = ctx.ptr_type(AddressSpace::default());
+            for lane in 0..lanes {
+                let lane_idx = build
+                    .build_extract_element(
+                        idx_vec,
+                        i64_type.const_int(lane as u64, false),
+                        &format!("idx_lane{}", lane),
+                    )
+                    .unwrap()
+                    .into_int_value();
+                let bit_index = build
+                    .build_int_add(slice_offset, lane_idx, &format!("bit_index_lane{}", lane))
+                    .unwrap();
+                let byte_index = build
+                    .build_right_shift(
+                        bit_index,
+                        i64_type.const_int(3, false),
+                        false,
+                        &format!("byte_index_lane{}", lane),
+                    )
+                    .unwrap();
+                let bit_in_byte_i64 = build
+                    .build_and(
+                        bit_index,
+                        i64_type.const_int(7, false),
+                        &format!("bit_in_byte_lane{}", lane),
+                    )
+                    .unwrap();
+                let bit_in_byte_i8 = build
+                    .build_int_truncate(
+                        bit_in_byte_i64,
+                        ctx.i8_type(),
+                        &format!("bit_in_byte_i8_lane{}", lane),
+                    )
+                    .unwrap();
+                let byte_ptr = increment_pointer!(ctx, build, data_ptr, 1, byte_index);
+                let byte_ptr = build
+                    .build_bit_cast(byte_ptr, byte_ptr_type, &format!("byte_ptr_lane{}", lane))
+                    .unwrap()
+                    .into_pointer_value();
+                let data_byte = build
+                    .build_load(ctx.i8_type(), byte_ptr, &format!("data_byte_lane{}", lane))
+                    .unwrap()
+                    .into_int_value();
+                let shifted = build
+                    .build_right_shift(
+                        data_byte,
+                        bit_in_byte_i8,
+                        false,
+                        &format!("shifted_lane{}", lane),
+                    )
+                    .unwrap();
+                let bit = build
+                    .build_and(
+                        shifted,
+                        ctx.i8_type().const_int(1, false),
+                        &format!("bit_lane{}", lane),
+                    )
+                    .unwrap();
+                result = build
+                    .build_insert_element(
+                        result,
+                        bit,
+                        i64_type.const_int(lane as u64, false),
+                        &format!("insert_lane{}", lane),
+                    )
+                    .unwrap();
+            }
+            build.build_return(Some(&result)).unwrap();
             Some(func)
         }
         _ => None,
@@ -1812,46 +1982,5 @@ pub fn generate_random_access<'a>(
         },
         IteratorHolder::ScalarPrimitive(_s) => todo!(),
         IteratorHolder::ScalarString(_) => todo!(),
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use arrow_array::{Array, Int32Array};
-    use inkwell::OptimizationLevel;
-
-    #[test]
-    fn test_get_base_ptr_primitive_iterator() {
-        let data = Int32Array::from(vec![1, 2, 3, 4, 5, 6, 7, 8]);
-        let mut iter = array_to_iter(&data);
-
-        let ctx = Context::create();
-        let module = ctx.create_module("get_base_ptr_test");
-
-        let func = generate_get_base_ptr(&ctx, &module, "prim", data.data_type(), &iter)
-            .expect("primitive iterator should expose a base pointer");
-
-        module.verify().unwrap();
-        let engine = module
-            .create_jit_execution_engine(OptimizationLevel::None)
-            .unwrap();
-        let fn_name = func.get_name().to_str().unwrap();
-        let base_fn = unsafe {
-            engine
-                .get_function::<unsafe extern "C" fn(*mut c_void) -> *const i8>(fn_name)
-                .unwrap()
-        };
-
-        let returned_ptr = unsafe { base_fn.call(iter.get_mut_ptr()) };
-        let expected_ptr = data.values().as_ptr() as *const i8;
-
-        assert_eq!(returned_ptr, expected_ptr);
-
-        // also ensure the pointer aliases to the original values by reading one element
-        unsafe {
-            let first = *(returned_ptr as *const i32);
-            assert_eq!(first, data.value(0));
-        }
     }
 }

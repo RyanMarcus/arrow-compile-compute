@@ -291,6 +291,19 @@ impl<'a> ArrayWriter<'a> for BooleanWriter<'a> {
             .unwrap();
     }
 
+    fn llvm_ingest_block(
+        &self,
+        ctx: &'a Context,
+        build: &Builder<'a>,
+        vals: inkwell::values::VectorValue<'a>,
+    ) {
+        assert_eq!(vals.get_type().get_size(), 64);
+        let val = build
+            .build_bit_cast(vals, ctx.i64_type(), "as_i64")
+            .unwrap();
+        self.llvm_ingest_64_bools(ctx, build, val);
+    }
+
     fn llvm_flush(&self, _ctx: &'a Context, build: &Builder<'a>) {
         build
             .build_call(

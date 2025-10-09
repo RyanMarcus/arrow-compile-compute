@@ -18,7 +18,6 @@ use inkwell::{
     builder::Builder,
     context::Context,
     execution_engine::JitFunction,
-    intrinsics::Intrinsic,
     module::{Linkage, Module},
     types::{BasicType, BasicTypeEnum},
     values::{BasicValue, BasicValueEnum, FunctionValue, PointerValue, VectorValue},
@@ -31,7 +30,7 @@ use thiserror::Error;
 
 use crate::{
     compiled_iter::{
-        array_to_setbit_iter, datum_to_iter, generate_get_base_ptr, generate_next,
+        array_to_setbit_iter, datum_to_iter, generate_blocked_random_access, generate_next,
         generate_next_block, generate_random_access, IteratorHolder,
     },
     compiled_kernels::{
@@ -48,7 +47,7 @@ use crate::{
 
 use super::{writers::StringArrayWriter, ArrowKernelError};
 
-const VEC_SIZE: u32 = 32;
+const VEC_SIZE: u32 = 64;
 
 #[derive(Debug, Error)]
 pub enum DSLError {
@@ -508,7 +507,7 @@ impl<'a> KernelExpression<'a> {
         vec_bufs: &HashMap<usize, PointerValue<'b>>,
         iter_llvm_types: &HashMap<usize, BasicTypeEnum<'b>>,
         iter_ptrs: &[PointerValue<'b>],
-        base_ptr_funcs: &HashMap<usize, FunctionValue<'b>>,
+        blocked_access_funcs: &HashMap<(usize, u32), FunctionValue<'b>>,
     ) -> Result<VectorValue<'b>, DSLError> {
         match self {
             KernelExpression::Item(kernel_input) => {
@@ -545,7 +544,7 @@ impl<'a> KernelExpression<'a> {
                     vec_bufs,
                     iter_llvm_types,
                     iter_ptrs,
-                    base_ptr_funcs,
+                    blocked_access_funcs,
                 )?;
                 let rhs = rhs.compile_block(
                     ctx,
@@ -554,7 +553,7 @@ impl<'a> KernelExpression<'a> {
                     vec_bufs,
                     iter_llvm_types,
                     iter_ptrs,
-                    base_ptr_funcs,
+                    blocked_access_funcs,
                 )?;
                 Ok(build.build_and(lhs, rhs, "and").unwrap())
             }
@@ -566,7 +565,7 @@ impl<'a> KernelExpression<'a> {
                     vec_bufs,
                     iter_llvm_types,
                     iter_ptrs,
-                    base_ptr_funcs,
+                    blocked_access_funcs,
                 )?;
                 let rhs = rhs.compile_block(
                     ctx,
@@ -575,7 +574,7 @@ impl<'a> KernelExpression<'a> {
                     vec_bufs,
                     iter_llvm_types,
                     iter_ptrs,
-                    base_ptr_funcs,
+                    blocked_access_funcs,
                 )?;
                 Ok(build.build_or(lhs, rhs, "or").unwrap())
             }
@@ -587,7 +586,7 @@ impl<'a> KernelExpression<'a> {
                     vec_bufs,
                     iter_llvm_types,
                     iter_ptrs,
-                    base_ptr_funcs,
+                    blocked_access_funcs,
                 )?;
                 Ok(build.build_not(c, "not").unwrap())
             }
@@ -599,7 +598,7 @@ impl<'a> KernelExpression<'a> {
                     vec_bufs,
                     iter_llvm_types,
                     iter_ptrs,
-                    base_ptr_funcs,
+                    blocked_access_funcs,
                 )?;
                 let v1 = v1.compile_block(
                     ctx,
@@ -608,7 +607,7 @@ impl<'a> KernelExpression<'a> {
                     vec_bufs,
                     iter_llvm_types,
                     iter_ptrs,
-                    base_ptr_funcs,
+                    blocked_access_funcs,
                 )?;
                 let v2 = v2.compile_block(
                     ctx,
@@ -617,7 +616,7 @@ impl<'a> KernelExpression<'a> {
                     vec_bufs,
                     iter_llvm_types,
                     iter_ptrs,
-                    base_ptr_funcs,
+                    blocked_access_funcs,
                 )?;
                 Ok(build
                     .build_select(cond, v1, v2, "select")
@@ -633,7 +632,7 @@ impl<'a> KernelExpression<'a> {
                     vec_bufs,
                     iter_llvm_types,
                     iter_ptrs,
-                    base_ptr_funcs,
+                    blocked_access_funcs,
                 )?;
                 Ok(gen_convert_numeric_vec(ctx, build, c, in_ty, *tar_pt))
             }
@@ -654,7 +653,7 @@ impl<'a> KernelExpression<'a> {
                     vec_bufs,
                     iter_llvm_types,
                     iter_ptrs,
-                    base_ptr_funcs,
+                    blocked_access_funcs,
                 )?;
                 let rhs = rhs.compile_block(
                     ctx,
@@ -663,7 +662,7 @@ impl<'a> KernelExpression<'a> {
                     vec_bufs,
                     iter_llvm_types,
                     iter_ptrs,
-                    base_ptr_funcs,
+                    blocked_access_funcs,
                 )?;
                 match pt {
                     PrimitiveType::I8
@@ -699,7 +698,7 @@ impl<'a> KernelExpression<'a> {
                     vec_bufs,
                     iter_llvm_types,
                     iter_ptrs,
-                    base_ptr_funcs,
+                    blocked_access_funcs,
                 )?;
                 let rhs = rhs.compile_block(
                     ctx,
@@ -708,7 +707,7 @@ impl<'a> KernelExpression<'a> {
                     vec_bufs,
                     iter_llvm_types,
                     iter_ptrs,
-                    base_ptr_funcs,
+                    blocked_access_funcs,
                 )?;
                 match pt {
                     PrimitiveType::I8
@@ -744,7 +743,7 @@ impl<'a> KernelExpression<'a> {
                     vec_bufs,
                     iter_llvm_types,
                     iter_ptrs,
-                    base_ptr_funcs,
+                    blocked_access_funcs,
                 )?;
                 let rhs = rhs.compile_block(
                     ctx,
@@ -753,7 +752,7 @@ impl<'a> KernelExpression<'a> {
                     vec_bufs,
                     iter_llvm_types,
                     iter_ptrs,
-                    base_ptr_funcs,
+                    blocked_access_funcs,
                 )?;
                 match pt {
                     PrimitiveType::I8
@@ -789,7 +788,7 @@ impl<'a> KernelExpression<'a> {
                     vec_bufs,
                     iter_llvm_types,
                     iter_ptrs,
-                    base_ptr_funcs,
+                    blocked_access_funcs,
                 )?;
                 let rhs = rhs.compile_block(
                     ctx,
@@ -798,7 +797,7 @@ impl<'a> KernelExpression<'a> {
                     vec_bufs,
                     iter_llvm_types,
                     iter_ptrs,
-                    base_ptr_funcs,
+                    blocked_access_funcs,
                 )?;
                 match pt {
                     PrimitiveType::I8
@@ -838,7 +837,7 @@ impl<'a> KernelExpression<'a> {
                     vec_bufs,
                     iter_llvm_types,
                     iter_ptrs,
-                    base_ptr_funcs,
+                    blocked_access_funcs,
                 )?;
                 let rhs = rhs.compile_block(
                     ctx,
@@ -847,7 +846,7 @@ impl<'a> KernelExpression<'a> {
                     vec_bufs,
                     iter_llvm_types,
                     iter_ptrs,
-                    base_ptr_funcs,
+                    blocked_access_funcs,
                 )?;
                 match pt {
                     PrimitiveType::I8
@@ -879,26 +878,11 @@ impl<'a> KernelExpression<'a> {
                     )));
                 }
 
-                let base_fn = match base_ptr_funcs.get(&iter.index()) {
-                    Some(f) => *f,
-                    None => {
-                        return Err(DSLError::NotVectorizable(
-                            "at operator requires gather support",
-                        ))
-                    }
-                };
-
                 let elem_pt = PrimitiveType::for_arrow_type(&iter.data_type());
 
                 let iter_ptr = *iter_ptrs
                     .get(iter.index())
                     .ok_or(DSLError::InvalidInputIndex(iter.index()))?;
-                let base_ptr = build
-                    .build_call(base_fn, &[iter_ptr.into()], "base_ptr")
-                    .unwrap()
-                    .try_as_basic_value()
-                    .unwrap_left()
-                    .into_pointer_value();
 
                 let idx_vec = idx.compile_block(
                     ctx,
@@ -907,11 +891,16 @@ impl<'a> KernelExpression<'a> {
                     vec_bufs,
                     iter_llvm_types,
                     iter_ptrs,
-                    base_ptr_funcs,
+                    blocked_access_funcs,
                 )?;
 
                 let i64_type = ctx.i64_type();
                 let lane_count = idx_vec.get_type().get_size();
+                if lane_count != VEC_SIZE {
+                    return Err(DSLError::NotVectorizable(
+                        "at operator requires 64-lane vector",
+                    ));
+                }
                 let vec_i64_type = i64_type.vec_type(lane_count);
                 let idx_vec = if idx_vec.get_type() == vec_i64_type {
                     idx_vec
@@ -928,92 +917,32 @@ impl<'a> KernelExpression<'a> {
                             "at operator requires primitive element type",
                         ))?;
 
-                let stride = i64_type.const_int(elem_pt.width() as u64, false);
-                let stride_insert = build
-                    .build_insert_element(
-                        vec_i64_type.const_zero(),
-                        stride,
-                        i64_type.const_zero(),
-                        "stride_insert",
-                    )
-                    .unwrap();
-                let stride_vec = build
-                    .build_shuffle_vector(
-                        stride_insert,
-                        vec_i64_type.const_zero(),
-                        vec_i64_type.const_zero(),
-                        "stride_splat",
-                    )
-                    .unwrap();
-                let byte_offsets = build
-                    .build_int_mul(idx_vec, stride_vec, "byte_offsets")
-                    .unwrap();
-
-                let base_ptr_int = build
-                    .build_ptr_to_int(base_ptr, i64_type, "base_ptr_int")
-                    .unwrap();
-                let base_insert = build
-                    .build_insert_element(
-                        vec_i64_type.const_zero(),
-                        base_ptr_int,
-                        i64_type.const_zero(),
-                        "base_insert",
-                    )
-                    .unwrap();
-                let base_vec = build
-                    .build_shuffle_vector(
-                        base_insert,
-                        vec_i64_type.const_zero(),
-                        vec_i64_type.const_zero(),
-                        "base_splat",
-                    )
-                    .unwrap();
-
-                let ptr_ints = build
-                    .build_int_add(base_vec, byte_offsets, "ptr_ints")
-                    .unwrap();
-                let ptr_vec_type = ctx.ptr_type(AddressSpace::default()).vec_type(lane_count);
-                let ptr_vec = build
-                    .build_int_to_ptr(ptr_ints, ptr_vec_type, "ptr_vec")
-                    .unwrap();
-
-                let gather = Intrinsic::find("llvm.masked.gather").unwrap();
-                let gather_fn = gather
-                    .get_declaration(
-                        llvm_mod,
-                        &[
-                            vec_type.as_basic_type_enum(),
-                            ptr_vec_type.as_basic_type_enum(),
-                        ],
-                    )
+                let access_fn = blocked_access_funcs
+                    .get(&(iter.index(), lane_count))
                     .ok_or(DSLError::NotVectorizable(
-                        "at operator requires gather intrinsic",
+                        "at operator missing blocked random access",
                     ))?;
-
-                let passthru = vec_type.const_zero();
-                let mask_bits = ctx.custom_width_int_type(lane_count).const_all_ones();
-                let mask_vec = build
-                    .build_bit_cast(mask_bits, ctx.bool_type().vec_type(lane_count), "mask")
-                    .unwrap()
-                    .into_vector_value();
 
                 let gathered = build
                     .build_call(
-                        gather_fn,
-                        &[
-                            ptr_vec.into(),
-                            ctx.i32_type().const_zero().into(),
-                            mask_vec.into(),
-                            passthru.into(),
-                        ],
-                        "gather",
+                        *access_fn,
+                        &[iter_ptr.into(), idx_vec.into()],
+                        "blocked_access",
                     )
                     .unwrap()
                     .try_as_basic_value()
                     .unwrap_left()
                     .into_vector_value();
 
-                Ok(gathered)
+                if gathered.get_type() != vec_type {
+                    let casted = build
+                        .build_bit_cast(gathered, vec_type, "at_cast")
+                        .unwrap()
+                        .into_vector_value();
+                    Ok(casted)
+                } else {
+                    Ok(gathered)
+                }
             }
         }
     }
@@ -2355,20 +2284,19 @@ fn build_kernel_with_writer<'a, W: ArrayWriter<'a>>(
         })
         .collect();
 
-    let base_ptr_funcs: HashMap<usize, FunctionValue> = program
-        .accessed_indexes()
-        .iter()
-        .filter_map(|idx| {
-            generate_get_base_ptr(
-                ctx,
-                &llvm_mod,
-                &format!("base_ptr{}", idx),
-                inputs[*idx].get().0.data_type(),
-                &ihs[*idx],
-            )
-            .map(|func| (*idx, func))
-        })
-        .collect();
+    let mut blocked_access_funcs: HashMap<(usize, u32), FunctionValue> = HashMap::new();
+    for &idx in program.accessed_indexes().iter() {
+        let dt = inputs[idx].get().0.data_type();
+        if let Some(func) = generate_blocked_random_access(
+            ctx,
+            &llvm_mod,
+            &format!("blocked_get{}", idx),
+            dt,
+            &ihs[idx],
+        ) {
+            blocked_access_funcs.insert((idx, VEC_SIZE), func);
+        }
+    }
 
     declare_blocks!(
         ctx,
@@ -2455,7 +2383,7 @@ fn build_kernel_with_writer<'a, W: ArrayWriter<'a>>(
                 &vec_bufs,
                 &vec_types,
                 &iter_ptrs,
-                &base_ptr_funcs,
+                &blocked_access_funcs,
             );
             match res {
                 Ok(mut v) => {
@@ -2470,8 +2398,8 @@ fn build_kernel_with_writer<'a, W: ArrayWriter<'a>>(
                             )
                             .unwrap();
                     }
-
                     writer.llvm_ingest_block(ctx, &builder, v);
+
                     let curr_produced = builder
                         .build_load(i64_type, produced_ptr, "curr_produced")
                         .unwrap()

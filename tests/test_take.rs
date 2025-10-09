@@ -1,6 +1,6 @@
 use arrow_array::{
-    cast::AsArray, types::Int32Type, Array, Int32Array, Int64Array, StringArray, UInt32Array,
-    UInt64Array,
+    cast::AsArray, types::Int32Type, Array, BooleanArray, Int32Array, Int64Array, StringArray,
+    UInt32Array, UInt64Array,
 };
 use arrow_compile_compute::dictionary_data_type;
 use arrow_schema::DataType;
@@ -124,4 +124,21 @@ fn test_take_i32_large_vectorized() {
     let values = res.as_primitive::<Int32Type>().values().to_vec();
     let expected = (0..128).rev().map(|v| v as i32).collect::<Vec<_>>();
     assert_eq!(values, expected);
+}
+
+#[test]
+fn test_take_bool_large_vectorized() {
+    let data = BooleanArray::from((0..256).map(|v| v % 3 == 0).collect::<Vec<_>>());
+    let idxes = UInt32Array::from((0..128u32).map(|v| (v * 2) % 256).collect::<Vec<_>>());
+
+    let res = arrow_compile_compute::select::take(&data, &idxes).unwrap();
+
+    let expected: Vec<bool> = idxes
+        .values()
+        .iter()
+        .map(|&idx| data.value(idx as usize))
+        .collect();
+    let actual: Vec<bool> = res.as_boolean().iter().map(|v| v.unwrap()).collect();
+
+    assert_eq!(actual, expected);
 }
