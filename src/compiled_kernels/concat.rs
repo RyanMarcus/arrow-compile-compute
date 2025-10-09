@@ -14,7 +14,7 @@ use crate::{
         writers::{ArrayWriter, PrimitiveArrayWriter, StringViewWriter, WriterAllocation},
         KernelCache,
     },
-    declare_blocks, logical_arrow_type, ArrowKernelError, Kernel, PrimitiveType,
+    declare_blocks, logical_arrow_type, logical_nulls, ArrowKernelError, Kernel, PrimitiveType,
 };
 
 pub fn concat_all(data: &[&dyn Array]) -> Result<ArrayRef, ArrowKernelError> {
@@ -38,7 +38,7 @@ where
     let nulls = if data.iter().any(|arr| arr.is_nullable()) {
         let mut bb = BooleanBufferBuilder::new(total_els);
         for el in data.iter() {
-            match el.logical_nulls() {
+            match logical_nulls(*el)? {
                 Some(nb) => bb.append_buffer(nb.inner()),
                 None => bb.append_n(el.len(), true),
             }

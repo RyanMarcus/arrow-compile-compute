@@ -19,11 +19,11 @@ use std::ffi::c_void;
 use crate::compiled_iter::{datum_to_iter, generate_next};
 use crate::compiled_kernels::writers::{ArrayWriter, PrimitiveArrayWriter, WriterAllocation};
 use crate::compiled_kernels::{link_req_helpers, optimize_module};
-use crate::set_noalias_params;
 use crate::{
     compiled_kernels::cmp::add_memcmp, declare_blocks, increment_pointer, pointer_diff,
     PrimitiveType,
 };
+use crate::{logical_nulls, set_noalias_params};
 
 use super::{ArrowKernelError, Kernel};
 
@@ -713,7 +713,7 @@ impl Kernel for HashKernel {
 
         unsafe { self.borrow_func().call(iter.get_mut_ptr(), alloc.get_ptr()) };
 
-        Ok(alloc.into_primitive_array(arr.len(), arr.logical_nulls()))
+        Ok(alloc.into_primitive_array(arr.len(), logical_nulls(arr)?))
     }
 
     fn compile(inp: &Self::Input<'_>, hf: Self::Params) -> Result<Self, super::ArrowKernelError> {

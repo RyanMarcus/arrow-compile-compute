@@ -4,7 +4,7 @@ use arrow_buffer::NullBuffer;
 use arrow_schema::DataType;
 
 use crate::compiled_kernels::dsl::{DSLKernel, KernelOutputType};
-use crate::{ArrowKernelError, PrimitiveType};
+use crate::{logical_nulls, ArrowKernelError, PrimitiveType};
 
 use crate::compiled_kernels::{replace_nulls, Kernel};
 
@@ -26,7 +26,7 @@ impl Kernel for FilterKernel {
 
     fn call(&self, inp: Self::Input<'_>) -> Result<Self::Output, ArrowKernelError> {
         let mut res = self.0.call(&[&inp.0, &inp.1])?;
-        if let Some(nulls) = inp.0.logical_nulls() {
+        if let Some(nulls) = logical_nulls(inp.0)? {
             let ba = BooleanArray::new(nulls.into_inner(), None);
             let filtered_nulls = crate::arrow_interface::select::filter(&ba, &inp.1)?;
             let filtered_nulls = filtered_nulls.as_boolean();

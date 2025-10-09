@@ -18,7 +18,7 @@ use crate::{
         dsl::KernelParameters,
         link_req_helpers, optimize_module, Kernel,
     },
-    declare_blocks, ArrowKernelError, PrimitiveType,
+    declare_blocks, logical_nulls, ArrowKernelError, PrimitiveType,
 };
 
 fn get_ucmp<'a>(
@@ -468,7 +468,7 @@ impl Kernel for SortKernel {
         let mut ptrs = Vec::new();
 
         for (arr, nullable) in inp.iter().zip(self.borrow_nullable().iter()) {
-            if let Some(nulls) = arr.logical_nulls() {
+            if let Some(nulls) = logical_nulls(*arr)? {
                 assert!(nullable, "kernel expected nullable input");
                 let ba = BooleanArray::from(nulls.inner().clone());
                 null_arrays.push(ba);
@@ -532,7 +532,7 @@ fn generate_sort<'a>(
     let mut config = Vec::new();
     for (idx, (arr, opts)) in inp.iter().zip(params.iter()).enumerate() {
         let ptype = PrimitiveType::for_arrow_type(arr.data_type());
-        let null_access = if let Some(nulls) = arr.logical_nulls() {
+        let null_access = if let Some(nulls) = logical_nulls(*arr)? {
             let ba = BooleanArray::from(nulls.inner().clone());
             let ih = datum_to_iter(&ba)?;
             Some(

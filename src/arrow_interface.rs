@@ -137,7 +137,7 @@ pub mod iter {
 
     use crate::{
         compiled_kernels::{ArrowIter, ArrowNullableIter, IterFuncHolder, KernelCache},
-        ArrowKernelError, PrimitiveType,
+        logical_nulls, ArrowKernelError, PrimitiveType,
     };
 
     static ITER_FUNC_CACHE: LazyLock<KernelCache<Arc<IterFuncHolder>>> =
@@ -179,7 +179,7 @@ pub mod iter {
         let data_ifh = ITER_FUNC_CACHE.get(array, (PrimitiveType::I64, true))?;
         let data_iter = ArrowIter::<i64>::new(array, data_ifh)?;
 
-        if let Some(nulls) = array.logical_nulls() {
+        if let Some(nulls) = logical_nulls(array)? {
             let ba = BooleanArray::new(nulls.into_inner(), None);
             let null_ifh = ITER_FUNC_CACHE.get(&ba, (PrimitiveType::U8, true))?;
             let null_iter = ArrowIter::<u8>::new(&ba, null_ifh)?;
@@ -215,7 +215,7 @@ pub mod iter {
         let data_ifh = ITER_FUNC_CACHE.get(array, (PrimitiveType::U64, true))?;
         let data_iter = ArrowIter::<u64>::new(array, data_ifh)?;
 
-        if let Some(nulls) = array.logical_nulls() {
+        if let Some(nulls) = logical_nulls(array)? {
             let ba = BooleanArray::new(nulls.into_inner(), None);
             let null_ifh = ITER_FUNC_CACHE.get(&ba, (PrimitiveType::U8, true))?;
             let null_iter = ArrowIter::<u8>::new(&ba, null_ifh)?;
@@ -251,7 +251,7 @@ pub mod iter {
         let data_ifh = ITER_FUNC_CACHE.get(array, (PrimitiveType::U8, true))?;
         let data_iter = ArrowIter::<u8>::new(array, data_ifh)?;
 
-        if let Some(nulls) = array.logical_nulls() {
+        if let Some(nulls) = logical_nulls(array)? {
             let ba = BooleanArray::new(nulls.into_inner(), None);
             let null_ifh = ITER_FUNC_CACHE.get(&ba, (PrimitiveType::U8, true))?;
             let null_iter = ArrowIter::<u8>::new(&ba, null_ifh)?;
@@ -287,7 +287,7 @@ pub mod iter {
         let data_ifh = ITER_FUNC_CACHE.get(array, (PrimitiveType::F64, true))?;
         let data_iter = ArrowIter::<f64>::new(array, data_ifh)?;
 
-        if let Some(nulls) = array.logical_nulls() {
+        if let Some(nulls) = logical_nulls(array)? {
             let ba = BooleanArray::new(nulls.into_inner(), None);
             let null_ifh = ITER_FUNC_CACHE.get(&ba, (PrimitiveType::U8, true))?;
             let null_iter = ArrowIter::<u8>::new(&ba, null_ifh)?;
@@ -313,7 +313,7 @@ pub mod iter {
         let data_ifh = ITER_FUNC_CACHE.get(array, (PrimitiveType::P64x2, true))?;
         let data_iter = ArrowIter::<&[u8]>::new(array, data_ifh)?;
 
-        if let Some(nulls) = array.logical_nulls() {
+        if let Some(nulls) = logical_nulls(array)? {
             let ba = BooleanArray::new(nulls.into_inner(), None);
             let null_ifh = ITER_FUNC_CACHE.get(&ba, (PrimitiveType::U8, true))?;
             let null_iter = ArrowIter::<u8>::new(&ba, null_ifh)?;

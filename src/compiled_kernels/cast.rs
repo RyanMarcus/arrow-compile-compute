@@ -6,7 +6,7 @@ use crate::{
         dsl::{DSLKernel, KernelOutputType},
         replace_nulls,
     },
-    PrimitiveType,
+    logical_nulls, PrimitiveType,
 };
 use arrow_array::{
     cast::AsArray,
@@ -126,7 +126,7 @@ impl Kernel for CastKernel {
             inp.len(),
             res.len()
         );
-        let res = replace_nulls(res, inp.logical_nulls());
+        let res = replace_nulls(res, logical_nulls(inp)?);
         coalesce_type(res, &self.tar)
     }
 

@@ -4,7 +4,7 @@ use arrow_buffer::NullBuffer;
 use arrow_schema::DataType;
 
 use crate::compiled_kernels::dsl::{DSLKernel, KernelOutputType};
-use crate::{ArrowKernelError, PrimitiveType};
+use crate::{logical_nulls, ArrowKernelError, PrimitiveType};
 
 use crate::compiled_kernels::{replace_nulls, Kernel};
 
@@ -33,7 +33,7 @@ impl Kernel for TakeKernel {
         }
         let mut res = self.0.call(&[&arr, &idx])?;
 
-        if let Some(nulls) = arr.logical_nulls() {
+        if let Some(nulls) = logical_nulls(arr)? {
             let ba = BooleanArray::new(nulls.into_inner(), None);
             let nulls = crate::arrow_interface::select::take(&ba, idx)?;
             let nulls = NullBuffer::new(nulls.as_boolean().clone().into_parts().0);
