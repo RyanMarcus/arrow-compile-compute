@@ -26,7 +26,7 @@ use inkwell::{
     context::Context,
     intrinsics::Intrinsic,
     module::{Linkage, Module},
-    types::BasicType,
+    types::{BasicType, VectorType},
     values::{BasicValue, FunctionValue, PointerValue},
     AddressSpace, IntPredicate,
 };
@@ -1530,75 +1530,114 @@ pub fn generate_blocked_random_access<'a>(
             let slice_offset = bitmap_iterator.llvm_slice_offset(ctx, &build, iter_ptr);
             let data_ptr = bitmap_iterator.llvm_get_data_ptr(ctx, &build, iter_ptr);
 
-            let mut result = vec_type.const_zero();
-            let byte_ptr_type = ctx.ptr_type(AddressSpace::default());
-            for lane in 0..lanes {
-                let lane_idx = build
-                    .build_extract_element(
-                        idx_vec,
-                        i64_type.const_int(lane as u64, false),
-                        &format!("idx_lane{}", lane),
-                    )
-                    .unwrap()
-                    .into_int_value();
-                let bit_index = build
-                    .build_int_add(slice_offset, lane_idx, &format!("bit_index_lane{}", lane))
-                    .unwrap();
-                let byte_index = build
-                    .build_right_shift(
-                        bit_index,
-                        i64_type.const_int(3, false),
-                        false,
-                        &format!("byte_index_lane{}", lane),
-                    )
-                    .unwrap();
-                let bit_in_byte_i64 = build
-                    .build_and(
-                        bit_index,
-                        i64_type.const_int(7, false),
-                        &format!("bit_in_byte_lane{}", lane),
-                    )
-                    .unwrap();
-                let bit_in_byte_i8 = build
-                    .build_int_truncate(
-                        bit_in_byte_i64,
-                        ctx.i8_type(),
-                        &format!("bit_in_byte_i8_lane{}", lane),
-                    )
-                    .unwrap();
-                let byte_ptr = increment_pointer!(ctx, build, data_ptr, 1, byte_index);
-                let byte_ptr = build
-                    .build_bit_cast(byte_ptr, byte_ptr_type, &format!("byte_ptr_lane{}", lane))
-                    .unwrap()
-                    .into_pointer_value();
-                let data_byte = build
-                    .build_load(ctx.i8_type(), byte_ptr, &format!("data_byte_lane{}", lane))
-                    .unwrap()
-                    .into_int_value();
-                let shifted = build
-                    .build_right_shift(
-                        data_byte,
-                        bit_in_byte_i8,
-                        false,
-                        &format!("shifted_lane{}", lane),
-                    )
-                    .unwrap();
-                let bit = build
-                    .build_and(
-                        shifted,
-                        ctx.i8_type().const_int(1, false),
-                        &format!("bit_lane{}", lane),
-                    )
-                    .unwrap();
-                result = build
-                    .build_insert_element(
-                        result,
-                        bit,
-                        i64_type.const_int(lane as u64, false),
-                        &format!("insert_lane{}", lane),
-                    )
-                    .unwrap();
-            }
+            let vec_i64_type = i64_type.vec_type(lanes);
+            let vec_i8_type = ctx.i8_type().vec_type(lanes);
+
+            let slice_insert = build
+                .build_insert_element(
+                    vec_i64_type.const_zero(),
+                    slice_offset,
+                    i64_type.const_zero(),
+                    "slice_insert",
+                )
+                .unwrap();
+            let slice_vec = build
+                .build_shuffle_vector(
+                    slice_insert,
+                    vec_i64_type.const_zero(),
+                    vec_i64_type.const_zero(),
+                    "slice_splat",
+                )
+                .unwrap();
+
+            let bit_indices = build
+                .build_int_add(slice_vec, idx_vec, "bit_indices")
+                .unwrap();
+
+            let shift_vals = vec![i64_type.const_int(3, false); lanes as usize];
+            let shift_const = VectorType::const_vector(&shift_vals);
+            let byte_indices = build
+                .build_right_shift(bit_indices, shift_const, false, "byte_indices")
+                .unwrap();
+
+            let base_ptr_int = build
+                .build_ptr_to_int(data_ptr, i64_type, "base_ptr_int")
+                .unwrap();
+            let base_insert = build
+                .build_insert_element(
+                    vec_i64_type.const_zero(),
+                    base_ptr_int,
+                    i64_type.const_zero(),
+                    "base_insert",
+                )
+                .unwrap();
+            let base_vec = build
+                .build_shuffle_vector(
+                    base_insert,
+                    vec_i64_type.const_zero(),
+                    vec_i64_type.const_zero(),
+                    "base_splat",
+                )
+                .unwrap();
+
+            let ptr_ints = build
+                .build_int_add(base_vec, byte_indices, "byte_ptr_ints")
+                .unwrap();
+            let ptr_vec_type = ctx.ptr_type(AddressSpace::default()).vec_type(lanes);
+            let ptr_vec = build
+                .build_int_to_ptr(ptr_ints, ptr_vec_type, "byte_ptrs")
+                .unwrap();
+
+            let gather = Intrinsic::find("llvm.masked.gather").unwrap();
+            let gather_fn = gather
+                .get_declaration(
+                    llvm_mod,
+                    &[
+                        vec_i8_type.as_basic_type_enum(),
+                        ptr_vec_type.as_basic_type_enum(),
+                    ],
+                )
+                .unwrap();
+
+            let passthru = vec_i8_type.const_zero();
+            let mask_bits = ctx.custom_width_int_type(lanes).const_all_ones();
+            let mask_vec = build
+                .build_bit_cast(mask_bits, ctx.bool_type().vec_type(lanes), "mask")
+                .unwrap()
+                .into_vector_value();
+
+            let gathered = build
+                .build_call(
+                    gather_fn,
+                    &[
+                        ptr_vec.into(),
+                        ctx.i32_type().const_zero().into(),
+                        mask_vec.into(),
+                        passthru.into(),
+                    ],
+                    "gather_bytes",
+                )
+                .unwrap()
+                .try_as_basic_value()
+                .unwrap_left()
+                .into_vector_value();
+
+            let bit_mask_vals = vec![i64_type.const_int(7, false); lanes as usize];
+            let bit_mask = VectorType::const_vector(&bit_mask_vals);
+            let bit_positions = build
+                .build_and(bit_indices, bit_mask, "bit_positions")
+                .unwrap();
+            let bit_positions_i8 = build
+                .build_int_truncate(bit_positions, vec_i8_type, "bit_positions_i8")
+                .unwrap();
+
+            let shifted = build
+                .build_right_shift(gathered, bit_positions_i8, false, "shifted_bits")
+                .unwrap();
+            let ones_vals = vec![ctx.i8_type().const_int(1, false); lanes as usize];
+            let ones = VectorType::const_vector(&ones_vals);
+            let result = build.build_and(shifted, ones, "final_bits").unwrap();
+
             build.build_return(Some(&result)).unwrap();
             Some(func)
         }

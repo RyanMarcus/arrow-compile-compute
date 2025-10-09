@@ -18,6 +18,7 @@ use super::{ArrayWriter, WriterAllocation};
 /// Writer for primitive arrays (ints and floats).
 pub struct PrimitiveArrayWriter<'a> {
     ingest_func: FunctionValue<'a>,
+    ingest_vec_func: FunctionValue<'a>,
     pt: PrimitiveType,
 }
 
@@ -128,8 +129,31 @@ impl<'a> ArrayWriter<'a> for PrimitiveArrayWriter<'a> {
             func
         };
 
+        let ingest_vec_func = {
+            let b2 = ctx.create_builder();
+            let fn_type = ctx
+                .void_type()
+                .fn_type(&[ty.llvm_vec_type(ctx, 64).unwrap().into()], false);
+            let func = llvm_mod.add_function(&func_name, fn_type, Some(Linkage::Private));
+            declare_blocks!(ctx, func, entry);
+            b2.position_at_end(entry);
+            let val = func.get_nth_param(0).unwrap();
+
+            let curr_ptr = b2
+                .build_load(ptr_type, global_alloc_ptr_ptr, "curr_ptr")
+                .unwrap()
+                .into_pointer_value();
+
+            b2.build_store(curr_ptr, val).unwrap();
+            let new_ptr = increment_pointer!(ctx, b2, curr_ptr, width * 64);
+            b2.build_store(global_alloc_ptr_ptr, new_ptr).unwrap();
+            b2.build_return(None).unwrap();
+            func
+        };
+
         PrimitiveArrayWriter {
             ingest_func,
+            ingest_vec_func,
             pt: ty,
         }
     }
@@ -141,6 +165,17 @@ impl<'a> ArrayWriter<'a> for PrimitiveArrayWriter<'a> {
     fn llvm_ingest(&self, _ctx: &'a Context, build: &Builder<'a>, val: BasicValueEnum<'a>) {
         build
             .build_call(self.ingest_func, &[val.into()], "ingest")
+            .unwrap();
+    }
+
+    fn llvm_ingest_block(
+        &self,
+        _ctx: &'a Context,
+        build: &Builder<'a>,
+        vals: inkwell::values::VectorValue<'a>,
+    ) {
+        build
+            .build_call(self.ingest_vec_func, &[vals.into()], "ingest")
             .unwrap();
     }
 
