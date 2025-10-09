@@ -93,7 +93,7 @@ impl Kernel for Arc<IterFuncHolder> {
         let (target_type, ignore_nulls) = params;
         let setbit_ih = (!ignore_nulls)
             .then(|| {
-                inp.logical_nulls().map(|nulls| {
+                logical_nulls(*inp).unwrap().map(|nulls| {
                     array_to_setbit_iter(&BooleanArray::from(nulls.clone().into_inner()))
                 })
             })

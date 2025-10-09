@@ -40,10 +40,19 @@ pub fn criterion_benchmark(c: &mut Criterion) {
         let dict = DictionaryArray::<Int32Type>::new(keys, Arc::new(values));
 
         c.bench_function("dict/arrow", |b| b.iter(|| dict.logical_nulls()));
-        c.bench_function("ree/arrow", |b| b.iter(|| data.logical_nulls()));
-
         c.bench_function("dict/llvm", |b| b.iter(|| logical_nulls(&dict).unwrap()));
+
+        c.bench_function("ree/arrow", |b| b.iter(|| data.logical_nulls()));
         c.bench_function("ree/llvm", |b| b.iter(|| logical_nulls(&data).unwrap()));
+
+        c.bench_function("iter_dict", |b| {
+            b.iter(|| {
+                arrow_compile_compute::iter::iter_nonnull_i64(&dict)
+                    .unwrap()
+                    .indexed()
+                    .collect_vec()
+            })
+        });
     }
 }
 
