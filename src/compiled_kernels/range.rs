@@ -253,7 +253,6 @@ impl Kernel for RangeKernel {
                 builder.build_store(out_max_ptr, max_ext).unwrap();
                 builder.build_return(None).unwrap();
 
-                llvm_mod.print_to_stderr();
                 llvm_mod.verify().unwrap();
                 optimize_module(&llvm_mod)?;
                 let ee = llvm_mod
