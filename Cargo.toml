@@ -19,6 +19,7 @@ bytemuck = { version = "1.23", features = ["extern_crate_alloc"] }
 thiserror = "2.0.12"
 strum = "0.27.2"
 strum_macros = "0.27.2"
+memchr = "2.7.6"
 
 [dev-dependencies]
 float-ord = "0.3.2"

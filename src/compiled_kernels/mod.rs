@@ -11,6 +11,7 @@ mod partition;
 mod range;
 mod rust_iter;
 mod sort;
+mod string;
 mod take;
 mod writers;
 use std::sync::Arc;
@@ -35,6 +36,7 @@ pub use partition::PartitionKernel;
 pub use range::RangeKernel;
 pub use rust_iter::{ArrowIter, ArrowNullableIter, IterFuncHolder};
 pub use sort::{SortKernel, SortOptions};
+pub use string::{string_contains, StringKernelType, StringStartEndKernel};
 pub use take::TakeKernel;
 
 use dsl::DSLError;

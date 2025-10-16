@@ -35,7 +35,9 @@ use crate::{
     },
     compiled_kernels::{
         cmp::{add_float_vec_to_int_vec, add_memcmp},
-        gen_convert_numeric_vec, link_req_helpers, optimize_module,
+        gen_convert_numeric_vec, link_req_helpers,
+        llvm_utils::{add_str_endswith, add_str_startswith},
+        optimize_module,
         writers::{
             ArrayWriter, BooleanWriter, DictWriter, PrimitiveArrayWriter, REEWriter,
             StringViewWriter, WriterAllocation,
@@ -329,6 +331,8 @@ pub enum KernelExpression<'a> {
     Mul(Box<KernelExpression<'a>>, Box<KernelExpression<'a>>),
     Div(Box<KernelExpression<'a>>, Box<KernelExpression<'a>>),
     Rem(Box<KernelExpression<'a>>, Box<KernelExpression<'a>>),
+    StartsWith(Box<KernelExpression<'a>>, Box<KernelExpression<'a>>),
+    EndsWith(Box<KernelExpression<'a>>, Box<KernelExpression<'a>>),
 }
 
 impl From<u64> for KernelExpression<'_> {
@@ -404,6 +408,12 @@ impl<'a> KernelExpression<'a> {
     pub fn mul(&self, other: &KernelExpression<'a>) -> KernelExpression<'a> {
         KernelExpression::Mul(Box::new(self.clone()), Box::new(other.clone()))
     }
+    pub fn starts_with(&self, other: &KernelExpression<'a>) -> KernelExpression<'a> {
+        KernelExpression::StartsWith(Box::new(self.clone()), Box::new(other.clone()))
+    }
+    pub fn ends_with(&self, other: &KernelExpression<'a>) -> KernelExpression<'a> {
+        KernelExpression::EndsWith(Box::new(self.clone()), Box::new(other.clone()))
+    }
 
     fn descend<F: FnMut(&Self)>(&self, f: &mut F) {
         match self {
@@ -450,7 +460,9 @@ impl<'a> KernelExpression<'a> {
             | KernelExpression::Sub(lhs, rhs)
             | KernelExpression::Mul(lhs, rhs)
             | KernelExpression::Div(lhs, rhs)
-            | KernelExpression::Rem(lhs, rhs) => {
+            | KernelExpression::Rem(lhs, rhs)
+            | KernelExpression::StartsWith(lhs, rhs)
+            | KernelExpression::EndsWith(lhs, rhs) => {
                 f(self);
                 lhs.descend(f);
                 rhs.descend(f);
@@ -486,7 +498,9 @@ impl<'a> KernelExpression<'a> {
             KernelExpression::Cmp(..)
             | KernelExpression::And(..)
             | KernelExpression::Or(..)
-            | KernelExpression::Not(..) => DataType::Boolean,
+            | KernelExpression::Not(..)
+            | KernelExpression::StartsWith(..)
+            | KernelExpression::EndsWith(..) => DataType::Boolean,
             KernelExpression::IntConst(..) => DataType::UInt64,
             KernelExpression::At { iter, .. } => base_type(&iter.data_type()),
             KernelExpression::Convert(_expr, pt) => pt.as_arrow_type(),
@@ -943,6 +957,9 @@ impl<'a> KernelExpression<'a> {
                 } else {
                     Ok(gathered)
                 }
+            }
+            KernelExpression::StartsWith(..) | KernelExpression::EndsWith(..) => {
+                Err(DSLError::NotVectorizable("string cmp operator"))
             }
         }
     }
@@ -1554,6 +1571,120 @@ impl<'a> KernelExpression<'a> {
                         "cannot subtract string types".to_string(),
                     )),
                 }
+            }
+            KernelExpression::StartsWith(haystack, needle) => {
+                match haystack.get_type() {
+                    DataType::Binary
+                    | DataType::FixedSizeBinary(_)
+                    | DataType::LargeBinary
+                    | DataType::BinaryView
+                    | DataType::Utf8
+                    | DataType::LargeUtf8
+                    | DataType::Utf8View => {}
+                    _ => Err(DSLError::TypeMismatch(
+                        "cannot StartsWith non-string types".to_string(),
+                    ))?,
+                };
+
+                match needle.get_type() {
+                    DataType::Binary
+                    | DataType::FixedSizeBinary(_)
+                    | DataType::LargeBinary
+                    | DataType::BinaryView
+                    | DataType::Utf8
+                    | DataType::LargeUtf8
+                    | DataType::Utf8View => {}
+                    _ => Err(DSLError::TypeMismatch(
+                        "cannot StartsWith non-string types".to_string(),
+                    ))?,
+                };
+
+                let haystack = haystack
+                    .compile(
+                        ctx,
+                        llvm_mod,
+                        build,
+                        bufs,
+                        accessors,
+                        iter_ptrs,
+                        iter_llvm_types,
+                    )
+                    .unwrap();
+                let needle = needle
+                    .compile(
+                        ctx,
+                        llvm_mod,
+                        build,
+                        bufs,
+                        accessors,
+                        iter_ptrs,
+                        iter_llvm_types,
+                    )
+                    .unwrap();
+
+                let func = add_str_startswith(ctx, llvm_mod);
+                Ok(build
+                    .build_call(func, &[haystack.into(), needle.into()], "starts_with")
+                    .unwrap()
+                    .try_as_basic_value()
+                    .unwrap_left())
+            }
+            KernelExpression::EndsWith(haystack, needle) => {
+                match haystack.get_type() {
+                    DataType::Binary
+                    | DataType::FixedSizeBinary(_)
+                    | DataType::LargeBinary
+                    | DataType::BinaryView
+                    | DataType::Utf8
+                    | DataType::LargeUtf8
+                    | DataType::Utf8View => {}
+                    _ => Err(DSLError::TypeMismatch(
+                        "cannot StartsWith non-string types".to_string(),
+                    ))?,
+                };
+
+                match needle.get_type() {
+                    DataType::Binary
+                    | DataType::FixedSizeBinary(_)
+                    | DataType::LargeBinary
+                    | DataType::BinaryView
+                    | DataType::Utf8
+                    | DataType::LargeUtf8
+                    | DataType::Utf8View => {}
+                    _ => Err(DSLError::TypeMismatch(
+                        "cannot StartsWith non-string types".to_string(),
+                    ))?,
+                };
+
+                let haystack = haystack
+                    .compile(
+                        ctx,
+                        llvm_mod,
+                        build,
+                        bufs,
+                        accessors,
+                        iter_ptrs,
+                        iter_llvm_types,
+                    )
+                    .unwrap();
+                let needle = needle
+                    .compile(
+                        ctx,
+                        llvm_mod,
+                        build,
+                        bufs,
+                        accessors,
+                        iter_ptrs,
+                        iter_llvm_types,
+                    )
+                    .unwrap();
+
+                let func = add_str_endswith(ctx, llvm_mod);
+                Ok(build
+                    .build_call(func, &[haystack.into(), needle.into()], "ends_with")
+                    .unwrap()
+                    .try_as_basic_value()
+                    .unwrap_left())
             }
         }
     }

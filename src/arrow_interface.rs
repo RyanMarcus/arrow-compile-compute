@@ -35,14 +35,20 @@ pub mod cmp {
     use arrow_array::Datum;
     use arrow_array::UInt32Array;
 
+    use crate::compiled_kernels;
     pub use crate::compiled_kernels::ComparisonKernel;
     use crate::compiled_kernels::KernelCache;
     use crate::compiled_kernels::SortKernel;
     use crate::compiled_kernels::SortOptions;
+    use crate::compiled_kernels::StringKernelType;
+    use crate::compiled_kernels::StringStartEndKernel;
     use crate::ArrowKernelError;
     use crate::Predicate;
 
     static CMP_PROGRAM_CACHE: LazyLock<KernelCache<ComparisonKernel>> =
+        LazyLock::new(KernelCache::new);
+
+    static STR_STARTEND_CACHE: LazyLock<KernelCache<StringStartEndKernel>> =
         LazyLock::new(KernelCache::new);
 
     static SORT_PROGRAM_CACHE: LazyLock<KernelCache<SortKernel>> = LazyLock::new(KernelCache::new);
@@ -75,6 +81,59 @@ pub mod cmp {
     /// Compute a bitvector for `lhs != rhs`
     pub fn neq(lhs: &dyn Datum, rhs: &dyn Datum) -> Result<BooleanArray, ArrowKernelError> {
         CMP_PROGRAM_CACHE.get((lhs, rhs), Predicate::Ne)
+    }
+
+    /// String prefix check.
+    ///
+    /// ```
+    /// use arrow_array::{BooleanArray, Scalar, StringArray};
+    /// use arrow_compile_compute::cmp;
+    ///
+    /// let haystack = StringArray::from(vec!["foobar", "barfoo", "foobaz"]);
+    /// let needle = Scalar::new(StringArray::from(vec!["foo"]));
+    /// let result = cmp::starts_with(&haystack, &needle).unwrap();
+    ///
+    /// assert_eq!(result, BooleanArray::from(vec![true, false, true]));
+    /// ```
+    pub fn starts_with(
+        haystack: &dyn Array,
+        needle: &dyn Datum,
+    ) -> Result<BooleanArray, ArrowKernelError> {
+        STR_STARTEND_CACHE.get((haystack, needle), StringKernelType::StartsWith)
+    }
+
+    /// String suffix check.
+    ///
+    /// ```
+    /// use arrow_array::{BooleanArray, Scalar, StringArray};
+    /// use arrow_compile_compute::cmp;
+    ///
+    /// let haystack = StringArray::from(vec!["foobar", "barfoo", "bazfoo"]);
+    /// let needle = Scalar::new(StringArray::from(vec!["foo"]));
+    /// let result = cmp::ends_with(&haystack, &needle).unwrap();
+    ///
+    /// assert_eq!(result, BooleanArray::from(vec![false, true, true]));
+    /// ```
+    pub fn ends_with(
+        haystack: &dyn Array,
+        needle: &dyn Datum,
+    ) -> Result<BooleanArray, ArrowKernelError> {
+        STR_STARTEND_CACHE.get((haystack, needle), StringKernelType::EndsWith)
+    }
+
+    /// String in-fix (contains) check.
+    ///
+    /// ```
+    /// use arrow_array::{BooleanArray, StringArray};
+    /// use arrow_compile_compute::cmp;
+    ///
+    /// let haystack = StringArray::from(vec!["alpha", "bet", "gamma"]);
+    /// let result = cmp::contains(&haystack, b"a").unwrap();
+    ///
+    /// assert_eq!(result, BooleanArray::from(vec![true, false, true]));
+    /// ```
+    pub fn contains(haystack: &dyn Array, needle: &[u8]) -> Result<BooleanArray, ArrowKernelError> {
+        compiled_kernels::string_contains(haystack, needle)
     }
 
     /// Returns an array of indices that would sort the input array. Combine
