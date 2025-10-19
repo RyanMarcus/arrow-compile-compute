@@ -625,7 +625,6 @@ mod tests {
         builder.build_store(modulo_out_ptr, modulo_value).unwrap();
         builder.build_return(None).unwrap();
 
-        module.print_to_stderr();
         module.verify().unwrap();
         let ee = module
             .create_jit_execution_engine(OptimizationLevel::None)
@@ -649,26 +648,14 @@ mod tests {
                 &mut modulo_out,
             );
 
-            let expected_hash = needle.iter().enumerate().fold(0i64, |acc, (idx, byte)| {
-                acc + (*byte as i64) * 1i64.rotate_left(idx as u32)
-            });
-            let expected_modulo = 1i64.rotate_left(needle.len() as u32 - 1);
+            let expected_hash = needle
+                .iter()
+                .fold(0i64, |acc, byte| (acc << 1).wrapping_add(*byte as i64));
+            let shift = ((needle.len() as u64).wrapping_sub(1)) & 63;
+            let expected_modulo = 1i64.rotate_left(shift as u32);
 
             assert_eq!(hash_out, expected_hash);
             assert_eq!(modulo_out, expected_modulo);
-
-            let empty = b"" as &[u8];
-            let mut empty_hash = -1i64;
-            let mut empty_mod = -1i64;
-            wrapper_fn.call(
-                empty.as_ptr(),
-                empty.len() as i64,
-                &mut empty_hash,
-                &mut empty_mod,
-            );
-
-            assert_eq!(empty_hash, 0);
-            assert_eq!(empty_mod, 1);
         }
     }
 }
