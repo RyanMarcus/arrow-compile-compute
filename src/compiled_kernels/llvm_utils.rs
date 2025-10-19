@@ -8,7 +8,8 @@ use inkwell::{
 };
 
 use crate::{
-    compiled_kernels::{aggregate::StringSaver, cmp::add_memcmp, writers::ViewBufferWriter},
+    compiled_kernels::{aggregate::StringSaver, cmp::add_memcmp},
+    compiled_writers::ViewBufferWriter,
     declare_blocks, increment_pointer, pointer_diff, PrimitiveType,
 };
 

@@ -188,7 +188,7 @@ impl<'a> ArrayWriter<'a> for PrimitiveArrayWriter<'a> {
 mod tests {
     use super::PrimitiveArrayWriter;
     use crate::{
-        compiled_kernels::writers::{ArrayWriter, WriterAllocation},
+        compiled_writers::{ArrayWriter, WriterAllocation},
         declare_blocks, PrimitiveType,
     };
     use arrow_array::{

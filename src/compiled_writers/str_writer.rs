@@ -229,10 +229,8 @@ impl<'a, T: OffsetSizeTrait> ArrayWriter<'a> for StringArrayWriter<'a, T> {
 mod tests {
     use super::StringArrayWriter;
     use crate::{
-        compiled_kernels::{
-            link_req_helpers,
-            writers::{ArrayWriter, WriterAllocation},
-        },
+        compiled_kernels::link_req_helpers,
+        compiled_writers::{ArrayWriter, WriterAllocation},
         declare_blocks, PrimitiveType,
     };
     use arrow_array::{LargeStringArray, StringArray};

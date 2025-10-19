@@ -10,12 +10,11 @@ use inkwell::{
 };
 use repr_offset::ReprOffset;
 
+use super::array_writer::ArrayOutput;
+use super::{ArrayWriter, PrimitiveArrayWriter, WriterAllocation};
 use crate::{
-    compiled_kernels::{
-        cmp::add_memcmp,
-        writers::{array_writer::ArrayOutput, ArrayWriter, PrimitiveArrayWriter, WriterAllocation},
-    },
-    declare_blocks, declare_global_pointer, increment_pointer, ComparisonType, PrimitiveType,
+    compiled_kernels::cmp::add_memcmp, declare_blocks, declare_global_pointer, increment_pointer,
+    ComparisonType, PrimitiveType,
 };
 
 #[repr(C)]
@@ -371,15 +370,10 @@ mod tests {
     use inkwell::{context::Context, AddressSpace, OptimizationLevel};
     use itertools::Itertools;
 
+    use super::{ArrayWriter, PrimitiveArrayWriter, REEWriter, WriterAllocation};
     use crate::{
-        compiled_kernels::{
-            link_req_helpers,
-            writers::{
-                ree_writer::REEWriter, ArrayWriter, PrimitiveArrayWriter, StringArrayWriter,
-                WriterAllocation,
-            },
-        },
-        declare_blocks, PrimitiveType,
+        compiled_kernels::link_req_helpers, compiled_writers::StringArrayWriter, declare_blocks,
+        PrimitiveType,
     };
 
     #[test]

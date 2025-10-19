@@ -9,7 +9,7 @@ use inkwell::{
 use repr_offset::ReprOffset;
 
 use crate::{
-    compiled_kernels::writers::{ArrayWriter, WriterAllocation},
+    compiled_writers::{ArrayWriter, WriterAllocation},
     declare_blocks, declare_global_pointer, increment_pointer, pointer_diff, PrimitiveType,
 };
 
@@ -282,16 +282,8 @@ mod tests {
     use inkwell::{context::Context, AddressSpace, OptimizationLevel};
     use itertools::Itertools;
 
-    use crate::{
-        compiled_kernels::{
-            link_req_helpers,
-            writers::{
-                view_writer::{StringViewWriter, ViewBufferWriter},
-                ArrayWriter, WriterAllocation,
-            },
-        },
-        declare_blocks, PrimitiveType,
-    };
+    use super::{ArrayWriter, StringViewWriter, ViewBufferWriter, WriterAllocation};
+    use crate::{compiled_kernels::link_req_helpers, declare_blocks, PrimitiveType};
 
     #[test]
     fn test_view_buffer_writer() {

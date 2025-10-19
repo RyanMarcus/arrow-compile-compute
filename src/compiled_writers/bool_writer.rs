@@ -350,7 +350,7 @@ mod tests {
     use itertools::Itertools;
 
     use crate::{
-        compiled_kernels::writers::{ArrayWriter, WriterAllocation},
+        compiled_writers::{ArrayWriter, WriterAllocation},
         declare_blocks, PrimitiveType,
     };
 

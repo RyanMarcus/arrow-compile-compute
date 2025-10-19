@@ -38,16 +38,16 @@ use crate::{
         gen_convert_numeric_vec, link_req_helpers,
         llvm_utils::{add_str_endswith, add_str_startswith},
         optimize_module,
-        writers::{
-            ArrayWriter, BooleanWriter, DictWriter, PrimitiveArrayWriter, REEWriter,
-            StringViewWriter, WriterAllocation,
-        },
+    },
+    compiled_writers::{
+        ArrayWriter, BooleanWriter, DictWriter, PrimitiveArrayWriter, REEWriter, StringArrayWriter,
+        StringViewWriter, WriterAllocation,
     },
     declare_blocks, increment_pointer, set_noalias_params, ComparisonType, Predicate,
     PrimitiveType,
 };
 
-use super::{writers::StringArrayWriter, ArrowKernelError};
+use super::ArrowKernelError;
 
 const VEC_SIZE: u32 = 64;
 

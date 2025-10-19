@@ -1,11 +1,11 @@
 mod aggregate;
 mod arith;
 mod cast;
-mod cmp;
+pub(crate) mod cmp;
 mod concat;
 pub mod dsl;
 mod filter;
-mod ht;
+pub(crate) mod ht;
 mod llvm_utils;
 mod partition;
 mod range;
@@ -13,7 +13,6 @@ mod rust_iter;
 mod sort;
 mod string;
 mod take;
-mod writers;
 use std::sync::Arc;
 use std::{collections::HashMap, sync::RwLock};
 
@@ -146,7 +145,10 @@ impl<K: Kernel> KernelCache<K> {
     }
 }
 
-fn link_req_helpers(module: &Module, ee: &ExecutionEngine) -> Result<(), ArrowKernelError> {
+pub(crate) fn link_req_helpers(
+    module: &Module,
+    ee: &ExecutionEngine,
+) -> Result<(), ArrowKernelError> {
     if let Some(func) = module.get_function("str_writer_append_bytes") {
         ee.add_global_mapping(&func, str_writer_append_bytes as usize);
     }

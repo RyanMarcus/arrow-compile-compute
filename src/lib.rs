@@ -25,6 +25,7 @@ use inkwell::{
 mod arrow_interface;
 mod compiled_iter;
 mod compiled_kernels;
+pub(crate) mod compiled_writers;
 mod llvm_debug;
 
 pub use arrow_interface::aggregate;

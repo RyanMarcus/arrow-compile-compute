@@ -11,11 +11,10 @@ use inkwell::{
 };
 use repr_offset::ReprOffset;
 
+use super::array_writer::ArrayOutput;
+use super::{ArrayWriter, PrimitiveArrayWriter, WriterAllocation};
 use crate::{
-    compiled_kernels::{
-        ht::{generate_hash_func, generate_lookup_or_insert, TicketTable},
-        writers::{array_writer::ArrayOutput, ArrayWriter, PrimitiveArrayWriter, WriterAllocation},
-    },
+    compiled_kernels::ht::{generate_hash_func, generate_lookup_or_insert, TicketTable},
     declare_blocks, increment_pointer, PrimitiveType,
 };
 
@@ -251,15 +250,8 @@ mod tests {
     use inkwell::{context::Context, AddressSpace, OptimizationLevel};
     use itertools::Itertools;
 
-    use crate::{
-        compiled_kernels::{
-            link_req_helpers,
-            writers::{
-                dict_writer::DictWriter, ArrayWriter, PrimitiveArrayWriter, WriterAllocation,
-            },
-        },
-        declare_blocks, PrimitiveType,
-    };
+    use super::{ArrayWriter, DictWriter, PrimitiveArrayWriter, WriterAllocation};
+    use crate::{compiled_kernels::link_req_helpers, declare_blocks, PrimitiveType};
 
     #[test]
     fn test_dict_writer() {

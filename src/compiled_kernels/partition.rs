@@ -15,9 +15,9 @@ use crate::{
         cast::coalesce_type,
         dsl::{base_type, KernelParameters},
         link_req_helpers, optimize_module,
-        writers::{
-            ArrayWriter, BooleanWriter, PrimitiveArrayWriter, StringViewWriter, WriterAllocation,
-        },
+    },
+    compiled_writers::{
+        ArrayWriter, BooleanWriter, PrimitiveArrayWriter, StringViewWriter, WriterAllocation,
     },
     declare_blocks, set_noalias_params, ArrowKernelError, Kernel, PrimitiveType,
 };

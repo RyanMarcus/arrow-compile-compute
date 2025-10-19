@@ -8,12 +8,8 @@ use ouroboros::self_referencing;
 
 use crate::{
     compiled_iter::{datum_to_iter, generate_next},
-    compiled_kernels::{
-        cast::coalesce_type,
-        link_req_helpers, optimize_module,
-        writers::{ArrayWriter, PrimitiveArrayWriter, StringViewWriter, WriterAllocation},
-        KernelCache,
-    },
+    compiled_kernels::{cast::coalesce_type, link_req_helpers, optimize_module, KernelCache},
+    compiled_writers::{ArrayWriter, PrimitiveArrayWriter, StringViewWriter, WriterAllocation},
     declare_blocks, logical_arrow_type, logical_nulls, ArrowKernelError, Kernel, PrimitiveType,
 };
 
@@ -197,10 +193,8 @@ mod tests {
     use itertools::Itertools;
 
     use crate::{
-        compiled_kernels::{
-            concat::ConcatKernel,
-            writers::{ArrayWriter, PrimitiveArrayWriter, StringViewWriter, WriterAllocation},
-        },
+        compiled_kernels::concat::ConcatKernel,
+        compiled_writers::{ArrayWriter, PrimitiveArrayWriter, StringViewWriter, WriterAllocation},
         Kernel,
     };
 
