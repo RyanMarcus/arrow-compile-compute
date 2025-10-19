@@ -35,21 +35,35 @@ use crate::{
     },
     compiled_kernels::{
         cmp::{add_float_vec_to_int_vec, add_memcmp},
-        gen_convert_numeric_vec, link_req_helpers,
-        llvm_utils::{add_str_endswith, add_str_startswith},
-        optimize_module,
+        dsl::string_funcs::{add_str_endswith, add_str_startswith},
+        gen_convert_numeric_vec, link_req_helpers, optimize_module,
     },
     compiled_writers::{
         ArrayWriter, BooleanWriter, DictWriter, PrimitiveArrayWriter, REEWriter, StringArrayWriter,
         StringViewWriter, WriterAllocation,
     },
-    declare_blocks, increment_pointer, set_noalias_params, ComparisonType, Predicate,
+    declare_blocks, increment_pointer, pointer_diff, set_noalias_params, ComparisonType, Predicate,
     PrimitiveType,
 };
 
 use super::ArrowKernelError;
 
+mod string_funcs;
+
 const VEC_SIZE: u32 = 64;
+
+// Shared state reused while recursively lowering expressions.
+struct CompilationContext<'ctx, 'b> {
+    llvm_ctx: &'ctx Context,
+    llvm_mod: &'b Module<'ctx>,
+    builder: &'b Builder<'ctx>,
+    bufs: &'b HashMap<usize, PointerValue<'ctx>>,
+    accessors: &'b HashMap<usize, FunctionValue<'ctx>>,
+    vec_bufs: &'b HashMap<usize, PointerValue<'ctx>>,
+    blocked_access_funcs: &'b HashMap<(usize, u32), FunctionValue<'ctx>>,
+    iter_ptrs: &'b [PointerValue<'ctx>],
+    iter_llvm_types: &'b HashMap<usize, BasicTypeEnum<'ctx>>,
+}
 
 #[derive(Debug, Error)]
 pub enum DSLError {
@@ -333,6 +347,13 @@ pub enum KernelExpression<'a> {
     Rem(Box<KernelExpression<'a>>, Box<KernelExpression<'a>>),
     StartsWith(Box<KernelExpression<'a>>, Box<KernelExpression<'a>>),
     EndsWith(Box<KernelExpression<'a>>, Box<KernelExpression<'a>>),
+    StrLen(Box<KernelExpression<'a>>),
+    Substring {
+        expr: Box<KernelExpression<'a>>,
+        start: Box<KernelExpression<'a>>,
+        len: Box<KernelExpression<'a>>,
+        check: bool,
+    },
 }
 
 impl From<u64> for KernelExpression<'_> {
@@ -414,6 +435,33 @@ impl<'a> KernelExpression<'a> {
     pub fn ends_with(&self, other: &KernelExpression<'a>) -> KernelExpression<'a> {
         KernelExpression::EndsWith(Box::new(self.clone()), Box::new(other.clone()))
     }
+    pub fn str_len(&self) -> KernelExpression<'a> {
+        KernelExpression::StrLen(Box::new(self.clone()))
+    }
+    pub fn substring(
+        &self,
+        start: &KernelExpression<'a>,
+        len: &KernelExpression<'a>,
+    ) -> KernelExpression<'a> {
+        KernelExpression::Substring {
+            expr: Box::new(self.clone()),
+            start: Box::new(start.clone()),
+            len: Box::new(len.clone()),
+            check: true,
+        }
+    }
+    pub unsafe fn substring_unchecked(
+        &self,
+        start: &KernelExpression<'a>,
+        len: &KernelExpression<'a>,
+    ) -> KernelExpression<'a> {
+        KernelExpression::Substring {
+            expr: Box::new(self.clone()),
+            start: Box::new(start.clone()),
+            len: Box::new(len.clone()),
+            check: false,
+        }
+    }
 
     fn descend<F: FnMut(&Self)>(&self, f: &mut F) {
         match self {
@@ -451,7 +499,7 @@ impl<'a> KernelExpression<'a> {
                 f(self);
                 idx.descend(f);
             }
-            KernelExpression::Convert(expr, ..) => {
+            KernelExpression::Convert(expr, ..) | KernelExpression::StrLen(expr) => {
                 f(self);
                 expr.descend(f);
             }
@@ -466,6 +514,14 @@ impl<'a> KernelExpression<'a> {
                 f(self);
                 lhs.descend(f);
                 rhs.descend(f);
+            }
+            KernelExpression::Substring {
+                expr, start, len, ..
+            } => {
+                f(self);
+                expr.descend(f);
+                start.descend(f);
+                len.descend(f);
             }
         }
     }
@@ -501,7 +557,7 @@ impl<'a> KernelExpression<'a> {
             | KernelExpression::Not(..)
             | KernelExpression::StartsWith(..)
             | KernelExpression::EndsWith(..) => DataType::Boolean,
-            KernelExpression::IntConst(..) => DataType::UInt64,
+            KernelExpression::IntConst(..) | KernelExpression::StrLen(..) => DataType::UInt64,
             KernelExpression::At { iter, .. } => base_type(&iter.data_type()),
             KernelExpression::Convert(_expr, pt) => pt.as_arrow_type(),
             KernelExpression::Add(lhs, _rhs)
@@ -509,20 +565,33 @@ impl<'a> KernelExpression<'a> {
             | KernelExpression::Mul(lhs, _rhs)
             | KernelExpression::Div(lhs, _rhs)
             | KernelExpression::Rem(lhs, _rhs) => lhs.get_type(),
+            KernelExpression::Substring { expr, .. } => expr.get_type(),
         }
     }
 
-    #[allow(clippy::too_many_arguments)]
-    fn compile_block<'b>(
+    fn is_string(&self) -> bool {
+        match self.get_type() {
+            DataType::Binary
+            | DataType::FixedSizeBinary(_)
+            | DataType::LargeBinary
+            | DataType::BinaryView
+            | DataType::Utf8
+            | DataType::LargeUtf8
+            | DataType::Utf8View => true,
+            _ => false,
+        }
+    }
+
+    fn compile_block<'ctx, 'b>(
         &self,
-        ctx: &'b Context,
-        llvm_mod: &Module<'b>,
-        build: &Builder<'b>,
-        vec_bufs: &HashMap<usize, PointerValue<'b>>,
-        iter_llvm_types: &HashMap<usize, BasicTypeEnum<'b>>,
-        iter_ptrs: &[PointerValue<'b>],
-        blocked_access_funcs: &HashMap<(usize, u32), FunctionValue<'b>>,
-    ) -> Result<VectorValue<'b>, DSLError> {
+        compilation: &CompilationContext<'ctx, 'b>,
+    ) -> Result<VectorValue<'ctx>, DSLError> {
+        let ctx = compilation.llvm_ctx;
+        let build = compilation.builder;
+        let vec_bufs = compilation.vec_bufs;
+        let iter_llvm_types = compilation.iter_llvm_types;
+        let iter_ptrs = compilation.iter_ptrs;
+        let blocked_access_funcs = compilation.blocked_access_funcs;
         match self {
             KernelExpression::Item(kernel_input) => {
                 let buf = vec_bufs[&kernel_input.index()];
@@ -550,88 +619,18 @@ impl<'a> KernelExpression<'a> {
                 Ok(v)
             }
             KernelExpression::Truncate(_kernel_expression, _) => todo!(),
-            KernelExpression::And(lhs, rhs) => {
-                let lhs = lhs.compile_block(
-                    ctx,
-                    llvm_mod,
-                    build,
-                    vec_bufs,
-                    iter_llvm_types,
-                    iter_ptrs,
-                    blocked_access_funcs,
-                )?;
-                let rhs = rhs.compile_block(
-                    ctx,
-                    llvm_mod,
-                    build,
-                    vec_bufs,
-                    iter_llvm_types,
-                    iter_ptrs,
-                    blocked_access_funcs,
-                )?;
-                Ok(build.build_and(lhs, rhs, "and").unwrap())
+            KernelExpression::And(..) | KernelExpression::Or(..) => {
+                Err(DSLError::NotVectorizable("short-circuit operator"))
             }
-            KernelExpression::Or(lhs, rhs) => {
-                let lhs = lhs.compile_block(
-                    ctx,
-                    llvm_mod,
-                    build,
-                    vec_bufs,
-                    iter_llvm_types,
-                    iter_ptrs,
-                    blocked_access_funcs,
-                )?;
-                let rhs = rhs.compile_block(
-                    ctx,
-                    llvm_mod,
-                    build,
-                    vec_bufs,
-                    iter_llvm_types,
-                    iter_ptrs,
-                    blocked_access_funcs,
-                )?;
-                Ok(build.build_or(lhs, rhs, "or").unwrap())
-            }
+
             KernelExpression::Not(c) => {
-                let c = c.compile_block(
-                    ctx,
-                    llvm_mod,
-                    build,
-                    vec_bufs,
-                    iter_llvm_types,
-                    iter_ptrs,
-                    blocked_access_funcs,
-                )?;
+                let c = c.compile_block(compilation)?;
                 Ok(build.build_not(c, "not").unwrap())
             }
             KernelExpression::Select { cond, v1, v2 } => {
-                let cond = cond.compile_block(
-                    ctx,
-                    llvm_mod,
-                    build,
-                    vec_bufs,
-                    iter_llvm_types,
-                    iter_ptrs,
-                    blocked_access_funcs,
-                )?;
-                let v1 = v1.compile_block(
-                    ctx,
-                    llvm_mod,
-                    build,
-                    vec_bufs,
-                    iter_llvm_types,
-                    iter_ptrs,
-                    blocked_access_funcs,
-                )?;
-                let v2 = v2.compile_block(
-                    ctx,
-                    llvm_mod,
-                    build,
-                    vec_bufs,
-                    iter_llvm_types,
-                    iter_ptrs,
-                    blocked_access_funcs,
-                )?;
+                let cond = cond.compile_block(compilation)?;
+                let v1 = v1.compile_block(compilation)?;
+                let v2 = v2.compile_block(compilation)?;
                 Ok(build
                     .build_select(cond, v1, v2, "select")
                     .unwrap()
@@ -639,15 +638,7 @@ impl<'a> KernelExpression<'a> {
             }
             KernelExpression::Convert(c, tar_pt) => {
                 let in_ty = PrimitiveType::for_arrow_type(&c.get_type());
-                let c = c.compile_block(
-                    ctx,
-                    llvm_mod,
-                    build,
-                    vec_bufs,
-                    iter_llvm_types,
-                    iter_ptrs,
-                    blocked_access_funcs,
-                )?;
+                let c = c.compile_block(compilation)?;
                 Ok(gen_convert_numeric_vec(ctx, build, c, in_ty, *tar_pt))
             }
             KernelExpression::Add(lhs, rhs) => {
@@ -660,24 +651,8 @@ impl<'a> KernelExpression<'a> {
                     )));
                 }
 
-                let lhs = lhs.compile_block(
-                    ctx,
-                    llvm_mod,
-                    build,
-                    vec_bufs,
-                    iter_llvm_types,
-                    iter_ptrs,
-                    blocked_access_funcs,
-                )?;
-                let rhs = rhs.compile_block(
-                    ctx,
-                    llvm_mod,
-                    build,
-                    vec_bufs,
-                    iter_llvm_types,
-                    iter_ptrs,
-                    blocked_access_funcs,
-                )?;
+                let lhs = lhs.compile_block(compilation)?;
+                let rhs = rhs.compile_block(compilation)?;
                 match pt {
                     PrimitiveType::I8
                     | PrimitiveType::I16
@@ -705,24 +680,8 @@ impl<'a> KernelExpression<'a> {
                     )));
                 }
 
-                let lhs = lhs.compile_block(
-                    ctx,
-                    llvm_mod,
-                    build,
-                    vec_bufs,
-                    iter_llvm_types,
-                    iter_ptrs,
-                    blocked_access_funcs,
-                )?;
-                let rhs = rhs.compile_block(
-                    ctx,
-                    llvm_mod,
-                    build,
-                    vec_bufs,
-                    iter_llvm_types,
-                    iter_ptrs,
-                    blocked_access_funcs,
-                )?;
+                let lhs = lhs.compile_block(compilation)?;
+                let rhs = rhs.compile_block(compilation)?;
                 match pt {
                     PrimitiveType::I8
                     | PrimitiveType::I16
@@ -750,24 +709,8 @@ impl<'a> KernelExpression<'a> {
                     )));
                 }
 
-                let lhs = lhs.compile_block(
-                    ctx,
-                    llvm_mod,
-                    build,
-                    vec_bufs,
-                    iter_llvm_types,
-                    iter_ptrs,
-                    blocked_access_funcs,
-                )?;
-                let rhs = rhs.compile_block(
-                    ctx,
-                    llvm_mod,
-                    build,
-                    vec_bufs,
-                    iter_llvm_types,
-                    iter_ptrs,
-                    blocked_access_funcs,
-                )?;
+                let lhs = lhs.compile_block(compilation)?;
+                let rhs = rhs.compile_block(compilation)?;
                 match pt {
                     PrimitiveType::I8
                     | PrimitiveType::I16
@@ -795,24 +738,8 @@ impl<'a> KernelExpression<'a> {
                     )));
                 }
 
-                let lhs = lhs.compile_block(
-                    ctx,
-                    llvm_mod,
-                    build,
-                    vec_bufs,
-                    iter_llvm_types,
-                    iter_ptrs,
-                    blocked_access_funcs,
-                )?;
-                let rhs = rhs.compile_block(
-                    ctx,
-                    llvm_mod,
-                    build,
-                    vec_bufs,
-                    iter_llvm_types,
-                    iter_ptrs,
-                    blocked_access_funcs,
-                )?;
+                let lhs = lhs.compile_block(compilation)?;
+                let rhs = rhs.compile_block(compilation)?;
                 match pt {
                     PrimitiveType::I8
                     | PrimitiveType::I16
@@ -844,24 +771,8 @@ impl<'a> KernelExpression<'a> {
                     )));
                 }
 
-                let lhs = lhs.compile_block(
-                    ctx,
-                    llvm_mod,
-                    build,
-                    vec_bufs,
-                    iter_llvm_types,
-                    iter_ptrs,
-                    blocked_access_funcs,
-                )?;
-                let rhs = rhs.compile_block(
-                    ctx,
-                    llvm_mod,
-                    build,
-                    vec_bufs,
-                    iter_llvm_types,
-                    iter_ptrs,
-                    blocked_access_funcs,
-                )?;
+                let lhs = lhs.compile_block(compilation)?;
+                let rhs = rhs.compile_block(compilation)?;
                 match pt {
                     PrimitiveType::I8
                     | PrimitiveType::I16
@@ -898,15 +809,7 @@ impl<'a> KernelExpression<'a> {
                     .get(iter.index())
                     .ok_or(DSLError::InvalidInputIndex(iter.index()))?;
 
-                let idx_vec = idx.compile_block(
-                    ctx,
-                    llvm_mod,
-                    build,
-                    vec_bufs,
-                    iter_llvm_types,
-                    iter_ptrs,
-                    blocked_access_funcs,
-                )?;
+                let idx_vec = idx.compile_block(compilation)?;
 
                 let i64_type = ctx.i64_type();
                 let lane_count = idx_vec.get_type().get_size();
@@ -958,23 +861,26 @@ impl<'a> KernelExpression<'a> {
                     Ok(gathered)
                 }
             }
-            KernelExpression::StartsWith(..) | KernelExpression::EndsWith(..) => {
-                Err(DSLError::NotVectorizable("string cmp operator"))
+            KernelExpression::StartsWith(..)
+            | KernelExpression::EndsWith(..)
+            | KernelExpression::StrLen(..)
+            | KernelExpression::Substring { .. } => {
+                Err(DSLError::NotVectorizable("string operator"))
             }
         }
     }
 
-    #[allow(clippy::too_many_arguments)]
-    fn compile<'b>(
+    fn compile<'ctx, 'b>(
         &self,
-        ctx: &'b Context,
-        llvm_mod: &Module<'b>,
-        build: &Builder<'b>,
-        bufs: &HashMap<usize, PointerValue<'b>>,
-        accessors: &HashMap<usize, FunctionValue<'b>>,
-        iter_ptrs: &[PointerValue<'b>],
-        iter_llvm_types: &HashMap<usize, BasicTypeEnum<'b>>,
-    ) -> Result<BasicValueEnum<'b>, DSLError> {
+        compilation: &CompilationContext<'ctx, 'b>,
+    ) -> Result<BasicValueEnum<'ctx>, DSLError> {
+        let ctx = compilation.llvm_ctx;
+        let llvm_mod = compilation.llvm_mod;
+        let build = compilation.builder;
+        let bufs = compilation.bufs;
+        let accessors = compilation.accessors;
+        let iter_ptrs = compilation.iter_ptrs;
+        let iter_llvm_types = compilation.iter_llvm_types;
         match self {
             KernelExpression::Item(kernel_input) => {
                 let buf = bufs[&kernel_input.index()];
@@ -983,24 +889,8 @@ impl<'a> KernelExpression<'a> {
             }
             KernelExpression::Truncate(_kernel_expression, _) => todo!(),
             KernelExpression::Cmp(predicate, lhs, rhs) => {
-                let lhs_v = lhs.compile(
-                    ctx,
-                    llvm_mod,
-                    build,
-                    bufs,
-                    accessors,
-                    iter_ptrs,
-                    iter_llvm_types,
-                )?;
-                let rhs_v = rhs.compile(
-                    ctx,
-                    llvm_mod,
-                    build,
-                    bufs,
-                    accessors,
-                    iter_ptrs,
-                    iter_llvm_types,
-                )?;
+                let lhs_v = lhs.compile(compilation)?;
+                let rhs_v = rhs.compile(compilation)?;
 
                 let lhs_ptype = PrimitiveType::for_arrow_type(&lhs.get_type());
                 let rhs_ptype = PrimitiveType::for_arrow_type(&rhs.get_type());
@@ -1091,67 +981,48 @@ impl<'a> KernelExpression<'a> {
                 Ok(res.as_basic_value_enum())
             }
             KernelExpression::And(lhs, rhs) => {
-                let lhs_v = lhs
-                    .compile(
-                        ctx,
-                        llvm_mod,
-                        build,
-                        bufs,
-                        accessors,
-                        iter_ptrs,
-                        iter_llvm_types,
-                    )?
-                    .into_int_value();
-                let rhs_v = rhs
-                    .compile(
-                        ctx,
-                        llvm_mod,
-                        build,
-                        bufs,
-                        accessors,
-                        iter_ptrs,
-                        iter_llvm_types,
-                    )?
-                    .into_int_value();
-                Ok(build.build_and(lhs_v, rhs_v, "and").unwrap().into())
+                let orig_block = build.get_insert_block().unwrap();
+                let func = orig_block.get_parent().unwrap();
+                declare_blocks!(ctx, func, rhs_and, finish_and);
+
+                let lhs = lhs.compile(compilation)?.into_int_value();
+                build
+                    .build_conditional_branch(lhs, rhs_and, finish_and)
+                    .unwrap();
+
+                build.position_at_end(rhs_and);
+                let rhs = rhs.compile(compilation)?.into_int_value();
+                build.build_unconditional_branch(finish_and).unwrap();
+
+                build.position_at_end(finish_and);
+                let phi = build.build_phi(ctx.bool_type(), "and_result").unwrap();
+                phi.add_incoming(&[(&ctx.bool_type().const_zero(), orig_block), (&rhs, rhs_and)]);
+                Ok(phi.as_basic_value())
             }
             KernelExpression::Or(lhs, rhs) => {
-                let lhs_v = lhs
-                    .compile(
-                        ctx,
-                        llvm_mod,
-                        build,
-                        bufs,
-                        accessors,
-                        iter_ptrs,
-                        iter_llvm_types,
-                    )?
-                    .into_int_value();
-                let rhs_v = rhs
-                    .compile(
-                        ctx,
-                        llvm_mod,
-                        build,
-                        bufs,
-                        accessors,
-                        iter_ptrs,
-                        iter_llvm_types,
-                    )?
-                    .into_int_value();
-                Ok(build.build_or(lhs_v, rhs_v, "or").unwrap().into())
+                let orig_block = build.get_insert_block().unwrap();
+                let func = orig_block.get_parent().unwrap();
+                declare_blocks!(ctx, func, rhs_or, finish_or);
+
+                let lhs = lhs.compile(compilation)?.into_int_value();
+                build
+                    .build_conditional_branch(lhs, finish_or, rhs_or)
+                    .unwrap();
+
+                build.position_at_end(rhs_or);
+                let rhs = rhs.compile(compilation)?.into_int_value();
+                build.build_unconditional_branch(finish_or).unwrap();
+
+                build.position_at_end(finish_or);
+                let phi = build.build_phi(ctx.bool_type(), "or_result").unwrap();
+                phi.add_incoming(&[
+                    (&ctx.bool_type().const_all_ones(), orig_block),
+                    (&rhs, rhs_or),
+                ]);
+                Ok(phi.as_basic_value())
             }
             KernelExpression::Not(e) => {
-                let e = e
-                    .compile(
-                        ctx,
-                        llvm_mod,
-                        build,
-                        bufs,
-                        accessors,
-                        iter_ptrs,
-                        iter_llvm_types,
-                    )?
-                    .into_int_value();
+                let e = e.compile(compilation)?.into_int_value();
                 Ok(build.build_not(e, "not").unwrap().into())
             }
             KernelExpression::Select { cond, v1, v2 } => {
@@ -1161,35 +1032,9 @@ impl<'a> KernelExpression<'a> {
                         cond.get_type()
                     )));
                 }
-                let cond_v = cond
-                    .compile(
-                        ctx,
-                        llvm_mod,
-                        build,
-                        bufs,
-                        accessors,
-                        iter_ptrs,
-                        iter_llvm_types,
-                    )?
-                    .into_int_value();
-                let a_v = v1.compile(
-                    ctx,
-                    llvm_mod,
-                    build,
-                    bufs,
-                    accessors,
-                    iter_ptrs,
-                    iter_llvm_types,
-                )?;
-                let b_v = v2.compile(
-                    ctx,
-                    llvm_mod,
-                    build,
-                    bufs,
-                    accessors,
-                    iter_ptrs,
-                    iter_llvm_types,
-                )?;
+                let cond_v = cond.compile(compilation)?.into_int_value();
+                let a_v = v1.compile(compilation)?;
+                let b_v = v2.compile(compilation)?;
 
                 if a_v.get_type() != b_v.get_type() {
                     return Err(DSLError::TypeMismatch(format!(
@@ -1211,17 +1056,7 @@ impl<'a> KernelExpression<'a> {
                         idx.get_type()
                     )));
                 }
-                let idx = idx
-                    .compile(
-                        ctx,
-                        llvm_mod,
-                        build,
-                        bufs,
-                        accessors,
-                        iter_ptrs,
-                        iter_llvm_types,
-                    )?
-                    .into_int_value();
+                let idx = idx.compile(compilation)?.into_int_value();
                 let idx = build
                     .build_int_z_extend_or_bit_cast(idx, ctx.i64_type(), "zext")
                     .unwrap();
@@ -1232,15 +1067,7 @@ impl<'a> KernelExpression<'a> {
                     .unwrap_left())
             }
             KernelExpression::Convert(expr, pt) => {
-                let to_convert = expr.compile(
-                    ctx,
-                    llvm_mod,
-                    build,
-                    bufs,
-                    accessors,
-                    iter_ptrs,
-                    iter_llvm_types,
-                )?;
+                let to_convert = expr.compile(compilation)?;
                 let src_pt = PrimitiveType::for_arrow_type(&expr.get_type());
                 let dst_pt = *pt;
 
@@ -1274,28 +1101,8 @@ impl<'a> KernelExpression<'a> {
                     )));
                 }
 
-                let lhs = lhs
-                    .compile(
-                        ctx,
-                        llvm_mod,
-                        build,
-                        bufs,
-                        accessors,
-                        iter_ptrs,
-                        iter_llvm_types,
-                    )
-                    .unwrap();
-                let rhs = rhs
-                    .compile(
-                        ctx,
-                        llvm_mod,
-                        build,
-                        bufs,
-                        accessors,
-                        iter_ptrs,
-                        iter_llvm_types,
-                    )
-                    .unwrap();
+                let lhs = lhs.compile(compilation).unwrap();
+                let rhs = rhs.compile(compilation).unwrap();
 
                 match lhs_pt {
                     PrimitiveType::I8
@@ -1333,28 +1140,8 @@ impl<'a> KernelExpression<'a> {
                     )));
                 }
 
-                let lhs = lhs
-                    .compile(
-                        ctx,
-                        llvm_mod,
-                        build,
-                        bufs,
-                        accessors,
-                        iter_ptrs,
-                        iter_llvm_types,
-                    )
-                    .unwrap();
-                let rhs = rhs
-                    .compile(
-                        ctx,
-                        llvm_mod,
-                        build,
-                        bufs,
-                        accessors,
-                        iter_ptrs,
-                        iter_llvm_types,
-                    )
-                    .unwrap();
+                let lhs = lhs.compile(compilation).unwrap();
+                let rhs = rhs.compile(compilation).unwrap();
 
                 match lhs_pt {
                     PrimitiveType::I8
@@ -1399,28 +1186,8 @@ impl<'a> KernelExpression<'a> {
                     )));
                 }
 
-                let lhs = lhs
-                    .compile(
-                        ctx,
-                        llvm_mod,
-                        build,
-                        bufs,
-                        accessors,
-                        iter_ptrs,
-                        iter_llvm_types,
-                    )
-                    .unwrap();
-                let rhs = rhs
-                    .compile(
-                        ctx,
-                        llvm_mod,
-                        build,
-                        bufs,
-                        accessors,
-                        iter_ptrs,
-                        iter_llvm_types,
-                    )
-                    .unwrap();
+                let lhs = lhs.compile(compilation).unwrap();
+                let rhs = rhs.compile(compilation).unwrap();
 
                 match lhs_pt {
                     PrimitiveType::I8
@@ -1458,28 +1225,8 @@ impl<'a> KernelExpression<'a> {
                     )));
                 }
 
-                let lhs = lhs
-                    .compile(
-                        ctx,
-                        llvm_mod,
-                        build,
-                        bufs,
-                        accessors,
-                        iter_ptrs,
-                        iter_llvm_types,
-                    )
-                    .unwrap();
-                let rhs = rhs
-                    .compile(
-                        ctx,
-                        llvm_mod,
-                        build,
-                        bufs,
-                        accessors,
-                        iter_ptrs,
-                        iter_llvm_types,
-                    )
-                    .unwrap();
+                let lhs = lhs.compile(compilation).unwrap();
+                let rhs = rhs.compile(compilation).unwrap();
 
                 match lhs_pt {
                     PrimitiveType::I8
@@ -1524,28 +1271,8 @@ impl<'a> KernelExpression<'a> {
                     )));
                 }
 
-                let lhs = lhs
-                    .compile(
-                        ctx,
-                        llvm_mod,
-                        build,
-                        bufs,
-                        accessors,
-                        iter_ptrs,
-                        iter_llvm_types,
-                    )
-                    .unwrap();
-                let rhs = rhs
-                    .compile(
-                        ctx,
-                        llvm_mod,
-                        build,
-                        bufs,
-                        accessors,
-                        iter_ptrs,
-                        iter_llvm_types,
-                    )
-                    .unwrap();
+                let lhs = lhs.compile(compilation).unwrap();
+                let rhs = rhs.compile(compilation).unwrap();
 
                 match lhs_pt {
                     PrimitiveType::I8
@@ -1573,54 +1300,14 @@ impl<'a> KernelExpression<'a> {
                 }
             }
             KernelExpression::StartsWith(haystack, needle) => {
-                match haystack.get_type() {
-                    DataType::Binary
-                    | DataType::FixedSizeBinary(_)
-                    | DataType::LargeBinary
-                    | DataType::BinaryView
-                    | DataType::Utf8
-                    | DataType::LargeUtf8
-                    | DataType::Utf8View => {}
-                    _ => Err(DSLError::TypeMismatch(
-                        "cannot StartsWith non-string types".to_string(),
-                    ))?,
-                };
+                if !haystack.is_string() || !needle.is_string() {
+                    Err(DSLError::TypeMismatch(
+                        "StartsWith only takes string types".to_string(),
+                    ))?
+                }
 
-                match needle.get_type() {
-                    DataType::Binary
-                    | DataType::FixedSizeBinary(_)
-                    | DataType::LargeBinary
-                    | DataType::BinaryView
-                    | DataType::Utf8
-                    | DataType::LargeUtf8
-                    | DataType::Utf8View => {}
-                    _ => Err(DSLError::TypeMismatch(
-                        "cannot StartsWith non-string types".to_string(),
-                    ))?,
-                };
-
-                let haystack = haystack
-                    .compile(
-                        ctx,
-                        llvm_mod,
-                        build,
-                        bufs,
-                        accessors,
-                        iter_ptrs,
-                        iter_llvm_types,
-                    )
-                    .unwrap();
-                let needle = needle
-                    .compile(
-                        ctx,
-                        llvm_mod,
-                        build,
-                        bufs,
-                        accessors,
-                        iter_ptrs,
-                        iter_llvm_types,
-                    )
-                    .unwrap();
+                let haystack = haystack.compile(compilation).unwrap();
+                let needle = needle.compile(compilation).unwrap();
 
                 let func = add_str_startswith(ctx, llvm_mod);
                 Ok(build
@@ -1630,54 +1317,14 @@ impl<'a> KernelExpression<'a> {
                     .unwrap_left())
             }
             KernelExpression::EndsWith(haystack, needle) => {
-                match haystack.get_type() {
-                    DataType::Binary
-                    | DataType::FixedSizeBinary(_)
-                    | DataType::LargeBinary
-                    | DataType::BinaryView
-                    | DataType::Utf8
-                    | DataType::LargeUtf8
-                    | DataType::Utf8View => {}
-                    _ => Err(DSLError::TypeMismatch(
-                        "cannot StartsWith non-string types".to_string(),
-                    ))?,
-                };
+                if !haystack.is_string() || !needle.is_string() {
+                    Err(DSLError::TypeMismatch(
+                        "EndsWith only takes string types".to_string(),
+                    ))?
+                }
 
-                match needle.get_type() {
-                    DataType::Binary
-                    | DataType::FixedSizeBinary(_)
-                    | DataType::LargeBinary
-                    | DataType::BinaryView
-                    | DataType::Utf8
-                    | DataType::LargeUtf8
-                    | DataType::Utf8View => {}
-                    _ => Err(DSLError::TypeMismatch(
-                        "cannot StartsWith non-string types".to_string(),
-                    ))?,
-                };
-
-                let haystack = haystack
-                    .compile(
-                        ctx,
-                        llvm_mod,
-                        build,
-                        bufs,
-                        accessors,
-                        iter_ptrs,
-                        iter_llvm_types,
-                    )
-                    .unwrap();
-                let needle = needle
-                    .compile(
-                        ctx,
-                        llvm_mod,
-                        build,
-                        bufs,
-                        accessors,
-                        iter_ptrs,
-                        iter_llvm_types,
-                    )
-                    .unwrap();
+                let haystack = haystack.compile(compilation).unwrap();
+                let needle = needle.compile(compilation).unwrap();
 
                 let func = add_str_endswith(ctx, llvm_mod);
                 Ok(build
@@ -1685,6 +1332,65 @@ impl<'a> KernelExpression<'a> {
                     .unwrap()
                     .try_as_basic_value()
                     .unwrap_left())
+            }
+            KernelExpression::StrLen(expr) => {
+                if !expr.is_string() {
+                    Err(DSLError::TypeMismatch(
+                        "StrLen takes string type".to_string(),
+                    ))?
+                }
+                let expr = expr.compile(compilation).unwrap().into_struct_value();
+                let start_ptr = expr.get_field_at_index(0).unwrap().into_pointer_value();
+                let end_ptr = expr.get_field_at_index(1).unwrap().into_pointer_value();
+                Ok(pointer_diff!(ctx, build, start_ptr, end_ptr).as_basic_value_enum())
+            }
+            KernelExpression::Substring {
+                expr,
+                start,
+                len,
+                check,
+            } => {
+                if !expr.is_string() {
+                    Err(DSLError::TypeMismatch(
+                        "Substring's first parameter must be of string type".to_string(),
+                    ))?
+                }
+                let expr = expr.compile(compilation).unwrap().into_struct_value();
+                let start = start.compile(compilation).unwrap().into_int_value();
+                let len = len.compile(compilation).unwrap().into_int_value();
+
+                let start_ptr = expr.get_field_at_index(0).unwrap().into_pointer_value();
+                let end_ptr = expr.get_field_at_index(1).unwrap().into_pointer_value();
+
+                let mut computed_start = increment_pointer!(ctx, build, start_ptr, 1, start);
+                let mut computed_end = increment_pointer!(ctx, build, computed_start, 1, len);
+
+                if *check {
+                    let orig_len = pointer_diff!(ctx, build, start_ptr, end_ptr);
+                    let last_in_substr = build.build_int_add(start, len, "last_in_substr").unwrap();
+                    let is_oob = build
+                        .build_int_compare(IntPredicate::UGT, last_in_substr, orig_len, "is_oob")
+                        .unwrap();
+                    computed_start = build
+                        .build_select(is_oob, end_ptr, computed_start, "computed_start")
+                        .unwrap()
+                        .into_pointer_value();
+                    computed_end = build
+                        .build_select(is_oob, end_ptr, computed_end, "computed_end")
+                        .unwrap()
+                        .into_pointer_value();
+                }
+
+                let str_type = PrimitiveType::P64x2.llvm_type(ctx);
+                let to_return = str_type.const_zero().into_struct_value();
+                let to_return = build
+                    .build_insert_value(to_return, computed_start, 0, "to_return")
+                    .unwrap();
+                let to_return = build
+                    .build_insert_value(to_return, computed_end, 1, "to_return")
+                    .unwrap();
+
+                Ok(to_return.as_basic_value_enum())
             }
         }
     }
@@ -2507,15 +2213,18 @@ fn build_kernel_with_writer<'a, W: ArrayWriter<'a>>(
             // all our inputs support block iteration, see if our program does
             declare_blocks!(ctx, func_inner, block_loop_cond, block_loop_body);
             builder.position_at_end(block_loop_body);
-            let res = program.expr().compile_block(
-                ctx,
-                &llvm_mod,
-                &builder,
-                &vec_bufs,
-                &vec_types,
-                &iter_ptrs,
-                &blocked_access_funcs,
-            );
+            let block_context = CompilationContext {
+                llvm_ctx: ctx,
+                llvm_mod: &llvm_mod,
+                builder: &builder,
+                bufs: &bufs,
+                accessors: &get_funcs,
+                vec_bufs: &vec_bufs,
+                blocked_access_funcs: &blocked_access_funcs,
+                iter_ptrs: &iter_ptrs,
+                iter_llvm_types: &vec_types,
+            };
+            let res = program.expr().compile_block(&block_context);
             match res {
                 Ok(mut v) => {
                     // send `v` to the writer, loop back
@@ -2630,17 +2339,20 @@ fn build_kernel_with_writer<'a, W: ArrayWriter<'a>>(
         .unwrap();
 
     builder.position_at_end(filter_check);
+    let scalar_context = CompilationContext {
+        llvm_ctx: ctx,
+        llvm_mod: &llvm_mod,
+        builder: &builder,
+        bufs: &bufs,
+        accessors: &get_funcs,
+        vec_bufs: &bufs,
+        blocked_access_funcs: &blocked_access_funcs,
+        iter_ptrs: &iter_ptrs,
+        iter_llvm_types: &iter_llvm_types,
+    };
     match program.filter() {
         Some(cond) => {
-            let result = cond.compile(
-                ctx,
-                &llvm_mod,
-                &builder,
-                &bufs,
-                &get_funcs,
-                &iter_ptrs,
-                &iter_llvm_types,
-            )?;
+            let result = cond.compile(&scalar_context)?;
             builder
                 .build_conditional_branch(result.into_int_value(), loop_body, loop_cond)
                 .unwrap();
@@ -2651,15 +2363,7 @@ fn build_kernel_with_writer<'a, W: ArrayWriter<'a>>(
     }
 
     builder.position_at_end(loop_body);
-    let mut result = program.expr().compile(
-        ctx,
-        &llvm_mod,
-        &builder,
-        &bufs,
-        &get_funcs,
-        &iter_ptrs,
-        &iter_llvm_types,
-    )?;
+    let mut result = program.expr().compile(&scalar_context)?;
 
     if writer.llvm_ingest_type(ctx) == ctx.bool_type().as_basic_type_enum() {
         result = builder
