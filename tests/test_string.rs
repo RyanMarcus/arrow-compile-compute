@@ -17,7 +17,7 @@ fn byte_pattern_strategy() -> impl Strategy<Value = Vec<u8>> {
 
 proptest! {
     #[test]
-    fn proptest_starts_with_scalar(haystack in optional_string_vec_strategy(), needle in any::<String>()) {
+    fn str_starts_with_scalar(haystack in optional_string_vec_strategy(), needle in any::<String>()) {
         let haystack_arr = StringArray::from(haystack.clone());
         let needle_scalar = StringArray::new_scalar(needle.as_str());
 
@@ -33,7 +33,7 @@ proptest! {
     }
 
     #[test]
-    fn proptest_ends_with_scalar(haystack in optional_string_vec_strategy(), needle in any::<String>()) {
+    fn str_ends_with_scalar(haystack in optional_string_vec_strategy(), needle in any::<String>()) {
         let haystack_arr = StringArray::from(haystack.clone());
         let needle_scalar = StringArray::new_scalar(needle.as_str());
 
@@ -50,7 +50,7 @@ proptest! {
 
 
     #[test]
-    fn proptest_contains_bytes(haystack in optional_string_vec_strategy(), needle in byte_pattern_strategy()) {
+    fn str_contains_bytes(haystack in optional_string_vec_strategy(), needle in byte_pattern_strategy()) {
         let haystack_arr = StringArray::from(haystack.clone());
         let result = arrow_compile_compute::cmp::contains(&haystack_arr, &needle).unwrap();
 

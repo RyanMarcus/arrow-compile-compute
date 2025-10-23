@@ -36,6 +36,7 @@ pub use arrow_interface::compute;
 pub use arrow_interface::iter;
 pub use arrow_interface::select;
 
+pub use compiled_kernels::compile_string_like;
 pub use compiled_kernels::ArrowKernelError;
 pub use compiled_kernels::Kernel;
 pub use compiled_kernels::SortOptions;

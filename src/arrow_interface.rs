@@ -136,6 +136,31 @@ pub mod cmp {
         compiled_kernels::string_contains(haystack, needle)
     }
 
+    /// String `LIKE` check. Uses `%` as a wildcard (zero-or-more) and `_` as a
+    /// single character wildcard. If `escape` is `None`, then backslash (`\`)
+    /// is used as the escape character.
+    ///
+    /// If you plan to use the same `needle` many times, consider compiling it
+    /// once and reusing the compiled kernel with `compile_string_like`.
+    ///
+    /// ```
+    /// use arrow_array::{BooleanArray, StringArray};
+    /// use arrow_compile_compute::cmp;
+    ///
+    /// let haystack = StringArray::from(vec!["alpha", "bet", "gamma"]);
+    /// let result = cmp::like(&haystack, b"%a", None).unwrap();
+    ///
+    /// assert_eq!(result, BooleanArray::from(vec![true, false, true]));
+    /// ```
+    pub fn like(
+        haystack: &dyn Array,
+        needle: &[u8],
+        escape: Option<u8>,
+    ) -> Result<BooleanArray, ArrowKernelError> {
+        let f = compiled_kernels::compile_string_like(needle, escape.unwrap_or(b'\\'))?;
+        f(haystack)
+    }
+
     /// Returns an array of indices that would sort the input array. Combine
     /// this kernel with `take` to physically sort the array.
     pub fn sort_to_indices(

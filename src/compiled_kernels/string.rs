@@ -1,4 +1,4 @@
-use arrow_array::{cast::AsArray, Array, BinaryArray, BooleanArray, Datum, StringArray};
+use arrow_array::{cast::AsArray, Array, BinaryArray, BooleanArray, Datum};
 use arrow_buffer::BooleanBufferBuilder;
 use arrow_schema::DataType;
 use itertools::Itertools;
@@ -30,149 +30,6 @@ impl LikeSeq {
             LikeSeq::Wildcard => unreachable!("cannot convert wildcard to literal"),
             LikeSeq::AnyChar => unreachable!("cannot convert any char to literal"),
             LikeSeq::Literal(c) => c,
-        }
-    }
-
-    fn into_literal_or_any(self) -> LiteralOrAny {
-        match self {
-            LikeSeq::Wildcard => unreachable!("cannot convert wildcard to literal or any"),
-            LikeSeq::AnyChar => LiteralOrAny::AnyChar,
-            LikeSeq::Literal(c) => LiteralOrAny::Literal(c),
-        }
-    }
-}
-
-enum LiteralOrAny {
-    Literal(u8),
-    AnyChar,
-}
-
-impl LiteralOrAny {
-    fn into_like_seq(self) -> LikeSeq {
-        match self {
-            LiteralOrAny::Literal(x) => LikeSeq::Literal(x),
-            LiteralOrAny::AnyChar => LikeSeq::AnyChar,
-        }
-    }
-}
-
-enum LiteralOrAnySeq {
-    OnlyLiteral(Vec<u8>),
-    Mixed(Vec<LiteralOrAny>),
-}
-
-impl LiteralOrAnySeq {
-    fn len(&self) -> usize {
-        match self {
-            LiteralOrAnySeq::OnlyLiteral(literals) => literals.len(),
-            LiteralOrAnySeq::Mixed(literals) => literals.len(),
-        }
-    }
-
-    fn check_match(&self, haystack: &[u8]) -> bool {
-        if haystack.len() != self.len() {
-            return false;
-        }
-
-        match self {
-            LiteralOrAnySeq::OnlyLiteral(v) => haystack == v,
-            LiteralOrAnySeq::Mixed(items) => {
-                haystack.iter().zip(items.iter()).all(|(h, p)| match p {
-                    LiteralOrAny::Literal(l) => *h == *l,
-                    LiteralOrAny::AnyChar => true,
-                })
-            }
-        }
-    }
-}
-
-impl From<Vec<LiteralOrAny>> for LiteralOrAnySeq {
-    fn from(literal_or_any: Vec<LiteralOrAny>) -> Self {
-        if literal_or_any
-            .iter()
-            .all(|l| matches!(l, LiteralOrAny::Literal(_)))
-        {
-            LiteralOrAnySeq::OnlyLiteral(
-                literal_or_any
-                    .into_iter()
-                    .map(|l| match l {
-                        LiteralOrAny::Literal(c) => c,
-                        _ => unreachable!(),
-                    })
-                    .collect(),
-            )
-        } else {
-            LiteralOrAnySeq::Mixed(literal_or_any)
-        }
-    }
-}
-
-enum LikeStrategy<'a> {
-    General(Vec<LikeSeq>),
-    Exact(LiteralOrAnySeq),
-    Prefix(LiteralOrAnySeq),
-    Infix(Finder<'a>),
-    Suffix(LiteralOrAnySeq),
-    PrefixSuffix(LiteralOrAnySeq, LiteralOrAnySeq),
-    Special {
-        prefix: LiteralOrAnySeq,
-        infix: Finder<'a>,
-        suffix: LiteralOrAnySeq,
-    },
-}
-
-impl<'a> LikeStrategy<'a> {
-    fn minimum_length(&self) -> usize {
-        match self {
-            LikeStrategy::General(like_seqs) => {
-                like_seqs.iter().filter(|p| !p.is_wildcard()).count()
-            }
-            LikeStrategy::Exact(v) => v.len(),
-            LikeStrategy::Prefix(v) => v.len(),
-            LikeStrategy::Infix(finder) => finder.needle().len(),
-            LikeStrategy::Suffix(v) => v.len(),
-            LikeStrategy::PrefixSuffix(p, s) => p.len() + s.len(),
-            LikeStrategy::Special {
-                prefix,
-                infix,
-                suffix,
-            } => prefix.len() + infix.needle().len() + suffix.len(),
-        }
-    }
-
-    fn match_string(&self, string: &[u8]) -> bool {
-        if string.len() < self.minimum_length() {
-            return false;
-        }
-
-        match self {
-            LikeStrategy::General(like_seqs) => todo!(),
-            LikeStrategy::Exact(l) => l.check_match(string),
-            LikeStrategy::Prefix(l) => l.check_match(&string[0..l.len()]),
-            LikeStrategy::Infix(f) => f.find(string).is_some(),
-            LikeStrategy::Suffix(l) => l.check_match(&string[string.len() - l.len()..]),
-            LikeStrategy::PrefixSuffix(p, s) => {
-                if !p.check_match(&string[0..p.len()]) {
-                    return false;
-                }
-                s.check_match(&string[string.len() - s.len()..])
-            }
-            LikeStrategy::Special {
-                prefix,
-                infix,
-                suffix,
-            } => {
-                if !prefix.check_match(&string[0..prefix.len()]) {
-                    return false;
-                }
-
-                if !suffix.check_match(&string[string.len() - suffix.len()..]) {
-                    return false;
-                }
-
-                let middle = &string[prefix.len()..string.len() - suffix.len()];
-                infix.find(middle).is_some()
-            }
         }
     }
 }
@@ -258,8 +115,10 @@ fn filter_bytes<F: Fn(&[u8]) -> bool>(
         for (idx, bytes) in crate::arrow_interface::iter::iter_nonnull_bytes(arr)?.indexed() {
             builder.append_n(idx - last_idx, false);
             last_idx = idx + 1;
-
             builder.append(f(bytes));
+        }
+        for _ in last_idx..arr.len() {
+            builder.append(false);
         }
     } else {
         for bytes in crate::arrow_interface::iter::iter_nonnull_bytes(arr)? {
@@ -269,7 +128,20 @@ fn filter_bytes<F: Fn(&[u8]) -> bool>(
     Ok(BooleanArray::new(builder.finish(), None))
 }
 
-fn compile_string_like(
+/// Compile a string pattern into a function that can be used to filter arrays.
+/// This has the same semantics as `arrow_interface::cmp::like`. Reusing the
+/// same compiled pattern is more efficient than compiling it each time.
+///
+/// ```
+/// use arrow_array::StringArray;
+/// use arrow_compile_compute::compile_string_like;
+/// let data = StringArray::from(vec!["hello", "world", "hello world"]);
+/// let like = compile_string_like(b"hell%", b'\\').unwrap();
+/// let result = like(&data).unwrap();
+/// let values: Vec<bool> = result.iter().map(|x| x.unwrap()).collect();
+/// assert_eq!(values, vec![true, false, true]);
+/// ```
+pub fn compile_string_like(
     like_pattern: &[u8],
     escape: u8,
 ) -> Result<Box<dyn Fn(&dyn Array) -> Result<BooleanArray, ArrowKernelError>>, ArrowKernelError> {
