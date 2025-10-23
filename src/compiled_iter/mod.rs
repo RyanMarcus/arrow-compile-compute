@@ -37,8 +37,8 @@ use setbit::SetBitIterator;
 use string::{LargeStringIterator, StringIterator};
 
 use crate::{
-    compiled_iter::view::ViewIterator, declare_blocks, increment_pointer, set_noalias_params,
-    ArrowKernelError, PrimitiveType,
+    compiled_iter::{scalar::ScalarBinaryIterator, view::ViewIterator},
+    declare_blocks, increment_pointer, set_noalias_params, ArrowKernelError, PrimitiveType,
 };
 
 pub fn array_to_setbit_iter(arr: &BooleanArray) -> Result<IteratorHolder, ArrowKernelError> {
@@ -166,7 +166,12 @@ pub fn datum_to_iter(val: &dyn Datum) -> Result<IteratorHolder, ArrowKernelError
             DataType::Time64(__time_unit) => todo!(),
             DataType::Duration(_time_unit) => todo!(),
             DataType::Interval(_interval_unit) => todo!(),
-            DataType::Binary => todo!(),
+            DataType::Binary => Ok(d
+                .as_binary::<i32>()
+                .value(0)
+                .to_owned()
+                .into_boxed_slice()
+                .into()),
             DataType::FixedSizeBinary(_) => todo!(),
             DataType::LargeBinary => todo!(),
             DataType::BinaryView => todo!(),
@@ -220,6 +225,7 @@ pub enum IteratorHolder {
     },
     ScalarPrimitive(Box<ScalarPrimitiveIterator>),
     ScalarString(Box<ScalarStringIterator>),
+    ScalarBinary(Box<ScalarBinaryIterator>),
 }
 
 impl IteratorHolder {
@@ -237,6 +243,7 @@ impl IteratorHolder {
             IteratorHolder::RunEnd { arr: iter, .. } => &mut **iter as *mut _ as *mut c_void,
             IteratorHolder::ScalarPrimitive(iter) => &mut **iter as *mut _ as *mut c_void,
             IteratorHolder::ScalarString(iter) => &mut **iter as *mut _ as *mut c_void,
+            IteratorHolder::ScalarBinary(iter) => &mut **iter as *mut _ as *mut c_void,
         }
     }
 
@@ -261,6 +268,7 @@ impl IteratorHolder {
             IteratorHolder::RunEnd { arr: iter, .. } => &**iter as *const _ as *const c_void,
             IteratorHolder::ScalarPrimitive(iter) => &**iter as *const _ as *const c_void,
             IteratorHolder::ScalarString(iter) => &**iter as *const _ as *const c_void,
+            IteratorHolder::ScalarBinary(iter) => &**iter as *const _ as *const c_void,
         }
     }
 
@@ -736,7 +744,8 @@ pub fn generate_next_block<'a, const N: u32>(
                 .unwrap();
             Some(next)
         }
-        IteratorHolder::ScalarString(_) => todo!(),
+        IteratorHolder::ScalarString(_) => None,
+        IteratorHolder::ScalarBinary(_) => None,
     };
 
     match res {
@@ -1359,6 +1368,43 @@ pub fn generate_next<'a>(
             Some(next)
         }
         IteratorHolder::ScalarString(s) => {
+            let ptr_type = ctx.ptr_type(AddressSpace::default());
+            let ret_type = PrimitiveType::P64x2.llvm_type(ctx).into_struct_type();
+            declare_blocks!(ctx, next, entry);
+            build.position_at_end(entry);
+            let (ptr1, ptr2) = s.llvm_val_ptr(ctx, &build, iter_ptr);
+            let ptr1 = build
+                .build_load(ptr_type, ptr1, "ptr1")
+                .unwrap()
+                .into_pointer_value();
+            ptr1.as_instruction_value()
+                .unwrap()
+                .set_metadata(ctx.metadata_node(&[]), ctx.get_kind_id("invariant.load"))
+                .unwrap();
+            let ptr2 = build
+                .build_load(ptr_type, ptr2, "ptr2")
+                .unwrap()
+                .into_pointer_value();
+            ptr2.as_instruction_value()
+                .unwrap()
+                .set_metadata(ctx.metadata_node(&[]), ctx.get_kind_id("invariant.load"))
+                .unwrap();
+
+            let to_return = ret_type.const_zero();
+            let to_return = build
+                .build_insert_value(to_return, ptr1, 0, "to_return")
+                .unwrap();
+            let to_return = build
+                .build_insert_value(to_return, ptr2, 1, "to_return")
+                .unwrap();
+            build.build_store(out_ptr, to_return).unwrap();
+            build
+                .build_return(Some(&bool_type.const_int(1, false)))
+                .unwrap();
+
+            Some(next)
+        }
+        IteratorHolder::ScalarBinary(s) => {
             let ptr_type = ctx.ptr_type(AddressSpace::default());
             let ret_type = PrimitiveType::P64x2.llvm_type(ctx).into_struct_type();
             declare_blocks!(ctx, next, entry);
@@ -2019,7 +2065,8 @@ pub fn generate_random_access<'a>(
             }
             _ => unreachable!("run-end iterator but non-iterator data type ({:?})", dt),
         },
-        IteratorHolder::ScalarPrimitive(_s) => todo!(),
-        IteratorHolder::ScalarString(_) => todo!(),
+        IteratorHolder::ScalarPrimitive(_) => None,
+        IteratorHolder::ScalarString(_) => None,
+        IteratorHolder::ScalarBinary(_) => None,
     }
 }

@@ -1,4 +1,4 @@
-use arrow_array::{cast::AsArray, Array, BooleanArray, Datum};
+use arrow_array::{cast::AsArray, Array, BinaryArray, BooleanArray, Datum, StringArray};
 use arrow_buffer::BooleanBufferBuilder;
 use arrow_schema::DataType;
 use itertools::Itertools;
@@ -9,6 +9,7 @@ use crate::{
     logical_nulls, ArrowKernelError, Kernel,
 };
 
+#[derive(Clone, Copy, Debug)]
 enum LikeSeq {
     Wildcard,
     AnyChar,
@@ -18,6 +19,18 @@ enum LikeSeq {
 impl LikeSeq {
     fn is_wildcard(&self) -> bool {
         matches!(self, LikeSeq::Wildcard)
+    }
+
+    fn is_any(&self) -> bool {
+        matches!(self, LikeSeq::AnyChar)
+    }
+
+    fn into_literal(self) -> u8 {
+        match self {
+            LikeSeq::Wildcard => unreachable!("cannot convert wildcard to literal"),
+            LikeSeq::AnyChar => unreachable!("cannot convert any char to literal"),
+            LikeSeq::Literal(c) => c,
+        }
     }
 
     fn into_literal_or_any(self) -> LiteralOrAny {
@@ -164,7 +177,102 @@ impl<'a> LikeStrategy<'a> {
     }
 }
 
-fn compile_string_like(like_pattern: &[u8], escape: u8) -> Result<LikeStrategy, ArrowKernelError> {
+fn masked_compare(str: &[u8], pattern: &[u8], mask: &[u32]) -> bool {
+    for idx in mask {
+        if str[*idx as usize] != pattern[*idx as usize] {
+            return false;
+        }
+    }
+    true
+}
+
+/// Fast LIKE matcher over raw bytes using a greedy wildcard with checkpoint
+/// backtracking. Inspired by Kirk Krauss' algorithm for '*'/'?' globbing.
+fn match_like(s: &[u8], pat: &[LikeSeq]) -> bool {
+    use LikeSeq::*;
+
+    let mut i = 0usize; // index in s
+    let mut j = 0usize; // index in pat
+
+    // Last seen wildcard checkpoint:
+    // - star_j: index of the wildcard in pat
+    // - star_i: the position in s that wildcard currently covers up to (exclusive).
+    let mut star_j: Option<usize> = None;
+    let mut star_i: usize = 0;
+
+    while i < s.len() {
+        if j < pat.len() {
+            match pat[j] {
+                Literal(b) if s[i] == b => {
+                    i += 1;
+                    j += 1;
+                    continue;
+                }
+                AnyChar => {
+                    i += 1;
+                    j += 1;
+                    continue;
+                }
+                Wildcard => {
+                    // If the wildcard is the last token, it matches the rest
+                    if j + 1 == pat.len() {
+                        return true;
+                    }
+                    // Record checkpoint: wildcard can expand later if needed.
+                    star_j = Some(j);
+                    star_i = i;
+                    j += 1; // try to match the token after the wildcard
+                    continue;
+                }
+                _ => { /* fall through to mismatch handling */ }
+            }
+        }
+
+        // Mismatch: if we saw a previous wildcard, expand it to eat one more byte.
+        if let Some(sj) = star_j {
+            star_i += 1; // make wildcard consume one more byte
+            if star_i > s.len() {
+                return false; // nothing left to consume
+            }
+            i = star_i; // retry matching after the wildcard
+            j = sj + 1; // right after the wildcard in the pattern
+        } else {
+            return false; // no wildcard to save us
+        }
+    }
+
+    // We've consumed all of s. Remaining pattern must be all wildcards.
+    while j < pat.len() && matches!(pat[j], Wildcard) {
+        j += 1;
+    }
+    j == pat.len()
+}
+
+fn filter_bytes<F: Fn(&[u8]) -> bool>(
+    arr: &dyn Array,
+    f: F,
+) -> Result<BooleanArray, ArrowKernelError> {
+    let mut builder = BooleanBufferBuilder::new(arr.len());
+    if arr.is_nullable() {
+        let mut last_idx = 0;
+        for (idx, bytes) in crate::arrow_interface::iter::iter_nonnull_bytes(arr)?.indexed() {
+            builder.append_n(idx - last_idx, false);
+            last_idx = idx + 1;
+
+            builder.append(f(bytes));
+        }
+    } else {
+        for bytes in crate::arrow_interface::iter::iter_nonnull_bytes(arr)? {
+            builder.append(f(bytes));
+        }
+    }
+    Ok(BooleanArray::new(builder.finish(), None))
+}
+
+fn compile_string_like(
+    like_pattern: &[u8],
+    escape: u8,
+) -> Result<Box<dyn Fn(&dyn Array) -> Result<BooleanArray, ArrowKernelError>>, ArrowKernelError> {
     let mut seq = Vec::new();
     let mut i = 0;
     while i < like_pattern.len() {
@@ -177,6 +285,7 @@ fn compile_string_like(like_pattern: &[u8], escape: u8) -> Result<LikeStrategy, 
                 {
                     seq.push(LikeSeq::Wildcard);
                 }
+                i += 1;
             }
             b'_' => seq.push(LikeSeq::AnyChar),
             x if x == escape => {
@@ -197,115 +306,207 @@ fn compile_string_like(like_pattern: &[u8], escape: u8) -> Result<LikeStrategy, 
     }
 
     let num_wildcards = seq.iter().filter(|seq| seq.is_wildcard()).count();
+    let has_masked = seq.iter().any(|seq| seq.is_any());
 
-    Ok(match num_wildcards {
-        0 => LikeStrategy::Exact(
-            seq.into_iter()
-                .map(|x| x.into_literal_or_any())
-                .collect_vec()
-                .into(),
-        ),
-        1 => {
+    Ok(match (num_wildcards, has_masked) {
+        (0, false) => {
+            // exact match
+            let pattern = seq.into_iter().map(|seq| seq.into_literal()).collect_vec();
+            let pattern = BinaryArray::new_scalar(pattern);
+            Box::new(move |arr| crate::arrow_interface::cmp::eq(&arr, &pattern))
+        }
+        (0, true) => {
+            // masked match
+            let mut mask = Vec::new();
+            let seq = seq
+                .iter()
+                .enumerate()
+                .map(|(idx, i)| match i {
+                    LikeSeq::Wildcard => unreachable!(),
+                    LikeSeq::AnyChar => {
+                        mask.push(idx as u32);
+                        b'_'
+                    }
+                    LikeSeq::Literal(l) => *l,
+                })
+                .collect_vec();
+
+            Box::new(move |arr| filter_bytes(arr, |bytes| masked_compare(bytes, &seq, &mask)))
+        }
+        (1, false) => {
+            // single wildcard, no any chars
             if seq[0].is_wildcard() {
-                // suffix scan
-                LikeStrategy::Suffix(
-                    seq.into_iter()
-                        .skip(1)
-                        .map(|x| x.into_literal_or_any())
-                        .collect_vec()
-                        .into(),
-                )
+                // suffix
+                let pattern = seq
+                    .into_iter()
+                    .skip(1)
+                    .map(|i| i.into_literal())
+                    .collect_vec();
+                let pattern = BinaryArray::new_scalar(pattern);
+                println!("pattern: {:?}", pattern);
+                Box::new(move |arr| crate::arrow_interface::cmp::ends_with(arr, &pattern))
             } else if seq.last().unwrap().is_wildcard() {
-                // prefix scan
-                seq.pop().unwrap();
-                LikeStrategy::Prefix(
-                    seq.into_iter()
-                        .map(|x| x.into_literal_or_any())
-                        .collect_vec()
-                        .into(),
-                )
+                // prefix
+                let seq_len = seq.len();
+                let pattern = seq
+                    .into_iter()
+                    .take(seq_len - 1)
+                    .map(|i| i.into_literal())
+                    .collect_vec();
+
+                let pattern = BinaryArray::new_scalar(pattern);
+                Box::new(move |arr| crate::arrow_interface::cmp::starts_with(arr, &pattern))
             } else {
-                // prefix and suffix scan
-                let mut seq = seq.into_iter();
-                let mut prefix = Vec::new();
-                while let Some(v) = seq.next() {
-                    if v.is_wildcard() {
-                        break;
-                    }
-                    prefix.push(v.into_literal_or_any());
-                }
+                // prefix and suffix
+                let wildcard_idx = seq.iter().position(|c| c.is_wildcard()).unwrap();
+                let prefix = seq[0..wildcard_idx]
+                    .iter()
+                    .copied()
+                    .map(|i| i.into_literal())
+                    .collect_vec();
+                let suffix = seq[wildcard_idx + 1..]
+                    .iter()
+                    .copied()
+                    .map(|i| i.into_literal())
+                    .collect_vec();
+                let min_length = prefix.len() + suffix.len();
 
-                let suffix = seq.map(|v| v.into_literal_or_any()).collect_vec();
-
-                LikeStrategy::PrefixSuffix(prefix.into(), suffix.into())
+                Box::new(move |arr| {
+                    filter_bytes(arr, |b| {
+                        b.len() >= min_length && b.starts_with(&prefix) && b.ends_with(&suffix)
+                    })
+                })
             }
         }
-        2 => {
-            // prefix, infix, and suffix scan
-            let mut seq = seq.into_iter();
-            let mut prefix = Vec::new();
-            while let Some(v) = seq.next() {
-                if v.is_wildcard() {
-                    break;
-                }
-                prefix.push(v.into_literal_or_any());
-            }
+        (1, true) => {
+            // single wildcard with any chars
+            if seq[0].is_wildcard() {
+                // suffix
+                let mut mask = Vec::new();
+                let pattern = seq
+                    .iter()
+                    .skip(1)
+                    .enumerate()
+                    .map(|(idx, i)| match i {
+                        LikeSeq::Wildcard => unreachable!(),
+                        LikeSeq::AnyChar => {
+                            mask.push(idx as u32);
+                            b'_'
+                        }
+                        LikeSeq::Literal(l) => *l,
+                    })
+                    .collect_vec();
+                let l = pattern.len();
 
-            let mut infix = Vec::new();
-            while let Some(v) = seq.next_back() {
-                if v.is_wildcard() {
-                    break;
-                }
-                infix.push(v.into_literal_or_any());
-            }
+                Box::new(move |arr| {
+                    filter_bytes(arr, |b| {
+                        b.len() > l && masked_compare(&b[b.len() - l..], &pattern, &mask)
+                    })
+                })
+            } else if seq.last().unwrap().is_wildcard() {
+                // prefix
+                let mut mask = Vec::new();
+                let pattern = seq
+                    .iter()
+                    .take(seq.len() - 1)
+                    .enumerate()
+                    .map(|(idx, i)| match i {
+                        LikeSeq::Wildcard => unreachable!(),
+                        LikeSeq::AnyChar => {
+                            mask.push(idx as u32);
+                            b'_'
+                        }
+                        LikeSeq::Literal(l) => *l,
+                    })
+                    .collect_vec();
+                let l = pattern.len();
 
-            let suffix = seq.map(|v| v.into_literal_or_any()).collect_vec();
-            let infix: LiteralOrAnySeq = infix.into();
+                Box::new(move |arr| {
+                    filter_bytes(arr, |b| {
+                        b.len() > l && masked_compare(&b[..l], &pattern, &mask)
+                    })
+                })
+            } else {
+                // prefix and suffix
+                let wildcard_idx = seq.iter().position(|c| c.is_wildcard()).unwrap();
+                let mut prefix_mask = Vec::new();
+                let mut suffix_mask = Vec::new();
+                let prefix = seq[..wildcard_idx]
+                    .iter()
+                    .copied()
+                    .enumerate()
+                    .map(|(idx, i)| match i {
+                        LikeSeq::Wildcard => unreachable!(),
+                        LikeSeq::AnyChar => {
+                            prefix_mask.push(idx as u32);
+                            b'_'
+                        }
+                        LikeSeq::Literal(l) => l,
+                    })
+                    .collect_vec();
+                let suffix = seq[wildcard_idx + 1..]
+                    .iter()
+                    .copied()
+                    .enumerate()
+                    .map(|(idx, i)| match i {
+                        LikeSeq::Wildcard => unreachable!(),
+                        LikeSeq::AnyChar => {
+                            suffix_mask.push(idx as u32);
+                            b'_'
+                        }
+                        LikeSeq::Literal(l) => l,
+                    })
+                    .collect_vec();
+                let min_length = prefix.len() + suffix.len();
 
-            match infix {
-                LiteralOrAnySeq::OnlyLiteral(items) => {
-                    let finder = Finder::new(&items).into_owned();
-                    LikeStrategy::Special {
-                        prefix: prefix.into(),
-                        infix: finder,
-                        suffix: suffix.into(),
-                    }
-                }
-                LiteralOrAnySeq::Mixed(items) => {
-                    LikeStrategy::General(items.into_iter().map(|x| x.into_like_seq()).collect())
-                }
+                Box::new(move |arr| {
+                    filter_bytes(arr, |b| {
+                        b.len() >= min_length
+                            && masked_compare(&b[..prefix.len()], &prefix, &prefix_mask)
+                            && masked_compare(&b[b.len() - suffix.len()..], &suffix, &suffix_mask)
+                    })
+                })
             }
         }
-        _ => LikeStrategy::General(seq),
+        (2, false) => {
+            // two wildcards no anychars
+            let wc1 = seq.iter().position(|i| i.is_wildcard()).unwrap();
+            let wc2 = seq.iter().rposition(|i| i.is_wildcard()).unwrap();
+
+            let prefix = seq[..wc1].iter().map(|i| i.into_literal()).collect_vec();
+            let infix = seq[wc1 + 1..wc2]
+                .iter()
+                .map(|i| i.into_literal())
+                .collect_vec();
+            let suffix = seq[wc2 + 1..]
+                .iter()
+                .map(|i| i.into_literal())
+                .collect_vec();
+
+            let finder = Finder::new(&infix).into_owned();
+            let min_len = prefix.len() + infix.len() + suffix.len();
+
+            Box::new(move |arr| {
+                filter_bytes(arr, |b| {
+                    b.len() >= min_len
+                        && b[..prefix.len()] == prefix
+                        && b[b.len() - suffix.len()..] == suffix
+                        && finder
+                            .find(&b[prefix.len()..b.len() - suffix.len()])
+                            .is_some()
+                })
+            })
+        }
+        _ => {
+            let min_len = seq.iter().filter(|i| !i.is_wildcard()).count();
+            Box::new(move |arr| filter_bytes(arr, |b| b.len() >= min_len && match_like(b, &seq)))
+        }
     })
 }
 
 pub fn string_contains(data: &dyn Array, pattern: &[u8]) -> Result<BooleanArray, ArrowKernelError> {
     let finder = Finder::new(pattern);
-
-    if data.null_count() == 0 {
-        let mut builder = BooleanBufferBuilder::new(data.len());
-        for bytes in crate::arrow_interface::iter::iter_nonnull_bytes(data)? {
-            builder.append(finder.find(bytes).is_some());
-        }
-        return Ok(BooleanArray::from(builder.finish()));
-    }
-
-    let mut last_position = 0;
-    let mut builder = BooleanBufferBuilder::new(data.len());
-    for (idx, bytes) in crate::arrow_interface::iter::iter_nonnull_bytes(data)?.indexed() {
-        if idx > last_position {
-            builder.append_n(idx - last_position, false);
-        }
-        builder.append(finder.find(bytes).is_some());
-        last_position = idx + 1;
-    }
-
-    if last_position < data.len() {
-        builder.append_n(data.len() - last_position, false);
-    }
-
-    Ok(BooleanArray::from(builder.finish()))
+    filter_bytes(data, |b| finder.find(b).is_some())
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -381,8 +582,9 @@ impl Kernel for StringStartEndKernel {
 #[cfg(test)]
 mod tests {
     use super::{StringKernelType, StringStartEndKernel};
-    use crate::compiled_kernels::Kernel;
+    use crate::compiled_kernels::{string::compile_string_like, string_contains, Kernel};
     use arrow_array::{BooleanArray, Scalar, StringArray, StringViewArray};
+    use itertools::Itertools;
 
     #[test]
     fn test_string_starts_with_kernel() {
@@ -436,5 +638,56 @@ mod tests {
         let result = kernel.call((&source, &needle)).unwrap();
 
         assert_eq!(result, BooleanArray::from(vec![false, true, true]));
+    }
+
+    #[test]
+    fn test_string_contains() {
+        let data = StringArray::from(vec!["hello", "world", "hello world"]);
+        let pattern = b"llo";
+
+        let result = string_contains(&data, pattern).unwrap();
+
+        assert_eq!(result, BooleanArray::from(vec![true, false, true]));
+    }
+
+    #[test]
+    fn test_string_like() {
+        let data = StringArray::from(vec!["hello", "world", "hello world"]);
+
+        let prefix = compile_string_like(b"hell%", b'\\').unwrap();
+        let result = prefix(&data)
+            .unwrap()
+            .iter()
+            .map(|x| x.unwrap())
+            .collect_vec();
+        assert_eq!(result, vec![true, false, true]);
+
+        let suffix = compile_string_like(b"%world", b'\\').unwrap();
+        let result = suffix(&data)
+            .unwrap()
+            .iter()
+            .map(|x| x.unwrap())
+            .collect_vec();
+        assert_eq!(result, vec![false, true, true]);
+
+        let infix = compile_string_like(b"%hello%", b'\\').unwrap();
+        let result = infix(&data)
+            .unwrap()
+            .iter()
+            .map(|x| x.unwrap())
+            .collect_vec();
+        assert_eq!(result, vec![true, false, true]);
+
+        let pands = compile_string_like(b"h%d", b'\\').unwrap();
+        let result = pands(&data)
+            .unwrap()
+            .iter()
+            .map(|x| x.unwrap())
+            .collect_vec();
+        assert_eq!(result, vec![false, false, true]);
+
+        let arb = compile_string_like(b"h%o%o%", b'\\').unwrap();
+        let result = arb(&data).unwrap().iter().map(|x| x.unwrap()).collect_vec();
+        assert_eq!(result, vec![false, false, true]);
     }
 }

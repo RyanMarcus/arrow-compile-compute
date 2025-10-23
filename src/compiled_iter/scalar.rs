@@ -143,6 +143,40 @@ impl From<Box<str>> for IteratorHolder {
     }
 }
 
+#[repr(C)]
+#[derive(ReprOffset, Debug)]
+#[roff(usize_offsets)]
+pub struct ScalarBinaryIterator {
+    ptr1: *const u8,
+    ptr2: *const u8,
+    val: Box<[u8]>,
+}
+
+impl ScalarBinaryIterator {
+    pub fn llvm_val_ptr<'a>(
+        &self,
+        ctx: &'a Context,
+        builder: &'a Builder,
+        ptr: PointerValue<'a>,
+    ) -> (PointerValue<'a>, PointerValue<'a>) {
+        let ptr1 = increment_pointer!(ctx, builder, ptr, ScalarBinaryIterator::OFFSET_PTR1);
+        let ptr2 = increment_pointer!(ctx, builder, ptr, ScalarBinaryIterator::OFFSET_PTR2);
+        (ptr1, ptr2)
+    }
+}
+
+impl From<Box<[u8]>> for IteratorHolder {
+    fn from(val: Box<[u8]>) -> Self {
+        let p1 = val.as_ptr();
+        let p2 = p1.wrapping_add(val.len());
+        IteratorHolder::ScalarBinary(Box::new(ScalarBinaryIterator {
+            ptr1: p1,
+            ptr2: p2,
+            val,
+        }))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::ffi::c_void;

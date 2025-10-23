@@ -327,7 +327,8 @@ impl PrimitiveType {
             DataType::Float64 => PrimitiveType::F64,
             DataType::Dictionary(_k, v) => PrimitiveType::for_arrow_type(v),
             DataType::RunEndEncoded(_k, v) => PrimitiveType::for_arrow_type(v.data_type()),
-            DataType::Utf8 => PrimitiveType::P64x2, // string view
+            DataType::Utf8 => PrimitiveType::P64x2, // string
+            DataType::Binary => PrimitiveType::P64x2, // binary
             DataType::LargeUtf8 => PrimitiveType::P64x2, // string view
             DataType::Utf8View => PrimitiveType::P64x2, // string view
             _ => todo!("no prim type for {:?}", dt),

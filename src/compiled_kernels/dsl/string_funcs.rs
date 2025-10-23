@@ -341,8 +341,8 @@ pub fn add_str_contains<'a>(ctx: &'a Context, llvm_mod: &Module<'a>) -> Function
         return func;
     }
 
-    let init_func = add_create_finder(ctx, llvm_mod);
     let memcmp = add_memcmp(ctx, llvm_mod);
+    let init_func = add_create_finder(ctx, llvm_mod);
 
     let i64_type = ctx.i64_type();
     let i64_one = i64_type.const_int(1, false);
@@ -351,7 +351,7 @@ pub fn add_str_contains<'a>(ctx: &'a Context, llvm_mod: &Module<'a>) -> Function
     let str_type = PrimitiveType::P64x2.llvm_type(ctx).into_struct_type();
     let func = llvm_mod.add_function(
         "str_contains",
-        i64_type.fn_type(&[str_type.into(), str_type.into()], false),
+        i64_type.fn_type(&[str_type.into(), str_type.into(), i64_type.into()], false),
         Some(Linkage::Private),
     );
 
@@ -371,21 +371,7 @@ pub fn add_str_contains<'a>(ctx: &'a Context, llvm_mod: &Module<'a>) -> Function
     b.position_at_end(entry);
     let needle = func.get_nth_param(0).unwrap().into_struct_value();
     let haystack = func.get_nth_param(1).unwrap().into_struct_value();
-
-    let init_data = b
-        .build_call(init_func, &[needle.into()], "init")
-        .unwrap()
-        .try_as_basic_value()
-        .unwrap_left()
-        .into_struct_value();
-    let needle_hash = b
-        .build_extract_value(init_data, 0, "needle_hash")
-        .unwrap()
-        .into_int_value();
-    let modulo = b
-        .build_extract_value(init_data, 1, "modulo")
-        .unwrap()
-        .into_int_value();
+    let needle_hash = func.get_nth_param(2).unwrap().into_int_value();
 
     let str_start = b
         .build_extract_value(haystack, 0, "str_start")
@@ -405,6 +391,7 @@ pub fn add_str_contains<'a>(ctx: &'a Context, llvm_mod: &Module<'a>) -> Function
         .unwrap()
         .into_pointer_value();
     let needle_len = pointer_diff!(ctx, b, needle_start, needle_end);
+
     let curr_hash_ptr = b.build_alloca(i64_type, "curr_hash_ptr").unwrap();
     let needle_fits = b
         .build_int_compare(IntPredicate::UGE, strlen, needle_len, "needle_fits")
@@ -422,14 +409,18 @@ pub fn add_str_contains<'a>(ctx: &'a Context, llvm_mod: &Module<'a>) -> Function
         .build_insert_value(prefix, init_end_ptr, 1, "with_end")
         .unwrap()
         .into_struct_value();
-    let init_hash = b
+    let init_hash_struct = b
         .build_call(init_func, &[prefix.into()], "haystack_prefix")
         .unwrap()
         .try_as_basic_value()
         .unwrap_left()
         .into_struct_value();
     let init_hash = b
-        .build_extract_value(init_hash, 0, "prefix_hash")
+        .build_extract_value(init_hash_struct, 0, "prefix_hash")
+        .unwrap()
+        .into_int_value();
+    let modulo = b
+        .build_extract_value(init_hash_struct, 1, "prefix_modulo")
         .unwrap()
         .into_int_value();
     b.build_store(curr_hash_ptr, init_hash).unwrap();
