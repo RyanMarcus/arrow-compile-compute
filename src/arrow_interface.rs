@@ -153,12 +153,13 @@ pub mod cmp {
     /// assert_eq!(result, BooleanArray::from(vec![true, false, true]));
     /// ```
     pub fn like(
-        haystack: &dyn Array,
+        haystack: &dyn Datum,
         needle: &[u8],
         escape: Option<u8>,
     ) -> Result<BooleanArray, ArrowKernelError> {
         let f = compiled_kernels::compile_string_like(needle, escape.unwrap_or(b'\\'))?;
-        f(haystack)
+        let (arr, _is_scalar) = haystack.get();
+        f(arr)
     }
 
     /// Returns an array of indices that would sort the input array. Combine
