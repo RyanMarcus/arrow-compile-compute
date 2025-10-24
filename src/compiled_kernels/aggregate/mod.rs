@@ -82,7 +82,9 @@ impl<T: Copy + Default> AggAlloc for Vec<T> {
     }
 
     fn ensure_capacity(&mut self, capacity: usize) {
-        self.resize_with(capacity, Default::default);
+        if capacity > self.len() {
+            self.resize_with(capacity, Default::default);
+        }
     }
 
     fn preallocate_capacity(&mut self, expected_unique: usize) {
@@ -589,15 +591,12 @@ mod tests {
     fn test_count_aggregator() {
         let mut agg = CountAggregator::new(&[], 1024);
         agg.ingest_grouped(
-            &[0, 1, 0, 1, 0, 1],
-            &Int32Array::from(vec![1, 2, 3, 4, 5, 6]),
+            &[0, 1, 0, 1, 0, 1, 2],
+            &Int32Array::from(vec![1, 2, 3, 4, 5, 6, 7]),
         );
-        agg.ingest_grouped(
-            &[0, 1, 0, 1, 0, 1],
-            &Int32Array::from(vec![1, 2, 3, 4, 5, 6]),
-        );
+        agg.ingest_grouped(&[0, 1, 0, 1], &Int32Array::from(vec![1, 2, 3, 4]));
         let res = agg.finish().values().iter().copied().collect_vec();
-        assert_eq!(res, vec![6, 6]);
+        assert_eq!(res, vec![5, 5, 1]);
     }
 
     #[test]
