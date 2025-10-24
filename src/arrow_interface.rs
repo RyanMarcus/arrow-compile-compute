@@ -33,13 +33,10 @@ pub mod cmp {
     use arrow_array::Array;
     use arrow_array::BooleanArray;
     use arrow_array::Datum;
-    use arrow_array::UInt32Array;
 
     use crate::compiled_kernels;
     pub use crate::compiled_kernels::ComparisonKernel;
     use crate::compiled_kernels::KernelCache;
-    use crate::compiled_kernels::SortKernel;
-    use crate::compiled_kernels::SortOptions;
     use crate::compiled_kernels::StringKernelType;
     use crate::compiled_kernels::StringStartEndKernel;
     use crate::ArrowKernelError;
@@ -50,8 +47,6 @@ pub mod cmp {
 
     static STR_STARTEND_CACHE: LazyLock<KernelCache<StringStartEndKernel>> =
         LazyLock::new(KernelCache::new);
-
-    static SORT_PROGRAM_CACHE: LazyLock<KernelCache<SortKernel>> = LazyLock::new(KernelCache::new);
 
     /// Compute a bitvector for `lhs < rhs`
     pub fn lt(lhs: &dyn Datum, rhs: &dyn Datum) -> Result<BooleanArray, ArrowKernelError> {
@@ -161,24 +156,6 @@ pub mod cmp {
         let (arr, _is_scalar) = haystack.get();
         f(arr)
     }
-
-    /// Returns an array of indices that would sort the input array. Combine
-    /// this kernel with `take` to physically sort the array.
-    pub fn sort_to_indices(
-        arr: &dyn Array,
-        options: SortOptions,
-    ) -> Result<UInt32Array, ArrowKernelError> {
-        SORT_PROGRAM_CACHE.get(vec![arr], vec![options])
-    }
-
-    /// Returns an array of indices that would sort the input arrays. Combine
-    /// this kernel with `take` to physically sort the array.
-    pub fn multicol_sort_to_indices(
-        arr: &[&dyn Array],
-        options: &[SortOptions],
-    ) -> Result<UInt32Array, ArrowKernelError> {
-        SORT_PROGRAM_CACHE.get(arr.to_vec(), options.to_vec())
-    }
 }
 
 /// Covert arrays between different data types and layouts
@@ -212,6 +189,37 @@ pub mod cast {
     /// ```
     pub fn cast(lhs: &dyn Array, to_type: &DataType) -> Result<ArrayRef, ArrowKernelError> {
         CAST_PROGRAM_CACHE.get(lhs, to_type.clone())
+    }
+}
+
+pub mod sort {
+    use std::sync::LazyLock;
+
+    use arrow_array::{Array, UInt32Array};
+
+    use crate::{
+        compiled_kernels::{KernelCache, SortKernel},
+        ArrowKernelError, SortOptions,
+    };
+
+    static SORT_PROGRAM_CACHE: LazyLock<KernelCache<SortKernel>> = LazyLock::new(KernelCache::new);
+
+    /// Returns an array of indices that would sort the input array. Combine
+    /// this kernel with `take` to physically sort the array.
+    pub fn sort_to_indices(
+        arr: &dyn Array,
+        options: SortOptions,
+    ) -> Result<UInt32Array, ArrowKernelError> {
+        SORT_PROGRAM_CACHE.get(vec![arr], vec![options])
+    }
+
+    /// Returns an array of indices that would sort the input arrays. Combine
+    /// this kernel with `take` to physically sort the array.
+    pub fn multicol_sort_to_indices(
+        arr: &[&dyn Array],
+        options: &[SortOptions],
+    ) -> Result<UInt32Array, ArrowKernelError> {
+        SORT_PROGRAM_CACHE.get(arr.to_vec(), options.to_vec())
     }
 }
 

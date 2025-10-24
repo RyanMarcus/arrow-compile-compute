@@ -19,7 +19,7 @@ pub fn criterion_benchmark(c: &mut Criterion) {
     let data = UInt64Array::from(vals.clone());
     let arrow_perm = arrow_ord::sort::sort_to_indices(&data, None, None).unwrap();
     let our_perm =
-        arrow_compile_compute::cmp::sort_to_indices(&data, SortOptions::default()).unwrap();
+        arrow_compile_compute::sort::sort_to_indices(&data, SortOptions::default()).unwrap();
     assert_eq!(arrow_perm, our_perm);
 
     c.bench_function("sort i32/arrow", |b| {
@@ -28,7 +28,8 @@ pub fn criterion_benchmark(c: &mut Criterion) {
     c.bench_function("sort i32/llvm", |b| {
         b.iter(|| {
             black_box(
-                arrow_compile_compute::cmp::sort_to_indices(&data, SortOptions::default()).unwrap(),
+                arrow_compile_compute::sort::sort_to_indices(&data, SortOptions::default())
+                    .unwrap(),
             )
         });
     });
@@ -44,7 +45,8 @@ pub fn criterion_benchmark(c: &mut Criterion) {
     c.bench_function("sort nullable i32/llvm", |b| {
         b.iter(|| {
             black_box(
-                arrow_compile_compute::cmp::sort_to_indices(&data, SortOptions::default()).unwrap(),
+                arrow_compile_compute::sort::sort_to_indices(&data, SortOptions::default())
+                    .unwrap(),
             )
         });
     });
@@ -82,7 +84,7 @@ pub fn criterion_benchmark(c: &mut Criterion) {
     });
     c.bench_function("sort multicol/llvm", |b| {
         b.iter(|| {
-            arrow_compile_compute::cmp::multicol_sort_to_indices(
+            arrow_compile_compute::sort::multicol_sort_to_indices(
                 &[&c1, &c2, &c3],
                 &[
                     SortOptions::default(),

@@ -15,7 +15,7 @@ proptest! {
         let mut p = (0..data.len() as u32).collect_vec();
         p.sort_by_key(|i| data[*i as usize]);
 
-        let res = arrow_compile_compute::cmp::sort_to_indices(
+        let res = arrow_compile_compute::sort::sort_to_indices(
             &Int32Array::from(data),
             SortOptions::default())
         .unwrap();
@@ -29,7 +29,7 @@ proptest! {
         let mut p = (0..data.len() as u32).collect_vec();
         p.sort_by_key(|i| data[*i as usize]);
 
-        let res = arrow_compile_compute::cmp::sort_to_indices(
+        let res = arrow_compile_compute::sort::sort_to_indices(
             &Int32Array::from(data),
             SortOptions::default())
         .unwrap();
@@ -44,7 +44,7 @@ proptest! {
         p.sort_by_key(|i| &data[*i as usize]);
 
 
-        let res = arrow_compile_compute::cmp::sort_to_indices(
+        let res = arrow_compile_compute::sort::sort_to_indices(
             &StringArray::from(data),
             SortOptions::default())
         .unwrap();
@@ -60,7 +60,7 @@ proptest! {
         let mut p = (0..data.len() as u32).collect_vec();
         p.sort_by_key(|i| float_ord::FloatOrd(data[*i as usize].to_f32()));
 
-        let res = arrow_compile_compute::cmp::sort_to_indices(
+        let res = arrow_compile_compute::sort::sort_to_indices(
             &Float16Array::from(data.clone()),
             SortOptions::default())
         .unwrap();
@@ -75,7 +75,7 @@ proptest! {
         let mut p = (0..data.len() as u32).collect_vec();
         p.sort_by_key(|i| float_ord::FloatOrd(data[*i as usize]));
 
-        let res = arrow_compile_compute::cmp::sort_to_indices(
+        let res = arrow_compile_compute::sort::sort_to_indices(
             &Float32Array::from(data.clone()),
             SortOptions::default())
         .unwrap();
@@ -89,7 +89,7 @@ proptest! {
         let mut p = (0..data.len() as u32).collect_vec();
         p.sort_by_key(|i| float_ord::FloatOrd(data[*i as usize]));
 
-        let res = arrow_compile_compute::cmp::sort_to_indices(
+        let res = arrow_compile_compute::sort::sort_to_indices(
             &Float64Array::from(data.clone()),
             SortOptions::default())
         .unwrap();
