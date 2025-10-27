@@ -585,7 +585,8 @@ mod test {
         Kernel,
     };
     use arrow_array::{
-        Array, ArrayRef, Float32Array, Int32Array, Int64Array, StringArray, UInt32Array,
+        cast::AsArray, types::Int32Type, Array, ArrayRef, Float32Array, Int32Array, Int64Array,
+        StringArray, UInt32Array,
     };
     use itertools::Itertools;
     use std::sync::Arc;
@@ -648,6 +649,12 @@ mod test {
             );
         }
 
+        let sorted = data.iter().filter_map(|x| x.clone()).sorted().collect_vec();
+        assert_eq!(
+            arr.as_primitive::<Int32Type>().values()[..arr.len() - num_nulls],
+            sorted
+        );
+
         let k = SortKernel::compile(&input, vec![SortOptions::default().reverse()]).unwrap();
         let our_res = k
             .call(input)
@@ -665,6 +672,54 @@ mod test {
                 i
             );
         }
+    }
+
+    #[test]
+    fn test_sort_i32_nulls_first() {
+        let mut rng = fastrand::Rng::with_seed(42);
+        let data = (0..32)
+            .map(|_| {
+                if rng.bool() {
+                    Some(rng.i32(-1000..1000))
+                } else {
+                    None
+                }
+            })
+            .collect_vec();
+
+        let arr = Arc::new(Int32Array::from(data.clone())) as ArrayRef;
+        let input = vec![&arr as &dyn Array];
+
+        let k = SortKernel::compile(
+            &input,
+            vec![SortOptions {
+                descending: false,
+                nulls_first: true,
+            }],
+        )
+        .unwrap();
+        let our_res = k
+            .call(input.clone())
+            .unwrap()
+            .into_iter()
+            .map(|x| x.unwrap())
+            .collect_vec();
+
+        let num_nulls = arr.null_count();
+        for i in 0..num_nulls {
+            assert!(
+                arr.is_null(our_res[i] as usize),
+                "index {} (null index {}) was not null",
+                our_res[i],
+                i
+            );
+        }
+
+        let sorted = data.iter().filter_map(|x| x.clone()).sorted().collect_vec();
+        assert_eq!(
+            arr.as_primitive::<Int32Type>().values()[num_nulls..],
+            sorted
+        );
     }
 
     #[test]
