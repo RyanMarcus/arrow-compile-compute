@@ -418,8 +418,8 @@ fn fill_in_cmp<'a>(
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Copy, Default)]
 pub struct SortOptions {
-    descending: bool,
-    nulls_first: bool,
+    pub descending: bool,
+    pub nulls_first: bool,
 }
 
 impl SortOptions {

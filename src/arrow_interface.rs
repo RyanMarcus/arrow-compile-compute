@@ -192,6 +192,7 @@ pub mod cast {
     }
 }
 
+/// Order arrays and groups of arrays
 pub mod sort {
     use std::sync::LazyLock;
 
