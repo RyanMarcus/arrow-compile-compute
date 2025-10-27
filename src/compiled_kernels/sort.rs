@@ -334,12 +334,18 @@ fn fill_in_cmp<'a>(
                 .try_as_basic_value()
                 .unwrap_left()
                 .into_int_value();
+            let lhs_null_bit = b
+                .build_xor(lhs_null_bit, i8_one, "lhs_is_null")
+                .unwrap();
             let rhs_null_bit = b
                 .build_call(null_access, &[bitmap_ptr.into(), idx2.into()], "rhs_null")
                 .unwrap()
                 .try_as_basic_value()
                 .unwrap_left()
                 .into_int_value();
+            let rhs_null_bit = b
+                .build_xor(rhs_null_bit, i8_one, "rhs_is_null")
+                .unwrap();
             let rhs_shifted = b
                 .build_left_shift(rhs_null_bit, i8_type.const_int(1, false), "shifted")
                 .unwrap();
@@ -358,16 +364,16 @@ fn fill_in_cmp<'a>(
 
             b.position_at_end(lhs_null);
             if pts[idx].2.nulls_first {
-                b.build_return(Some(&i8_one)).unwrap();
-            } else {
                 b.build_return(Some(&i8_neg_one)).unwrap();
+            } else {
+                b.build_return(Some(&i8_one)).unwrap();
             }
 
             b.position_at_end(rhs_null);
             if pts[idx].2.nulls_first {
-                b.build_return(Some(&i8_neg_one)).unwrap();
-            } else {
                 b.build_return(Some(&i8_one)).unwrap();
+            } else {
+                b.build_return(Some(&i8_neg_one)).unwrap();
             }
 
             b.position_at_end(both_null);
@@ -638,7 +644,6 @@ mod test {
             .into_iter()
             .map(|x| x.unwrap())
             .collect_vec();
-
         let num_nulls = arr.null_count();
         for i in 0..num_nulls {
             assert!(
@@ -650,10 +655,12 @@ mod test {
         }
 
         let sorted = data.iter().filter_map(|x| x.clone()).sorted().collect_vec();
-        assert_eq!(
-            arr.as_primitive::<Int32Type>().values()[..arr.len() - num_nulls],
-            sorted
-        );
+        let perm_values = our_res
+            .iter()
+            .filter(|idx| !arr.is_null(**idx as usize))
+            .map(|idx| arr.as_primitive::<Int32Type>().value(*idx as usize))
+            .collect_vec();
+        assert_eq!(perm_values, sorted);
 
         let k = SortKernel::compile(&input, vec![SortOptions::default().reverse()]).unwrap();
         let our_res = k
@@ -716,10 +723,12 @@ mod test {
         }
 
         let sorted = data.iter().filter_map(|x| x.clone()).sorted().collect_vec();
-        assert_eq!(
-            arr.as_primitive::<Int32Type>().values()[num_nulls..],
-            sorted
-        );
+        let perm_values = our_res
+            .iter()
+            .filter(|idx| !arr.is_null(**idx as usize))
+            .map(|idx| arr.as_primitive::<Int32Type>().value(*idx as usize))
+            .collect_vec();
+        assert_eq!(perm_values, sorted);
     }
 
     #[test]
