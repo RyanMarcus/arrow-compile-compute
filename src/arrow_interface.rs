@@ -196,14 +196,16 @@ pub mod cast {
 pub mod sort {
     use std::sync::LazyLock;
 
-    use arrow_array::{Array, UInt32Array};
+    use arrow_array::{Array, Datum, UInt32Array};
 
     use crate::{
-        compiled_kernels::{KernelCache, SortKernel},
+        compiled_kernels::{KernelCache, LowerBoundKernel, SortKernel},
         ArrowKernelError, SortOptions,
     };
 
     static SORT_PROGRAM_CACHE: LazyLock<KernelCache<SortKernel>> = LazyLock::new(KernelCache::new);
+    static LOWER_BOUND_PROGRAM_CACHE: LazyLock<KernelCache<LowerBoundKernel>> =
+        LazyLock::new(KernelCache::new);
 
     /// Returns an array of indices that would sort the input array. Combine
     /// this kernel with `take` to physically sort the array.
@@ -221,6 +223,14 @@ pub mod sort {
         options: &[SortOptions],
     ) -> Result<UInt32Array, ArrowKernelError> {
         SORT_PROGRAM_CACHE.get(arr.to_vec(), options.to_vec())
+    }
+
+    pub fn lower_bound(
+        arrays: &[&dyn Array],
+        keys: &[&dyn Datum],
+        options: &[SortOptions],
+    ) -> Result<u64, ArrowKernelError> {
+        LOWER_BOUND_PROGRAM_CACHE.get((arrays.to_vec(), keys.to_vec()), options.to_vec())
     }
 }
 

@@ -1,6 +1,8 @@
 use std::collections::HashSet;
 
-use arrow_array::{Float16Array, Float32Array, Float64Array, Int32Array, StringArray};
+use arrow_array::{
+    Array, Datum, Float16Array, Float32Array, Float64Array, Int32Array, Scalar, StringArray,
+};
 use arrow_compile_compute::SortOptions;
 use itertools::Itertools;
 use proptest::proptest;
@@ -97,4 +99,21 @@ proptest! {
 
         assert_eq!(res, p);
     }
+}
+
+#[test]
+fn test_lower_bound_interface() {
+    let array = Int32Array::from(vec![1, 3, 5, 7, 9]);
+    let arrays: Vec<&dyn Array> = vec![&array];
+    let key = Scalar::new(Int32Array::from(vec![4]));
+    let options = vec![SortOptions::default()];
+
+    let idx = arrow_compile_compute::sort::lower_bound(
+        arrays.as_slice(),
+        &[&key as &dyn Datum],
+        &options,
+    )
+    .unwrap();
+
+    assert_eq!(idx, 2);
 }
