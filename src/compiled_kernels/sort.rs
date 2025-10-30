@@ -1,18 +1,18 @@
-use arrow_array::{Array, BooleanArray, Datum, UInt32Array};
+use arrow_array::{Array, BooleanArray, UInt32Array};
 use arrow_schema::DataType;
 use inkwell::{
     context::Context,
     intrinsics::Intrinsic,
     module::{Linkage, Module},
     types::BasicTypeEnum,
-    values::{FunctionValue, PointerValue},
+    values::FunctionValue,
     AddressSpace, IntPredicate, OptimizationLevel,
 };
 use itertools::Itertools;
 use ouroboros::self_referencing;
 
 use crate::{
-    compiled_iter::{datum_to_iter, generate_random_access, IteratorHolder},
+    compiled_iter::{datum_to_iter, generate_random_access},
     compiled_kernels::{
         cmp::{add_float_to_int, add_memcmp},
         dsl::KernelParameters,
@@ -20,81 +20,6 @@ use crate::{
     },
     declare_blocks, logical_nulls, ArrowKernelError, PrimitiveType,
 };
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
-enum ComparatorSide {
-    Left,
-    Right,
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
-enum PointerKind {
-    Data,
-    Null,
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
-struct PointerLayoutEntry {
-    field: usize,
-    side: ComparatorSide,
-    kind: PointerKind,
-}
-
-struct PointerIndexAllocator {
-    entries: Vec<PointerLayoutEntry>,
-}
-
-impl PointerIndexAllocator {
-    fn new() -> Self {
-        Self {
-            entries: Vec::new(),
-        }
-    }
-
-    fn get_index(&mut self, field: usize, side: ComparatorSide, kind: PointerKind) -> usize {
-        let entry = PointerLayoutEntry { field, side, kind };
-        if let Some((idx, _)) = self
-            .entries
-            .iter()
-            .enumerate()
-            .find(|(_, existing)| **existing == entry)
-        {
-            idx
-        } else {
-            self.entries.push(entry);
-            self.entries.len() - 1
-        }
-    }
-
-    fn entries(&self) -> &[PointerLayoutEntry] {
-        &self.entries
-    }
-
-    fn into_entries(self) -> Vec<PointerLayoutEntry> {
-        self.entries
-    }
-}
-
-#[derive(Clone, Copy)]
-struct FieldAccessor<'a> {
-    access: FunctionValue<'a>,
-    null_access: Option<FunctionValue<'a>>,
-    data_index: usize,
-    null_index: Option<usize>,
-}
-
-struct ComparatorField<'a> {
-    primitive: PrimitiveType,
-    options: SortOptions,
-    lhs: FieldAccessor<'a>,
-    rhs: FieldAccessor<'a>,
-}
-
-#[derive(Clone)]
-struct LowerBoundFieldMeta {
-    array_nullable: bool,
-    array_type: DataType,
-}
 
 fn get_ucmp<'a>(
     ctx: &'a Context,
@@ -198,9 +123,11 @@ fn generate_single_cmp<'a>(
     ctx: &'a Context,
     llvm_mod: &Module<'a>,
     pt: PrimitiveType,
-    reverse: bool,
+    sort_opts: SortOptions,
     access1: FunctionValue<'a>,
+    nulls1: Option<FunctionValue<'a>>,
     access2: FunctionValue<'a>,
+    nulls2: Option<FunctionValue<'a>>,
 ) -> FunctionValue<'a> {
     let fname = format!("sort_cmp_{}", pt);
     if let Some(f) = llvm_mod.get_function(&fname) {
@@ -209,11 +136,16 @@ fn generate_single_cmp<'a>(
 
     let i64_type = ctx.i64_type();
     let i8_type = ctx.i8_type();
+    let i8_neg_one = i8_type.const_all_ones();
+    let i8_one = i8_type.const_int(1, true);
+
     let ptr_type = ctx.ptr_type(AddressSpace::default());
     let func = llvm_mod.add_function(
         &fname,
         i8_type.fn_type(
             &[
+                ptr_type.into(),
+                ptr_type.into(),
                 ptr_type.into(),
                 ptr_type.into(),
                 i64_type.into(),
@@ -227,20 +159,132 @@ fn generate_single_cmp<'a>(
     let b = ctx.create_builder();
     let llvm_type = pt.llvm_type(ctx);
 
-    declare_blocks!(ctx, func, entry);
+    declare_blocks!(
+        ctx,
+        func,
+        entry,
+        lhs_null,
+        rhs_null,
+        check_nulls,
+        both_null,
+        only_lhs_null,
+        only_rhs_null,
+        do_cmp
+    );
     b.position_at_end(entry);
-    let lhs_ptr = func.get_nth_param(0).unwrap().into_pointer_value();
-    let rhs_ptr = func.get_nth_param(1).unwrap().into_pointer_value();
-    let idx1 = func.get_nth_param(2).unwrap().into_int_value();
-    let idx2 = func.get_nth_param(3).unwrap().into_int_value();
+    let data_ptr1 = func.get_nth_param(0).unwrap().into_pointer_value();
+    let null_ptr1 = func.get_nth_param(1).unwrap().into_pointer_value();
+    let data_ptr2 = func.get_nth_param(2).unwrap().into_pointer_value();
+    let null_ptr2 = func.get_nth_param(3).unwrap().into_pointer_value();
+    let idx1 = func.get_nth_param(4).unwrap().into_int_value();
+    let idx2 = func.get_nth_param(5).unwrap().into_int_value();
+    let lhs_is_valid = b.build_alloca(ctx.bool_type(), "lhs_validity_ptr").unwrap();
+    b.build_store(lhs_is_valid, ctx.bool_type().const_all_ones())
+        .unwrap();
+    let rhs_is_valid = b.build_alloca(ctx.bool_type(), "rhs_validity_ptr").unwrap();
+    b.build_store(rhs_is_valid, ctx.bool_type().const_all_ones())
+        .unwrap();
+    b.build_unconditional_branch(lhs_null).unwrap();
 
+    b.position_at_end(lhs_null);
+    if let Some(null_accessor) = nulls1 {
+        let validity_bit = b
+            .build_call(
+                null_accessor,
+                &[null_ptr1.into(), idx1.into()],
+                "lhs_null_call",
+            )
+            .unwrap()
+            .try_as_basic_value()
+            .unwrap_left()
+            .into_int_value();
+        b.build_store(lhs_is_valid, validity_bit).unwrap();
+    }
+    b.build_unconditional_branch(rhs_null).unwrap();
+
+    b.position_at_end(rhs_null);
+    if let Some(null_accessor) = nulls2 {
+        let validity_bit = b
+            .build_call(
+                null_accessor,
+                &[null_ptr2.into(), idx2.into()],
+                "rhs_null_call",
+            )
+            .unwrap()
+            .try_as_basic_value()
+            .unwrap_left()
+            .into_int_value();
+        b.build_store(rhs_is_valid, validity_bit).unwrap();
+    }
+    b.build_unconditional_branch(check_nulls).unwrap();
+
+    b.position_at_end(check_nulls);
+    let lhs_null = b
+        .build_load(ctx.bool_type(), lhs_is_valid, "lhs_null")
+        .unwrap()
+        .into_int_value();
+    let rhs_null = b
+        .build_load(ctx.bool_type(), rhs_is_valid, "rhs_null")
+        .unwrap()
+        .into_int_value();
+
+    let lhs_as_i8 = b
+        .build_int_z_extend(lhs_null, ctx.i8_type(), "lhs_as_i8")
+        .unwrap();
+
+    let combined = b
+        .build_or(
+            lhs_as_i8,
+            b.build_select(
+                rhs_null,
+                ctx.i8_type().const_int(2, false),
+                i8_type.const_zero(),
+                "shifted",
+            )
+            .unwrap()
+            .into_int_value(),
+            "combined",
+        )
+        .unwrap();
+    b.build_switch(
+        combined,
+        do_cmp,
+        &[
+            (ctx.i8_type().const_int(0, false), both_null),
+            (ctx.i8_type().const_int(1, false), only_rhs_null),
+            (ctx.i8_type().const_int(2, false), only_lhs_null),
+            (ctx.i8_type().const_int(3, false), do_cmp),
+        ],
+    )
+    .unwrap();
+
+    b.position_at_end(only_rhs_null);
+    let r = if sort_opts.nulls_first {
+        i8_one
+    } else {
+        i8_neg_one
+    };
+    b.build_return(Some(&r)).unwrap();
+
+    b.position_at_end(only_lhs_null);
+    let r = if sort_opts.nulls_first {
+        i8_neg_one
+    } else {
+        i8_one
+    };
+    b.build_return(Some(&r)).unwrap();
+
+    b.position_at_end(both_null);
+    b.build_return(Some(&ctx.i8_type().const_zero())).unwrap();
+
+    b.position_at_end(do_cmp);
     let val1 = b
-        .build_call(access1, &[lhs_ptr.into(), idx1.into()], "val1")
+        .build_call(access1, &[data_ptr1.into(), idx1.into()], "val1")
         .unwrap()
         .try_as_basic_value()
         .unwrap_left();
     let val2 = b
-        .build_call(access2, &[rhs_ptr.into(), idx2.into()], "val2")
+        .build_call(access2, &[data_ptr2.into(), idx2.into()], "val2")
         .unwrap()
         .try_as_basic_value()
         .unwrap_left();
@@ -328,7 +372,7 @@ fn generate_single_cmp<'a>(
         }
     };
 
-    let cmp = if reverse {
+    let cmp = if sort_opts.descending {
         b.build_call(cmp_f, &[val2.into(), val1.into()], "cmp")
     } else {
         b.build_call(cmp_f, &[val1.into(), val2.into()], "cmp")
@@ -342,23 +386,29 @@ fn generate_single_cmp<'a>(
     func
 }
 
-fn fill_in_cmp<'a>(
-    ctx: &'a Context,
-    llvm_mod: &Module<'a>,
-    fields: &[ComparatorField<'a>],
-    pointer_layout: &[PointerLayoutEntry],
-) {
-    let mut cmp_funcs = Vec::new();
-    for field in fields {
+struct ComparatorField<'a> {
+    ptype: PrimitiveType,
+    sort_options: SortOptions,
+    lhs_nulls: Option<FunctionValue<'a>>,
+    lhs_accessor: FunctionValue<'a>,
+    rhs_nulls: Option<FunctionValue<'a>>,
+    rhs_accessor: FunctionValue<'a>,
+}
+
+fn fill_in_cmp<'a>(ctx: &'a Context, llvm_mod: &Module<'a>, pts: &[ComparatorField<'a>]) {
+    let mut all_cmps = Vec::new();
+    for cf in pts.iter() {
         let cmp = generate_single_cmp(
             ctx,
             llvm_mod,
-            field.primitive,
-            field.options.descending,
-            field.lhs.access,
-            field.rhs.access,
+            cf.ptype,
+            cf.sort_options,
+            cf.lhs_accessor,
+            cf.lhs_nulls,
+            cf.rhs_accessor,
+            cf.rhs_nulls,
         );
-        cmp_funcs.push(cmp);
+        all_cmps.push(cmp);
     }
 
     let ptr_type = ctx.ptr_type(AddressSpace::default());
@@ -374,193 +424,58 @@ fn fill_in_cmp<'a>(
         ),
         None,
     );
+
     let i8_type = ctx.i8_type();
-    let i8_one = i8_type.const_int(1, false);
-    let i8_neg_one = i8_type.const_all_ones();
     let b = ctx.create_builder();
     declare_blocks!(ctx, cmp, entry, final_exit);
     b.position_at_end(entry);
-    let params_ptr = cmp.get_nth_param(0).unwrap().into_pointer_value();
+    let data_ptr = cmp.get_nth_param(0).unwrap().into_pointer_value();
     let idx1 = cmp.get_nth_param(1).unwrap().into_int_value();
     let idx2 = cmp.get_nth_param(2).unwrap().into_int_value();
+    let mut cmp_ptrs = Vec::new();
 
-    let mut cached_ptrs: Vec<Option<PointerValue<'a>>> = vec![None; pointer_layout.len()];
-    let mut get_ptr = |index: usize| {
-        if let Some(ptr) = cached_ptrs[index] {
+    let mut idx = 0;
+    for cf in pts.iter() {
+        let lhs_data_ptr = KernelParameters::llvm_get(ctx, &b, data_ptr, idx);
+        idx += 1;
+        let lhs_null_ptr = if cf.lhs_nulls.is_some() {
+            let ptr = KernelParameters::llvm_get(ctx, &b, data_ptr, idx);
+            idx += 1;
             ptr
         } else {
-            let ptr = KernelParameters::llvm_get(ctx, &b, params_ptr, index);
-            cached_ptrs[index] = Some(ptr);
-            ptr
-        }
-    };
+            ptr_type.const_null()
+        };
 
-    if fields.is_empty() {
-        let f = get_ucmp(ctx, llvm_mod, ctx.i64_type().into());
-        let res = b
-            .build_call(f, &[idx1.into(), idx2.into()], "idx_cmp_empty")
-            .unwrap()
-            .try_as_basic_value()
-            .unwrap_left()
-            .into_int_value();
-        b.build_return(Some(&res)).unwrap();
-        return;
+        let rhs_data_ptr = KernelParameters::llvm_get(ctx, &b, data_ptr, idx);
+        idx += 1;
+        let rhs_null_ptr = if cf.rhs_nulls.is_some() {
+            let ptr = KernelParameters::llvm_get(ctx, &b, data_ptr, idx);
+            idx += 1;
+            ptr
+        } else {
+            ptr_type.const_null()
+        };
+
+        cmp_ptrs.push((lhs_data_ptr, lhs_null_ptr, rhs_data_ptr, rhs_null_ptr));
     }
 
-    let all_entry_blocks = cmp_funcs
+    let all_entry_blocks = all_cmps
         .iter()
         .map(|_| ctx.append_basic_block(cmp, "entry"))
         .collect_vec();
     b.build_unconditional_branch(all_entry_blocks[0]).unwrap();
 
-    for (idx, (field, cmp_f)) in fields.iter().zip(cmp_funcs.into_iter()).enumerate() {
-        declare_blocks!(ctx, cmp, not_null, nonzero);
+    for (idx, (cmp_f, cmp_ptr)) in all_cmps.into_iter().zip(cmp_ptrs.into_iter()).enumerate() {
+        declare_blocks!(ctx, cmp, nonzero);
         b.position_at_end(all_entry_blocks[idx]);
-
-        let lhs_data_ptr = get_ptr(field.lhs.data_index);
-        let rhs_data_ptr = get_ptr(field.rhs.data_index);
-        let lhs_null_ptr = field.lhs.null_index.map(|i| get_ptr(i));
-        let rhs_null_ptr = field.rhs.null_index.map(|i| get_ptr(i));
-
-        match (field.lhs.null_access, field.rhs.null_access) {
-            (Some(lhs_null_fn), Some(rhs_null_fn)) => {
-                declare_blocks!(ctx, cmp, lhs_null, rhs_null, both_null);
-                let lhs_null_ptr = lhs_null_ptr.expect("missing lhs null pointer");
-                let rhs_null_ptr = rhs_null_ptr.expect("missing rhs null pointer");
-
-                let lhs_valid = b
-                    .build_call(
-                        lhs_null_fn,
-                        &[lhs_null_ptr.into(), idx1.into()],
-                        "lhs_valid",
-                    )
-                    .unwrap()
-                    .try_as_basic_value()
-                    .unwrap_left()
-                    .into_int_value();
-                let lhs_is_null = b.build_xor(lhs_valid, i8_one, "lhs_is_null").unwrap();
-
-                let rhs_valid = b
-                    .build_call(
-                        rhs_null_fn,
-                        &[rhs_null_ptr.into(), idx2.into()],
-                        "rhs_valid",
-                    )
-                    .unwrap()
-                    .try_as_basic_value()
-                    .unwrap_left()
-                    .into_int_value();
-                let rhs_is_null = b.build_xor(rhs_valid, i8_one, "rhs_is_null").unwrap();
-
-                let rhs_shifted = b
-                    .build_left_shift(rhs_is_null, i8_type.const_int(1, false), "rhs_shifted")
-                    .unwrap();
-                let sum = b.build_or(lhs_is_null, rhs_shifted, "null_sum").unwrap();
-                b.build_switch(
-                    sum,
-                    not_null,
-                    &[
-                        (i8_type.const_int(0, false), not_null),
-                        (i8_type.const_int(1, false), lhs_null),
-                        (i8_type.const_int(2, false), rhs_null),
-                        (i8_type.const_int(3, false), both_null),
-                    ],
-                )
-                .unwrap();
-
-                b.position_at_end(lhs_null);
-                if field.options.nulls_first {
-                    b.build_return(Some(&i8_neg_one)).unwrap();
-                } else {
-                    b.build_return(Some(&i8_one)).unwrap();
-                }
-
-                b.position_at_end(rhs_null);
-                if field.options.nulls_first {
-                    b.build_return(Some(&i8_one)).unwrap();
-                } else {
-                    b.build_return(Some(&i8_neg_one)).unwrap();
-                }
-
-                b.position_at_end(both_null);
-                b.build_return(Some(&i8_type.const_zero())).unwrap();
-            }
-            (Some(lhs_null_fn), None) => {
-                declare_blocks!(ctx, cmp, lhs_null);
-                let lhs_null_ptr = lhs_null_ptr.expect("missing lhs null pointer");
-                let lhs_valid = b
-                    .build_call(
-                        lhs_null_fn,
-                        &[lhs_null_ptr.into(), idx1.into()],
-                        "lhs_valid",
-                    )
-                    .unwrap()
-                    .try_as_basic_value()
-                    .unwrap_left()
-                    .into_int_value();
-                let lhs_is_null = b.build_xor(lhs_valid, i8_one, "lhs_is_null").unwrap();
-                let lhs_null_cond = b
-                    .build_int_compare(
-                        IntPredicate::NE,
-                        lhs_is_null,
-                        i8_type.const_zero(),
-                        "lhs_null_cond",
-                    )
-                    .unwrap();
-                b.build_conditional_branch(lhs_null_cond, lhs_null, not_null)
-                    .unwrap();
-
-                b.position_at_end(lhs_null);
-                if field.options.nulls_first {
-                    b.build_return(Some(&i8_neg_one)).unwrap();
-                } else {
-                    b.build_return(Some(&i8_one)).unwrap();
-                }
-            }
-            (None, Some(rhs_null_fn)) => {
-                declare_blocks!(ctx, cmp, rhs_null);
-                let rhs_null_ptr = rhs_null_ptr.expect("missing rhs null pointer");
-                let rhs_valid = b
-                    .build_call(
-                        rhs_null_fn,
-                        &[rhs_null_ptr.into(), idx2.into()],
-                        "rhs_valid",
-                    )
-                    .unwrap()
-                    .try_as_basic_value()
-                    .unwrap_left()
-                    .into_int_value();
-                let rhs_is_null = b.build_xor(rhs_valid, i8_one, "rhs_is_null").unwrap();
-                let rhs_null_cond = b
-                    .build_int_compare(
-                        IntPredicate::NE,
-                        rhs_is_null,
-                        i8_type.const_zero(),
-                        "rhs_null_cond",
-                    )
-                    .unwrap();
-                b.build_conditional_branch(rhs_null_cond, rhs_null, not_null)
-                    .unwrap();
-
-                b.position_at_end(rhs_null);
-                if field.options.nulls_first {
-                    b.build_return(Some(&i8_one)).unwrap();
-                } else {
-                    b.build_return(Some(&i8_neg_one)).unwrap();
-                }
-            }
-            (None, None) => {
-                b.build_unconditional_branch(not_null).unwrap();
-            }
-        }
-
-        b.position_at_end(not_null);
         let res = b
             .build_call(
                 cmp_f,
                 &[
-                    lhs_data_ptr.into(),
-                    rhs_data_ptr.into(),
+                    cmp_ptr.0.into(),
+                    cmp_ptr.1.into(),
+                    cmp_ptr.2.into(),
+                    cmp_ptr.3.into(),
                     idx1.into(),
                     idx2.into(),
                 ],
@@ -575,7 +490,7 @@ fn fill_in_cmp<'a>(
             .unwrap();
         b.build_conditional_branch(
             is_zero,
-            if idx + 1 < fields.len() {
+            if idx + 1 < pts.len() {
                 all_entry_blocks[idx + 1]
             } else {
                 final_exit
@@ -620,7 +535,6 @@ use std::ffi::c_void;
 #[self_referencing]
 pub struct SortKernel {
     context: Context,
-    pointer_layout: Vec<PointerLayoutEntry>,
     nullable: Vec<bool>,
 
     #[borrows(context)]
@@ -647,58 +561,27 @@ impl Kernel for SortKernel {
             "input arrays must have the same length"
         );
 
-        let pointer_layout = self.borrow_pointer_layout();
-        let nullable = self.borrow_nullable();
+        let mut null_arrays = Vec::new();
+        let mut ihs = Vec::new();
+        let mut ptrs = Vec::new();
 
-        let mut _lhs_null_arrays: Vec<Option<BooleanArray>> = Vec::with_capacity(inp.len());
-        let mut lhs_null_iters: Vec<Option<IteratorHolder>> = Vec::with_capacity(inp.len());
-        let mut lhs_data_iters: Vec<Option<IteratorHolder>> = Vec::with_capacity(inp.len());
-
-        for (arr, expected_nullable) in inp.iter().zip(nullable.iter()) {
+        for (arr, nullable) in inp.iter().zip(self.borrow_nullable().iter()) {
+            ihs.push(datum_to_iter(arr).unwrap());
+            let data_ptr = ihs.last_mut().unwrap().get_mut_ptr();
             if let Some(nulls) = logical_nulls(*arr)? {
-                assert!(*expected_nullable, "kernel expected nullable input");
+                assert!(nullable, "kernel expected nullable input");
                 let ba = BooleanArray::from(nulls.inner().clone());
-                let ba_datum: &dyn Datum = &ba;
-                let ih = datum_to_iter(ba_datum)?;
-                _lhs_null_arrays.push(Some(ba));
-                lhs_null_iters.push(Some(ih));
+                null_arrays.push(ba);
+                ihs.push(datum_to_iter(&null_arrays.last().unwrap()).unwrap());
+                let nulls_ptr = ihs.last_mut().unwrap().get_mut_ptr();
+                ptrs.push(data_ptr);
+                ptrs.push(nulls_ptr);
+                ptrs.push(data_ptr);
+                ptrs.push(nulls_ptr);
             } else {
-                assert!(!expected_nullable, "kernel expected non-nullable input");
-                _lhs_null_arrays.push(None);
-                lhs_null_iters.push(None);
-            }
-
-            let arr_datum = &*arr as &dyn Datum;
-            let data_iter = datum_to_iter(arr_datum)?;
-            lhs_data_iters.push(Some(data_iter));
-        }
-
-        let mut holders: Vec<IteratorHolder> = Vec::with_capacity(pointer_layout.len());
-        let mut ptrs: Vec<*mut c_void> = Vec::with_capacity(pointer_layout.len());
-
-        for entry in pointer_layout.iter() {
-            match (entry.side, entry.kind) {
-                (ComparatorSide::Left, PointerKind::Data) => {
-                    let holder = lhs_data_iters[entry.field]
-                        .take()
-                        .expect("missing lhs data iterator");
-                    let mut holder = holder;
-                    let ptr = holder.get_mut_ptr();
-                    ptrs.push(ptr);
-                    holders.push(holder);
-                }
-                (ComparatorSide::Left, PointerKind::Null) => {
-                    let holder = lhs_null_iters[entry.field]
-                        .take()
-                        .expect("missing lhs null iterator");
-                    let mut holder = holder;
-                    let ptr = holder.get_mut_ptr();
-                    ptrs.push(ptr);
-                    holders.push(holder);
-                }
-                (ComparatorSide::Right, _) => {
-                    panic!("sort comparator unexpectedly referenced RHS iterator");
-                }
+                assert!(!nullable, "kernel expected non-nullable input");
+                ptrs.push(data_ptr);
+                ptrs.push(data_ptr);
             }
         }
 
@@ -708,6 +591,7 @@ impl Kernel for SortKernel {
         let func = self.borrow_func();
         perm.sort_unstable_by(|a, b| {
             let res = unsafe { func.call(kp_ptr, *a as u64, *b as u64) };
+            println!("res: {} for a: {}, b: {}", res, a, b);
             debug_assert!(res == -1 || res == 0 || res == 1);
             unsafe { std::mem::transmute(res) }
         });
@@ -721,21 +605,12 @@ impl Kernel for SortKernel {
         params: Self::Params,
     ) -> Result<Self, super::ArrowKernelError> {
         let ctx = Context::create();
-        let pointer_layout_cell = std::cell::RefCell::new(Vec::new());
-        let kernel = SortKernelTryBuilder {
+        SortKernelTryBuilder {
             context: ctx,
-            pointer_layout: Vec::new(),
             nullable: inp.iter().map(|x| x.is_nullable()).collect_vec(),
-            func_builder: |ctx| {
-                let (func, layout) = generate_sort(ctx, inp, &params)?;
-                *pointer_layout_cell.borrow_mut() = layout;
-                Ok::<_, ArrowKernelError>(func)
-            },
+            func_builder: |ctx| generate_sort(ctx, inp, &params),
         }
-        .try_build()?;
-        let mut kernel = kernel;
-        kernel.with_pointer_layout_mut(|pl| *pl = pointer_layout_cell.into_inner());
-        Ok(kernel)
+        .try_build()
     }
 
     fn get_key_for_input(
@@ -755,18 +630,10 @@ fn generate_sort<'a>(
     ctx: &'a Context,
     inp: &[&dyn Array],
     params: &[SortOptions],
-) -> Result<
-    (
-        JitFunction<'a, unsafe extern "C" fn(*mut c_void, u64, u64) -> i8>,
-        Vec<PointerLayoutEntry>,
-    ),
-    ArrowKernelError,
-> {
+) -> Result<JitFunction<'a, unsafe extern "C" fn(*mut c_void, u64, u64) -> i8>, ArrowKernelError> {
     let llvm_mod = ctx.create_module("test");
 
-    let mut allocator = PointerIndexAllocator::new();
-    let mut fields = Vec::new();
-
+    let mut config = Vec::new();
     for (idx, (arr, opts)) in inp.iter().zip(params.iter()).enumerate() {
         let ptype = PrimitiveType::for_arrow_type(arr.data_type());
         let null_access = if let Some(nulls) = logical_nulls(*arr)? {
@@ -786,8 +653,7 @@ fn generate_sort<'a>(
             None
         };
 
-        let arr_datum = &*arr as &dyn Datum;
-        let ih = datum_to_iter(arr_datum)?;
+        let ih = datum_to_iter(arr)?;
         let access = generate_random_access(
             ctx,
             &llvm_mod,
@@ -797,36 +663,16 @@ fn generate_sort<'a>(
         )
         .unwrap();
 
-        let lhs_data_index = allocator.get_index(idx, ComparatorSide::Left, PointerKind::Data);
-        let lhs_null_index = if null_access.is_some() {
-            Some(allocator.get_index(idx, ComparatorSide::Left, PointerKind::Null))
-        } else {
-            None
-        };
-
-        let lhs_accessor = FieldAccessor {
-            access,
-            null_access,
-            data_index: lhs_data_index,
-            null_index: lhs_null_index,
-        };
-        let rhs_accessor = FieldAccessor {
-            access,
-            null_access,
-            data_index: lhs_data_index,
-            null_index: lhs_null_index,
-        };
-
-        fields.push(ComparatorField {
-            primitive: ptype,
-            options: *opts,
-            lhs: lhs_accessor,
-            rhs: rhs_accessor,
+        config.push(ComparatorField {
+            ptype,
+            sort_options: *opts,
+            lhs_nulls: null_access,
+            lhs_accessor: access,
+            rhs_nulls: null_access,
+            rhs_accessor: access,
         });
     }
-
-    fill_in_cmp(ctx, &llvm_mod, &fields, allocator.entries());
-    let pointer_layout = allocator.into_entries();
+    fill_in_cmp(ctx, &llvm_mod, &config);
 
     llvm_mod.verify().unwrap();
     optimize_module(&llvm_mod)?;
@@ -840,393 +686,18 @@ fn generate_sort<'a>(
             .unwrap()
     };
 
-    Ok((cmp_func, pointer_layout))
-}
-
-#[self_referencing]
-pub struct LowerBoundKernel {
-    context: Context,
-    pointer_layout: Vec<PointerLayoutEntry>,
-    field_meta: Vec<LowerBoundFieldMeta>,
-
-    #[borrows(context)]
-    #[covariant]
-    func: JitFunction<'this, unsafe extern "C" fn(*mut c_void, u64, u64) -> i8>,
-}
-
-unsafe impl Sync for LowerBoundKernel {}
-unsafe impl Send for LowerBoundKernel {}
-
-impl Kernel for LowerBoundKernel {
-    type Key = Vec<(DataType, bool, SortOptions)>;
-    type Input<'a> = (Vec<&'a dyn Array>, Vec<&'a dyn Datum>);
-    type Params = Vec<SortOptions>;
-    type Output = u64;
-
-    fn call(&self, inp: Self::Input<'_>) -> Result<Self::Output, ArrowKernelError> {
-        let (arrays, keys) = inp;
-        if arrays.is_empty() {
-            return Ok(0);
-        }
-
-        let len = arrays[0].len();
-        if !arrays.iter().all(|arr| arr.len() == len) {
-            return Err(ArrowKernelError::SizeMismatch);
-        }
-        if arrays.len() != keys.len() {
-            return Err(ArrowKernelError::ArgumentMismatch(
-                "lower_bound expects the same number of arrays and keys".to_string(),
-            ));
-        }
-
-        let pointer_layout = self.borrow_pointer_layout();
-        let field_meta = self.borrow_field_meta();
-
-        let mut _lhs_null_arrays: Vec<Option<BooleanArray>> = Vec::with_capacity(arrays.len());
-        let mut lhs_null_iters: Vec<Option<IteratorHolder>> = Vec::with_capacity(arrays.len());
-        let mut lhs_data_iters: Vec<Option<IteratorHolder>> = Vec::with_capacity(arrays.len());
-
-        for (arr, meta) in arrays.iter().zip(field_meta.iter()) {
-            if arr.is_nullable() != meta.array_nullable {
-                return Err(ArrowKernelError::ArgumentMismatch(format!(
-                    "array nullability changed (expected {}, found {})",
-                    meta.array_nullable,
-                    arr.is_nullable()
-                )));
-            }
-            if arr.data_type() != &meta.array_type {
-                return Err(ArrowKernelError::ArgumentMismatch(format!(
-                    "array type mismatch: expected {:?}, found {:?}",
-                    meta.array_type,
-                    arr.data_type()
-                )));
-            }
-
-            if let Some(nulls) = logical_nulls(*arr)? {
-                let ba = BooleanArray::from(nulls.inner().clone());
-                let ba_datum: &dyn Datum = &ba;
-                let ih = datum_to_iter(ba_datum)?;
-                _lhs_null_arrays.push(Some(ba));
-                lhs_null_iters.push(Some(ih));
-            } else {
-                _lhs_null_arrays.push(None);
-                lhs_null_iters.push(None);
-            }
-
-            let arr_datum = &*arr as &dyn Datum;
-            let data_iter = datum_to_iter(arr_datum)?;
-            lhs_data_iters.push(Some(data_iter));
-        }
-
-        let mut rhs_data_iters: Vec<Option<IteratorHolder>> = Vec::with_capacity(keys.len());
-        for (key, meta) in keys.iter().zip(field_meta.iter()) {
-            let (key_arr, is_scalar) = key.get();
-            if !is_scalar {
-                return Err(ArrowKernelError::ArgumentMismatch(
-                    "lower_bound requires scalar keys".to_string(),
-                ));
-            }
-            if key_arr.data_type() != &meta.array_type {
-                return Err(ArrowKernelError::ArgumentMismatch(format!(
-                    "key type {:?} did not match array type {:?}",
-                    key_arr.data_type(),
-                    meta.array_type
-                )));
-            }
-            if key_arr.is_null(0) {
-                return Err(ArrowKernelError::UnsupportedArguments(
-                    "lower_bound does not support null scalar keys".to_string(),
-                ));
-            }
-            rhs_data_iters.push(Some(datum_to_iter(*key)?));
-        }
-
-        let mut holders: Vec<IteratorHolder> = Vec::with_capacity(pointer_layout.len());
-        let mut ptrs: Vec<*mut c_void> = Vec::with_capacity(pointer_layout.len());
-
-        for entry in pointer_layout.iter() {
-            match (entry.side, entry.kind) {
-                (ComparatorSide::Left, PointerKind::Data) => {
-                    let holder = lhs_data_iters[entry.field]
-                        .take()
-                        .expect("missing lhs data iterator");
-                    let mut holder = holder;
-                    let ptr = holder.get_mut_ptr();
-                    ptrs.push(ptr);
-                    holders.push(holder);
-                }
-                (ComparatorSide::Left, PointerKind::Null) => {
-                    let holder = lhs_null_iters[entry.field]
-                        .take()
-                        .expect("missing lhs null iterator");
-                    let mut holder = holder;
-                    let ptr = holder.get_mut_ptr();
-                    ptrs.push(ptr);
-                    holders.push(holder);
-                }
-                (ComparatorSide::Right, PointerKind::Data) => {
-                    let holder = rhs_data_iters[entry.field]
-                        .take()
-                        .expect("missing rhs data iterator");
-                    let mut holder = holder;
-                    let ptr = holder.get_mut_ptr();
-                    ptrs.push(ptr);
-                    holders.push(holder);
-                }
-                (ComparatorSide::Right, PointerKind::Null) => {
-                    panic!("lower_bound comparator unexpectedly referenced RHS null iterator");
-                }
-            }
-        }
-
-        let mut kp = KernelParameters::new(ptrs);
-        let kp_ptr = kp.get_mut_ptr();
-        let func = self.borrow_func();
-
-        let mut lo = 0u64;
-        let mut hi = len as u64;
-        while lo < hi {
-            let mid = (lo + hi) / 2;
-            let res = unsafe { func.call(kp_ptr, mid, 0) };
-            debug_assert!(res == -1 || res == 0 || res == 1);
-            if res == -1 {
-                lo = mid + 1;
-            } else {
-                hi = mid;
-            }
-        }
-
-        Ok(lo)
-    }
-
-    fn compile(inp: &Self::Input<'_>, params: Self::Params) -> Result<Self, ArrowKernelError> {
-        let (arrays, keys) = inp;
-        if arrays.len() != params.len() {
-            return Err(ArrowKernelError::ArgumentMismatch(
-                "lower_bound requires one SortOptions per array".to_string(),
-            ));
-        }
-        if keys.len() != params.len() {
-            return Err(ArrowKernelError::ArgumentMismatch(
-                "lower_bound requires the same number of keys and arrays".to_string(),
-            ));
-        }
-
-        for (arr, key) in arrays.iter().zip(keys.iter()) {
-            let (key_arr, is_scalar) = key.get();
-            if !is_scalar {
-                return Err(ArrowKernelError::ArgumentMismatch(
-                    "lower_bound requires scalar keys".to_string(),
-                ));
-            }
-            if key_arr.data_type() != arr.data_type() {
-                return Err(ArrowKernelError::ArgumentMismatch(format!(
-                    "key type {:?} did not match array type {:?}",
-                    key_arr.data_type(),
-                    arr.data_type()
-                )));
-            }
-            if key_arr.is_null(0) {
-                return Err(ArrowKernelError::UnsupportedArguments(
-                    "lower_bound does not support null scalar keys".to_string(),
-                ));
-            }
-        }
-
-        let ctx = Context::create();
-        let field_meta = arrays
-            .iter()
-            .map(|arr| LowerBoundFieldMeta {
-                array_nullable: arr.is_nullable(),
-                array_type: arr.data_type().clone(),
-            })
-            .collect_vec();
-
-        let pointer_layout_cell = std::cell::RefCell::new(Vec::new());
-        let kernel = LowerBoundKernelTryBuilder {
-            context: ctx,
-            pointer_layout: Vec::new(),
-            field_meta,
-            func_builder: |ctx| {
-                let (func, layout) = generate_lower_bound(
-                    ctx,
-                    arrays.as_slice(),
-                    keys.as_slice(),
-                    params.as_slice(),
-                )?;
-                *pointer_layout_cell.borrow_mut() = layout;
-                Ok::<_, ArrowKernelError>(func)
-            },
-        }
-        .try_build()?;
-        let mut kernel = kernel;
-        kernel.with_pointer_layout_mut(|pl| *pl = pointer_layout_cell.into_inner());
-        Ok(kernel)
-    }
-
-    fn get_key_for_input(
-        i: &Self::Input<'_>,
-        p: &Self::Params,
-    ) -> Result<Self::Key, ArrowKernelError> {
-        let (arrays, keys) = i;
-        if arrays.len() != p.len() || keys.len() != p.len() {
-            return Err(ArrowKernelError::ArgumentMismatch(
-                "lower_bound requires matching numbers of arrays, keys, and options".to_string(),
-            ));
-        }
-
-        let mut result = Vec::new();
-        for ((arr, key), opts) in arrays.iter().zip(keys.iter()).zip(p.iter()) {
-            let (key_arr, is_scalar) = key.get();
-            if !is_scalar {
-                return Err(ArrowKernelError::ArgumentMismatch(
-                    "lower_bound requires scalar keys".to_string(),
-                ));
-            }
-            if key_arr.data_type() != arr.data_type() {
-                return Err(ArrowKernelError::ArgumentMismatch(format!(
-                    "key type {:?} did not match array type {:?}",
-                    key_arr.data_type(),
-                    arr.data_type()
-                )));
-            }
-            result.push((arr.data_type().clone(), arr.is_nullable(), *opts));
-        }
-        Ok(result)
-    }
-}
-
-fn generate_lower_bound<'a>(
-    ctx: &'a Context,
-    arrays: &[&dyn Array],
-    keys: &[&dyn Datum],
-    params: &[SortOptions],
-) -> Result<
-    (
-        JitFunction<'a, unsafe extern "C" fn(*mut c_void, u64, u64) -> i8>,
-        Vec<PointerLayoutEntry>,
-    ),
-    ArrowKernelError,
-> {
-    let llvm_mod = ctx.create_module("lower_bound");
-
-    let mut allocator = PointerIndexAllocator::new();
-    let mut fields = Vec::new();
-
-    for (idx, ((arr, key), opts)) in arrays
-        .iter()
-        .zip(keys.iter())
-        .zip(params.iter())
-        .enumerate()
-    {
-        let ptype = PrimitiveType::for_arrow_type(arr.data_type());
-        let lhs_null_access = if let Some(nulls) = logical_nulls(*arr)? {
-            let ba = BooleanArray::from(nulls.inner().clone());
-            let ba_datum: &dyn Datum = &ba;
-            let ih = datum_to_iter(ba_datum)?;
-            Some(
-                generate_random_access(
-                    ctx,
-                    &llvm_mod,
-                    &format!("lhs_null{}", idx),
-                    &DataType::Boolean,
-                    &ih,
-                )
-                .unwrap(),
-            )
-        } else {
-            None
-        };
-
-        let lhs_datum = &*arr as &dyn Datum;
-        let lhs_iter = datum_to_iter(lhs_datum)?;
-        let lhs_access = generate_random_access(
-            ctx,
-            &llvm_mod,
-            &format!("lhs_access{}", idx),
-            arr.data_type(),
-            &lhs_iter,
-        )
-        .unwrap();
-
-        let (key_arr, is_scalar) = key.get();
-        if !is_scalar {
-            return Err(ArrowKernelError::ArgumentMismatch(
-                "lower_bound requires scalar keys".to_string(),
-            ));
-        }
-        if key_arr.is_null(0) {
-            return Err(ArrowKernelError::UnsupportedArguments(
-                "lower_bound does not support null scalar keys".to_string(),
-            ));
-        }
-
-        let key_iter = datum_to_iter(*key)?;
-        let rhs_access = generate_random_access(
-            ctx,
-            &llvm_mod,
-            &format!("rhs_access{}", idx),
-            key_arr.data_type(),
-            &key_iter,
-        )
-        .ok_or_else(|| ArrowKernelError::UnsupportedScalar(key_arr.data_type().clone()))?;
-
-        let lhs_data_index = allocator.get_index(idx, ComparatorSide::Left, PointerKind::Data);
-        let lhs_null_index = if lhs_null_access.is_some() {
-            Some(allocator.get_index(idx, ComparatorSide::Left, PointerKind::Null))
-        } else {
-            None
-        };
-        let rhs_data_index = allocator.get_index(idx, ComparatorSide::Right, PointerKind::Data);
-
-        let lhs_accessor = FieldAccessor {
-            access: lhs_access,
-            null_access: lhs_null_access,
-            data_index: lhs_data_index,
-            null_index: lhs_null_index,
-        };
-        let rhs_accessor = FieldAccessor {
-            access: rhs_access,
-            null_access: None,
-            data_index: rhs_data_index,
-            null_index: None,
-        };
-
-        fields.push(ComparatorField {
-            primitive: ptype,
-            options: *opts,
-            lhs: lhs_accessor,
-            rhs: rhs_accessor,
-        });
-    }
-
-    fill_in_cmp(ctx, &llvm_mod, &fields, allocator.entries());
-    let pointer_layout = allocator.into_entries();
-
-    llvm_mod.verify().unwrap();
-    optimize_module(&llvm_mod)?;
-    let ee = llvm_mod
-        .create_jit_execution_engine(OptimizationLevel::Aggressive)
-        .unwrap();
-    link_req_helpers(&llvm_mod, &ee)?;
-
-    let cmp_func = unsafe {
-        ee.get_function::<unsafe extern "C" fn(*mut c_void, u64, u64) -> i8>("cmp")
-            .unwrap()
-    };
-
-    Ok((cmp_func, pointer_layout))
+    Ok(cmp_func)
 }
 
 #[cfg(test)]
 mod test {
     use crate::{
-        compiled_kernels::sort::{LowerBoundKernel, SortKernel, SortOptions},
+        compiled_kernels::sort::{SortKernel, SortOptions},
         Kernel,
     };
     use arrow_array::{
-        cast::AsArray, types::Int32Type, Array, ArrayRef, Datum, Float32Array, Int32Array,
-        Int64Array, Scalar, StringArray, UInt32Array,
+        cast::AsArray, types::Int32Type, Array, ArrayRef, Float32Array, Int32Array, Int64Array,
+        StringArray, UInt32Array,
     };
     use itertools::Itertools;
     use std::sync::Arc;
@@ -1317,17 +788,7 @@ mod test {
 
     #[test]
     fn test_sort_i32_nulls_first() {
-        let mut rng = fastrand::Rng::with_seed(42);
-        let data = (0..32)
-            .map(|_| {
-                if rng.bool() {
-                    Some(rng.i32(-1000..1000))
-                } else {
-                    None
-                }
-            })
-            .collect_vec();
-
+        let data = vec![Some(1), None, Some(3), None, Some(2)];
         let arr = Arc::new(Int32Array::from(data.clone())) as ArrayRef;
         let input = vec![&arr as &dyn Array];
 
@@ -1339,30 +800,15 @@ mod test {
             }],
         )
         .unwrap();
-        let our_res = k
+
+        let perm = k
             .call(input.clone())
             .unwrap()
             .into_iter()
             .map(|x| x.unwrap())
             .collect_vec();
 
-        let num_nulls = arr.null_count();
-        for i in 0..num_nulls {
-            assert!(
-                arr.is_null(our_res[i] as usize),
-                "index {} (null index {}) was not null",
-                our_res[i],
-                i
-            );
-        }
-
-        let sorted = data.iter().filter_map(|x| x.clone()).sorted().collect_vec();
-        let perm_values = our_res
-            .iter()
-            .filter(|idx| !arr.is_null(**idx as usize))
-            .map(|idx| arr.as_primitive::<Int32Type>().value(*idx as usize))
-            .collect_vec();
-        assert_eq!(perm_values, sorted);
+        assert_eq!(perm, vec![1, 3, 0, 4, 2]);
     }
 
     #[test]
@@ -1422,65 +868,5 @@ mod test {
         let res = res.iter().map(|x| x.unwrap()).collect_vec();
 
         assert_eq!(res, vec![1, 0, 3, 2]);
-    }
-
-    #[test]
-    fn test_lower_bound_basic() {
-        let array = Int32Array::from(vec![1, 3, 5, 7, 9]);
-        let arrays = vec![&array as &dyn Array];
-        let options = vec![SortOptions::default()];
-        let init_key = Scalar::new(Int32Array::from(vec![0]));
-        let kernel = LowerBoundKernel::compile(
-            &(arrays.clone(), vec![&init_key as &dyn Datum]),
-            options.clone(),
-        )
-        .unwrap();
-
-        let cases = vec![
-            (-1, 0u64),
-            (1, 0u64),
-            (4, 2u64),
-            (5, 2u64),
-            (6, 3u64),
-            (10, 5u64),
-        ];
-        for (value, expected) in cases {
-            let scalar = Scalar::new(Int32Array::from(vec![value]));
-            let result = kernel
-                .call((arrays.clone(), vec![&scalar as &dyn Datum]))
-                .unwrap();
-            assert_eq!(result, expected, "value {value}");
-        }
-    }
-
-    #[test]
-    fn test_lower_bound_with_nulls() {
-        let array = Int32Array::from(vec![Some(2), Some(4), None, None]);
-        let arrays = vec![&array as &dyn Array];
-        let options = vec![SortOptions::default()];
-        let init_key = Scalar::new(Int32Array::from(vec![0]));
-        let kernel = LowerBoundKernel::compile(
-            &(arrays.clone(), vec![&init_key as &dyn Datum]),
-            options.clone(),
-        )
-        .unwrap();
-
-        let scalar = Scalar::new(Int32Array::from(vec![1]));
-        let res = kernel
-            .call((arrays.clone(), vec![&scalar as &dyn Datum]))
-            .unwrap();
-        assert_eq!(res, 0);
-
-        let scalar = Scalar::new(Int32Array::from(vec![3]));
-        let res = kernel
-            .call((arrays.clone(), vec![&scalar as &dyn Datum]))
-            .unwrap();
-        assert_eq!(res, 1);
-
-        let scalar = Scalar::new(Int32Array::from(vec![6]));
-        let res = kernel
-            .call((arrays.clone(), vec![&scalar as &dyn Datum]))
-            .unwrap();
-        assert_eq!(res, 2);
     }
 }

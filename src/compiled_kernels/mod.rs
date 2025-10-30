@@ -34,7 +34,7 @@ use llvm_utils::str_writer_append_bytes;
 pub use partition::PartitionKernel;
 pub use range::RangeKernel;
 pub use rust_iter::{ArrowIter, ArrowNullableIter, IterFuncHolder};
-pub use sort::{LowerBoundKernel, SortKernel, SortOptions};
+pub use sort::{SortKernel, SortOptions};
 pub use string::{compile_string_like, string_contains, StringKernelType, StringStartEndKernel};
 pub use take::TakeKernel;
 
