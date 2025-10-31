@@ -395,7 +395,17 @@ struct ComparatorField<'a> {
     rhs_accessor: FunctionValue<'a>,
 }
 
-fn fill_in_cmp<'a>(ctx: &'a Context, llvm_mod: &Module<'a>, pts: &[ComparatorField<'a>]) {
+enum BreakTies {
+    ByIndex,
+    DoNotBreakTies,
+}
+
+fn fill_in_cmp<'a>(
+    ctx: &'a Context,
+    llvm_mod: &Module<'a>,
+    pts: &[ComparatorField<'a>],
+    break_ties: BreakTies,
+) {
     let mut all_cmps = Vec::new();
     for cf in pts.iter() {
         let cmp = generate_single_cmp(
@@ -504,14 +514,21 @@ fn fill_in_cmp<'a>(ctx: &'a Context, llvm_mod: &Module<'a>, pts: &[ComparatorFie
     }
 
     b.position_at_end(final_exit);
-    let f = get_ucmp(ctx, llvm_mod, ctx.i64_type().into());
-    let res = b
-        .build_call(f, &[idx1.into(), idx2.into()], "idx_cmp")
-        .unwrap()
-        .try_as_basic_value()
-        .unwrap_left()
-        .into_int_value();
-    b.build_return(Some(&res)).unwrap();
+    match break_ties {
+        BreakTies::ByIndex => {
+            let f = get_ucmp(ctx, llvm_mod, ctx.i64_type().into());
+            let res = b
+                .build_call(f, &[idx1.into(), idx2.into()], "idx_cmp")
+                .unwrap()
+                .try_as_basic_value()
+                .unwrap_left()
+                .into_int_value();
+            b.build_return(Some(&res)).unwrap();
+        }
+        BreakTies::DoNotBreakTies => {
+            b.build_return(Some(&i8_type.const_zero())).unwrap();
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Copy, Default)]
@@ -591,7 +608,6 @@ impl Kernel for SortKernel {
         let func = self.borrow_func();
         perm.sort_unstable_by(|a, b| {
             let res = unsafe { func.call(kp_ptr, *a as u64, *b as u64) };
-            println!("res: {} for a: {}, b: {}", res, a, b);
             debug_assert!(res == -1 || res == 0 || res == 1);
             unsafe { std::mem::transmute(res) }
         });
@@ -672,7 +688,7 @@ fn generate_sort<'a>(
             rhs_accessor: access,
         });
     }
-    fill_in_cmp(ctx, &llvm_mod, &config);
+    fill_in_cmp(ctx, &llvm_mod, &config, BreakTies::ByIndex);
 
     llvm_mod.verify().unwrap();
     optimize_module(&llvm_mod)?;
@@ -687,6 +703,304 @@ fn generate_sort<'a>(
     };
 
     Ok(cmp_func)
+}
+
+fn generate_lower_bound_cmp<'a>(
+    ctx: &'a Context,
+    keys: &[&dyn Array],
+    sorted: &[&dyn Array],
+    params: &[SortOptions],
+) -> Result<JitFunction<'a, unsafe extern "C" fn(*mut c_void, u64, u64) -> i8>, ArrowKernelError> {
+    let llvm_mod = ctx.create_module("lower_bound");
+
+    let mut config = Vec::new();
+    for (idx, ((key_arr, sorted_arr), opts)) in keys
+        .iter()
+        .zip(sorted.iter())
+        .zip(params.iter())
+        .enumerate()
+    {
+        let key_ptype = PrimitiveType::for_arrow_type(key_arr.data_type());
+        let sorted_ptype = PrimitiveType::for_arrow_type(sorted_arr.data_type());
+        if key_ptype != sorted_ptype {
+            return Err(ArrowKernelError::TypeMismatch(key_ptype, sorted_ptype));
+        }
+
+        let key_null_access = if let Some(nulls) = logical_nulls(*key_arr)? {
+            let ba = BooleanArray::from(nulls.inner().clone());
+            let ih = datum_to_iter(&ba)?;
+            Some(
+                generate_random_access(
+                    ctx,
+                    &llvm_mod,
+                    &format!("key_null{}", idx),
+                    &DataType::Boolean,
+                    &ih,
+                )
+                .unwrap(),
+            )
+        } else {
+            None
+        };
+
+        let key_iter = datum_to_iter(&*key_arr)?;
+        let key_access = generate_random_access(
+            ctx,
+            &llvm_mod,
+            &format!("key_access{}", idx),
+            key_arr.data_type(),
+            &key_iter,
+        )
+        .unwrap();
+
+        let sorted_null_access = if let Some(nulls) = logical_nulls(*sorted_arr)? {
+            let ba = BooleanArray::from(nulls.inner().clone());
+            let ih = datum_to_iter(&ba)?;
+            Some(
+                generate_random_access(
+                    ctx,
+                    &llvm_mod,
+                    &format!("sorted_null{}", idx),
+                    &DataType::Boolean,
+                    &ih,
+                )
+                .unwrap(),
+            )
+        } else {
+            None
+        };
+
+        let sorted_iter = datum_to_iter(&*sorted_arr)?;
+        let sorted_access = generate_random_access(
+            ctx,
+            &llvm_mod,
+            &format!("sorted_access{}", idx),
+            sorted_arr.data_type(),
+            &sorted_iter,
+        )
+        .unwrap();
+
+        config.push(ComparatorField {
+            ptype: key_ptype,
+            sort_options: *opts,
+            lhs_nulls: key_null_access,
+            lhs_accessor: key_access,
+            rhs_nulls: sorted_null_access,
+            rhs_accessor: sorted_access,
+        });
+    }
+
+    fill_in_cmp(ctx, &llvm_mod, &config, BreakTies::DoNotBreakTies);
+
+    llvm_mod.verify().unwrap();
+    optimize_module(&llvm_mod)?;
+    let ee = llvm_mod
+        .create_jit_execution_engine(OptimizationLevel::Aggressive)
+        .unwrap();
+    link_req_helpers(&llvm_mod, &ee)?;
+
+    let cmp_func = unsafe {
+        ee.get_function::<unsafe extern "C" fn(*mut c_void, u64, u64) -> i8>("cmp")
+            .unwrap()
+    };
+
+    Ok(cmp_func)
+}
+
+#[self_referencing]
+pub struct LowerBoundKernel {
+    context: Context,
+    key_nullable: Vec<bool>,
+    sorted_nullable: Vec<bool>,
+    options: Vec<SortOptions>,
+
+    #[borrows(context)]
+    #[covariant]
+    func: JitFunction<'this, unsafe extern "C" fn(*mut c_void, u64, u64) -> i8>,
+}
+
+unsafe impl Sync for LowerBoundKernel {}
+unsafe impl Send for LowerBoundKernel {}
+
+impl Kernel for LowerBoundKernel {
+    type Key = Vec<(DataType, bool, DataType, bool, SortOptions)>;
+
+    type Input<'a> = (Vec<&'a dyn Array>, Vec<&'a dyn Array>);
+
+    type Params = Vec<SortOptions>;
+
+    type Output = UInt32Array;
+
+    fn call(&self, inp: Self::Input<'_>) -> Result<Self::Output, super::ArrowKernelError> {
+        let (keys, sorted) = inp;
+
+        if keys.is_empty() {
+            return Err(ArrowKernelError::ArgumentMismatch(
+                "lower_bound requires at least one key column".to_string(),
+            ));
+        }
+
+        if keys.len() != sorted.len() {
+            return Err(ArrowKernelError::ArgumentMismatch(format!(
+                "expected the same number of key and sorted columns, got {} and {}",
+                keys.len(),
+                sorted.len()
+            )));
+        }
+
+        let key_len = keys[0].len();
+        for arr in keys.iter().skip(1) {
+            if arr.len() != key_len {
+                return Err(ArrowKernelError::SizeMismatch);
+            }
+        }
+
+        let sorted_len = sorted.get(0).map(|arr| arr.len()).unwrap_or(0);
+        for arr in sorted.iter().skip(1) {
+            if arr.len() != sorted_len {
+                return Err(ArrowKernelError::SizeMismatch);
+            }
+        }
+
+        let mut null_arrays = Vec::new();
+        let mut iters = Vec::new();
+        let mut ptrs = Vec::new();
+
+        for (idx, (key_arr, sorted_arr)) in keys.iter().zip(sorted.iter()).enumerate() {
+            iters.push(datum_to_iter(&*key_arr)?);
+            let key_data_ptr = iters.last_mut().unwrap().get_mut_ptr();
+            if let Some(nulls) = logical_nulls(*key_arr)? {
+                if !self.borrow_key_nullable()[idx] {
+                    return Err(ArrowKernelError::ArgumentMismatch(format!(
+                        "kernel expected non-nullable key column at index {}",
+                        idx
+                    )));
+                }
+                let ba = BooleanArray::from(nulls.inner().clone());
+                null_arrays.push(ba);
+                iters.push(datum_to_iter(&null_arrays.last().unwrap())?);
+                let null_ptr = iters.last_mut().unwrap().get_mut_ptr();
+                ptrs.push(key_data_ptr);
+                ptrs.push(null_ptr);
+            } else {
+                if self.borrow_key_nullable()[idx] {
+                    return Err(ArrowKernelError::ArgumentMismatch(format!(
+                        "kernel expected nullable key column at index {}",
+                        idx
+                    )));
+                }
+                ptrs.push(key_data_ptr);
+            }
+
+            iters.push(datum_to_iter(&*sorted_arr)?);
+            let sorted_data_ptr = iters.last_mut().unwrap().get_mut_ptr();
+            if let Some(nulls) = logical_nulls(*sorted_arr)? {
+                if !self.borrow_sorted_nullable()[idx] {
+                    return Err(ArrowKernelError::ArgumentMismatch(format!(
+                        "kernel expected non-nullable sorted column at index {}",
+                        idx
+                    )));
+                }
+                let ba = BooleanArray::from(nulls.inner().clone());
+                null_arrays.push(ba);
+                iters.push(datum_to_iter(&null_arrays.last().unwrap())?);
+                let null_ptr = iters.last_mut().unwrap().get_mut_ptr();
+                ptrs.push(sorted_data_ptr);
+                ptrs.push(null_ptr);
+            } else {
+                if self.borrow_sorted_nullable()[idx] {
+                    return Err(ArrowKernelError::ArgumentMismatch(format!(
+                        "kernel expected nullable sorted column at index {}",
+                        idx
+                    )));
+                }
+                ptrs.push(sorted_data_ptr);
+            }
+        }
+
+        let mut kp = KernelParameters::new(ptrs);
+        let kp_ptr = kp.get_mut_ptr();
+        let func = self.borrow_func();
+
+        let mut out = Vec::with_capacity(key_len);
+        for key_idx in 0..key_len {
+            let mut lo = 0u64;
+            let mut hi = sorted_len as u64;
+            while lo < hi {
+                let mid = (lo + hi) / 2;
+                let cmp = unsafe { func.call(kp_ptr, key_idx as u64, mid) } as i8;
+                if cmp <= 0 {
+                    hi = mid;
+                } else {
+                    lo = mid + 1;
+                }
+            }
+            out.push(lo as u32);
+        }
+
+        Ok(UInt32Array::from(out))
+    }
+
+    fn compile(
+        inp: &Self::Input<'_>,
+        params: Self::Params,
+    ) -> Result<Self, super::ArrowKernelError> {
+        let (keys, sorted) = inp;
+
+        if keys.is_empty() {
+            return Err(ArrowKernelError::ArgumentMismatch(
+                "lower_bound requires at least one column".to_string(),
+            ));
+        }
+
+        if keys.len() != sorted.len() || keys.len() != params.len() {
+            return Err(ArrowKernelError::ArgumentMismatch(format!(
+                "expected the same number of key, sorted, and option columns, got {} keys, {} sorted, {} options",
+                keys.len(),
+                sorted.len(),
+                params.len()
+            )));
+        }
+
+        let key_nullable = keys.iter().map(|arr| arr.is_nullable()).collect_vec();
+        let sorted_nullable = sorted.iter().map(|arr| arr.is_nullable()).collect_vec();
+
+        let ctx = Context::create();
+        LowerBoundKernelTryBuilder {
+            context: ctx,
+            key_nullable,
+            sorted_nullable,
+            options: params.clone(),
+            func_builder: |ctx| generate_lower_bound_cmp(ctx, keys, sorted, &params),
+        }
+        .try_build()
+    }
+
+    fn get_key_for_input(
+        i: &Self::Input<'_>,
+        p: &Self::Params,
+    ) -> Result<Self::Key, super::ArrowKernelError> {
+        let (keys, sorted) = i;
+
+        if keys.is_empty() {
+            return Err(ArrowKernelError::ArgumentMismatch(
+                "lower_bound requires at least one column".to_string(),
+            ));
+        }
+
+        let mut res = Vec::with_capacity(keys.len());
+        for ((key_arr, sorted_arr), opts) in keys.iter().zip(sorted.iter()).zip(p.iter()) {
+            res.push((
+                key_arr.data_type().clone(),
+                key_arr.is_nullable(),
+                sorted_arr.data_type().clone(),
+                sorted_arr.is_nullable(),
+                *opts,
+            ));
+        }
+
+        Ok(res)
+    }
 }
 
 #[cfg(test)]

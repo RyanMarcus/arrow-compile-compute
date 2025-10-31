@@ -199,11 +199,13 @@ pub mod sort {
     use arrow_array::{Array, UInt32Array};
 
     use crate::{
-        compiled_kernels::{KernelCache, SortKernel},
+        compiled_kernels::{KernelCache, LowerBoundKernel, SortKernel},
         ArrowKernelError, SortOptions,
     };
 
     static SORT_PROGRAM_CACHE: LazyLock<KernelCache<SortKernel>> = LazyLock::new(KernelCache::new);
+    static LOWER_BOUND_CACHE: LazyLock<KernelCache<LowerBoundKernel>> =
+        LazyLock::new(KernelCache::new);
 
     /// Returns an array of indices that would sort the input array. Combine
     /// this kernel with `take` to physically sort the array.
@@ -221,6 +223,31 @@ pub mod sort {
         options: &[SortOptions],
     ) -> Result<UInt32Array, ArrowKernelError> {
         SORT_PROGRAM_CACHE.get(arr.to_vec(), options.to_vec())
+    }
+
+    /// For each row of `keys`, returns the insertion point in `sorted`
+    /// preserving sort order (lower bound).
+    pub fn lower_bound(
+        keys: &[&dyn Array],
+        sorted: &[&dyn Array],
+        options: &[SortOptions],
+    ) -> Result<UInt32Array, ArrowKernelError> {
+        if keys.len() != sorted.len() || keys.len() != options.len() {
+            return Err(ArrowKernelError::ArgumentMismatch(format!(
+                "expected the same number of key, sorted, and option columns, got {} keys, {} sorted, {} options",
+                keys.len(),
+                sorted.len(),
+                options.len()
+            )));
+        }
+
+        if keys.is_empty() {
+            return Err(ArrowKernelError::ArgumentMismatch(
+                "lower_bound requires at least one column".to_string(),
+            ));
+        }
+
+        LOWER_BOUND_CACHE.get((keys.to_vec(), sorted.to_vec()), options.to_vec())
     }
 }
 
