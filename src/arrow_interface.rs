@@ -199,11 +199,12 @@ pub mod sort {
     use arrow_array::{Array, UInt32Array};
 
     use crate::{
-        compiled_kernels::{KernelCache, LowerBoundKernel, SortKernel},
+        compiled_kernels::{KernelCache, LowerBoundKernel, SortKernel, TopKKernel},
         ArrowKernelError, SortOptions,
     };
 
     static SORT_PROGRAM_CACHE: LazyLock<KernelCache<SortKernel>> = LazyLock::new(KernelCache::new);
+    static TOPK_PROGRAM_CACHE: LazyLock<KernelCache<TopKKernel>> = LazyLock::new(KernelCache::new);
     static LOWER_BOUND_CACHE: LazyLock<KernelCache<LowerBoundKernel>> =
         LazyLock::new(KernelCache::new);
 
@@ -223,6 +224,16 @@ pub mod sort {
         options: &[SortOptions],
     ) -> Result<UInt32Array, ArrowKernelError> {
         SORT_PROGRAM_CACHE.get(arr.to_vec(), options.to_vec())
+    }
+
+    /// Returns an array of indices that to the top K elements of the input
+    /// arrays.
+    pub fn topk_indices(
+        arr: &[&dyn Array],
+        options: &[SortOptions],
+        k: usize,
+    ) -> Result<UInt32Array, ArrowKernelError> {
+        TOPK_PROGRAM_CACHE.get((arr.to_vec(), k), options.to_vec())
     }
 
     /// For each row of `keys`, returns the insertion point in `sorted`

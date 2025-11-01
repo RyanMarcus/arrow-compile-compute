@@ -99,6 +99,49 @@ proptest! {
     }
 
     #[test]
+    fn test_topk_indices_i32(
+        data in proptest::collection::vec(any::<i32>(), 0..50),
+        descending in any::<bool>(),
+        raw_k in 0..50usize,
+    ) {
+        let k = match data.len() {
+            0 => 0,
+            len => raw_k.min(len.saturating_sub(1)),
+        };
+
+        let array = Int32Array::from(data.clone());
+        let arr_refs: [&dyn Array; 1] = [&array];
+        let options = [SortOptions {
+            descending,
+            ..SortOptions::default()
+        }];
+
+        let result = arrow_compile_compute::sort::topk_indices(&arr_refs, &options, k)
+            .unwrap()
+            .into_iter()
+            .map(|x| x.unwrap())
+            .collect_vec();
+
+        let mut expected = (0..data.len() as u32).collect_vec();
+        if descending {
+            expected.sort_by(|a, b| {
+                let lhs = data[*a as usize];
+                let rhs = data[*b as usize];
+                rhs.cmp(&lhs).then_with(|| a.cmp(b))
+            });
+        } else {
+            expected.sort_by(|a, b| {
+                let lhs = data[*a as usize];
+                let rhs = data[*b as usize];
+                lhs.cmp(&rhs).then_with(|| a.cmp(b))
+            });
+        }
+        expected.truncate(k);
+
+        assert_eq!(result, expected);
+    }
+
+    #[test]
     fn test_lower_bound_proptest(
         mut sorted in proptest::collection::vec(any::<i32>(), 0..40),
         keys in proptest::collection::vec(any::<i32>(), 0..40),
@@ -185,7 +228,12 @@ fn test_lower_bound_descending() {
 
     let expected: Vec<u32> = key_values
         .iter()
-        .map(|key| sorted_values.iter().position(|v| *v <= *key).unwrap_or(sorted_values.len()) as u32)
+        .map(|key| {
+            sorted_values
+                .iter()
+                .position(|v| *v <= *key)
+                .unwrap_or(sorted_values.len()) as u32
+        })
         .collect();
 
     assert_eq!(indices, expected);

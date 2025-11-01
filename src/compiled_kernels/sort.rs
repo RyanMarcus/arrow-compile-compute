@@ -642,6 +642,112 @@ impl Kernel for SortKernel {
     }
 }
 
+#[self_referencing]
+pub struct TopKKernel {
+    context: Context,
+    nullable: Vec<bool>,
+
+    #[borrows(context)]
+    #[covariant]
+    func: JitFunction<'this, unsafe extern "C" fn(*mut c_void, u64, u64) -> i8>,
+}
+
+unsafe impl Sync for TopKKernel {}
+unsafe impl Send for TopKKernel {}
+
+impl Kernel for TopKKernel {
+    type Key = Vec<(DataType, bool, SortOptions)>;
+
+    type Input<'a> = (Vec<&'a dyn Array>, usize);
+
+    type Params = Vec<SortOptions>;
+
+    type Output = UInt32Array;
+
+    fn call(&self, inp: Self::Input<'_>) -> Result<Self::Output, super::ArrowKernelError> {
+        let (arrs, k) = inp;
+        let len = arrs[0].len();
+        assert!(
+            arrs.iter().all(|arr| arr.len() == len),
+            "input arrays must have the same length"
+        );
+
+        let mut null_arrays = Vec::new();
+        let mut ihs = Vec::new();
+        let mut ptrs = Vec::new();
+
+        for (arr, nullable) in arrs.iter().zip(self.borrow_nullable().iter()) {
+            ihs.push(datum_to_iter(arr).unwrap());
+            let data_ptr = ihs.last_mut().unwrap().get_mut_ptr();
+            if let Some(nulls) = logical_nulls(*arr)? {
+                assert!(nullable, "kernel expected nullable input");
+                let ba = BooleanArray::from(nulls.inner().clone());
+                null_arrays.push(ba);
+                ihs.push(datum_to_iter(&null_arrays.last().unwrap()).unwrap());
+                let nulls_ptr = ihs.last_mut().unwrap().get_mut_ptr();
+                ptrs.push(data_ptr);
+                ptrs.push(nulls_ptr);
+                ptrs.push(data_ptr);
+                ptrs.push(nulls_ptr);
+            } else {
+                assert!(!nullable, "kernel expected non-nullable input");
+                ptrs.push(data_ptr);
+                ptrs.push(data_ptr);
+            }
+        }
+
+        let mut kp = KernelParameters::new(ptrs);
+        let mut perm = (0..len as u32).collect_vec();
+        let kp_ptr = kp.get_mut_ptr();
+        let func = self.borrow_func();
+
+        if k >= perm.len() {
+            return Ok(UInt32Array::from(perm));
+        }
+
+        perm.select_nth_unstable_by(k, |a, b| {
+            let res = unsafe { func.call(kp_ptr, *a as u64, *b as u64) };
+            debug_assert!(res == -1 || res == 0 || res == 1);
+            unsafe { std::mem::transmute(res) }
+        });
+
+        let mut perm = perm[..k].to_vec();
+        perm.sort_unstable_by(|a, b| {
+            let res = unsafe { func.call(kp_ptr, *a as u64, *b as u64) };
+            debug_assert!(res == -1 || res == 0 || res == 1);
+            unsafe { std::mem::transmute(res) }
+        });
+
+        let res = UInt32Array::from(perm);
+        Ok(res)
+    }
+
+    fn compile(
+        inp: &Self::Input<'_>,
+        params: Self::Params,
+    ) -> Result<Self, super::ArrowKernelError> {
+        let ctx = Context::create();
+        TopKKernelTryBuilder {
+            context: ctx,
+            nullable: inp.0.iter().map(|x| x.is_nullable()).collect_vec(),
+            func_builder: |ctx| generate_sort(ctx, &inp.0, &params),
+        }
+        .try_build()
+    }
+
+    fn get_key_for_input(
+        i: &Self::Input<'_>,
+        p: &Self::Params,
+    ) -> Result<Self::Key, super::ArrowKernelError> {
+        let mut keys = Vec::new();
+        for (arr, opts) in i.0.iter().zip(p.iter()) {
+            let nullable = arr.is_nullable();
+            keys.push((arr.data_type().clone(), nullable, *opts));
+        }
+        Ok(keys)
+    }
+}
+
 fn generate_sort<'a>(
     ctx: &'a Context,
     inp: &[&dyn Array],
@@ -1006,7 +1112,7 @@ impl Kernel for LowerBoundKernel {
 #[cfg(test)]
 mod test {
     use crate::{
-        compiled_kernels::sort::{SortKernel, SortOptions},
+        compiled_kernels::sort::{SortKernel, SortOptions, TopKKernel},
         Kernel,
     };
     use arrow_array::{
@@ -1182,5 +1288,18 @@ mod test {
         let res = res.iter().map(|x| x.unwrap()).collect_vec();
 
         assert_eq!(res, vec![1, 0, 3, 2]);
+    }
+
+    #[test]
+    fn test_topk_i32_nonnull_fwd() {
+        let data = vec![-10, 2, 7, 100, -274, 18, -22, 10000, -193, 18, 22, 12000];
+        let arr = Int32Array::from(data.clone());
+        let input = vec![&arr as &dyn Array];
+
+        let k = TopKKernel::compile(&(input.clone(), 3), vec![SortOptions::default()]).unwrap();
+
+        let our_res = k.call((input.clone(), 3)).unwrap();
+        let our_res = our_res.values().to_vec();
+        assert_eq!(our_res, vec![4, 8, 6]);
     }
 }
