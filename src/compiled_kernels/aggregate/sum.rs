@@ -58,7 +58,7 @@ impl Aggregation for SumAgg {
                 alloc1.iter_mut().zip(alloc2).for_each(|(a, b)| *a += b);
                 bytemuck::cast_vec(alloc1)
             }
-            PrimitiveType::P64x2 => unreachable!(),
+            PrimitiveType::P64x2 | PrimitiveType::List(_, _) => unreachable!(),
         }
     }
 
@@ -75,7 +75,7 @@ impl Aggregation for SumAgg {
                 let v: Vec<f64> = bytemuck::cast_vec(alloc);
                 Arc::new(Float64Array::from(v))
             }
-            PrimitiveType::P64x2 => unreachable!(),
+            PrimitiveType::P64x2 | PrimitiveType::List(_, _) => unreachable!(),
         }
     }
 

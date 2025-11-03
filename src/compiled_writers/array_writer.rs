@@ -37,6 +37,7 @@ impl WriterAllocation for ArrayOutput {
     fn get_ptr(&mut self) -> *mut c_void {
         self.out_ptr
     }
+
     fn to_array(self, len: usize, nulls: Option<NullBuffer>) -> Self::Output {
         let buf = Buffer::from(self.out);
         let buf = buf.slice_with_length(0, len * self.pt.width());

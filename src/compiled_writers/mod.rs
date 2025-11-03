@@ -13,6 +13,7 @@ use inkwell::{
 mod array_writer;
 mod bool_writer;
 mod dict_writer;
+mod fixed_size_list_writer;
 mod ree_writer;
 mod str_writer;
 mod view_writer;
@@ -20,6 +21,7 @@ mod view_writer;
 pub use array_writer::PrimitiveArrayWriter;
 pub use bool_writer::BooleanWriter;
 pub use dict_writer::DictWriter;
+pub use fixed_size_list_writer::FixedSizeListWriter;
 pub use ree_writer::REEWriter;
 pub use str_writer::StringArrayWriter;
 pub use view_writer::StringViewWriter;
@@ -65,6 +67,7 @@ pub trait WriterAllocation {
     /// write. The behavior of reusing a writer without calling this function is
     /// undefined.
     fn add_last_written_offset(&mut self, offset: usize);
+
     fn to_array(self, len: usize, nulls: Option<NullBuffer>) -> Self::Output;
     fn to_array_ref(self, len: usize, nulls: Option<NullBuffer>) -> ArrayRef;
 }

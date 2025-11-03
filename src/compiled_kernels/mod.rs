@@ -13,6 +13,7 @@ mod rust_iter;
 mod sort;
 mod string;
 mod take;
+mod vec;
 use std::sync::Arc;
 use std::{collections::HashMap, sync::RwLock};
 
@@ -37,6 +38,7 @@ pub use rust_iter::{ArrowIter, ArrowNullableIter, IterFuncHolder};
 pub use sort::{LowerBoundKernel, SortKernel, SortOptions, TopKKernel};
 pub use string::{compile_string_like, string_contains, StringKernelType, StringStartEndKernel};
 pub use take::TakeKernel;
+pub use vec::DotKernel;
 
 use dsl::DSLError;
 use inkwell::{

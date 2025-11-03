@@ -36,6 +36,7 @@ pub use arrow_interface::compute;
 pub use arrow_interface::iter;
 pub use arrow_interface::select;
 pub use arrow_interface::sort;
+pub use arrow_interface::vec;
 
 pub use compiled_kernels::compile_string_like;
 pub use compiled_kernels::ArrowKernelError;
@@ -214,6 +215,84 @@ pub fn logical_arrow_type(dt: &DataType) -> DataType {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum PrimitiveSuperType {
+    Int,
+    UInt,
+    Float,
+    String,
+    List(ListItemType, usize),
+}
+
+impl PrimitiveSuperType {
+    pub fn list_type_into_inner(&self) -> PrimitiveSuperType {
+        match self {
+            PrimitiveSuperType::List(t, _) => PrimitiveSuperType::from(PrimitiveType::from(*t)),
+            _ => *self,
+        }
+    }
+}
+
+impl From<PrimitiveType> for PrimitiveSuperType {
+    fn from(value: PrimitiveType) -> Self {
+        match value {
+            PrimitiveType::I8 | PrimitiveType::I16 | PrimitiveType::I32 | PrimitiveType::I64 => {
+                PrimitiveSuperType::Int
+            }
+            PrimitiveType::U8 | PrimitiveType::U16 | PrimitiveType::U32 | PrimitiveType::U64 => {
+                PrimitiveSuperType::UInt
+            }
+            PrimitiveType::F16 | PrimitiveType::F32 | PrimitiveType::F64 => {
+                PrimitiveSuperType::Float
+            }
+            PrimitiveType::P64x2 => PrimitiveSuperType::String,
+            PrimitiveType::List(t, s) => PrimitiveSuperType::List(t, s),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum ListItemType {
+    I8,
+    I16,
+    I32,
+    I64,
+    U8,
+    U16,
+    U32,
+    U64,
+    F16,
+    F32,
+    F64,
+    P64x2,
+}
+
+impl TryFrom<PrimitiveType> for ListItemType {
+    type Error = ArrowKernelError;
+
+    fn try_from(value: PrimitiveType) -> Result<Self, Self::Error> {
+        Ok(match value {
+            PrimitiveType::I8 => ListItemType::I8,
+            PrimitiveType::I16 => ListItemType::I16,
+            PrimitiveType::I32 => ListItemType::I32,
+            PrimitiveType::I64 => ListItemType::I64,
+            PrimitiveType::U8 => ListItemType::U8,
+            PrimitiveType::U16 => ListItemType::U16,
+            PrimitiveType::U32 => ListItemType::U32,
+            PrimitiveType::U64 => ListItemType::U64,
+            PrimitiveType::F16 => ListItemType::F16,
+            PrimitiveType::F32 => ListItemType::F32,
+            PrimitiveType::F64 => ListItemType::F64,
+            PrimitiveType::P64x2 => ListItemType::P64x2,
+            PrimitiveType::List(_, _) => {
+                return Err(ArrowKernelError::UnsupportedArguments(format!(
+                    "nested lists not supported"
+                )))
+            }
+        })
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum PrimitiveType {
     I8,
     I16,
@@ -223,10 +302,11 @@ pub enum PrimitiveType {
     U16,
     U32,
     U64,
-    P64x2,
     F16,
     F32,
     F64,
+    P64x2,
+    List(ListItemType, usize),
 }
 
 #[derive(Copy, Clone, Debug)]
@@ -234,6 +314,7 @@ enum ComparisonType {
     Int { signed: bool },
     Float,
     String,
+    List,
 }
 
 impl std::fmt::Display for PrimitiveType {
@@ -251,22 +332,15 @@ impl std::fmt::Display for PrimitiveType {
             PrimitiveType::F16 => "F16".fmt(f),
             PrimitiveType::F32 => "F32".fmt(f),
             PrimitiveType::F64 => "F64".fmt(f),
+            PrimitiveType::List(item_type, size) => {
+                write!(f, "List({:?}x{})", item_type, size)
+            }
         }
     }
 }
 
 impl PrimitiveType {
-    const fn max_width() -> usize {
-        16
-    }
-
-    const fn max_width_type() -> Self {
-        PrimitiveType::P64x2
-    }
-
-    const fn width(&self) -> usize {
-        // if any of these widths are updated, make sure to check `max_width` as
-        // well!
+    fn width(&self) -> usize {
         match self {
             PrimitiveType::I8 | PrimitiveType::U8 => 1,
             PrimitiveType::I16 | PrimitiveType::U16 => 2,
@@ -276,27 +350,27 @@ impl PrimitiveType {
             PrimitiveType::F16 => 2,
             PrimitiveType::F32 => 4,
             PrimitiveType::F64 => 8,
+            PrimitiveType::List(t, s) => PrimitiveType::from(*t).width() * s,
         }
     }
 
     fn llvm_type<'a>(&self, ctx: &'a Context) -> BasicTypeEnum<'a> {
+        let ptr_type = ctx.ptr_type(AddressSpace::default());
         match self {
             PrimitiveType::I8 | PrimitiveType::U8 => ctx.i8_type().into(),
             PrimitiveType::I16 | PrimitiveType::U16 => ctx.i16_type().into(),
             PrimitiveType::I32 | PrimitiveType::U32 => ctx.i32_type().into(),
             PrimitiveType::I64 | PrimitiveType::U64 => ctx.i64_type().into(),
             PrimitiveType::P64x2 => ctx
-                .struct_type(
-                    &[
-                        ctx.ptr_type(AddressSpace::default()).into(),
-                        ctx.ptr_type(AddressSpace::default()).into(),
-                    ],
-                    false,
-                )
+                .struct_type(&[ptr_type.into(), ptr_type.into()], false)
                 .into(),
             PrimitiveType::F16 => ctx.f16_type().into(),
             PrimitiveType::F32 => ctx.f32_type().into(),
             PrimitiveType::F64 => ctx.f64_type().into(),
+            PrimitiveType::List(t, s) => PrimitiveType::from(*t)
+                .llvm_vec_type(ctx, *s as u32)
+                .unwrap()
+                .into(),
         }
     }
 
@@ -306,10 +380,11 @@ impl PrimitiveType {
             PrimitiveType::I16 | PrimitiveType::U16 => Some(ctx.i16_type().vec_type(size)),
             PrimitiveType::I32 | PrimitiveType::U32 => Some(ctx.i32_type().vec_type(size)),
             PrimitiveType::I64 | PrimitiveType::U64 => Some(ctx.i64_type().vec_type(size)),
-            PrimitiveType::P64x2 => None,
             PrimitiveType::F16 => Some(ctx.f16_type().vec_type(size)),
             PrimitiveType::F32 => Some(ctx.f32_type().vec_type(size)),
             PrimitiveType::F64 => Some(ctx.f64_type().vec_type(size)),
+            PrimitiveType::P64x2 => None,
+            PrimitiveType::List(_, _) => None,
         }
     }
 
@@ -333,6 +408,12 @@ impl PrimitiveType {
             DataType::Binary => PrimitiveType::P64x2, // binary
             DataType::LargeUtf8 => PrimitiveType::P64x2, // string view
             DataType::Utf8View => PrimitiveType::P64x2, // string view
+            DataType::FixedSizeList(f, l) => PrimitiveType::List(
+                PrimitiveType::for_arrow_type(f.data_type())
+                    .try_into()
+                    .unwrap(),
+                *l as usize,
+            ),
             _ => todo!("no prim type for {:?}", dt),
         }
     }
@@ -351,6 +432,13 @@ impl PrimitiveType {
             PrimitiveType::F16 => DataType::Float16,
             PrimitiveType::F32 => DataType::Float32,
             PrimitiveType::F64 => DataType::Float64,
+            PrimitiveType::List(t, s) => DataType::FixedSizeList(
+                Arc::new(Field::new_list_field(
+                    PrimitiveType::from(*t).as_arrow_type(),
+                    false,
+                )),
+                *s as i32,
+            ),
         }
     }
 
@@ -373,12 +461,8 @@ impl PrimitiveType {
             PrimitiveType::I8 | PrimitiveType::I16 | PrimitiveType::I32 | PrimitiveType::I64 => {
                 true
             }
-            PrimitiveType::U8
-            | PrimitiveType::U16
-            | PrimitiveType::U32
-            | PrimitiveType::U64
-            | PrimitiveType::P64x2 => false,
             PrimitiveType::F16 | PrimitiveType::F32 | PrimitiveType::F64 => true,
+            _ => false,
         }
     }
 
@@ -392,15 +476,25 @@ impl PrimitiveType {
             | PrimitiveType::U16
             | PrimitiveType::U32
             | PrimitiveType::U64 => true,
-            PrimitiveType::P64x2 | PrimitiveType::F16 | PrimitiveType::F32 | PrimitiveType::F64 => {
-                false
-            }
+            _ => false,
         }
     }
 
     /// Returns the "best" common value to cast both types to in order to
     /// perform a comparison. Returns `None` if there is no compatible type.
     fn dominant(lhs_prim: PrimitiveType, rhs_prim: PrimitiveType) -> Option<PrimitiveType> {
+        if let PrimitiveType::List(lt, ls) = lhs_prim {
+            if let PrimitiveType::List(rt, rs) = rhs_prim {
+                if lt == rt && ls == rs {
+                    return Some(PrimitiveType::List(lt, ls));
+                } else {
+                    return None;
+                }
+            } else {
+                return None;
+            }
+        }
+
         if matches!(lhs_prim, PrimitiveType::P64x2) && matches!(rhs_prim, PrimitiveType::P64x2) {
             Some(PrimitiveType::P64x2)
         } else if matches!(lhs_prim, PrimitiveType::P64x2)
@@ -425,7 +519,35 @@ impl PrimitiveType {
                 ComparisonType::Int { signed: false }
             }
             PrimitiveType::P64x2 => ComparisonType::String,
+            PrimitiveType::List(_, _) => ComparisonType::List,
             PrimitiveType::F16 | PrimitiveType::F32 | PrimitiveType::F64 => ComparisonType::Float,
+        }
+    }
+
+    /// Returns either self or the inner type of a list
+    pub fn list_type_into_inner(&self) -> PrimitiveType {
+        match self {
+            PrimitiveType::List(t, _) => PrimitiveType::from(*t),
+            _ => *self,
+        }
+    }
+}
+
+impl From<ListItemType> for PrimitiveType {
+    fn from(value: ListItemType) -> Self {
+        match value {
+            ListItemType::I8 => PrimitiveType::I8,
+            ListItemType::I16 => PrimitiveType::I16,
+            ListItemType::I32 => PrimitiveType::I32,
+            ListItemType::I64 => PrimitiveType::I64,
+            ListItemType::U8 => PrimitiveType::U8,
+            ListItemType::U16 => PrimitiveType::U16,
+            ListItemType::U32 => PrimitiveType::U32,
+            ListItemType::U64 => PrimitiveType::U64,
+            ListItemType::F16 => PrimitiveType::F16,
+            ListItemType::F32 => PrimitiveType::F32,
+            ListItemType::F64 => PrimitiveType::F64,
+            ListItemType::P64x2 => PrimitiveType::P64x2,
         }
     }
 }

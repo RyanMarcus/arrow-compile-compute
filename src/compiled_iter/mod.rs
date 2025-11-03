@@ -1,5 +1,6 @@
 mod bitmap;
 mod dictionary;
+mod fixed_size_list;
 mod primitive;
 mod runend;
 mod scalar;
@@ -37,7 +38,11 @@ use setbit::SetBitIterator;
 use string::{LargeStringIterator, StringIterator};
 
 use crate::{
-    compiled_iter::{scalar::ScalarBinaryIterator, view::ViewIterator},
+    compiled_iter::{
+        fixed_size_list::FixedSizeListIterator,
+        scalar::{ScalarBinaryIterator, ScalarVectorIterator},
+        view::ViewIterator,
+    },
     declare_blocks, increment_pointer, set_noalias_params, ArrowKernelError, PrimitiveType,
 };
 
@@ -114,7 +119,9 @@ fn array_to_iter(arr: &dyn Array) -> IteratorHolder {
         }
         arrow_schema::DataType::List(_field) => todo!(),
         arrow_schema::DataType::ListView(_field) => todo!(),
-        arrow_schema::DataType::FixedSizeList(_field, _) => todo!(),
+        arrow_schema::DataType::FixedSizeList(_field, _) => {
+            IteratorHolder::FixedSizeList(arr.as_fixed_size_list().into())
+        }
         arrow_schema::DataType::LargeList(_field) => todo!(),
         arrow_schema::DataType::LargeListView(_field) => todo!(),
         arrow_schema::DataType::Struct(_fields) => todo!(),
@@ -187,10 +194,53 @@ pub fn datum_to_iter(val: &dyn Datum) -> Result<IteratorHolder, ArrowKernelError
                 .to_owned()
                 .into_boxed_str()
                 .into()),
-            DataType::Utf8View => todo!(),
+            DataType::Utf8View => Ok(d
+                .as_string_view()
+                .value(0)
+                .to_owned()
+                .into_boxed_str()
+                .into()),
             DataType::List(_field) => todo!(),
             DataType::ListView(_field) => todo!(),
-            DataType::FixedSizeList(_field, _) => todo!(),
+            DataType::FixedSizeList(_, _) => {
+                let value = d.as_fixed_size_list().value(0);
+                match value.data_type() {
+                    DataType::Int8 => Ok(IteratorHolder::ScalarVec(
+                        ScalarVectorIterator::from_primitive(value.as_primitive::<Int8Type>()),
+                    )),
+                    DataType::Int16 => Ok(IteratorHolder::ScalarVec(
+                        ScalarVectorIterator::from_primitive(value.as_primitive::<Int16Type>()),
+                    )),
+                    DataType::Int32 => Ok(IteratorHolder::ScalarVec(
+                        ScalarVectorIterator::from_primitive(value.as_primitive::<Int32Type>()),
+                    )),
+                    DataType::Int64 => Ok(IteratorHolder::ScalarVec(
+                        ScalarVectorIterator::from_primitive(value.as_primitive::<Int64Type>()),
+                    )),
+                    DataType::UInt8 => Ok(IteratorHolder::ScalarVec(
+                        ScalarVectorIterator::from_primitive(value.as_primitive::<UInt8Type>()),
+                    )),
+                    DataType::UInt16 => Ok(IteratorHolder::ScalarVec(
+                        ScalarVectorIterator::from_primitive(value.as_primitive::<UInt16Type>()),
+                    )),
+                    DataType::UInt32 => Ok(IteratorHolder::ScalarVec(
+                        ScalarVectorIterator::from_primitive(value.as_primitive::<UInt32Type>()),
+                    )),
+                    DataType::UInt64 => Ok(IteratorHolder::ScalarVec(
+                        ScalarVectorIterator::from_primitive(value.as_primitive::<UInt64Type>()),
+                    )),
+                    DataType::Float16 => Ok(IteratorHolder::ScalarVec(
+                        ScalarVectorIterator::from_primitive(value.as_primitive::<Float16Type>()),
+                    )),
+                    DataType::Float32 => Ok(IteratorHolder::ScalarVec(
+                        ScalarVectorIterator::from_primitive(value.as_primitive::<Float32Type>()),
+                    )),
+                    DataType::Float64 => Ok(IteratorHolder::ScalarVec(
+                        ScalarVectorIterator::from_primitive(value.as_primitive::<Float64Type>()),
+                    )),
+                    _ => todo!(),
+                }
+            }
             DataType::LargeList(_field) => todo!(),
             DataType::LargeListView(_field) => todo!(),
             DataType::Struct(_fields) => todo!(),
@@ -223,9 +273,11 @@ pub enum IteratorHolder {
         run_ends: Box<IteratorHolder>,
         values: Box<IteratorHolder>,
     },
+    FixedSizeList(Box<FixedSizeListIterator>),
     ScalarPrimitive(Box<ScalarPrimitiveIterator>),
     ScalarString(Box<ScalarStringIterator>),
     ScalarBinary(Box<ScalarBinaryIterator>),
+    ScalarVec(Box<ScalarVectorIterator>),
 }
 
 impl IteratorHolder {
@@ -241,9 +293,11 @@ impl IteratorHolder {
             IteratorHolder::SetBit(iter) => &mut **iter as *mut _ as *mut c_void,
             IteratorHolder::Dictionary { arr: iter, .. } => &mut **iter as *mut _ as *mut c_void,
             IteratorHolder::RunEnd { arr: iter, .. } => &mut **iter as *mut _ as *mut c_void,
+            IteratorHolder::FixedSizeList(iter) => &mut **iter as *mut _ as *mut c_void,
             IteratorHolder::ScalarPrimitive(iter) => &mut **iter as *mut _ as *mut c_void,
             IteratorHolder::ScalarString(iter) => &mut **iter as *mut _ as *mut c_void,
             IteratorHolder::ScalarBinary(iter) => &mut **iter as *mut _ as *mut c_void,
+            IteratorHolder::ScalarVec(iter) => &mut **iter as *mut _ as *mut c_void,
         }
     }
 
@@ -266,9 +320,11 @@ impl IteratorHolder {
             IteratorHolder::SetBit(iter) => &**iter as *const _ as *const c_void,
             IteratorHolder::Dictionary { arr: iter, .. } => &**iter as *const _ as *const c_void,
             IteratorHolder::RunEnd { arr: iter, .. } => &**iter as *const _ as *const c_void,
+            IteratorHolder::FixedSizeList(iter) => &**iter as *const _ as *const c_void,
             IteratorHolder::ScalarPrimitive(iter) => &**iter as *const _ as *const c_void,
             IteratorHolder::ScalarString(iter) => &**iter as *const _ as *const c_void,
             IteratorHolder::ScalarBinary(iter) => &**iter as *const _ as *const c_void,
+            IteratorHolder::ScalarVec(iter) => &**iter as *const _ as *const c_void,
         }
     }
 
@@ -282,6 +338,7 @@ impl IteratorHolder {
     ) -> PointerValue<'a> {
         match self {
             IteratorHolder::Primitive(i) => i.localize_struct(ctx, b, ptr),
+            IteratorHolder::FixedSizeList(i) => i.localize_struct(ctx, b, ptr),
             _ => ptr,
         }
     }
@@ -711,6 +768,7 @@ pub fn generate_next_block<'a, const N: u32>(
             }
             _ => unreachable!("run-end iterator but not run-end data type ({:?})", dt),
         },
+        IteratorHolder::FixedSizeList(_) => None,
         IteratorHolder::ScalarPrimitive(s) => {
             assert_eq!(ptype.width(), s.width as usize);
             let get_next_single = generate_next(
@@ -746,6 +804,7 @@ pub fn generate_next_block<'a, const N: u32>(
         }
         IteratorHolder::ScalarString(_) => None,
         IteratorHolder::ScalarBinary(_) => None,
+        IteratorHolder::ScalarVec(_) => None,
     };
 
     match res {
@@ -1310,6 +1369,37 @@ pub fn generate_next<'a>(
             }
             _ => unreachable!("run-end iterator but not run-end data type ({:?})", dt),
         },
+        IteratorHolder::FixedSizeList(iter) => {
+            declare_blocks!(ctx, next, entry, none_left, get_next);
+
+            build.position_at_end(entry);
+            let curr_pos = iter.llvm_pos(ctx, &build, iter_ptr);
+            let curr_len = iter.llvm_len(ctx, &build, iter_ptr);
+            let have_more = build
+                .build_int_compare(IntPredicate::ULT, curr_pos, curr_len, "have_enough")
+                .unwrap();
+            build
+                .build_conditional_branch(have_more, get_next, none_left)
+                .unwrap();
+
+            build.position_at_end(none_left);
+            build
+                .build_return(Some(&bool_type.const_int(0, false)))
+                .unwrap();
+
+            build.position_at_end(get_next);
+            // there are at least n elements left, we can load them and increment
+            let data_ptr = iter.llvm_data(ctx, &build, iter_ptr);
+            let data_ptr = increment_pointer!(ctx, build, data_ptr, ptype.width(), curr_pos);
+            let out = build.build_load(llvm_type, data_ptr, "elem").unwrap();
+            build.build_store(out_ptr, out).unwrap();
+            iter.llvm_increment_pos(ctx, &build, iter_ptr, i64_type.const_int(1, false));
+            build
+                .build_return(Some(&bool_type.const_int(1, false)))
+                .unwrap();
+
+            Some(next)
+        }
         IteratorHolder::ScalarPrimitive(s) => {
             assert_eq!(ptype.width(), s.width as usize);
             declare_blocks!(ctx, next, entry);
@@ -1435,6 +1525,17 @@ pub fn generate_next<'a>(
                 .build_insert_value(to_return, ptr2, 1, "to_return")
                 .unwrap();
             build.build_store(out_ptr, to_return).unwrap();
+            build
+                .build_return(Some(&bool_type.const_int(1, false)))
+                .unwrap();
+
+            Some(next)
+        }
+        IteratorHolder::ScalarVec(iter) => {
+            declare_blocks!(ctx, next, entry);
+            build.position_at_end(entry);
+            let val = iter.llvm_val(ctx, &build, iter_ptr);
+            build.build_store(out_ptr, val).unwrap();
             build
                 .build_return(Some(&bool_type.const_int(1, false)))
                 .unwrap();
@@ -1740,6 +1841,17 @@ pub fn generate_random_access<'a>(
 
             build.position_at_end(entry);
             let data_ptr = primitive_iter.llvm_data(ctx, &build, iter_ptr);
+            let data_ptr = increment_pointer!(ctx, build, data_ptr, ptype.width(), idx);
+            let out = build.build_load(llvm_type, data_ptr, "elem").unwrap();
+            build.build_return(Some(&out)).unwrap();
+
+            Some(access_f)
+        }
+        IteratorHolder::FixedSizeList(iter) => {
+            declare_blocks!(ctx, access_f, entry);
+
+            build.position_at_end(entry);
+            let data_ptr = iter.llvm_data(ctx, &build, iter_ptr);
             let data_ptr = increment_pointer!(ctx, build, data_ptr, ptype.width(), idx);
             let out = build.build_load(llvm_type, data_ptr, "elem").unwrap();
             build.build_return(Some(&out)).unwrap();
@@ -2068,5 +2180,10 @@ pub fn generate_random_access<'a>(
         IteratorHolder::ScalarPrimitive(_) => None,
         IteratorHolder::ScalarString(_) => None,
         IteratorHolder::ScalarBinary(_) => None,
+        IteratorHolder::ScalarVec(iter) => {
+            let val = iter.llvm_val(ctx, &build, iter_ptr);
+            build.build_return(Some(&val)).unwrap();
+            Some(access_f)
+        }
     }
 }

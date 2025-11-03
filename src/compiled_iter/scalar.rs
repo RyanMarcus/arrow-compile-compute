@@ -78,11 +78,18 @@ impl From<u64> for IteratorHolder {
     }
 }
 
+use arrow_array::{Array, ArrowPrimitiveType, PrimitiveArray};
+use arrow_buffer::ToByteSlice;
 use half::f16;
-use inkwell::{builder::Builder, context::Context, values::PointerValue};
+use inkwell::{
+    builder::Builder,
+    context::Context,
+    values::{PointerValue, VectorValue},
+    AddressSpace,
+};
 use repr_offset::ReprOffset;
 
-use crate::increment_pointer;
+use crate::{increment_pointer, mark_load_invariant, ListItemType, PrimitiveType};
 
 use super::IteratorHolder;
 impl From<f16> for IteratorHolder {
@@ -174,6 +181,57 @@ impl From<Box<[u8]>> for IteratorHolder {
             ptr2: p2,
             val,
         }))
+    }
+}
+
+#[repr(C)]
+#[derive(ReprOffset, Debug)]
+#[roff(usize_offsets)]
+pub struct ScalarVectorIterator {
+    ptype: ListItemType,
+    l: usize,
+    val: Box<[u8]>,
+}
+
+impl ScalarVectorIterator {
+    pub fn from_primitive<K: ArrowPrimitiveType>(arr: &PrimitiveArray<K>) -> Box<Self> {
+        let ptype = PrimitiveType::for_arrow_type(arr.data_type())
+            .try_into()
+            .unwrap();
+        let l = arr.len();
+        let val = arr
+            .values()
+            .inner()
+            .to_byte_slice()
+            .to_vec()
+            .into_boxed_slice();
+        Box::new(ScalarVectorIterator { ptype, l, val })
+    }
+
+    pub fn llvm_val<'a>(
+        &self,
+        ctx: &'a Context,
+        builder: &'a Builder,
+        ptr: PointerValue<'a>,
+    ) -> VectorValue<'a> {
+        let ptr_type = ctx.ptr_type(AddressSpace::default());
+        let val_ptr_ptr = increment_pointer!(ctx, builder, ptr, ScalarBinaryIterator::OFFSET_VAL);
+        let val_ptr = builder
+            .build_load(ptr_type, val_ptr_ptr, "val_ptr")
+            .unwrap()
+            .into_pointer_value();
+        mark_load_invariant!(ctx, val_ptr);
+
+        let vec_type = PrimitiveType::from(self.ptype)
+            .llvm_vec_type(ctx, self.l as u32)
+            .unwrap();
+        let val = builder
+            .build_load(vec_type, val_ptr, "val")
+            .unwrap()
+            .into_vector_value();
+        mark_load_invariant!(ctx, val);
+
+        val
     }
 }
 

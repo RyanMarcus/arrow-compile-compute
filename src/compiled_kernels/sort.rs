@@ -370,6 +370,7 @@ fn generate_single_cmp<'a>(
             b2.build_return(Some(&res)).unwrap();
             cmp_f
         }
+        PrimitiveType::List(_, _) => todo!(),
     };
 
     let cmp = if sort_opts.descending {

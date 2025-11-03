@@ -1,3 +1,4 @@
+use paste::paste;
 use std::{
     collections::{BTreeMap, BTreeSet, HashMap},
     ffi::c_void,
@@ -18,6 +19,7 @@ use inkwell::{
     builder::Builder,
     context::Context,
     execution_engine::JitFunction,
+    intrinsics::Intrinsic,
     module::{Linkage, Module},
     types::{BasicType, BasicTypeEnum},
     values::{BasicValue, BasicValueEnum, FunctionValue, PointerValue, VectorValue},
@@ -39,11 +41,11 @@ use crate::{
         gen_convert_numeric_vec, link_req_helpers, optimize_module,
     },
     compiled_writers::{
-        ArrayWriter, BooleanWriter, DictWriter, PrimitiveArrayWriter, REEWriter, StringArrayWriter,
-        StringViewWriter, WriterAllocation,
+        ArrayWriter, BooleanWriter, DictWriter, FixedSizeListWriter, PrimitiveArrayWriter,
+        REEWriter, StringArrayWriter, StringViewWriter, WriterAllocation,
     },
     declare_blocks, increment_pointer, pointer_diff, set_noalias_params, ComparisonType, Predicate,
-    PrimitiveType,
+    PrimitiveSuperType, PrimitiveType,
 };
 
 use super::ArrowKernelError;
@@ -51,6 +53,94 @@ use super::ArrowKernelError;
 mod string_funcs;
 
 const VEC_SIZE: u32 = 64;
+
+macro_rules! vec_or_scalar_op {
+    ($builder: expr, $func_name: ident, $v1: expr, $v2: expr) => {
+        match ($v1, $v2) {
+            (BasicValueEnum::IntValue(v1), BasicValueEnum::IntValue(v2)) => Ok(
+                paste! { $builder. [<build_int_ $func_name>] (v1, v2, "int_op") }
+                    .unwrap()
+                    .as_basic_value_enum(),
+            ),
+            (BasicValueEnum::FloatValue(v1), BasicValueEnum::FloatValue(v2)) => Ok(
+                paste! { $builder. [<build_float_ $func_name>] (v1, v2, "float_op") }
+                    .unwrap()
+                    .as_basic_value_enum(),
+            ),
+            (BasicValueEnum::VectorValue(v1), BasicValueEnum::VectorValue(v2)) => {
+                match (
+                    v1.get_type().get_element_type(),
+                    v2.get_type().get_element_type(),
+                ) {
+                    (BasicTypeEnum::IntType(_), BasicTypeEnum::IntType(_)) => Ok(
+                        paste! { $builder. [<build_int_ $func_name>] (v1, v2, "int_vec_op") }
+                            .unwrap()
+                            .as_basic_value_enum(),
+                    ),
+                    (BasicTypeEnum::FloatType(_), BasicTypeEnum::FloatType(_)) => Ok(
+                        paste! { $builder. [<build_float_ $func_name>] (v1, v2, "float_vec_op") }
+                            .unwrap()
+                            .as_basic_value_enum(),
+                    ),
+                    _ => Err(DSLError::TypeMismatch(format!(
+                        "invalid vector types for {}",
+                        stringify!($func_name)
+                    ))),
+                }
+            }
+            _ => panic!("Unsupported types for addition"),
+        }
+    };
+}
+
+macro_rules! signed_vec_or_scalar_op {
+    ($builder: expr, $func_name: ident, $signed: expr, $v1: expr, $v2: expr) => {
+        match ($v1, $v2) {
+            (BasicValueEnum::IntValue(v1), BasicValueEnum::IntValue(v2)) => Ok(
+                if $signed {
+                    paste! { $builder. [<build_int_signed_ $func_name>] (v1, v2, "int_op") }
+                        .unwrap()
+                        .as_basic_value_enum()
+                } else {
+                    paste! { $builder. [<build_int_unsigned_ $func_name>] (v1, v2, "int_op") }
+                        .unwrap()
+                        .as_basic_value_enum()
+                }
+            ),
+            (BasicValueEnum::FloatValue(v1), BasicValueEnum::FloatValue(v2)) => Ok(
+                paste! { $builder. [<build_float_ $func_name>] (v1, v2, "float_op") }
+                    .unwrap()
+                    .as_basic_value_enum()
+            ),
+            (BasicValueEnum::VectorValue(v1), BasicValueEnum::VectorValue(v2)) => {
+                match (
+                    v1.get_type().get_element_type(),
+                    v2.get_type().get_element_type(),
+                ) {
+                    (BasicTypeEnum::IntType(_), BasicTypeEnum::IntType(_)) => Ok(
+                        if $signed {
+                            paste! { $builder. [<build_int_signed_ $func_name>] (v1, v2, "int_vec_op") }
+                        } else {
+                            paste! { $builder. [<build_int_unsigned_ $func_name>] (v1, v2, "int_vec_op") }
+                        }
+                        .unwrap()
+                        .as_basic_value_enum()
+                    ),
+                    (BasicTypeEnum::FloatType(_), BasicTypeEnum::FloatType(_)) => Ok(
+                        paste! { $builder. [<build_float_ $func_name>] (v1, v2, "float_vec_op") }
+                            .unwrap()
+                            .as_basic_value_enum()
+                    ),
+                    _ => Err(DSLError::TypeMismatch(format!(
+                        "invalid vector types for {}",
+                        stringify!($func_name)
+                    ))),
+                }
+            }
+            _ => panic!("Unsupported types for addition"),
+        }
+    };
+}
 
 // Shared state reused while recursively lowering expressions.
 struct CompilationContext<'ctx, 'b> {
@@ -69,18 +159,28 @@ struct CompilationContext<'ctx, 'b> {
 pub enum DSLError {
     #[error("Invalid input index: {0}")]
     InvalidInputIndex(usize),
+
     #[error("Invalid kernel output length: {0}")]
     InvalidKernelOutputLength(usize),
+
     #[error("Type mismatch: {0}")]
     TypeMismatch(String),
+
     #[error("Boolean expected: {0}")]
     BooleanExpected(String),
+
     #[error("Unused input: {0}")]
     UnusedInput(String),
+
     #[error("Unsupported dictionary value type: {0}")]
     UnsupportedDictionaryValueType(DataType),
+
+    #[error("Unsupported list value type: {0}")]
+    UnsupportedListValueType(DataType),
+
     #[error("No iteration")]
     NoIteration,
+
     #[error("Not vectorizable: {0}")]
     NotVectorizable(&'static str),
 }
@@ -189,6 +289,7 @@ pub enum KernelOutputType {
     String,
     View,
     Boolean,
+    FixedSizeList(usize),
     Dictionary(DictKeyType),
     RunEnd(RunEndType),
 }
@@ -223,7 +324,7 @@ impl KernelOutputType {
             DataType::FixedSizeBinary(_) => todo!(),
             DataType::List(..) => todo!(),
             DataType::ListView(..) => todo!(),
-            DataType::FixedSizeList(..) => todo!(),
+            DataType::FixedSizeList(_f, l) => Ok(KernelOutputType::FixedSizeList(*l as usize)),
             DataType::LargeList(..) => todo!(),
             DataType::LargeListView(..) => todo!(),
             DataType::Struct(..) => todo!(),
@@ -261,14 +362,15 @@ impl KernelOutputType {
     /// result in booleans.
     fn can_collect(&self, dt: &DataType) -> Result<(), DSLError> {
         match self {
-            KernelOutputType::Array => {
-                if PrimitiveType::for_arrow_type(dt) == PrimitiveType::P64x2 {
+            KernelOutputType::Array => match PrimitiveType::for_arrow_type(dt) {
+                PrimitiveType::P64x2 | PrimitiveType::List(_, _) => {
                     return Err(DSLError::TypeMismatch(format!(
                         "array output type can only collect primitives, but expression has type {}",
-                        dt
-                    )));
+                        PrimitiveType::for_arrow_type(dt)
+                    )))
                 }
-            }
+                _ => {}
+            },
             KernelOutputType::String => {
                 if PrimitiveType::for_arrow_type(dt) != PrimitiveType::P64x2 {
                     return Err(DSLError::TypeMismatch(format!(
@@ -295,7 +397,16 @@ impl KernelOutputType {
             }
             KernelOutputType::Dictionary(_) => {}
             KernelOutputType::RunEnd(_) => {}
-        };
+            KernelOutputType::FixedSizeList(l) => {
+                return match PrimitiveType::for_arrow_type(dt) {
+                    PrimitiveType::List(_, s) if s == *l => Ok(()),
+                    _ => Err(DSLError::TypeMismatch(format!(
+                        "cannot collect type {} into fixed size list<{}>",
+                        dt, l
+                    ))),
+                }
+            }
+        }
 
         Ok(())
     }
@@ -345,6 +456,7 @@ pub enum KernelExpression<'a> {
     Mul(Box<KernelExpression<'a>>, Box<KernelExpression<'a>>),
     Div(Box<KernelExpression<'a>>, Box<KernelExpression<'a>>),
     Rem(Box<KernelExpression<'a>>, Box<KernelExpression<'a>>),
+    VectorSum(Box<KernelExpression<'a>>),
     StartsWith(Box<KernelExpression<'a>>, Box<KernelExpression<'a>>),
     EndsWith(Box<KernelExpression<'a>>, Box<KernelExpression<'a>>),
     StrLen(Box<KernelExpression<'a>>),
@@ -429,6 +541,12 @@ impl<'a> KernelExpression<'a> {
     pub fn mul(&self, other: &KernelExpression<'a>) -> KernelExpression<'a> {
         KernelExpression::Mul(Box::new(self.clone()), Box::new(other.clone()))
     }
+
+    /// Sums all the elements into a vector, mapping the vector to a scalar
+    pub fn vec_sum(&self) -> KernelExpression<'a> {
+        KernelExpression::VectorSum(Box::new(self.clone()))
+    }
+
     pub fn starts_with(&self, other: &KernelExpression<'a>) -> KernelExpression<'a> {
         KernelExpression::StartsWith(Box::new(self.clone()), Box::new(other.clone()))
     }
@@ -499,7 +617,9 @@ impl<'a> KernelExpression<'a> {
                 f(self);
                 idx.descend(f);
             }
-            KernelExpression::Convert(expr, ..) | KernelExpression::StrLen(expr) => {
+            KernelExpression::Convert(expr, ..)
+            | KernelExpression::StrLen(expr)
+            | KernelExpression::VectorSum(expr) => {
                 f(self);
                 expr.descend(f);
             }
@@ -565,6 +685,9 @@ impl<'a> KernelExpression<'a> {
             | KernelExpression::Mul(lhs, _rhs)
             | KernelExpression::Div(lhs, _rhs)
             | KernelExpression::Rem(lhs, _rhs) => lhs.get_type(),
+            KernelExpression::VectorSum(expr) => PrimitiveType::for_arrow_type(&expr.get_type())
+                .list_type_into_inner()
+                .as_arrow_type(),
             KernelExpression::Substring { expr, .. } => expr.get_type(),
         }
     }
@@ -653,20 +776,18 @@ impl<'a> KernelExpression<'a> {
 
                 let lhs = lhs.compile_block(compilation)?;
                 let rhs = rhs.compile_block(compilation)?;
-                match pt {
-                    PrimitiveType::I8
-                    | PrimitiveType::I16
-                    | PrimitiveType::I32
-                    | PrimitiveType::I64
-                    | PrimitiveType::U8
-                    | PrimitiveType::U16
-                    | PrimitiveType::U32
-                    | PrimitiveType::U64 => Ok(build.build_int_add(lhs, rhs, "add").unwrap()),
-                    PrimitiveType::F16 | PrimitiveType::F32 | PrimitiveType::F64 => {
+                match PrimitiveSuperType::from(pt) {
+                    PrimitiveSuperType::Int | PrimitiveSuperType::UInt => {
+                        Ok(build.build_int_add(lhs, rhs, "add").unwrap())
+                    }
+                    PrimitiveSuperType::Float => {
                         Ok(build.build_float_add(lhs, rhs, "add").unwrap())
                     }
-                    PrimitiveType::P64x2 => Err(DSLError::TypeMismatch(
+                    PrimitiveSuperType::String => Err(DSLError::TypeMismatch(
                         "cannot add string types".to_string(),
+                    )),
+                    PrimitiveSuperType::List(_, _) => Err(DSLError::TypeMismatch(
+                        "cannot block add list types".to_string(),
                     )),
                 }
             }
@@ -682,20 +803,18 @@ impl<'a> KernelExpression<'a> {
 
                 let lhs = lhs.compile_block(compilation)?;
                 let rhs = rhs.compile_block(compilation)?;
-                match pt {
-                    PrimitiveType::I8
-                    | PrimitiveType::I16
-                    | PrimitiveType::I32
-                    | PrimitiveType::I64
-                    | PrimitiveType::U8
-                    | PrimitiveType::U16
-                    | PrimitiveType::U32
-                    | PrimitiveType::U64 => Ok(build.build_int_sub(lhs, rhs, "add").unwrap()),
-                    PrimitiveType::F16 | PrimitiveType::F32 | PrimitiveType::F64 => {
+                match PrimitiveSuperType::from(pt) {
+                    PrimitiveSuperType::Int | PrimitiveSuperType::UInt => {
+                        Ok(build.build_int_sub(lhs, rhs, "add").unwrap())
+                    }
+                    PrimitiveSuperType::Float => {
                         Ok(build.build_float_sub(lhs, rhs, "add").unwrap())
                     }
-                    PrimitiveType::P64x2 => Err(DSLError::TypeMismatch(
+                    PrimitiveSuperType::String => Err(DSLError::TypeMismatch(
                         "cannot subtract string types".to_string(),
+                    )),
+                    PrimitiveSuperType::List(_, _) => Err(DSLError::TypeMismatch(
+                        "cannot block add list types".to_string(),
                     )),
                 }
             }
@@ -711,20 +830,18 @@ impl<'a> KernelExpression<'a> {
 
                 let lhs = lhs.compile_block(compilation)?;
                 let rhs = rhs.compile_block(compilation)?;
-                match pt {
-                    PrimitiveType::I8
-                    | PrimitiveType::I16
-                    | PrimitiveType::I32
-                    | PrimitiveType::I64
-                    | PrimitiveType::U8
-                    | PrimitiveType::U16
-                    | PrimitiveType::U32
-                    | PrimitiveType::U64 => Ok(build.build_int_mul(lhs, rhs, "mul").unwrap()),
-                    PrimitiveType::F16 | PrimitiveType::F32 | PrimitiveType::F64 => {
-                        Ok(build.build_float_mul(lhs, rhs, "mul").unwrap())
+                match PrimitiveSuperType::from(pt) {
+                    PrimitiveSuperType::Int | PrimitiveSuperType::UInt => {
+                        Ok(build.build_int_mul(lhs, rhs, "add").unwrap())
                     }
-                    PrimitiveType::P64x2 => Err(DSLError::TypeMismatch(
+                    PrimitiveSuperType::Float => {
+                        Ok(build.build_float_mul(lhs, rhs, "add").unwrap())
+                    }
+                    PrimitiveSuperType::String => Err(DSLError::TypeMismatch(
                         "cannot multiply string types".to_string(),
+                    )),
+                    PrimitiveSuperType::List(_, _) => Err(DSLError::TypeMismatch(
+                        "cannot block add list types".to_string(),
                     )),
                 }
             }
@@ -740,24 +857,21 @@ impl<'a> KernelExpression<'a> {
 
                 let lhs = lhs.compile_block(compilation)?;
                 let rhs = rhs.compile_block(compilation)?;
-                match pt {
-                    PrimitiveType::I8
-                    | PrimitiveType::I16
-                    | PrimitiveType::I32
-                    | PrimitiveType::I64 => {
-                        Ok(build.build_int_signed_div(lhs, rhs, "div").unwrap())
+                match PrimitiveSuperType::from(pt) {
+                    PrimitiveSuperType::Int => {
+                        Ok(build.build_int_signed_div(lhs, rhs, "add").unwrap())
                     }
-                    PrimitiveType::U8
-                    | PrimitiveType::U16
-                    | PrimitiveType::U32
-                    | PrimitiveType::U64 => {
-                        Ok(build.build_int_unsigned_div(lhs, rhs, "div").unwrap())
+                    PrimitiveSuperType::UInt => {
+                        Ok(build.build_int_unsigned_div(lhs, rhs, "add").unwrap())
                     }
-                    PrimitiveType::F16 | PrimitiveType::F32 | PrimitiveType::F64 => {
-                        Ok(build.build_float_div(lhs, rhs, "div").unwrap())
+                    PrimitiveSuperType::Float => {
+                        Ok(build.build_float_div(lhs, rhs, "add").unwrap())
                     }
-                    PrimitiveType::P64x2 => Err(DSLError::TypeMismatch(
+                    PrimitiveSuperType::String => Err(DSLError::TypeMismatch(
                         "cannot divide string types".to_string(),
+                    )),
+                    PrimitiveSuperType::List(_, _) => Err(DSLError::TypeMismatch(
+                        "cannot block add list types".to_string(),
                     )),
                 }
             }
@@ -773,26 +887,26 @@ impl<'a> KernelExpression<'a> {
 
                 let lhs = lhs.compile_block(compilation)?;
                 let rhs = rhs.compile_block(compilation)?;
-                match pt {
-                    PrimitiveType::I8
-                    | PrimitiveType::I16
-                    | PrimitiveType::I32
-                    | PrimitiveType::I64 => {
-                        Ok(build.build_int_signed_rem(lhs, rhs, "rem").unwrap())
+                match PrimitiveSuperType::from(pt) {
+                    PrimitiveSuperType::Int => {
+                        Ok(build.build_int_signed_rem(lhs, rhs, "add").unwrap())
                     }
-                    PrimitiveType::U8
-                    | PrimitiveType::U16
-                    | PrimitiveType::U32
-                    | PrimitiveType::U64 => {
-                        Ok(build.build_int_unsigned_rem(lhs, rhs, "rem").unwrap())
+                    PrimitiveSuperType::UInt => {
+                        Ok(build.build_int_unsigned_rem(lhs, rhs, "add").unwrap())
                     }
-                    PrimitiveType::F16 | PrimitiveType::F32 | PrimitiveType::F64 => {
-                        Ok(build.build_float_rem(lhs, rhs, "rem").unwrap())
+                    PrimitiveSuperType::Float => {
+                        Ok(build.build_float_rem(lhs, rhs, "add").unwrap())
                     }
-                    PrimitiveType::P64x2 => Err(DSLError::TypeMismatch(
+                    PrimitiveSuperType::String => Err(DSLError::TypeMismatch(
                         "cannot rem string types".to_string(),
                     )),
+                    PrimitiveSuperType::List(_, _) => Err(DSLError::TypeMismatch(
+                        "cannot block add list types".to_string(),
+                    )),
                 }
+            }
+            KernelExpression::VectorSum(..) => {
+                Err(DSLError::NotVectorizable("vector sum operator"))
             }
             KernelExpression::Cmp(..) => Err(DSLError::NotVectorizable("cmp operator")),
             KernelExpression::At { iter, idx } => {
@@ -969,7 +1083,7 @@ impl<'a> KernelExpression<'a> {
                                     .build_int_compare(predicate.as_int_pred(true), lhs, rhs, "cmp")
                                     .unwrap()
                             }
-                            ComparisonType::String => unreachable!(),
+                            ComparisonType::String | ComparisonType::List => unreachable!(),
                         };
 
                         build
@@ -1104,30 +1218,7 @@ impl<'a> KernelExpression<'a> {
                 let lhs = lhs.compile(compilation).unwrap();
                 let rhs = rhs.compile(compilation).unwrap();
 
-                match lhs_pt {
-                    PrimitiveType::I8
-                    | PrimitiveType::I16
-                    | PrimitiveType::I32
-                    | PrimitiveType::I64
-                    | PrimitiveType::U8
-                    | PrimitiveType::U16
-                    | PrimitiveType::U32
-                    | PrimitiveType::U64 => Ok(build
-                        .build_int_add(lhs.into_int_value(), rhs.into_int_value(), "add_int")
-                        .unwrap()
-                        .into()),
-                    PrimitiveType::F16 | PrimitiveType::F32 | PrimitiveType::F64 => Ok(build
-                        .build_float_add(
-                            lhs.into_float_value(),
-                            rhs.into_float_value(),
-                            "add_float",
-                        )
-                        .unwrap()
-                        .into()),
-                    PrimitiveType::P64x2 => Err(DSLError::TypeMismatch(
-                        "cannot add string types".to_string(),
-                    )),
-                }
+                vec_or_scalar_op!(build, add, lhs, rhs)
             }
             KernelExpression::Div(lhs, rhs) => {
                 let lhs_pt = PrimitiveType::for_arrow_type(&lhs.get_type());
@@ -1143,37 +1234,12 @@ impl<'a> KernelExpression<'a> {
                 let lhs = lhs.compile(compilation).unwrap();
                 let rhs = rhs.compile(compilation).unwrap();
 
-                match lhs_pt {
-                    PrimitiveType::I8
-                    | PrimitiveType::I16
-                    | PrimitiveType::I32
-                    | PrimitiveType::I64 => Ok(build
-                        .build_int_signed_div(lhs.into_int_value(), rhs.into_int_value(), "div_int")
-                        .unwrap()
-                        .into()),
-                    PrimitiveType::U8
-                    | PrimitiveType::U16
-                    | PrimitiveType::U32
-                    | PrimitiveType::U64 => Ok(build
-                        .build_int_unsigned_div(
-                            lhs.into_int_value(),
-                            rhs.into_int_value(),
-                            "div_int",
-                        )
-                        .unwrap()
-                        .into()),
-                    PrimitiveType::F16 | PrimitiveType::F32 | PrimitiveType::F64 => Ok(build
-                        .build_float_div(
-                            lhs.into_float_value(),
-                            rhs.into_float_value(),
-                            "div_float",
-                        )
-                        .unwrap()
-                        .into()),
-                    PrimitiveType::P64x2 => Err(DSLError::TypeMismatch(
-                        "cannot divide string types".to_string(),
-                    )),
-                }
+                let signed = matches!(
+                    PrimitiveSuperType::from(lhs_pt).list_type_into_inner(),
+                    PrimitiveSuperType::Int
+                );
+
+                signed_vec_or_scalar_op!(build, div, signed, lhs, rhs)
             }
             KernelExpression::Mul(lhs, rhs) => {
                 let lhs_pt = PrimitiveType::for_arrow_type(&lhs.get_type());
@@ -1189,30 +1255,7 @@ impl<'a> KernelExpression<'a> {
                 let lhs = lhs.compile(compilation).unwrap();
                 let rhs = rhs.compile(compilation).unwrap();
 
-                match lhs_pt {
-                    PrimitiveType::I8
-                    | PrimitiveType::I16
-                    | PrimitiveType::I32
-                    | PrimitiveType::I64
-                    | PrimitiveType::U8
-                    | PrimitiveType::U16
-                    | PrimitiveType::U32
-                    | PrimitiveType::U64 => Ok(build
-                        .build_int_mul(lhs.into_int_value(), rhs.into_int_value(), "mul_int")
-                        .unwrap()
-                        .into()),
-                    PrimitiveType::F16 | PrimitiveType::F32 | PrimitiveType::F64 => Ok(build
-                        .build_float_mul(
-                            lhs.into_float_value(),
-                            rhs.into_float_value(),
-                            "mul_float",
-                        )
-                        .unwrap()
-                        .into()),
-                    PrimitiveType::P64x2 => Err(DSLError::TypeMismatch(
-                        "cannot multiply string types".to_string(),
-                    )),
-                }
+                vec_or_scalar_op!(build, mul, lhs, rhs)
             }
             KernelExpression::Rem(lhs, rhs) => {
                 let lhs_pt = PrimitiveType::for_arrow_type(&lhs.get_type());
@@ -1228,37 +1271,11 @@ impl<'a> KernelExpression<'a> {
                 let lhs = lhs.compile(compilation).unwrap();
                 let rhs = rhs.compile(compilation).unwrap();
 
-                match lhs_pt {
-                    PrimitiveType::I8
-                    | PrimitiveType::I16
-                    | PrimitiveType::I32
-                    | PrimitiveType::I64 => Ok(build
-                        .build_int_signed_rem(lhs.into_int_value(), rhs.into_int_value(), "rem_int")
-                        .unwrap()
-                        .into()),
-                    PrimitiveType::U8
-                    | PrimitiveType::U16
-                    | PrimitiveType::U32
-                    | PrimitiveType::U64 => Ok(build
-                        .build_int_unsigned_rem(
-                            lhs.into_int_value(),
-                            rhs.into_int_value(),
-                            "rem_int",
-                        )
-                        .unwrap()
-                        .into()),
-                    PrimitiveType::F16 | PrimitiveType::F32 | PrimitiveType::F64 => Ok(build
-                        .build_float_rem(
-                            lhs.into_float_value(),
-                            rhs.into_float_value(),
-                            "rem_float",
-                        )
-                        .unwrap()
-                        .into()),
-                    PrimitiveType::P64x2 => Err(DSLError::TypeMismatch(
-                        "cannot compute remainder of string types".to_string(),
-                    )),
-                }
+                let signed = matches!(
+                    PrimitiveSuperType::from(lhs_pt).list_type_into_inner(),
+                    PrimitiveSuperType::Int
+                );
+                signed_vec_or_scalar_op!(build, rem, signed, lhs, rhs)
             }
             KernelExpression::Sub(lhs, rhs) => {
                 let lhs_pt = PrimitiveType::for_arrow_type(&lhs.get_type());
@@ -1271,32 +1288,57 @@ impl<'a> KernelExpression<'a> {
                     )));
                 }
 
-                let lhs = lhs.compile(compilation).unwrap();
-                let rhs = rhs.compile(compilation).unwrap();
+                let lhs = lhs.compile(compilation)?;
+                let rhs = rhs.compile(compilation)?;
 
-                match lhs_pt {
-                    PrimitiveType::I8
-                    | PrimitiveType::I16
-                    | PrimitiveType::I32
-                    | PrimitiveType::I64
-                    | PrimitiveType::U8
-                    | PrimitiveType::U16
-                    | PrimitiveType::U32
-                    | PrimitiveType::U64 => Ok(build
-                        .build_int_sub(lhs.into_int_value(), rhs.into_int_value(), "sub_int")
-                        .unwrap()
-                        .into()),
-                    PrimitiveType::F16 | PrimitiveType::F32 | PrimitiveType::F64 => Ok(build
-                        .build_float_sub(
-                            lhs.into_float_value(),
-                            rhs.into_float_value(),
-                            "sub_float",
-                        )
-                        .unwrap()
-                        .into()),
-                    PrimitiveType::P64x2 => Err(DSLError::TypeMismatch(
-                        "cannot subtract string types".to_string(),
-                    )),
+                vec_or_scalar_op!(build, sub, lhs, rhs)
+            }
+            KernelExpression::VectorSum(expr) => {
+                let child_type = PrimitiveType::for_arrow_type(&expr.get_type());
+                if let PrimitiveType::List(t, _s) = child_type {
+                    let input = expr.compile(compilation)?.into_vector_value();
+                    let ptype: PrimitiveType = t.into();
+                    match PrimitiveSuperType::from(ptype) {
+                        PrimitiveSuperType::Int | PrimitiveSuperType::UInt => {
+                            let reducer = Intrinsic::find("llvm.vector.reduce.add").unwrap();
+                            let reducer = reducer
+                                .get_declaration(compilation.llvm_mod, &[input.get_type().into()])
+                                .unwrap();
+
+                            Ok(build
+                                .build_call(reducer, &[input.into()], "vec_sum")
+                                .unwrap()
+                                .try_as_basic_value()
+                                .unwrap_left())
+                        }
+                        PrimitiveSuperType::Float => {
+                            let reducer = Intrinsic::find("llvm.vector.reduce.fadd").unwrap();
+                            let reducer = reducer
+                                .get_declaration(compilation.llvm_mod, &[input.get_type().into()])
+                                .unwrap();
+
+                            Ok(build
+                                .build_call(
+                                    reducer,
+                                    &[ptype.llvm_type(ctx).const_zero().into(), input.into()],
+                                    "vec_sum",
+                                )
+                                .unwrap()
+                                .try_as_basic_value()
+                                .unwrap_left())
+                        }
+                        PrimitiveSuperType::String => {
+                            return Err(DSLError::TypeMismatch(
+                                "cannot sum string vectors".to_string(),
+                            ))
+                        }
+                        PrimitiveSuperType::List(_, _) => unreachable!(),
+                    }
+                } else {
+                    Err(DSLError::TypeMismatch(format!(
+                        "cannot sum non-list type: {}",
+                        child_type
+                    )))
                 }
             }
             KernelExpression::StartsWith(haystack, needle) => {
@@ -1822,6 +1864,14 @@ impl DSLKernel {
                     Arc::new(self.exec_to_ree::<Int64Type>(ptrs, max_len, p_out_type))
                 }
             }),
+            KernelOutputType::FixedSizeList(_s) => {
+                let mut alloc = FixedSizeListWriter::allocate(max_len, p_out_type);
+                ptrs.push(alloc.get_ptr());
+                let mut kp = KernelParameters::new(ptrs);
+
+                let num_results = unsafe { self.borrow_func().1.call(kp.get_mut_ptr()) } as usize;
+                Ok(alloc.to_array_ref(num_results, None))
+            }
         }
     }
 
@@ -1901,6 +1951,9 @@ fn build_kernel<'a>(
         }
         KernelOutputType::View => {
             build_kernel_with_writer::<StringViewWriter>(ctx, inputs, program)
+        }
+        KernelOutputType::FixedSizeList(_s) => {
+            build_kernel_with_writer::<FixedSizeListWriter>(ctx, inputs, program)
         }
         KernelOutputType::Dictionary(key) => match key {
             DictKeyType::Int8 => build_dict_kernel::<Int8Type>(ctx, inputs, program),
@@ -2441,10 +2494,13 @@ fn build_kernel_with_writer<'a, W: ArrayWriter<'a>>(
 #[cfg(test)]
 mod test {
 
+    use std::sync::Arc;
+
     use arrow_array::{
+        builder::{FixedSizeListBuilder, Int32Builder},
         cast::AsArray,
         types::{BinaryViewType, Int32Type, Int64Type, UInt64Type},
-        BooleanArray, Float32Array, Int32Array, StringArray,
+        Array, BooleanArray, Float32Array, Int32Array, Scalar, StringArray,
     };
     use arrow_schema::DataType;
     use itertools::Itertools;
@@ -2698,5 +2754,121 @@ mod test {
             .map(|b| std::str::from_utf8(b.unwrap()).unwrap())
             .collect_vec();
         assert_eq!(res, strs);
+    }
+
+    #[test]
+    fn test_kernel_add_vecs() {
+        let ib = Int32Builder::new();
+        let mut vecs = FixedSizeListBuilder::new(ib, 4);
+        vecs.values().append_value(1);
+        vecs.values().append_value(2);
+        vecs.values().append_value(3);
+        vecs.values().append_value(4);
+        vecs.append(true);
+        vecs.values().append_value(4);
+        vecs.values().append_value(5);
+        vecs.values().append_value(6);
+        vecs.values().append_value(7);
+        vecs.append(true);
+        let vecs: Arc<dyn Array> = Arc::new(vecs.finish());
+
+        let ib = Int32Builder::new();
+        let mut to_add = FixedSizeListBuilder::new(ib, 4);
+        to_add.values().append_value(1);
+        to_add.values().append_value(10);
+        to_add.values().append_value(100);
+        to_add.values().append_value(1000);
+        to_add.append(true);
+        let to_add = Scalar::new(to_add.finish());
+
+        let k = DSLKernel::compile(&[&vecs, &to_add], |ctx| {
+            ctx.iter_over(vec![ctx.get_input(0)?, ctx.get_input(1)?])
+                .map(|i| vec![i[0].add(&i[1])])
+                .collect(KernelOutputType::FixedSizeList(4))
+        })
+        .unwrap();
+        let res = k.call(&[&vecs, &to_add]).unwrap();
+        let res = res.as_fixed_size_list();
+        assert_eq!(res.len(), 2);
+
+        assert_eq!(
+            res.value(0).as_primitive::<Int32Type>().values(),
+            &[2, 12, 103, 1004]
+        );
+
+        assert_eq!(
+            res.value(1).as_primitive::<Int32Type>().values(),
+            &[5, 15, 106, 1007]
+        );
+    }
+
+    #[test]
+    fn test_kernel_dot_vecs() {
+        let ib = Int32Builder::new();
+        let mut vecs = FixedSizeListBuilder::new(ib, 4);
+        vecs.values().append_value(1);
+        vecs.values().append_value(2);
+        vecs.values().append_value(3);
+        vecs.values().append_value(4);
+        vecs.append(true);
+        vecs.values().append_value(4);
+        vecs.values().append_value(5);
+        vecs.values().append_value(6);
+        vecs.values().append_value(7);
+        vecs.append(true);
+        let vecs: Arc<dyn Array> = Arc::new(vecs.finish());
+
+        let ib = Int32Builder::new();
+        let mut to_add = FixedSizeListBuilder::new(ib, 4);
+        to_add.values().append_value(1);
+        to_add.values().append_value(10);
+        to_add.values().append_value(100);
+        to_add.values().append_value(1000);
+        to_add.append(true);
+        let to_add = Scalar::new(to_add.finish());
+
+        let k = DSLKernel::compile(&[&vecs, &to_add], |ctx| {
+            ctx.iter_over(vec![ctx.get_input(0)?, ctx.get_input(1)?])
+                .map(|i| vec![i[0].mul(&i[1])])
+                .map(|i| vec![i[0].vec_sum()])
+                .collect(KernelOutputType::Array)
+        })
+        .unwrap();
+        let res = k.call(&[&vecs, &to_add]).unwrap();
+        let res = res.as_primitive::<Int32Type>().values();
+        assert_eq!(
+            res,
+            &[
+                1 + 2 * 10 + 3 * 100 + 4 * 1000,
+                4 + 5 * 10 + 6 * 100 + 7 * 1000
+            ]
+        );
+    }
+
+    #[test]
+    fn test_kernel_vec_sum() {
+        let ib = Int32Builder::new();
+        let mut vecs = FixedSizeListBuilder::new(ib, 4);
+        vecs.values().append_value(1);
+        vecs.values().append_value(2);
+        vecs.values().append_value(3);
+        vecs.values().append_value(4);
+        vecs.append(true);
+        vecs.values().append_value(4);
+        vecs.values().append_value(5);
+        vecs.values().append_value(6);
+        vecs.values().append_value(7);
+        vecs.append(true);
+        let vecs: Arc<dyn Array> = Arc::new(vecs.finish());
+
+        let k = DSLKernel::compile(&[&vecs], |ctx| {
+            ctx.iter_over(vec![ctx.get_input(0)?])
+                .map(|i| vec![i[0].vec_sum()])
+                .collect(KernelOutputType::Array)
+        })
+        .unwrap();
+        let res = k.call(&[&vecs]).unwrap();
+        let res = res.as_primitive::<Int32Type>().values();
+        assert_eq!(res, &[4 + 3 + 2 + 1, 4 + 5 + 6 + 7]);
     }
 }

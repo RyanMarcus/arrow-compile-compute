@@ -794,3 +794,20 @@ pub mod arith {
         BINOP_PROGRAM_CACHE.get((left, right), BinOp::Rem)
     }
 }
+
+pub mod vec {
+    use std::sync::LazyLock;
+
+    use arrow_array::{Array, ArrayRef, Datum};
+
+    use crate::{
+        compiled_kernels::{DotKernel, KernelCache},
+        ArrowKernelError,
+    };
+
+    static DOT_KERNEL_CACHE: LazyLock<KernelCache<DotKernel>> = LazyLock::new(KernelCache::new);
+
+    pub fn dot(left: &dyn Datum, right: &dyn Array) -> Result<ArrayRef, ArrowKernelError> {
+        DOT_KERNEL_CACHE.get((left, right), ())
+    }
+}

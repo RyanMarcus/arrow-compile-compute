@@ -327,6 +327,7 @@ pub fn generate_lookup_or_insert<'a>(
                 )
                 .unwrap()
         }
+        PrimitiveType::List(_, _) => todo!(),
     };
 
     build
@@ -501,6 +502,7 @@ pub fn generate_hash_func<'a>(
             build.build_store(buf_ptr, t).unwrap();
             build.build_unconditional_branch(do_hash).unwrap();
         }
+        PrimitiveType::List(_, _) => todo!(),
     };
 
     build.position_at_end(do_hash);

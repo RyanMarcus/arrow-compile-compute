@@ -20,6 +20,7 @@ thiserror = "2.0.12"
 strum = "0.27.2"
 strum_macros = "0.27.2"
 memchr = "2.7.6"
+paste = "1.0.15"
 
 [dev-dependencies]
 float-ord = "0.3.2"
@@ -79,4 +80,8 @@ harness = false
 
 [[bench]]
 name = "lognull_bench"
+harness = false
+
+[[bench]]
+name = "vec_bench"
 harness = false

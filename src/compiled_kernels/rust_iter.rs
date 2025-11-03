@@ -124,7 +124,7 @@ impl Kernel for Arc<IterFuncHolder> {
 }
 
 pub struct ArrowIter<T: ApplyType> {
-    buffer: [u8; 64 * PrimitiveType::max_width()],
+    buffer: Box<[u8]>,
     ibuffer: [u64; 64],
     buffer_idx: usize,
     buffer_len: usize,
@@ -181,10 +181,8 @@ impl<T: ApplyType> Iterator for ArrowIter<T> {
     fn next(&mut self) -> Option<Self::Item> {
         if self.buffer_idx < self.buffer_len {
             let width = T::primitive_type().width();
-            let slice = unsafe {
-                self.buffer
-                    .get_unchecked(self.buffer_idx * width..(self.buffer_idx + 1) * width)
-            };
+            let slice = &self.buffer[self.buffer_idx * width..(self.buffer_idx + 1) * width];
+
             self.buffer_idx += 1;
             Some(unsafe { T::from_byte_slice(slice) })
         } else {
@@ -204,7 +202,7 @@ impl<T: ApplyType> ArrowIter<T> {
             .transpose()?;
 
         Ok(ArrowIter {
-            buffer: [0; 1024],
+            buffer: vec![0; T::primitive_type().width() * 64].into_boxed_slice(),
             ibuffer: [0; 64],
             buffer_idx: 0,
             buffer_len: 0,

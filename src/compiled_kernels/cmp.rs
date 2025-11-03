@@ -226,6 +226,7 @@ fn generate_llvm_cmp_kernel<'a>(
     let res = match lhs_prim.comparison_type() {
         ComparisonType::Int { .. } => unreachable!("ints should use block compare"),
         ComparisonType::Float => unreachable!("floats should use block compare"),
+        ComparisonType::List => todo!("implement list comparison"),
         ComparisonType::String => {
             let memcmp = add_memcmp(ctx, &module);
             let res = build
@@ -389,6 +390,7 @@ fn generate_block_llvm_cmp_kernel<'a>(
                 .unwrap()
         }
         ComparisonType::String => unreachable!("no block comparison for strings"),
+        ComparisonType::List => unreachable!("no block comparison for lists"),
     };
 
     let res = build.build_bit_cast(res, i64_type, "res_u64").unwrap();
@@ -465,7 +467,7 @@ fn generate_block_llvm_cmp_kernel<'a>(
                 )
                 .unwrap()
         }
-        ComparisonType::String => todo!(),
+        ComparisonType::String | ComparisonType::List => todo!(),
     };
 
     writer.llvm_ingest(ctx, &build, res.into());

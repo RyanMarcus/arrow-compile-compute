@@ -23,7 +23,7 @@ impl Aggregation for CountAgg {
     }
 
     fn ptype(&self) -> PrimitiveType {
-        PrimitiveType::max_width_type()
+        PrimitiveType::U64
     }
 
     fn agg_type() -> AggType {

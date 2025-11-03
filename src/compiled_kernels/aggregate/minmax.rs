@@ -274,6 +274,7 @@ impl<const MIN: bool> Aggregation for MinMaxAgg<MIN> {
                 };
                 MinMaxAlloc::W128(sa, data, ss)
             }
+            PrimitiveType::List(_, _) => todo!("implement list minmax aggregation"),
         };
         alloc.ensure_capacity(num_tickets);
         alloc
@@ -616,7 +617,7 @@ impl<const MIN: bool> Aggregation for MinMaxAgg<MIN> {
                     )
                     .unwrap()
                 }
-                PrimitiveType::P64x2 => unreachable!(),
+                PrimitiveType::P64x2 | PrimitiveType::List(_, _) => unreachable!(),
             };
 
             let new_val_assume_used = b

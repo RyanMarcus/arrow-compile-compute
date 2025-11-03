@@ -23,7 +23,7 @@ use crate::{
 pub struct REEAllocation<'a, K: RunEndIndexType, VW: ArrayWriter<'a>> {
     res_ptr: *mut c_void,
     values_ptr: *mut c_void,
-    last_val: [u8; PrimitiveType::max_width()],
+    last_val: Box<[u8]>,
     num_unique: u64,
     curr_run_end: u64,
     res: Box<ArrayOutput>,
@@ -87,10 +87,11 @@ impl<'a, K: RunEndIndexType, VW: ArrayWriter<'a>> ArrayWriter<'a> for REEWriter<
             PrimitiveType::for_arrow_type(&K::DATA_TYPE),
         ));
         let mut vw = Box::new(VW::allocate(expected_count, ty));
+        let last_val = vec![0; ty.width()].into_boxed_slice();
         REEAllocation {
             res_ptr: rw.get_ptr(),
             values_ptr: vw.get_ptr(),
-            last_val: [0; PrimitiveType::max_width()],
+            last_val,
             num_unique: 0,
             curr_run_end: 0,
             res: rw,
@@ -181,6 +182,7 @@ impl<'a, K: RunEndIndexType, VW: ArrayWriter<'a>> ArrayWriter<'a> for REEWriter<
                 .unwrap();
             let last_val_ptr =
                 increment_pointer!(ctx, b2, alloc_ptr, Self::Allocation::OFFSET_LAST_VAL);
+            let last_val_ptr = b2.build_load(ptr_type, last_val_ptr, "last_val_ptr").unwrap().into_pointer_value();
             b2.build_conditional_branch(cmp, has_value, insert_first)
                 .unwrap();
 
@@ -224,6 +226,7 @@ impl<'a, K: RunEndIndexType, VW: ArrayWriter<'a>> ArrayWriter<'a> for REEWriter<
                     b2.build_int_compare(IntPredicate::EQ, cmp, i64_type.const_zero(), "matches")
                         .unwrap()
                 }
+                ComparisonType::List => todo!("implement list ree writer"),
             };
             b2.build_conditional_branch(cmp, matches_prev, insert_next)
                 .unwrap();
@@ -305,6 +308,7 @@ impl<'a, K: RunEndIndexType, VW: ArrayWriter<'a>> ArrayWriter<'a> for REEWriter<
             b2.position_at_end(has_value);
             let last_val_ptr =
                 increment_pointer!(ctx, b2, alloc_ptr, Self::Allocation::OFFSET_LAST_VAL);
+            let last_val_ptr = b2.build_load(ptr_type, last_val_ptr, "last_val_ptr").unwrap().into_pointer_value();
             let llvm_run_end_type = PrimitiveType::for_arrow_type(&K::DATA_TYPE)
                 .llvm_type(ctx)
                 .into_int_type();
