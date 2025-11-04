@@ -182,7 +182,10 @@ impl<'a, K: RunEndIndexType, VW: ArrayWriter<'a>> ArrayWriter<'a> for REEWriter<
                 .unwrap();
             let last_val_ptr =
                 increment_pointer!(ctx, b2, alloc_ptr, Self::Allocation::OFFSET_LAST_VAL);
-            let last_val_ptr = b2.build_load(ptr_type, last_val_ptr, "last_val_ptr").unwrap().into_pointer_value();
+            let last_val_ptr = b2
+                .build_load(ptr_type, last_val_ptr, "last_val_ptr")
+                .unwrap()
+                .into_pointer_value();
             b2.build_conditional_branch(cmp, has_value, insert_first)
                 .unwrap();
 
@@ -308,7 +311,10 @@ impl<'a, K: RunEndIndexType, VW: ArrayWriter<'a>> ArrayWriter<'a> for REEWriter<
             b2.position_at_end(has_value);
             let last_val_ptr =
                 increment_pointer!(ctx, b2, alloc_ptr, Self::Allocation::OFFSET_LAST_VAL);
-            let last_val_ptr = b2.build_load(ptr_type, last_val_ptr, "last_val_ptr").unwrap().into_pointer_value();
+            let last_val_ptr = b2
+                .build_load(ptr_type, last_val_ptr, "last_val_ptr")
+                .unwrap()
+                .into_pointer_value();
             let llvm_run_end_type = PrimitiveType::for_arrow_type(&K::DATA_TYPE)
                 .llvm_type(ctx)
                 .into_int_type();
