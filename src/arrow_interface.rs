@@ -796,18 +796,24 @@ pub mod arith {
 }
 
 pub mod vec {
-    use std::sync::LazyLock;
+    use std::sync::{Arc, LazyLock};
 
     use arrow_array::{Array, ArrayRef, Datum};
 
     use crate::{
-        compiled_kernels::{DotKernel, KernelCache},
+        compiled_kernels::{DotKernel, KernelCache, NormVecKernel},
         ArrowKernelError,
     };
 
     static DOT_KERNEL_CACHE: LazyLock<KernelCache<DotKernel>> = LazyLock::new(KernelCache::new);
+    static NORM_VEC_KERNEL_CACHE: LazyLock<KernelCache<NormVecKernel>> =
+        LazyLock::new(KernelCache::new);
 
     pub fn dot(left: &dyn Datum, right: &dyn Array) -> Result<ArrayRef, ArrowKernelError> {
         DOT_KERNEL_CACHE.get((left, right), ())
+    }
+
+    pub fn norm(left: &dyn Datum) -> Result<Arc<dyn Datum>, ArrowKernelError> {
+        NORM_VEC_KERNEL_CACHE.get(left, ())
     }
 }

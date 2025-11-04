@@ -14,12 +14,16 @@ use arrow_array::{
     },
     Array, ArrayRef, BooleanArray, Datum, DictionaryArray, RunArray, StringArray,
 };
-use arrow_schema::DataType;
+use arrow_schema::{DataType, Field};
 use inkwell::{
     builder::Builder,
     context::Context,
     execution_engine::JitFunction,
     intrinsics::Intrinsic,
+    llvm_sys::{
+        LLVMFastMathAllowContract, LLVMFastMathAllowReassoc, LLVMFastMathAllowReciprocal,
+        LLVMFastMathApproxFunc,
+    },
     module::{Linkage, Module},
     types::{BasicType, BasicTypeEnum},
     values::{BasicValue, BasicValueEnum, FunctionValue, PointerValue, VectorValue},
@@ -55,8 +59,8 @@ mod string_funcs;
 const VEC_SIZE: u32 = 64;
 
 macro_rules! vec_or_scalar_op {
-    ($builder: expr, $func_name: ident, $v1: expr, $v2: expr) => {
-        match ($v1, $v2) {
+    ($builder: expr, $func_name: ident, $v1: expr, $v2: expr) => {{
+        let instr = match ($v1, $v2) {
             (BasicValueEnum::IntValue(v1), BasicValueEnum::IntValue(v2)) => Ok(
                 paste! { $builder. [<build_int_ $func_name>] (v1, v2, "int_op") }
                     .unwrap()
@@ -89,13 +93,24 @@ macro_rules! vec_or_scalar_op {
                 }
             }
             _ => panic!("Unsupported types for addition"),
+        };
+
+        if let Ok(instr) = instr {
+            instr.as_instruction_value().unwrap().set_fast_math_flags(
+                LLVMFastMathAllowContract
+                    | LLVMFastMathAllowReassoc
+                    | LLVMFastMathAllowReciprocal
+                    | LLVMFastMathApproxFunc,
+            );
         }
-    };
+
+        instr
+    }};
 }
 
 macro_rules! signed_vec_or_scalar_op {
-    ($builder: expr, $func_name: ident, $signed: expr, $v1: expr, $v2: expr) => {
-        match ($v1, $v2) {
+    ($builder: expr, $func_name: ident, $signed: expr, $v1: expr, $v2: expr) => {{
+        let instr = match ($v1, $v2) {
             (BasicValueEnum::IntValue(v1), BasicValueEnum::IntValue(v2)) => Ok(
                 if $signed {
                     paste! { $builder. [<build_int_signed_ $func_name>] (v1, v2, "int_op") }
@@ -138,8 +153,19 @@ macro_rules! signed_vec_or_scalar_op {
                 }
             }
             _ => panic!("Unsupported types for addition"),
+        };
+
+        if let Ok(instr) = instr {
+            instr.as_instruction_value().unwrap().set_fast_math_flags(
+                LLVMFastMathAllowContract
+                    | LLVMFastMathAllowReassoc
+                    | LLVMFastMathAllowReciprocal
+                    | LLVMFastMathApproxFunc,
+            );
         }
-    };
+
+        instr
+    }};
 }
 
 // Shared state reused while recursively lowering expressions.
@@ -456,7 +482,10 @@ pub enum KernelExpression<'a> {
     Mul(Box<KernelExpression<'a>>, Box<KernelExpression<'a>>),
     Div(Box<KernelExpression<'a>>, Box<KernelExpression<'a>>),
     Rem(Box<KernelExpression<'a>>, Box<KernelExpression<'a>>),
+    Powi(Box<KernelExpression<'a>>, i32),
+    Sqrt(Box<KernelExpression<'a>>),
     VectorSum(Box<KernelExpression<'a>>),
+    Splat(Box<KernelExpression<'a>>, usize),
     StartsWith(Box<KernelExpression<'a>>, Box<KernelExpression<'a>>),
     EndsWith(Box<KernelExpression<'a>>, Box<KernelExpression<'a>>),
     StrLen(Box<KernelExpression<'a>>),
@@ -541,10 +570,21 @@ impl<'a> KernelExpression<'a> {
     pub fn mul(&self, other: &KernelExpression<'a>) -> KernelExpression<'a> {
         KernelExpression::Mul(Box::new(self.clone()), Box::new(other.clone()))
     }
+    pub fn powi(&self, power: i32) -> KernelExpression<'a> {
+        KernelExpression::Powi(Box::new(self.clone()), power)
+    }
+    pub fn sqrt(&self) -> KernelExpression<'a> {
+        KernelExpression::Sqrt(Box::new(self.clone()))
+    }
 
     /// Sums all the elements into a vector, mapping the vector to a scalar
     pub fn vec_sum(&self) -> KernelExpression<'a> {
         KernelExpression::VectorSum(Box::new(self.clone()))
+    }
+
+    /// Turns a scalar into a vector by repeating it. The resulting vector's size is `size`.
+    pub fn splat(&self, size: usize) -> KernelExpression<'a> {
+        KernelExpression::Splat(Box::new(self.clone()), size)
     }
 
     pub fn starts_with(&self, other: &KernelExpression<'a>) -> KernelExpression<'a> {
@@ -603,7 +643,7 @@ impl<'a> KernelExpression<'a> {
                 lhs.descend(f);
                 rhs.descend(f);
             }
-            KernelExpression::Not(c) => {
+            KernelExpression::Not(c) | KernelExpression::Powi(c, _) | KernelExpression::Sqrt(c) => {
                 f(self);
                 c.descend(f);
             }
@@ -619,7 +659,8 @@ impl<'a> KernelExpression<'a> {
             }
             KernelExpression::Convert(expr, ..)
             | KernelExpression::StrLen(expr)
-            | KernelExpression::VectorSum(expr) => {
+            | KernelExpression::VectorSum(expr)
+            | KernelExpression::Splat(expr, _) => {
                 f(self);
                 expr.descend(f);
             }
@@ -680,14 +721,20 @@ impl<'a> KernelExpression<'a> {
             KernelExpression::IntConst(..) | KernelExpression::StrLen(..) => DataType::UInt64,
             KernelExpression::At { iter, .. } => base_type(&iter.data_type()),
             KernelExpression::Convert(_expr, pt) => pt.as_arrow_type(),
-            KernelExpression::Add(lhs, _rhs)
-            | KernelExpression::Sub(lhs, _rhs)
-            | KernelExpression::Mul(lhs, _rhs)
-            | KernelExpression::Div(lhs, _rhs)
-            | KernelExpression::Rem(lhs, _rhs) => lhs.get_type(),
+            KernelExpression::Add(lhs, _)
+            | KernelExpression::Sub(lhs, _)
+            | KernelExpression::Mul(lhs, _)
+            | KernelExpression::Div(lhs, _)
+            | KernelExpression::Rem(lhs, _)
+            | KernelExpression::Powi(lhs, _)
+            | KernelExpression::Sqrt(lhs) => lhs.get_type(),
             KernelExpression::VectorSum(expr) => PrimitiveType::for_arrow_type(&expr.get_type())
                 .list_type_into_inner()
                 .as_arrow_type(),
+            KernelExpression::Splat(expr, s) => DataType::FixedSizeList(
+                Arc::new(Field::new_list_field(expr.get_type(), false)),
+                *s as i32,
+            ),
             KernelExpression::Substring { expr, .. } => expr.get_type(),
         }
     }
@@ -905,9 +952,103 @@ impl<'a> KernelExpression<'a> {
                     )),
                 }
             }
+            KernelExpression::Powi(lhs, power) => {
+                let f = Intrinsic::find("llvm.powi").unwrap();
+                let func = match lhs.get_type() {
+                    DataType::Float16 => f.get_declaration(
+                        compilation.llvm_mod,
+                        &[
+                            ctx.f16_type().vec_type(VEC_SIZE).into(),
+                            ctx.i32_type().into(),
+                        ],
+                    ),
+                    DataType::Float32 => f.get_declaration(
+                        compilation.llvm_mod,
+                        &[
+                            ctx.f32_type().vec_type(VEC_SIZE).into(),
+                            ctx.i32_type().into(),
+                        ],
+                    ),
+                    DataType::Float64 => f.get_declaration(
+                        compilation.llvm_mod,
+                        &[
+                            ctx.f64_type().vec_type(VEC_SIZE).into(),
+                            ctx.i32_type().into(),
+                        ],
+                    ),
+                    _ => {
+                        return Err(DSLError::TypeMismatch(
+                            "cannot pow-i non-float types".to_string(),
+                        ))
+                    }
+                }
+                .unwrap();
+
+                let inp = lhs.compile_block(compilation)?;
+                let call = build
+                    .build_call(
+                        func,
+                        &[
+                            inp.into(),
+                            ctx.i32_type().const_int(*power as u64, true).into(),
+                        ],
+                        "powi",
+                    )
+                    .unwrap()
+                    .try_as_basic_value()
+                    .unwrap_left()
+                    .into_vector_value();
+                call.as_instruction_value().unwrap().set_fast_math_flags(
+                    LLVMFastMathAllowContract
+                        | LLVMFastMathAllowReassoc
+                        | LLVMFastMathAllowReciprocal
+                        | LLVMFastMathApproxFunc,
+                );
+
+                Ok(call)
+            }
+            KernelExpression::Sqrt(expr) => {
+                let f = Intrinsic::find("llvm.sqrt").unwrap();
+                let func = match expr.get_type() {
+                    DataType::Float16 => f.get_declaration(
+                        compilation.llvm_mod,
+                        &[ctx.f16_type().vec_type(VEC_SIZE).into()],
+                    ),
+                    DataType::Float32 => f.get_declaration(
+                        compilation.llvm_mod,
+                        &[ctx.f32_type().vec_type(VEC_SIZE).into()],
+                    ),
+                    DataType::Float64 => f.get_declaration(
+                        compilation.llvm_mod,
+                        &[ctx.f64_type().vec_type(VEC_SIZE).into()],
+                    ),
+                    _ => {
+                        return Err(DSLError::TypeMismatch(
+                            "cannot sqrt non-float types".to_string(),
+                        ))
+                    }
+                }
+                .unwrap();
+
+                let inp = expr.compile_block(compilation)?;
+                let call = build
+                    .build_call(func, &[inp.into()], "sqrt")
+                    .unwrap()
+                    .try_as_basic_value()
+                    .unwrap_left()
+                    .into_vector_value();
+                call.as_instruction().unwrap().set_fast_math_flags(
+                    LLVMFastMathAllowContract
+                        | LLVMFastMathAllowReassoc
+                        | LLVMFastMathAllowReciprocal
+                        | LLVMFastMathApproxFunc,
+                );
+                Ok(call)
+            }
             KernelExpression::VectorSum(..) => {
                 Err(DSLError::NotVectorizable("vector sum operator"))
             }
+            KernelExpression::Splat(..) => Err(DSLError::NotVectorizable("splat operator")),
             KernelExpression::Cmp(..) => Err(DSLError::NotVectorizable("cmp operator")),
             KernelExpression::At { iter, idx } => {
                 if !idx.get_type().is_integer() {
@@ -1293,6 +1434,99 @@ impl<'a> KernelExpression<'a> {
 
                 vec_or_scalar_op!(build, sub, lhs, rhs)
             }
+            KernelExpression::Powi(inp, power) => {
+                let f = Intrinsic::find("llvm.powi").unwrap();
+                let func = match inp.get_type() {
+                    DataType::Float16 | DataType::Float32 | DataType::Float64 => f.get_declaration(
+                        compilation.llvm_mod,
+                        &[
+                            PrimitiveType::for_arrow_type(&inp.get_type())
+                                .llvm_type(ctx)
+                                .into(),
+                            ctx.i32_type().into(),
+                        ],
+                    ),
+                    DataType::FixedSizeList(t, s) => {
+                        let t = PrimitiveType::for_arrow_type(t.data_type());
+                        if !matches!(
+                            t,
+                            PrimitiveType::F16 | PrimitiveType::F32 | PrimitiveType::F64
+                        ) {
+                            return Err(DSLError::TypeMismatch(format!(
+                                "cannot pow-i vector of non-float type {}",
+                                t
+                            )));
+                        }
+
+                        let t = t.llvm_vec_type(ctx, s as u32).unwrap();
+                        f.get_declaration(compilation.llvm_mod, &[t.into(), ctx.i32_type().into()])
+                    }
+                    _ => {
+                        return Err(DSLError::TypeMismatch(format!(
+                            "cannot pow-i non-float type {}",
+                            inp.get_type()
+                        )))
+                    }
+                }
+                .unwrap();
+
+                let inp = inp.compile(compilation)?;
+                let call = build
+                    .build_call(
+                        func,
+                        &[
+                            inp.into(),
+                            ctx.i32_type().const_int(*power as u64, true).into(),
+                        ],
+                        "powi",
+                    )
+                    .unwrap()
+                    .try_as_basic_value()
+                    .unwrap_left();
+
+                call.as_instruction_value().unwrap().set_fast_math_flags(
+                    LLVMFastMathAllowContract
+                        | LLVMFastMathAllowReassoc
+                        | LLVMFastMathAllowReciprocal
+                        | LLVMFastMathApproxFunc,
+                );
+
+                Ok(call)
+            }
+            KernelExpression::Sqrt(expr) => {
+                let f = Intrinsic::find("llvm.sqrt").unwrap();
+                let func = match expr.get_type() {
+                    DataType::Float16 => {
+                        f.get_declaration(compilation.llvm_mod, &[ctx.f16_type().into()])
+                    }
+                    DataType::Float32 => {
+                        f.get_declaration(compilation.llvm_mod, &[ctx.f32_type().into()])
+                    }
+                    DataType::Float64 => {
+                        f.get_declaration(compilation.llvm_mod, &[ctx.f64_type().into()])
+                    }
+                    _ => {
+                        return Err(DSLError::TypeMismatch(
+                            "cannot sqrt non-float types".to_string(),
+                        ))
+                    }
+                }
+                .unwrap();
+
+                let inp = expr.compile(compilation)?;
+                let call = build
+                    .build_call(func, &[inp.into()], "sqrt")
+                    .unwrap()
+                    .try_as_basic_value()
+                    .unwrap_left();
+                call.as_instruction_value().unwrap().set_fast_math_flags(
+                    LLVMFastMathAllowContract
+                        | LLVMFastMathAllowReassoc
+                        | LLVMFastMathAllowReciprocal
+                        | LLVMFastMathApproxFunc,
+                );
+                Ok(call)
+            }
             KernelExpression::VectorSum(expr) => {
                 let child_type = PrimitiveType::for_arrow_type(&expr.get_type());
                 if let PrimitiveType::List(t, _s) = child_type {
@@ -1317,7 +1551,7 @@ impl<'a> KernelExpression<'a> {
                                 .get_declaration(compilation.llvm_mod, &[input.get_type().into()])
                                 .unwrap();
 
-                            Ok(build
+                            let call = build
                                 .build_call(
                                     reducer,
                                     &[ptype.llvm_type(ctx).const_zero().into(), input.into()],
@@ -1325,7 +1559,16 @@ impl<'a> KernelExpression<'a> {
                                 )
                                 .unwrap()
                                 .try_as_basic_value()
-                                .unwrap_left())
+                                .unwrap_left();
+
+                            call.as_instruction_value().unwrap().set_fast_math_flags(
+                                LLVMFastMathAllowContract
+                                    | LLVMFastMathAllowReassoc
+                                    | LLVMFastMathAllowReciprocal
+                                    | LLVMFastMathApproxFunc,
+                            );
+
+                            Ok(call)
                         }
                         PrimitiveSuperType::String => {
                             return Err(DSLError::TypeMismatch(
@@ -1340,6 +1583,35 @@ impl<'a> KernelExpression<'a> {
                         child_type
                     )))
                 }
+            }
+            KernelExpression::Splat(expr, size) => {
+                let c_type = expr.get_type();
+                let p_type = PrimitiveType::for_arrow_type(&c_type)
+                    .llvm_vec_type(ctx, *size as u32)
+                    .ok_or_else(|| {
+                        DSLError::TypeMismatch(format!(
+                            "cannot turn type {} into a vector for splat",
+                            c_type
+                        ))
+                    })?;
+                let val = expr.compile(compilation)?;
+                let singleton = build
+                    .build_insert_element(
+                        p_type.const_zero(),
+                        val,
+                        ctx.i32_type().const_zero(),
+                        "singleton",
+                    )
+                    .unwrap();
+                Ok(build
+                    .build_shuffle_vector(
+                        singleton,
+                        p_type.get_poison(),
+                        p_type.const_zero(),
+                        "splatted",
+                    )
+                    .unwrap()
+                    .into())
             }
             KernelExpression::StartsWith(haystack, needle) => {
                 if !haystack.is_string() || !needle.is_string() {
@@ -2499,7 +2771,7 @@ mod test {
     use arrow_array::{
         builder::{FixedSizeListBuilder, Int32Builder},
         cast::AsArray,
-        types::{BinaryViewType, Int32Type, Int64Type, UInt64Type},
+        types::{BinaryViewType, Float32Type, Int32Type, Int64Type, UInt64Type},
         Array, BooleanArray, Float32Array, Int32Array, Scalar, StringArray,
     };
     use arrow_schema::DataType;
@@ -2754,6 +3026,36 @@ mod test {
             .map(|b| std::str::from_utf8(b.unwrap()).unwrap())
             .collect_vec();
         assert_eq!(res, strs);
+    }
+
+    #[test]
+    fn test_kernel_powi() {
+        let data = Float32Array::from(vec![1.0, 2.0, 3.0]);
+        let k = DSLKernel::compile(&[&data], |ctx| {
+            ctx.iter_over(vec![ctx.get_input(0)?])
+                .map(|x| vec![x[0].powi(2)])
+                .collect(KernelOutputType::Array)
+        })
+        .unwrap();
+        let res = k.call(&[&data]).unwrap();
+        let res = res.as_primitive::<Float32Type>();
+        let res = res.iter().map(|x| x.unwrap()).collect_vec();
+        assert_eq!(res, vec![1.0, 4.0, 9.0]);
+    }
+
+    #[test]
+    fn test_kernel_sqrt() {
+        let data = Float32Array::from(vec![1.0, 4.0, 9.0]);
+        let k = DSLKernel::compile(&[&data], |ctx| {
+            ctx.iter_over(vec![ctx.get_input(0)?])
+                .map(|x| vec![x[0].sqrt()])
+                .collect(KernelOutputType::Array)
+        })
+        .unwrap();
+        let res = k.call(&[&data]).unwrap();
+        let res = res.as_primitive::<Float32Type>();
+        let res = res.iter().map(|x| x.unwrap()).collect_vec();
+        assert_eq!(res, vec![1.0, 2.0, 3.0]);
     }
 
     #[test]

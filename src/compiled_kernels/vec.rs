@@ -1,4 +1,11 @@
-use arrow_array::{cast::AsArray, Array, ArrayRef, Datum};
+use std::sync::Arc;
+
+use arrow_array::{
+    builder::{FixedSizeListBuilder, Float16Builder, Float32Builder, Float64Builder},
+    cast::AsArray,
+    types::{Float16Type, Float32Type, Float64Type},
+    Array, ArrayRef, Datum, FixedSizeListArray, Scalar,
+};
 use arrow_schema::DataType;
 
 use crate::{
@@ -6,7 +13,7 @@ use crate::{
         dsl::{DSLKernel, KernelOutputType},
         replace_nulls,
     },
-    logical_nulls, ArrowKernelError, Kernel,
+    logical_nulls, ArrayDatum, ArrowKernelError, Kernel,
 };
 
 pub struct DotKernel(DSLKernel);
@@ -100,12 +107,134 @@ impl Kernel for DotKernel {
     }
 }
 
+pub struct NormVecKernel(DSLKernel);
+unsafe impl Sync for NormVecKernel {}
+unsafe impl Send for NormVecKernel {}
+
+impl Kernel for NormVecKernel {
+    type Key = DataType;
+
+    type Input<'a>
+        = &'a dyn Datum
+    where
+        Self: 'a;
+
+    type Params = ();
+
+    type Output = Arc<dyn Datum>;
+
+    fn call(&self, inp: Self::Input<'_>) -> Result<Self::Output, ArrowKernelError> {
+        let (data, is_scalar) = inp.get();
+        let mut res = self.0.call(&[&data])?;
+        if let Some(nulls) = logical_nulls(data)? {
+            res = replace_nulls(res, Some(nulls));
+        }
+
+        if is_scalar {
+            let data = data.as_fixed_size_list();
+            return single_vec_norm(&data)
+                .map(|x| Scalar::new(x))
+                .map(|x| Arc::new(x) as Arc<dyn Datum>);
+        }
+
+        return Ok(Arc::new(ArrayDatum(res)));
+    }
+
+    fn compile(inp: &Self::Input<'_>, _params: Self::Params) -> Result<Self, ArrowKernelError> {
+        let (arr, _is_scalar) = inp.get();
+
+        let arr = arr.as_fixed_size_list_opt().ok_or_else(|| {
+            ArrowKernelError::UnsupportedArguments(format!(
+                "Vectors must be fixed size list, got {}",
+                arr.data_type()
+            ))
+        })?;
+
+        if arr.values().is_nullable() {
+            if arr.values().null_count() > 0 {
+                return Err(ArrowKernelError::UnsupportedArguments(
+                    "vector values must not contain null".to_string(),
+                ));
+            }
+        }
+
+        Ok(NormVecKernel(
+            DSLKernel::compile(&[arr], |ctx| {
+                let vecs = ctx.get_input(0)?;
+                ctx.iter_over(vec![vecs])
+                    .map(|i| vec![i[0].powi(2).vec_sum().sqrt(), i[0].clone()])
+                    .map(|i| vec![i[1].div(&i[0].splat(arr.value_length() as usize))])
+                    .collect(KernelOutputType::FixedSizeList(arr.value_length() as usize))
+            })
+            .map_err(ArrowKernelError::DSLError)?,
+        ))
+    }
+
+    fn get_key_for_input(
+        i: &Self::Input<'_>,
+        _p: &Self::Params,
+    ) -> Result<Self::Key, ArrowKernelError> {
+        Ok(i.get().0.data_type().clone())
+    }
+}
+
+fn single_vec_norm(vec: &FixedSizeListArray) -> Result<FixedSizeListArray, ArrowKernelError> {
+    match vec.values().data_type() {
+        DataType::Float16 => {
+            let v = vec.values().as_primitive::<Float16Type>();
+            let norm = v
+                .values()
+                .iter()
+                .map(|x| x.to_f64().powi(2))
+                .sum::<f64>()
+                .sqrt();
+            let norm = half::f16::from_f64(norm);
+
+            let mut builder = FixedSizeListBuilder::new(Float16Builder::new(), vec.value_length());
+            for value in v.values().iter() {
+                builder.values().append_value(value / norm);
+            }
+            builder.append(true);
+            Ok(builder.finish())
+        }
+        DataType::Float32 => {
+            let v = vec.values().as_primitive::<Float32Type>();
+            let norm = v.values().iter().map(|x| x.powi(2)).sum::<f32>().sqrt();
+
+            let mut builder = FixedSizeListBuilder::new(Float32Builder::new(), vec.value_length());
+            for value in v.values().iter() {
+                builder.values().append_value(value / norm);
+            }
+            builder.append(true);
+            Ok(builder.finish())
+        }
+        DataType::Float64 => {
+            let v = vec.values().as_primitive::<Float64Type>();
+            let norm = v.values().iter().map(|x| x.powi(2)).sum::<f64>().sqrt();
+
+            let mut builder = FixedSizeListBuilder::new(Float64Builder::new(), vec.value_length());
+            for value in v.values().iter() {
+                builder.values().append_value(*value / norm);
+            }
+            builder.append(true);
+            Ok(builder.finish())
+        }
+        _ => Err(ArrowKernelError::UnsupportedArguments(
+            "can only normalize float vectors".into(),
+        )),
+    }
+}
+
 #[cfg(test)]
 mod test {
+    use std::sync::Arc;
+
     use super::DotKernel;
+    use crate::compiled_kernels::vec::NormVecKernel;
     use crate::Kernel;
     use arrow_array::{builder::FixedSizeListBuilder, cast::AsArray};
     use arrow_array::{builder::Float16Builder, types::Float16Type, Scalar};
+    use arrow_array::{Array, Datum};
     use half::f16;
 
     #[test]
@@ -151,5 +280,53 @@ mod test {
         assert_eq!(out.value(0), f16::from_f32(0.5));
         assert_eq!(out.value(1), f16::from_f32(2.0));
         assert_eq!(out.value(2), f16::from_f32(-0.5));
+    }
+
+    #[test]
+    fn test_vec_norm_kernel() {
+        // Build a FixedSizeList<f16, 3> array of vectors
+        let mut list_builder = FixedSizeListBuilder::new(Float16Builder::new(), 3);
+
+        // v0 = [1, 2, 3]
+        list_builder.values().append_value(f16::from_f32(1.0));
+        list_builder.values().append_value(f16::from_f32(2.0));
+        list_builder.values().append_value(f16::from_f32(3.0));
+        list_builder.append(true);
+
+        // v1 = [4, 5, 6]
+        list_builder.values().append_value(f16::from_f32(4.0));
+        list_builder.values().append_value(f16::from_f32(5.0));
+        list_builder.values().append_value(f16::from_f32(6.0));
+        list_builder.append(true);
+
+        // v2 = [-1, 0.5, 2]
+        list_builder.values().append_value(f16::from_f32(-1.0));
+        list_builder.values().append_value(f16::from_f32(0.5));
+        list_builder.values().append_value(f16::from_f32(2.0));
+        list_builder.append(true);
+        let vecs: Arc<dyn Datum> = Arc::new(list_builder.finish());
+
+        // Compile and run kernel
+        let kernel = NormVecKernel::compile(&vecs.as_ref(), ()).unwrap();
+        let out = kernel.call(vecs.as_ref()).unwrap();
+        let out = out.get().0.as_fixed_size_list();
+
+        assert_eq!(out.len(), 3);
+        assert_eq!(out.value(0).len(), 3);
+        assert_eq!(out.value(1).len(), 3);
+        assert_eq!(out.value(2).len(), 3);
+
+        let mut list_builder = FixedSizeListBuilder::new(Float16Builder::new(), 3);
+        list_builder.values().append_value(f16::from_f32(1.0));
+        list_builder.values().append_value(f16::from_f32(2.0));
+        list_builder.values().append_value(f16::from_f32(3.0));
+        list_builder.append(true);
+        let s: Arc<dyn Datum> = Arc::new(Scalar::new(list_builder.finish()));
+        let kernel = NormVecKernel::compile(&s.as_ref(), ()).unwrap();
+        let r = kernel.call(s.as_ref()).unwrap();
+
+        let (r, is_scalar) = r.get();
+        assert!(is_scalar);
+        assert_eq!(r.as_fixed_size_list().value(0).len(), 3);
     }
 }

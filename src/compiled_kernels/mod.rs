@@ -38,7 +38,7 @@ pub use rust_iter::{ArrowIter, ArrowNullableIter, IterFuncHolder};
 pub use sort::{LowerBoundKernel, SortKernel, SortOptions, TopKKernel};
 pub use string::{compile_string_like, string_contains, StringKernelType, StringStartEndKernel};
 pub use take::TakeKernel;
-pub use vec::DotKernel;
+pub use vec::{DotKernel, NormVecKernel};
 
 use dsl::DSLError;
 use inkwell::{

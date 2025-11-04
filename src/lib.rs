@@ -6,7 +6,7 @@ use arrow_array::{
     cast::AsArray,
     make_array,
     types::{Int16Type, Int32Type, Int64Type, RunEndIndexType},
-    Array, ArrayRef, BinaryArray, BinaryViewArray, BooleanArray, Date32Array, Date64Array,
+    Array, ArrayRef, BinaryArray, BinaryViewArray, BooleanArray, Date32Array, Date64Array, Datum,
     FixedSizeBinaryArray, Float16Array, Float32Array, Float64Array, Int16Array, Int32Array,
     Int64Array, Int8Array, LargeBinaryArray, LargeStringArray, NullArray, PrimitiveArray,
     StringArray, StringViewArray, UInt16Array, UInt32Array, UInt64Array, UInt8Array,
@@ -594,6 +594,13 @@ impl Predicate {
             Predicate::Gt => Predicate::Lt,
             Predicate::Gte => Predicate::Lte,
         }
+    }
+}
+
+struct ArrayDatum(ArrayRef);
+impl Datum for ArrayDatum {
+    fn get(&self) -> (&dyn Array, bool) {
+        (&self.0, false)
     }
 }
 

@@ -54,6 +54,32 @@ pub fn criterion_benchmark(c: &mut Criterion) {
                 f32b.finish()
             })
         });
+
+        c.bench_function("norm/llvm", |b| {
+            b.iter(|| arrow_compile_compute::vec::norm(&vecs).unwrap())
+        });
+
+        c.bench_function("norm/arrow", |b| {
+            b.iter(|| {
+                let mut b = FixedSizeListBuilder::new(Float32Builder::new(), vecs.value_length());
+                for el in vecs.iter() {
+                    match el {
+                        Some(v) => {
+                            let v = v.as_primitive::<Float32Type>();
+                            let norm = v.values().iter().map(|x| x.powi(2)).sum::<f32>().sqrt();
+                            v.values()
+                                .iter()
+                                .map(|x| x / norm)
+                                .for_each(|x| b.values().append_value(x));
+
+                            b.append(true);
+                        }
+                        None => b.append(false),
+                    }
+                }
+                b.finish()
+            })
+        });
     }
 }
 
