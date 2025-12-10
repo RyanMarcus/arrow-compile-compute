@@ -1,6 +1,6 @@
 use std::sync::Arc;
 
-use arrow_array::{Array, GenericStringArray, StringArray};
+use arrow_array::{Array, GenericBinaryArray, GenericStringArray, StringArray};
 use inkwell::{
     builder::Builder,
     context::Context,
@@ -26,6 +26,18 @@ pub struct StringIterator {
 
 impl From<&StringArray> for Box<StringIterator> {
     fn from(value: &StringArray) -> Self {
+        Box::new(StringIterator {
+            offsets: value.offsets().as_ptr(),
+            data: value.values().as_ptr(),
+            pos: value.offset() as u64,
+            len: (value.len() + value.offset()) as u64,
+            array_ref: Arc::new(value.clone()),
+        })
+    }
+}
+
+impl From<&GenericBinaryArray<i32>> for Box<StringIterator> {
+    fn from(value: &GenericBinaryArray<i32>) -> Self {
         Box::new(StringIterator {
             offsets: value.offsets().as_ptr(),
             data: value.values().as_ptr(),

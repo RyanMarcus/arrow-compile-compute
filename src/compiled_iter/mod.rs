@@ -100,7 +100,7 @@ fn array_to_iter(arr: &dyn Array) -> IteratorHolder {
         arrow_schema::DataType::Time64(_time_unit) => todo!(),
         arrow_schema::DataType::Duration(_time_unit) => todo!(),
         arrow_schema::DataType::Interval(_interval_unit) => todo!(),
-        arrow_schema::DataType::Binary => todo!(),
+        arrow_schema::DataType::Binary => IteratorHolder::String(arr.as_binary().into()),
         arrow_schema::DataType::FixedSizeBinary(_) => todo!(),
         arrow_schema::DataType::LargeBinary => todo!(),
         arrow_schema::DataType::BinaryView => {
