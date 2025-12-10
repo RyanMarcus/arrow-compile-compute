@@ -88,8 +88,13 @@ impl Kernel for ComparisonKernel {
         self.with_func(|func| unsafe {
             func.call(a_iter.get_mut_ptr(), b_iter.get_mut_ptr(), alloc.get_ptr())
         });
+        let mut arr = alloc.to_array(a_arr.len(), None);
 
-        Ok(alloc.to_array(a_arr.len(), NullBuffer::union(a_arr.nulls(), b_arr.nulls())))
+        if let Some(nulls) = NullBuffer::union(a_arr.nulls(), b_arr.nulls()) {
+            arr = (&arr.into_parts().0 & nulls.inner()).into();
+        }
+
+        Ok(arr)
     }
 
     fn compile(inp: &Self::Input<'_>, pred: Predicate) -> Result<Self, ArrowKernelError> {
@@ -783,7 +788,16 @@ mod tests {
         let b = UInt32Array::from(vec![11, 0, 13]);
         let k = ComparisonKernel::compile(&(&a, &b), Predicate::Lt).unwrap();
         let r = k.call((&a, &b)).unwrap();
-        assert_eq!(r, BooleanArray::from(vec![true, false, true]))
+        assert_eq!(r, BooleanArray::from(vec![true, false, true]));
+    }
+
+    #[test]
+    fn test_num_num_cmp_nulls() {
+        let a = UInt32Array::from(vec![Some(1), Some(2), None]);
+        let b = UInt32Array::from(vec![Some(11), Some(0), Some(13)]);
+        let k = ComparisonKernel::compile(&(&a, &b), Predicate::Lt).unwrap();
+        let r = k.call((&a, &b)).unwrap();
+        assert_eq!(r, BooleanArray::from(vec![true, false, false]));
     }
 
     #[test]
