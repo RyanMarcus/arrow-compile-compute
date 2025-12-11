@@ -1099,6 +1099,28 @@ pub fn generate_next<'a>(
             build.position_at_end(fetch_next_segment);
             let new_segment = it.llvm_get_segment(ctx, &build, curr_segment_idx, iter_ptr);
             it.llvm_set_current_u64(ctx, &build, new_segment, iter_ptr);
+            let rel_segment_idx = build
+                .build_int_sub(
+                    curr_segment_idx,
+                    it.llvm_segment_start(ctx, &build, iter_ptr),
+                    "rel_segment_idx",
+                )
+                .unwrap();
+            let segment_bit_offset = build
+                .build_int_mul(
+                    rel_segment_idx,
+                    i64_type.const_int(64, false),
+                    "segment_bit_offset",
+                )
+                .unwrap();
+            let segment_base = build
+                .build_int_add(
+                    it.llvm_head_len(ctx, &build, iter_ptr),
+                    segment_bit_offset,
+                    "segment_base",
+                )
+                .unwrap();
+            it.llvm_set_current_bit_idx(ctx, &build, segment_base, iter_ptr);
             it.llvm_inc_curr_segment(ctx, &build, iter_ptr);
             build.build_unconditional_branch(main_cond).unwrap();
 
@@ -1151,6 +1173,28 @@ pub fn generate_next<'a>(
                 .unwrap();
 
             build.position_at_end(tail_cond);
+            let rel_segments_done = build
+                .build_int_sub(
+                    it.llvm_get_curr_segment_pos(ctx, &build, iter_ptr),
+                    it.llvm_segment_start(ctx, &build, iter_ptr),
+                    "segments_done",
+                )
+                .unwrap();
+            let tail_bit_offset = build
+                .build_int_mul(
+                    rel_segments_done,
+                    i64_type.const_int(64, false),
+                    "tail_bit_offset",
+                )
+                .unwrap();
+            let tail_base = build
+                .build_int_add(
+                    it.llvm_head_len(ctx, &build, iter_ptr),
+                    tail_bit_offset,
+                    "tail_base",
+                )
+                .unwrap();
+            it.llvm_set_current_bit_idx(ctx, &build, tail_base, iter_ptr);
             let (tail_ptr, tail_pos, tail_len) = it.llvm_tail_info(ctx, &build, iter_ptr);
             let have_tail = build
                 .build_int_compare(IntPredicate::ULT, tail_pos, tail_len, "have_tail")

@@ -79,18 +79,34 @@ fn split_bit_span(offset: usize, len: usize) -> Result<Segments, &'static str> {
 #[derive(ReprOffset, Debug)]
 #[roff(usize_offsets)]
 pub struct SetBitIterator {
+    /// Pointer to the start of the bitmap backing bytes.
     bitmap: *const u8,
+    /// Materialized set-bit positions within the unaligned prefix (max 64 entries).
     header: [u64; 64],
+    /// Cursor into `header`.
     header_idx: u64,
+    /// Number of populated entries in `header`.
     header_len: u64,
+    /// Logical length (in bits) of the unaligned prefix before the first aligned 64-bit block.
+    head_len: u64,
+    /// Materialized set-bit positions within the unaligned suffix (max 64 entries).
     tail: [u64; 64],
+    /// Cursor into `tail`.
     tail_idx: u64,
+    /// Number of populated entries in `tail`.
     tail_len: u64,
 
+    /// Current 64-bit segment being scanned for trailing set bits.
     current_u64: u64,
+    /// Absolute bit index of the current segment start plus intra-segment offset.
     curr_setbit_idx: u64,
+    /// Index of the next 64-bit segment to load (relative to the bitmap start).
     segment_pos: u64,
+    /// Total number of full 64-bit segments to scan.
     segment_len: u64,
+    /// Index of the first aligned 64-bit segment (used to compute absolute offsets).
+    segment_start: u64,
+    /// Keep the array alive while iterating.
     array_ref: BooleanArray,
 }
 
@@ -136,18 +152,22 @@ impl From<&BooleanArray> for SetBitIterator {
             None => (0, 0),
         };
 
+        let head_len = segments.head.map(|r| r.len()).unwrap_or(0) as u64;
+
         SetBitIterator {
             bitmap: array.values().values().as_ptr(),
             header,
             header_len,
+            head_len,
             tail,
             tail_len,
             header_idx: 0,
             tail_idx: 0,
             current_u64: 0,
-            curr_setbit_idx: segments.head.map(|r| r.len()).unwrap_or(0) as u64,
+            curr_setbit_idx: head_len,
             segment_pos: first_full_segment_idx as u64,
             segment_len: last_full_segment_idx as u64 - first_full_segment_idx as u64,
+            segment_start: first_full_segment_idx as u64,
             array_ref: array.clone(),
         }
     }
@@ -211,6 +231,37 @@ impl SetBitIterator {
             .unwrap()
             .into_int_value();
         (tail_ptr, tail_idx, tail_len.into_int_value())
+    }
+
+    /// returns the logical number of bits before the first aligned segment
+    pub fn llvm_head_len<'a>(
+        &self,
+        ctx: &'a Context,
+        b: &'a Builder,
+        ptr: PointerValue<'a>,
+    ) -> IntValue<'a> {
+        let head_len_ptr = increment_pointer!(ctx, b, ptr, SetBitIterator::OFFSET_HEAD_LEN);
+        let head_len = b
+            .build_load(ctx.i64_type(), head_len_ptr, "head_len")
+            .unwrap();
+        mark_load_invariant!(ctx, head_len);
+        head_len.into_int_value()
+    }
+
+    /// returns the starting aligned segment index for this iterator
+    pub fn llvm_segment_start<'a>(
+        &self,
+        ctx: &'a Context,
+        b: &'a Builder,
+        ptr: PointerValue<'a>,
+    ) -> IntValue<'a> {
+        let segment_start_ptr =
+            increment_pointer!(ctx, b, ptr, SetBitIterator::OFFSET_SEGMENT_START);
+        let segment_start = b
+            .build_load(ctx.i64_type(), segment_start_ptr, "segment_start")
+            .unwrap();
+        mark_load_invariant!(ctx, segment_start);
+        segment_start.into_int_value()
     }
 
     pub fn llvm_inc_tail_pos<'a>(&self, ctx: &'a Context, b: &'a Builder, ptr: PointerValue<'a>) {
@@ -336,6 +387,18 @@ impl SetBitIterator {
             .unwrap();
         let curr_and = build.build_and(curr, curr_minus_one, "curr_and").unwrap();
         build.build_store(curr_ptr, curr_and).unwrap();
+    }
+
+    /// set the base bit index for the current segment
+    pub fn llvm_set_current_bit_idx<'a>(
+        &self,
+        ctx: &'a Context,
+        build: &'a Builder,
+        val: IntValue<'a>,
+        ptr: PointerValue<'a>,
+    ) {
+        let curr_ptr = increment_pointer!(ctx, build, ptr, SetBitIterator::OFFSET_CURR_SETBIT_IDX);
+        build.build_store(curr_ptr, val).unwrap();
     }
 
     pub fn llvm_add_and_get_current_bit_idx<'a>(
@@ -571,6 +634,10 @@ mod tests {
             offset_of!(SetBitIterator, header_len)
         );
         assert_eq!(
+            SetBitIterator::OFFSET_HEAD_LEN,
+            offset_of!(SetBitIterator, head_len)
+        );
+        assert_eq!(
             SetBitIterator::OFFSET_TAIL,
             offset_of!(SetBitIterator, tail)
         );
@@ -597,6 +664,10 @@ mod tests {
         assert_eq!(
             SetBitIterator::OFFSET_SEGMENT_LEN,
             offset_of!(SetBitIterator, segment_len)
+        );
+        assert_eq!(
+            SetBitIterator::OFFSET_SEGMENT_START,
+            offset_of!(SetBitIterator, segment_start)
         );
         assert_eq!(
             SetBitIterator::OFFSET_BITMAP,
