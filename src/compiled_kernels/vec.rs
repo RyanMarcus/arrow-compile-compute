@@ -1,11 +1,6 @@
 use std::sync::Arc;
 
-use arrow_array::{
-    builder::{FixedSizeListBuilder, Float16Builder, Float32Builder, Float64Builder},
-    cast::AsArray,
-    types::{Float16Type, Float32Type, Float64Type},
-    Array, ArrayRef, Datum, FixedSizeListArray, Scalar,
-};
+use arrow_array::{cast::AsArray, Array, ArrayRef, Datum, Scalar};
 use arrow_schema::DataType;
 
 use crate::{
@@ -131,10 +126,7 @@ impl Kernel for NormVecKernel {
         }
 
         if is_scalar {
-            let data = data.as_fixed_size_list();
-            return single_vec_norm(&data)
-                .map(|x| Scalar::new(x))
-                .map(|x| Arc::new(x) as Arc<dyn Datum>);
+            return Ok(Arc::new(Scalar::new(res)));
         }
 
         return Ok(Arc::new(ArrayDatum(res)));
@@ -175,53 +167,6 @@ impl Kernel for NormVecKernel {
         _p: &Self::Params,
     ) -> Result<Self::Key, ArrowKernelError> {
         Ok(i.get().0.data_type().clone())
-    }
-}
-
-fn single_vec_norm(vec: &FixedSizeListArray) -> Result<FixedSizeListArray, ArrowKernelError> {
-    match vec.values().data_type() {
-        DataType::Float16 => {
-            let v = vec.values().as_primitive::<Float16Type>();
-            let norm = v
-                .values()
-                .iter()
-                .map(|x| x.to_f64().powi(2))
-                .sum::<f64>()
-                .sqrt();
-            let norm = half::f16::from_f64(norm);
-
-            let mut builder = FixedSizeListBuilder::new(Float16Builder::new(), vec.value_length());
-            for value in v.values().iter() {
-                builder.values().append_value(value / norm);
-            }
-            builder.append(true);
-            Ok(builder.finish())
-        }
-        DataType::Float32 => {
-            let v = vec.values().as_primitive::<Float32Type>();
-            let norm = v.values().iter().map(|x| x.powi(2)).sum::<f32>().sqrt();
-
-            let mut builder = FixedSizeListBuilder::new(Float32Builder::new(), vec.value_length());
-            for value in v.values().iter() {
-                builder.values().append_value(value / norm);
-            }
-            builder.append(true);
-            Ok(builder.finish())
-        }
-        DataType::Float64 => {
-            let v = vec.values().as_primitive::<Float64Type>();
-            let norm = v.values().iter().map(|x| x.powi(2)).sum::<f64>().sqrt();
-
-            let mut builder = FixedSizeListBuilder::new(Float64Builder::new(), vec.value_length());
-            for value in v.values().iter() {
-                builder.values().append_value(*value / norm);
-            }
-            builder.append(true);
-            Ok(builder.finish())
-        }
-        _ => Err(ArrowKernelError::UnsupportedArguments(
-            "can only normalize float vectors".into(),
-        )),
     }
 }
 
