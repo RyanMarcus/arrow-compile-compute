@@ -3,7 +3,7 @@ use arrow_array::{Array, ArrayRef, BooleanArray};
 use arrow_buffer::NullBuffer;
 use arrow_schema::DataType;
 
-use crate::compiled_kernels::dsl::{DSLKernel, KernelOutputType};
+use crate::compiled_kernels::dsl::{base_type, DSLKernel, KernelOutputType};
 use crate::{logical_nulls, ArrowKernelError, PrimitiveType};
 
 use crate::compiled_kernels::{replace_nulls, Kernel};
@@ -26,6 +26,10 @@ impl Kernel for TakeKernel {
 
     fn call(&self, inp: Self::Input<'_>) -> Result<Self::Output, ArrowKernelError> {
         let (arr, idx) = inp;
+        if arr.is_empty() && !idx.is_empty() {
+            panic!("empty array with non-empty indexes in take");
+        }
+
         if idx.nulls().is_some() {
             return Err(ArrowKernelError::UnsupportedArguments(
                 "indexes for take must not be nullable".to_string(),
@@ -52,15 +56,7 @@ impl Kernel for TakeKernel {
             )));
         }
 
-        // TODO more robust output type selecction
-        let out_type = if PrimitiveType::for_arrow_type(arr.data_type()) == PrimitiveType::P64x2 {
-            KernelOutputType::String
-        } else if arr.data_type() == &DataType::Boolean {
-            KernelOutputType::Boolean
-        } else {
-            KernelOutputType::Array
-        };
-
+        let out_type = KernelOutputType::for_data_type(&base_type(arr.data_type()))?;
         Ok(TakeKernel(
             DSLKernel::compile(&[arr, idx], |ctx| {
                 let arr = ctx.get_input(0)?;
@@ -84,8 +80,9 @@ impl Kernel for TakeKernel {
 #[cfg(test)]
 mod tests {
     use arrow_array::{
+        builder::{FixedSizeListBuilder, Float32Builder},
         cast::AsArray,
-        types::{Int32Type, Int64Type},
+        types::{Float32Type, Int32Type, Int64Type},
         BooleanArray, Int32Array, Int64Array, RunArray, StringArray, UInt16Array, UInt32Array,
         UInt8Array,
     };
@@ -191,5 +188,25 @@ mod tests {
         let res = k.call((&data, &idxes)).unwrap();
         let res = res.as_boolean();
         assert_eq!(res.values().iter().collect_vec(), &[true, true, false]);
+    }
+
+    #[test]
+    fn test_take_vec() {
+        let mut b = FixedSizeListBuilder::new(Float32Builder::new(), 2);
+        b.values().append_slice(&[0.0, 1.0]);
+        b.append(true);
+        b.values().append_slice(&[2.0, 3.0]);
+        b.append(true);
+        b.values().append_slice(&[4.0, 5.0]);
+        b.append(true);
+
+        let data = b.finish();
+        let sel = Int32Array::from(vec![1]);
+        let k = TakeKernel::compile(&(&data, &sel), ()).unwrap();
+        let res = k.call((&data, &sel)).unwrap();
+        let res = res.as_fixed_size_list();
+        let val = res.value(0);
+        let val = val.as_primitive::<Float32Type>();
+        assert_eq!(val.values(), &[2.0, 3.0]);
     }
 }
