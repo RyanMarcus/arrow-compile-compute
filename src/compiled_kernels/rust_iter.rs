@@ -458,8 +458,8 @@ mod tests {
     use std::sync::Arc;
 
     use arrow_array::{
-        types::Int64Type, Array, BooleanArray, Float32Array, Int32Array, Int64Array, RunArray,
-        StringArray, UInt32Array,
+        types::Int64Type, Array, BooleanArray, Float32Array, Int32Array, Int64Array,
+        LargeBinaryArray, RunArray, StringArray, UInt32Array,
     };
     use itertools::Itertools;
 
@@ -588,6 +588,22 @@ mod tests {
             .map(|x| String::from_utf8(x.to_vec()).unwrap())
             .collect_vec();
         assert_eq!(res.len(), 5);
+    }
+
+    #[test]
+    fn test_iter_large_binary() {
+        let vdata = (0..1000)
+            .map(|i| format!("bin{}", i).into_bytes())
+            .collect_vec();
+        let data = LargeBinaryArray::from(vdata.iter().map(|x| x.as_slice()).collect_vec());
+        let ifh =
+            Arc::<IterFuncHolder>::compile(&(&data as &dyn Array), (PrimitiveType::P64x2, false))
+                .unwrap();
+        let res = ArrowIter::<&[u8]>::new(&data, ifh)
+            .unwrap()
+            .map(|x| x.to_vec())
+            .collect_vec();
+        assert_eq!(res, vdata);
     }
 
     #[test]

@@ -406,6 +406,7 @@ impl PrimitiveType {
             DataType::RunEndEncoded(_k, v) => PrimitiveType::for_arrow_type(v.data_type()),
             DataType::Utf8 => PrimitiveType::P64x2, // string
             DataType::Binary => PrimitiveType::P64x2, // binary
+            DataType::LargeBinary => PrimitiveType::P64x2, // binary
             DataType::LargeUtf8 => PrimitiveType::P64x2, // string view
             DataType::Utf8View => PrimitiveType::P64x2, // string view
             DataType::FixedSizeList(f, l) => PrimitiveType::List(

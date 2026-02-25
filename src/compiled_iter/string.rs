@@ -242,17 +242,36 @@ impl From<&GenericStringArray<i64>> for Box<LargeStringIterator> {
     }
 }
 
+impl From<&GenericBinaryArray<i64>> for Box<LargeStringIterator> {
+    fn from(value: &GenericBinaryArray<i64>) -> Self {
+        Box::new(LargeStringIterator {
+            offsets: value.offsets().as_ptr(),
+            data: value.values().as_ptr(),
+            pos: value.offset() as u64,
+            len: (value.len() + value.offset()) as u64,
+        })
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::ffi::c_void;
 
-    use arrow_array::{Datum, LargeStringArray, StringArray};
+    use arrow_array::{Datum, LargeBinaryArray, LargeStringArray, Scalar, StringArray};
     use inkwell::{context::Context, OptimizationLevel};
 
     use crate::{
         compiled_iter::{datum_to_iter, generate_next, generate_random_access},
         pointers_to_str,
     };
+
+    unsafe fn pointers_to_bytes(ptrs: u128) -> Vec<u8> {
+        let b = ptrs.to_le_bytes();
+        let ptr1 = u64::from_le_bytes(b[0..8].try_into().unwrap());
+        let ptr2 = u64::from_le_bytes(b[8..16].try_into().unwrap());
+        let len = (ptr2 - ptr1) as usize;
+        std::slice::from_raw_parts(ptr1 as *const u8, len).to_vec()
+    }
 
     #[test]
     fn test_string_scalar() {
@@ -321,6 +340,34 @@ mod tests {
             let slice = std::slice::from_raw_parts(ptr1 as *const u8, len);
             let string = std::str::from_utf8(slice).unwrap();
             assert_eq!(string, "hello");
+        }
+    }
+
+    #[test]
+    fn test_large_binary_scalar() {
+        let arr = LargeBinaryArray::from(vec![Some("hello".as_bytes())]);
+        let s = Scalar::new(arr);
+        let mut iter = datum_to_iter(&s).unwrap();
+
+        let ctx = Context::create();
+        let module = ctx.create_module("test_scalar_large_binary");
+        let func_next = generate_next(&ctx, &module, "next", s.get().0.data_type(), &iter).unwrap();
+        let fname_next = func_next.get_name().to_str().unwrap();
+
+        module.verify().unwrap();
+        let ee = module
+            .create_jit_execution_engine(OptimizationLevel::None)
+            .unwrap();
+
+        let next_func = unsafe {
+            ee.get_function::<unsafe extern "C" fn(*mut c_void, *mut u128) -> bool>(fname_next)
+                .unwrap()
+        };
+
+        unsafe {
+            let mut b: u128 = 0;
+            assert!(next_func.call(iter.get_mut_ptr(), &mut b));
+            assert_eq!(pointers_to_bytes(b), b"hello".to_vec());
         }
     }
 
@@ -533,6 +580,77 @@ mod tests {
 
             assert!(func.call(iter.get_mut_ptr(), &mut b));
             assert_eq!(pointers_to_str(b), "test");
+
+            assert!(!func.call(iter.get_mut_ptr(), &mut b));
+        }
+    }
+
+    #[test]
+    fn test_large_binary_random_access() {
+        let data =
+            LargeBinaryArray::from(vec![b"this".as_ref(), b"is".as_ref(), b"a".as_ref(), b"test"]);
+        let mut iter = datum_to_iter(&data).unwrap();
+
+        let ctx = Context::create();
+        let module = ctx.create_module("test_large_binary_random_access");
+        let func_access =
+            generate_random_access(&ctx, &module, "access", data.get().0.data_type(), &iter)
+                .unwrap();
+        let fname = func_access.get_name().to_str().unwrap();
+
+        module.verify().unwrap();
+        let ee = module
+            .create_jit_execution_engine(OptimizationLevel::None)
+            .unwrap();
+
+        let func = unsafe {
+            ee.get_function::<unsafe extern "C" fn(*mut c_void, u64) -> u128>(fname)
+                .unwrap()
+        };
+
+        unsafe {
+            let b = func.call(iter.get_mut_ptr(), 0);
+            assert_eq!(pointers_to_bytes(b), b"this".to_vec());
+
+            let b = func.call(iter.get_mut_ptr(), 2);
+            assert_eq!(pointers_to_bytes(b), b"a".to_vec());
+        }
+    }
+
+    #[test]
+    fn test_large_binary_next() {
+        let data =
+            LargeBinaryArray::from(vec![b"this".as_ref(), b"is".as_ref(), b"a".as_ref(), b"test"]);
+        let mut iter = datum_to_iter(&data).unwrap();
+
+        let ctx = Context::create();
+        let module = ctx.create_module("test_large_binary_next");
+        let func_next = generate_next(&ctx, &module, "next", data.get().0.data_type(), &iter).unwrap();
+        let fname = func_next.get_name().to_str().unwrap();
+
+        module.verify().unwrap();
+        let ee = module
+            .create_jit_execution_engine(OptimizationLevel::None)
+            .unwrap();
+
+        let func = unsafe {
+            ee.get_function::<unsafe extern "C" fn(*mut c_void, *mut u128) -> bool>(fname)
+                .unwrap()
+        };
+
+        unsafe {
+            let mut b: u128 = 0;
+            assert!(func.call(iter.get_mut_ptr(), &mut b));
+            assert_eq!(pointers_to_bytes(b), b"this".to_vec());
+
+            assert!(func.call(iter.get_mut_ptr(), &mut b));
+            assert_eq!(pointers_to_bytes(b), b"is".to_vec());
+
+            assert!(func.call(iter.get_mut_ptr(), &mut b));
+            assert_eq!(pointers_to_bytes(b), b"a".to_vec());
+
+            assert!(func.call(iter.get_mut_ptr(), &mut b));
+            assert_eq!(pointers_to_bytes(b), b"test".to_vec());
 
             assert!(!func.call(iter.get_mut_ptr(), &mut b));
         }

@@ -102,7 +102,9 @@ fn array_to_iter(arr: &dyn Array) -> IteratorHolder {
         arrow_schema::DataType::Interval(_interval_unit) => todo!(),
         arrow_schema::DataType::Binary => IteratorHolder::String(arr.as_binary().into()),
         arrow_schema::DataType::FixedSizeBinary(_) => todo!(),
-        arrow_schema::DataType::LargeBinary => todo!(),
+        arrow_schema::DataType::LargeBinary => {
+            IteratorHolder::LargeString(arr.as_binary::<i64>().into())
+        }
         arrow_schema::DataType::BinaryView => {
             IteratorHolder::View(arr.as_byte_view::<BinaryViewType>().into())
         }
@@ -180,7 +182,12 @@ pub fn datum_to_iter(val: &dyn Datum) -> Result<IteratorHolder, ArrowKernelError
                 .into_boxed_slice()
                 .into()),
             DataType::FixedSizeBinary(_) => todo!(),
-            DataType::LargeBinary => todo!(),
+            DataType::LargeBinary => Ok(d
+                .as_binary::<i64>()
+                .value(0)
+                .to_owned()
+                .into_boxed_slice()
+                .into()),
             DataType::BinaryView => todo!(),
             DataType::Utf8 => Ok(d
                 .as_string::<i32>()
