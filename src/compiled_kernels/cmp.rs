@@ -772,7 +772,7 @@ mod tests {
 
     use arrow_array::{
         BooleanArray, Float32Array, Int32Array, Int64Array, Scalar, StringArray, StringViewArray,
-        UInt32Array,
+        UInt16Array, UInt32Array,
     };
     use arrow_schema::DataType;
     use itertools::Itertools;
@@ -967,5 +967,18 @@ mod tests {
 
         let expected_result = (0..100).map(|i| i % 4 == 2).collect_vec();
         assert_eq!(r, BooleanArray::from(expected_result));
+    }
+
+    #[test]
+    fn test_u16_scalar_eq_on_sliced_input() {
+        let base = UInt16Array::from((0..4096).map(|v| (v % 1024) as u16).collect_vec());
+        let sliced = base.slice(3, 2048);
+        let rhs = UInt16Array::new_scalar(127);
+
+        let res = crate::cmp::eq(&sliced, &rhs).unwrap();
+        assert_eq!(
+            res.true_count(),
+            (0..2048).filter(|i| ((i + 3) % 1024) == 127).count()
+        );
     }
 }

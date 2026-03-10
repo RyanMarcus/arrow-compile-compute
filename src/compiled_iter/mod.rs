@@ -415,6 +415,11 @@ pub fn generate_next_block<'a, const N: u32>(
             let data_ptr = primitive_iter.llvm_data(ctx, &build, iter_ptr);
             let data_ptr = increment_pointer!(ctx, build, data_ptr, ptype.width(), curr_pos);
             let vec = build.build_load(vec_type, data_ptr, "vec").unwrap();
+            vec.as_instruction_value()
+                .unwrap()
+                .set_alignment(1)
+                .unwrap();
+
             build.build_store(out_ptr, vec).unwrap();
             primitive_iter.llvm_increment_pos(ctx, &build, iter_ptr, llvm_n);
             build
