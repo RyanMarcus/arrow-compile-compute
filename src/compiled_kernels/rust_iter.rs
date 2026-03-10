@@ -91,6 +91,7 @@ impl Kernel for Arc<IterFuncHolder> {
     fn compile(inp: &Self::Input<'_>, params: Self::Params) -> Result<Self, ArrowKernelError> {
         let ih = datum_to_iter(inp)?;
         let (target_type, ignore_nulls) = params;
+        validate_iter_target(inp.data_type(), target_type)?;
         let setbit_ih = (!ignore_nulls)
             .then(|| {
                 logical_nulls(*inp).unwrap().map(|nulls| {
@@ -115,11 +116,26 @@ impl Kernel for Arc<IterFuncHolder> {
         p: &Self::Params,
     ) -> Result<Self::Key, ArrowKernelError> {
         let (target_dt, ignore_nulls) = p;
+        validate_iter_target(i.data_type(), *target_dt)?;
         Ok((
             i.data_type().clone(),
             i.is_nullable() && !ignore_nulls,
             *target_dt,
         ))
+    }
+}
+
+fn validate_iter_target(dt: &DataType, target_type: PrimitiveType) -> Result<(), ArrowKernelError> {
+    let input_type = PrimitiveType::for_arrow_type(dt);
+    match (input_type, target_type) {
+        (PrimitiveType::P64x2, PrimitiveType::P64x2) => Ok(()),
+        (PrimitiveType::P64x2, _)
+        | (_, PrimitiveType::P64x2)
+        | (PrimitiveType::List(_, _), _)
+        | (_, PrimitiveType::List(_, _)) => {
+            Err(ArrowKernelError::TypeMismatch(target_type, input_type))
+        }
+        _ => Ok(()),
     }
 }
 

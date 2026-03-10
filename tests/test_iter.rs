@@ -3,6 +3,7 @@ use arrow_array::{
     UInt64Array,
 };
 use arrow_compile_compute::dictionary_data_type;
+use arrow_compile_compute::{ArrowKernelError, PrimitiveType};
 use arrow_schema::DataType;
 use itertools::Itertools;
 use proptest::proptest;
@@ -97,4 +98,28 @@ proptest! {
         assert_eq!(v, arr.iter().map(|&x| x as i64).collect::<Vec<_>>());
     }
 
+}
+
+#[test]
+fn test_iter_bytes_type_mismatch() {
+    let arr = Int32Array::from(vec![1, 2, 3]);
+    let err = arrow_compile_compute::iter::iter_nonnull_bytes(&arr)
+        .err()
+        .unwrap();
+    assert!(matches!(
+        err,
+        ArrowKernelError::TypeMismatch(PrimitiveType::P64x2, PrimitiveType::I32)
+    ));
+}
+
+#[test]
+fn test_iter_i64_type_mismatch() {
+    let arr = StringArray::from(vec!["a", "b", "c"]);
+    let err = arrow_compile_compute::iter::iter_nonnull_i64(&arr)
+        .err()
+        .unwrap();
+    assert!(matches!(
+        err,
+        ArrowKernelError::TypeMismatch(PrimitiveType::I64, PrimitiveType::P64x2)
+    ));
 }
