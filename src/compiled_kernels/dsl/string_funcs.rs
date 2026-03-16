@@ -19,7 +19,7 @@ pub fn add_str_startswith<'a>(ctx: &'a Context, llvm_mod: &Module<'a>) -> Functi
 
     let memcmp = add_memcmp(ctx, llvm_mod);
     let bool_type = ctx.bool_type();
-    let str_type = PrimitiveType::P64x2.llvm_type(&ctx).into_struct_type();
+    let str_type = PrimitiveType::P64x2.llvm_type(ctx).into_struct_type();
 
     let func = llvm_mod.add_function(
         "str_startswith",
@@ -105,7 +105,7 @@ pub fn add_str_endswith<'a>(ctx: &'a Context, llvm_mod: &Module<'a>) -> Function
 
     let memcmp = add_memcmp(ctx, llvm_mod);
     let bool_type = ctx.bool_type();
-    let str_type = PrimitiveType::P64x2.llvm_type(&ctx).into_struct_type();
+    let str_type = PrimitiveType::P64x2.llvm_type(ctx).into_struct_type();
 
     let func = llvm_mod.add_function(
         "str_endswith",

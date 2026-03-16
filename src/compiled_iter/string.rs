@@ -587,8 +587,12 @@ mod tests {
 
     #[test]
     fn test_large_binary_random_access() {
-        let data =
-            LargeBinaryArray::from(vec![b"this".as_ref(), b"is".as_ref(), b"a".as_ref(), b"test"]);
+        let data = LargeBinaryArray::from(vec![
+            b"this".as_ref(),
+            b"is".as_ref(),
+            b"a".as_ref(),
+            b"test",
+        ]);
         let mut iter = datum_to_iter(&data).unwrap();
 
         let ctx = Context::create();
@@ -619,13 +623,18 @@ mod tests {
 
     #[test]
     fn test_large_binary_next() {
-        let data =
-            LargeBinaryArray::from(vec![b"this".as_ref(), b"is".as_ref(), b"a".as_ref(), b"test"]);
+        let data = LargeBinaryArray::from(vec![
+            b"this".as_ref(),
+            b"is".as_ref(),
+            b"a".as_ref(),
+            b"test",
+        ]);
         let mut iter = datum_to_iter(&data).unwrap();
 
         let ctx = Context::create();
         let module = ctx.create_module("test_large_binary_next");
-        let func_next = generate_next(&ctx, &module, "next", data.get().0.data_type(), &iter).unwrap();
+        let func_next =
+            generate_next(&ctx, &module, "next", data.get().0.data_type(), &iter).unwrap();
         let fname = func_next.get_name().to_str().unwrap();
 
         module.verify().unwrap();

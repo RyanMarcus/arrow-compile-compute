@@ -119,16 +119,26 @@ fn get_scmp<'a>(
     func
 }
 
+struct ComparatorField<'a> {
+    ptype: PrimitiveType,
+    sort_options: SortOptions,
+    lhs_nulls: Option<FunctionValue<'a>>,
+    lhs_accessor: FunctionValue<'a>,
+    rhs_nulls: Option<FunctionValue<'a>>,
+    rhs_accessor: FunctionValue<'a>,
+}
+
 fn generate_single_cmp<'a>(
     ctx: &'a Context,
     llvm_mod: &Module<'a>,
-    pt: PrimitiveType,
-    sort_opts: SortOptions,
-    access1: FunctionValue<'a>,
-    nulls1: Option<FunctionValue<'a>>,
-    access2: FunctionValue<'a>,
-    nulls2: Option<FunctionValue<'a>>,
+    field: &ComparatorField<'a>,
 ) -> FunctionValue<'a> {
+    let pt = field.ptype;
+    let sort_opts = field.sort_options;
+    let access1 = field.lhs_accessor;
+    let nulls1 = field.lhs_nulls;
+    let access2 = field.rhs_accessor;
+    let nulls2 = field.rhs_nulls;
     let fname = format!("sort_cmp_{}", pt);
     if let Some(f) = llvm_mod.get_function(&fname) {
         return f;
@@ -387,15 +397,6 @@ fn generate_single_cmp<'a>(
     func
 }
 
-struct ComparatorField<'a> {
-    ptype: PrimitiveType,
-    sort_options: SortOptions,
-    lhs_nulls: Option<FunctionValue<'a>>,
-    lhs_accessor: FunctionValue<'a>,
-    rhs_nulls: Option<FunctionValue<'a>>,
-    rhs_accessor: FunctionValue<'a>,
-}
-
 enum BreakTies {
     ByIndex,
     DoNotBreakTies,
@@ -409,16 +410,7 @@ fn fill_in_cmp<'a>(
 ) {
     let mut all_cmps = Vec::new();
     for cf in pts.iter() {
-        let cmp = generate_single_cmp(
-            ctx,
-            llvm_mod,
-            cf.ptype,
-            cf.sort_options,
-            cf.lhs_accessor,
-            cf.lhs_nulls,
-            cf.rhs_accessor,
-            cf.rhs_nulls,
-        );
+        let cmp = generate_single_cmp(ctx, llvm_mod, cf);
         all_cmps.push(cmp);
     }
 
@@ -850,7 +842,7 @@ fn generate_lower_bound_cmp<'a>(
             None
         };
 
-        let key_iter = datum_to_iter(&*key_arr)?;
+        let key_iter = datum_to_iter(key_arr)?;
         let key_access = generate_random_access(
             ctx,
             &llvm_mod,
@@ -877,7 +869,7 @@ fn generate_lower_bound_cmp<'a>(
             None
         };
 
-        let sorted_iter = datum_to_iter(&*sorted_arr)?;
+        let sorted_iter = datum_to_iter(sorted_arr)?;
         let sorted_access = generate_random_access(
             ctx,
             &llvm_mod,
@@ -962,7 +954,7 @@ impl Kernel for LowerBoundKernel {
             }
         }
 
-        let sorted_len = sorted.get(0).map(|arr| arr.len()).unwrap_or(0);
+        let sorted_len = sorted.first().map(|arr| arr.len()).unwrap_or(0);
         for arr in sorted.iter().skip(1) {
             if arr.len() != sorted_len {
                 return Err(ArrowKernelError::SizeMismatch);
@@ -974,7 +966,7 @@ impl Kernel for LowerBoundKernel {
         let mut ptrs = Vec::new();
 
         for (idx, (key_arr, sorted_arr)) in keys.iter().zip(sorted.iter()).enumerate() {
-            iters.push(datum_to_iter(&*key_arr)?);
+            iters.push(datum_to_iter(key_arr)?);
             let key_data_ptr = iters.last_mut().unwrap().get_mut_ptr();
             if let Some(nulls) = logical_nulls(*key_arr)? {
                 if !self.borrow_key_nullable()[idx] {
@@ -999,7 +991,7 @@ impl Kernel for LowerBoundKernel {
                 ptrs.push(key_data_ptr);
             }
 
-            iters.push(datum_to_iter(&*sorted_arr)?);
+            iters.push(datum_to_iter(sorted_arr)?);
             let sorted_data_ptr = iters.last_mut().unwrap().get_mut_ptr();
             if let Some(nulls) = logical_nulls(*sorted_arr)? {
                 if !self.borrow_sorted_nullable()[idx] {
@@ -1035,7 +1027,7 @@ impl Kernel for LowerBoundKernel {
             let mut hi = sorted_len as u64;
             while lo < hi {
                 let mid = (lo + hi) / 2;
-                let cmp = unsafe { func.call(kp_ptr, key_idx as u64, mid) } as i8;
+                let cmp = unsafe { func.call(kp_ptr, key_idx as u64, mid) };
                 if cmp <= 0 {
                     hi = mid;
                 } else {

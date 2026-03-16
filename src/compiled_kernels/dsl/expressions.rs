@@ -428,16 +428,16 @@ impl<'a> KernelExpression<'a> {
     }
 
     fn is_string(&self) -> bool {
-        match self.get_type() {
+        matches!(
+            self.get_type(),
             DataType::Binary
-            | DataType::FixedSizeBinary(_)
-            | DataType::LargeBinary
-            | DataType::BinaryView
-            | DataType::Utf8
-            | DataType::LargeUtf8
-            | DataType::Utf8View => true,
-            _ => false,
-        }
+                | DataType::FixedSizeBinary(_)
+                | DataType::LargeBinary
+                | DataType::BinaryView
+                | DataType::Utf8
+                | DataType::LargeUtf8
+                | DataType::Utf8View
+        )
     }
 
     pub(super) fn compile_block<'ctx, 'b>(
@@ -1128,9 +1128,7 @@ impl<'a> KernelExpression<'a> {
                     DataType::Float16 | DataType::Float32 | DataType::Float64 => f.get_declaration(
                         compilation.llvm_mod,
                         &[
-                            PrimitiveType::for_arrow_type(&inp.get_type())
-                                .llvm_type(ctx)
-                                .into(),
+                            PrimitiveType::for_arrow_type(&inp.get_type()).llvm_type(ctx),
                             ctx.i32_type().into(),
                         ],
                     ),
@@ -1258,11 +1256,9 @@ impl<'a> KernelExpression<'a> {
 
                             Ok(call)
                         }
-                        PrimitiveSuperType::String => {
-                            return Err(DSLError::TypeMismatch(
-                                "cannot sum string vectors".to_string(),
-                            ))
-                        }
+                        PrimitiveSuperType::String => Err(DSLError::TypeMismatch(
+                            "cannot sum string vectors".to_string(),
+                        )),
                         PrimitiveSuperType::List(_, _) => unreachable!(),
                     }
                 } else {

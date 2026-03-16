@@ -116,7 +116,7 @@ impl Kernel for RangeKernel {
             )));
         }
 
-        if inp.len() == 0 {
+        if inp.is_empty() {
             return Err(ArrowKernelError::ArgumentMismatch(
                 "range kernel requires a non-empty array".to_string(),
             ));

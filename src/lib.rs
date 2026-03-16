@@ -284,9 +284,9 @@ impl TryFrom<PrimitiveType> for ListItemType {
             PrimitiveType::F64 => ListItemType::F64,
             PrimitiveType::P64x2 => ListItemType::P64x2,
             PrimitiveType::List(_, _) => {
-                return Err(ArrowKernelError::UnsupportedArguments(format!(
-                    "nested lists not supported"
-                )))
+                return Err(ArrowKernelError::UnsupportedArguments(
+                    "nested lists not supported".to_string(),
+                ))
             }
         })
     }
@@ -458,27 +458,30 @@ impl PrimitiveType {
     }
 
     fn is_signed(&self) -> bool {
-        match self {
-            PrimitiveType::I8 | PrimitiveType::I16 | PrimitiveType::I32 | PrimitiveType::I64 => {
-                true
-            }
-            PrimitiveType::F16 | PrimitiveType::F32 | PrimitiveType::F64 => true,
-            _ => false,
-        }
+        matches!(
+            self,
+            PrimitiveType::I8
+                | PrimitiveType::I16
+                | PrimitiveType::I32
+                | PrimitiveType::I64
+                | PrimitiveType::F16
+                | PrimitiveType::F32
+                | PrimitiveType::F64
+        )
     }
 
     fn is_int(&self) -> bool {
-        match self {
+        matches!(
+            self,
             PrimitiveType::I8
-            | PrimitiveType::I16
-            | PrimitiveType::I32
-            | PrimitiveType::I64
-            | PrimitiveType::U8
-            | PrimitiveType::U16
-            | PrimitiveType::U32
-            | PrimitiveType::U64 => true,
-            _ => false,
-        }
+                | PrimitiveType::I16
+                | PrimitiveType::I32
+                | PrimitiveType::I64
+                | PrimitiveType::U8
+                | PrimitiveType::U16
+                | PrimitiveType::U32
+                | PrimitiveType::U64
+        )
     }
 
     /// Returns the "best" common value to cast both types to in order to

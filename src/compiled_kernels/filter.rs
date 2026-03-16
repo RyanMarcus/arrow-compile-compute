@@ -28,7 +28,7 @@ impl Kernel for FilterKernel {
         let mut res = self.0.call(&[&inp.0, &inp.1])?;
         if let Some(nulls) = logical_nulls(inp.0)? {
             let ba = BooleanArray::new(nulls.into_inner(), None);
-            let filtered_nulls = crate::arrow_interface::select::filter(&ba, &inp.1)?;
+            let filtered_nulls = crate::arrow_interface::select::filter(&ba, inp.1)?;
             let filtered_nulls = filtered_nulls.as_boolean();
             let filtered_nulls = NullBuffer::new(filtered_nulls.clone().into_parts().0);
             res = replace_nulls(res, Some(filtered_nulls));

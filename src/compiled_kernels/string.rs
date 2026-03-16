@@ -128,6 +128,8 @@ fn filter_bytes<F: Fn(&[u8]) -> bool>(
     Ok(BooleanArray::new(builder.finish(), None))
 }
 
+type StringLikePredicate = dyn Fn(&dyn Array) -> Result<BooleanArray, ArrowKernelError>;
+
 /// Compile a string pattern into a function that can be used to filter arrays.
 /// This has the same semantics as `arrow_interface::cmp::like`. Reusing the
 /// same compiled pattern is more efficient than compiling it each time.
@@ -144,7 +146,7 @@ fn filter_bytes<F: Fn(&[u8]) -> bool>(
 pub fn compile_string_like(
     like_pattern: &[u8],
     escape: u8,
-) -> Result<Box<dyn Fn(&dyn Array) -> Result<BooleanArray, ArrowKernelError>>, ArrowKernelError> {
+) -> Result<Box<StringLikePredicate>, ArrowKernelError> {
     let mut seq = Vec::new();
     let mut i = 0;
     while i < like_pattern.len() {

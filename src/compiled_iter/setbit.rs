@@ -54,7 +54,7 @@ fn split_bit_span(offset: usize, len: usize) -> Result<Segments, &'static str> {
     let last_aligned = align_down64(end);
 
     // Head: from offset up to min(end, first_aligned) if offset is not aligned.
-    let head = if offset % 64 != 0 {
+    let head = if !offset.is_multiple_of(64) {
         let he = first_aligned.min(end);
         Some(offset..he).filter(|r| r.start < r.end)
     } else {

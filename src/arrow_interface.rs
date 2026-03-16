@@ -632,10 +632,10 @@ pub mod compute {
     /// in:
     ///
     /// > Altan Birler, Tobias Schmidt, Philipp Fent, and Thomas Neumann. 2024.
-    /// Simple, Efficient, and Robust Hash Tables for Join Processing. In 20th
-    /// International Workshop on Data Management on New Hardware (DaMoN ’24),
-    /// June 10, 2024, Santiago, AA, Chile. ACM, New York, NY, USA, 9 pages.
-    /// https://doi.org/10.1145/3662010.3663442
+    /// > Simple, Efficient, and Robust Hash Tables for Join Processing. In 20th
+    /// > International Workshop on Data Management on New Hardware (DaMoN ’24),
+    /// > June 10, 2024, Santiago, AA, Chile. ACM, New York, NY, USA, 9 pages.
+    /// > https://doi.org/10.1145/3662010.3663442
     ///
     ///
     /// # Example

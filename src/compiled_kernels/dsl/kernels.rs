@@ -804,12 +804,12 @@ fn build_kernel_with_writer<'a, W: ArrayWriter<'a>>(
     );
     builder.position_at_end(entry);
     let mut iter_ptrs = Vec::new();
-    for i in 0..inputs.len() {
+    for (i, ih) in ihs.iter().take(inputs.len()).enumerate() {
         let ptr = func_inner
             .get_nth_param(i as u32)
             .unwrap()
             .into_pointer_value();
-        iter_ptrs.push(ihs[i].localize_struct(ctx, &builder, ptr));
+        iter_ptrs.push(ih.localize_struct(ctx, &builder, ptr));
     }
 
     let out_ptr = func_inner

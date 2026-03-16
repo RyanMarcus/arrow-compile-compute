@@ -66,12 +66,10 @@ impl Kernel for DotKernel {
             ));
         }
 
-        if vecs.values().is_nullable() {
-            if vecs.values().null_count() > 0 {
-                return Err(ArrowKernelError::UnsupportedArguments(
-                    "vector values must not contain null".to_string(),
-                ));
-            }
+        if vecs.values().is_nullable() && vecs.values().null_count() > 0 {
+            return Err(ArrowKernelError::UnsupportedArguments(
+                "vector values must not contain null".to_string(),
+            ));
         }
 
         if vecs.values().data_type() != q_val.values().data_type() {
@@ -129,7 +127,7 @@ impl Kernel for NormVecKernel {
             return Ok(Arc::new(Scalar::new(res)));
         }
 
-        return Ok(Arc::new(ArrayDatum(res)));
+        Ok(Arc::new(ArrayDatum(res)))
     }
 
     fn compile(inp: &Self::Input<'_>, _params: Self::Params) -> Result<Self, ArrowKernelError> {
@@ -142,12 +140,10 @@ impl Kernel for NormVecKernel {
             ))
         })?;
 
-        if arr.values().is_nullable() {
-            if arr.values().null_count() > 0 {
-                return Err(ArrowKernelError::UnsupportedArguments(
-                    "vector values must not contain null".to_string(),
-                ));
-            }
+        if arr.values().is_nullable() && arr.values().null_count() > 0 {
+            return Err(ArrowKernelError::UnsupportedArguments(
+                "vector values must not contain null".to_string(),
+            ));
         }
 
         Ok(NormVecKernel(

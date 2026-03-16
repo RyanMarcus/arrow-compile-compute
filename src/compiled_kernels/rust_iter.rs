@@ -182,12 +182,12 @@ impl<T: ApplyType> ArrowIter<T> {
         };
 
         if num_returned == 0 {
-            return false;
+            false
+        } else {
+            self.buffer_idx = 0;
+            self.buffer_len = num_returned as usize;
+            true
         }
-
-        self.buffer_idx = 0;
-        self.buffer_len = num_returned as usize;
-        return true;
     }
 }
 
