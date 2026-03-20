@@ -5,7 +5,7 @@ edition = "2021"
 license = "GPL-3.0"
 
 [dependencies]
-inkwell = { version = "0.6.0", features = ["llvm18-1"] }
+inkwell = { version = "0.8.0", features = ["llvm21-1"] }
 arrow-schema = "55.2"
 arrow-buffer = "55.2"
 arrow-data = "55.2"
@@ -33,7 +33,7 @@ arrow-arith = "55.2"
 criterion = "0.5"
 fastrand = "2.2.0"
 itertools = "0.13.0"
-proptest = "1.5"
+proptest = "1.10"
 rayon = "1.10"
 #chrono = "= 0.4.39"
 

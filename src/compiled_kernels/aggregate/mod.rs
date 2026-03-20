@@ -19,13 +19,15 @@ use ouroboros::self_referencing;
 use crate::{
     compiled_iter::{datum_to_iter, generate_next},
     compiled_kernels::{
-        aggregate::minmax::MinMaxAgg, link_req_helpers, optimize_module, KernelCache,
+        aggregate::{minmax::MinMaxAgg, most_recent::MostRecentAgg},
+        link_req_helpers, optimize_module, KernelCache,
     },
     declare_blocks, increment_pointer, ArrowKernelError, Kernel, PrimitiveType,
 };
 
 mod count;
 mod minmax;
+mod most_recent;
 mod sum;
 
 pub use count::CountAgg;
@@ -56,6 +58,7 @@ pub enum AggType {
     Sum,
     Min,
     Max,
+    MostRecent,
 }
 
 pub trait AggAlloc {
@@ -139,7 +142,7 @@ pub trait Aggregation {
             .build_call(next_func, &[iter_ptr.into(), buf_ptr.into()], "next")
             .unwrap()
             .try_as_basic_value()
-            .unwrap_left()
+            .unwrap_basic()
             .into_int_value();
         b.build_conditional_branch(had_next, loop_body, exit)
             .unwrap();
@@ -194,7 +197,7 @@ pub trait Aggregation {
             .build_call(next_func, &[iter_ptr.into(), buf_ptr.into()], "next")
             .unwrap()
             .try_as_basic_value()
-            .unwrap_left()
+            .unwrap_basic()
             .into_int_value();
         b.build_conditional_branch(had_next, loop_body, exit)
             .unwrap();
@@ -300,6 +303,7 @@ impl Kernel for GroupedAggFunc {
             AggType::Sum => compile_grouped_agg_func::<SumAgg>(data[0], atomic),
             AggType::Min => compile_grouped_agg_func::<MinMaxAgg<true>>(data[0], atomic),
             AggType::Max => compile_grouped_agg_func::<MinMaxAgg<false>>(data[0], atomic),
+            AggType::MostRecent => compile_grouped_agg_func::<MostRecentAgg>(data[0], atomic),
         }
     }
 
@@ -388,6 +392,7 @@ impl Kernel for UngroupedAggFunc {
             AggType::Sum => compile_ungrouped_agg_func::<SumAgg>(data[0]),
             AggType::Min => compile_ungrouped_agg_func::<MinMaxAgg<true>>(data[0]),
             AggType::Max => compile_ungrouped_agg_func::<MinMaxAgg<false>>(data[0]),
+            AggType::MostRecent => compile_ungrouped_agg_func::<MostRecentAgg>(data[0]),
         })
     }
 
@@ -564,6 +569,7 @@ pub type CountAggregator = Aggregator<CountAgg>;
 pub type SumAggregator = Aggregator<SumAgg>;
 pub type MinAggregator = Aggregator<MinMaxAgg<true>>;
 pub type MaxAggregator = Aggregator<MinMaxAgg<false>>;
+pub type MostRecentAggregator = Aggregator<MostRecentAgg>;
 
 #[cfg(test)]
 mod tests {

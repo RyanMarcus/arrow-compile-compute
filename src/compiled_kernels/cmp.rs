@@ -215,7 +215,7 @@ fn generate_llvm_cmp_kernel<'a>(
         .build_call(lhs_next, &[lhs_ptr.into(), lhs_buf.into()], "lhs_next")
         .unwrap()
         .try_as_basic_value()
-        .unwrap_left()
+        .unwrap_basic()
         .into_int_value();
     build
         .build_call(rhs_next, &[rhs_ptr.into(), rhs_buf.into()], "rhs_next")
@@ -238,7 +238,7 @@ fn generate_llvm_cmp_kernel<'a>(
                 .build_call(memcmp, &[lv.into(), rv.into()], "res")
                 .unwrap()
                 .try_as_basic_value()
-                .unwrap_left()
+                .unwrap_basic()
                 .into_int_value();
             build
                 .build_int_compare(
@@ -346,7 +346,7 @@ fn generate_block_llvm_cmp_kernel<'a>(
         )
         .unwrap()
         .try_as_basic_value()
-        .unwrap_left()
+        .unwrap_basic()
         .into_int_value();
     build
         .build_call(
@@ -382,13 +382,13 @@ fn generate_block_llvm_cmp_kernel<'a>(
                 .build_call(convert, &[lvec.into()], "lhs_converted")
                 .unwrap()
                 .try_as_basic_value()
-                .unwrap_left()
+                .unwrap_basic()
                 .into_vector_value();
             let rhs = build
                 .build_call(convert, &[rvec.into()], "rhs_converted")
                 .unwrap()
                 .try_as_basic_value()
-                .unwrap_left()
+                .unwrap_basic()
                 .into_vector_value();
             build
                 .build_int_compare(pred.as_int_pred(true), lhs, rhs, "block_cmp_result")
@@ -411,7 +411,7 @@ fn generate_block_llvm_cmp_kernel<'a>(
         )
         .unwrap()
         .try_as_basic_value()
-        .unwrap_left()
+        .unwrap_basic()
         .into_int_value();
     build
         .build_call(
@@ -456,12 +456,12 @@ fn generate_block_llvm_cmp_kernel<'a>(
                 .build_call(convert, &[lv.into()], "lhs_converted")
                 .unwrap()
                 .try_as_basic_value()
-                .unwrap_left();
+                .unwrap_basic();
             let rhs = build
                 .build_call(convert, &[rv.into()], "rhs_converted")
                 .unwrap()
                 .try_as_basic_value()
-                .unwrap_left();
+                .unwrap_basic();
 
             build
                 .build_int_compare(
@@ -673,7 +673,7 @@ pub fn add_memcmp<'a>(ctx: &'a Context, module: &Module<'a>) -> FunctionValue<'a
         .build_call(umin_f, &[len1.into(), len2.into()], "len")
         .unwrap()
         .try_as_basic_value()
-        .unwrap_left()
+        .unwrap_basic()
         .into_int_value();
 
     let index_ptr = builder.build_alloca(i64_type, "index_ptr").unwrap();

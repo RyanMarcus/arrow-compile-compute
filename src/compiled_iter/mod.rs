@@ -23,9 +23,11 @@ use arrow_schema::DataType;
 use bitmap::BitmapIterator;
 use dictionary::DictionaryIterator;
 use inkwell::{
+    attributes::AttributeLoc,
     builder::Builder,
     context::Context,
     intrinsics::Intrinsic,
+    llvm_sys::core::LLVMGetVersion,
     module::{Linkage, Module},
     types::{BasicType, VectorType},
     values::{BasicValue, FunctionValue, PointerValue},
@@ -462,7 +464,7 @@ pub fn generate_next_block<'a, const N: u32>(
                     )
                     .unwrap()
                     .try_as_basic_value()
-                    .unwrap_left()
+                    .unwrap_basic()
                     .into_int_value();
                 build
                     .build_conditional_branch(key_block_result, get_next, none_left)
@@ -492,7 +494,7 @@ pub fn generate_next_block<'a, const N: u32>(
                         .build_call(value_access, &[val_iter.into(), key.into()], "value")
                         .unwrap()
                         .try_as_basic_value()
-                        .unwrap_left();
+                        .unwrap_basic();
                     out_vec = build
                         .build_insert_element(
                             out_vec,
@@ -621,7 +623,7 @@ pub fn generate_next_block<'a, const N: u32>(
                     .build_call(access_ends, &[ends_iter.into(), pos.into()], "my_end")
                     .unwrap()
                     .try_as_basic_value()
-                    .unwrap_left()
+                    .unwrap_basic()
                     .into_int_value();
 
                 let pr_end = build
@@ -638,7 +640,7 @@ pub fn generate_next_block<'a, const N: u32>(
                     )
                     .unwrap()
                     .try_as_basic_value()
-                    .unwrap_left()
+                    .unwrap_basic()
                     .into_int_value();
                 let remaining = build.build_int_sub(my_end, pr_end, "remaining").unwrap();
                 let remaining = build
@@ -653,7 +655,7 @@ pub fn generate_next_block<'a, const N: u32>(
                     .build_call(access_values, &[vals_iter.into(), pos.into()], "val")
                     .unwrap()
                     .try_as_basic_value()
-                    .unwrap_left();
+                    .unwrap_basic();
                 let curr_val = build
                     .build_insert_element(
                         vec_type.const_zero(),
@@ -691,7 +693,7 @@ pub fn generate_next_block<'a, const N: u32>(
                     )
                     .unwrap()
                     .try_as_basic_value()
-                    .unwrap_left()
+                    .unwrap_basic()
                     .into_int_value();
 
                 // build a mask that 1 in the slots we want to insert value into
@@ -918,7 +920,7 @@ pub fn generate_next<'a>(
                 .build_call(access, &[iter_ptr.into(), curr_pos.into()], "access_result")
                 .unwrap()
                 .try_as_basic_value()
-                .unwrap_left();
+                .unwrap_basic();
 
             build.build_store(out_ptr, result).unwrap();
             iter.llvm_increment_pos(ctx, &build, iter_ptr, i64_type.const_int(1, false));
@@ -953,7 +955,7 @@ pub fn generate_next<'a>(
                 .build_call(access, &[iter_ptr.into(), curr_pos.into()], "access_result")
                 .unwrap()
                 .try_as_basic_value()
-                .unwrap_left();
+                .unwrap_basic();
 
             build.build_store(out_ptr, result).unwrap();
             iter.llvm_increment_pos(ctx, &build, iter_ptr, i64_type.const_int(1, false));
@@ -988,7 +990,7 @@ pub fn generate_next<'a>(
                 .build_call(access, &[iter_ptr.into(), curr_pos.into()], "access_result")
                 .unwrap()
                 .try_as_basic_value()
-                .unwrap_left();
+                .unwrap_basic();
 
             build.build_store(out_ptr, result).unwrap();
             iter.llvm_increment_pos(ctx, &build, iter_ptr, i64_type.const_int(1, false));
@@ -1022,7 +1024,7 @@ pub fn generate_next<'a>(
                 .build_call(access, &[iter_ptr.into(), curr_pos.into()], "access_result")
                 .unwrap()
                 .try_as_basic_value()
-                .unwrap_left();
+                .unwrap_basic();
             build.build_store(out_ptr, result).unwrap();
             bitmap_iterator.llvm_increment_pos(ctx, &build, iter_ptr, i64_type.const_int(1, false));
             build
@@ -1145,7 +1147,7 @@ pub fn generate_next<'a>(
                 )
                 .unwrap()
                 .try_as_basic_value()
-                .unwrap_left()
+                .unwrap_basic()
                 .into_int_value();
             it.llvm_clear_last(ctx, &build, iter_ptr);
             let res =
@@ -1262,7 +1264,7 @@ pub fn generate_next<'a>(
                     .build_call(key_next, &[key_iter.into(), key_buf.into()], "next_key")
                     .unwrap()
                     .try_as_basic_value()
-                    .unwrap_left()
+                    .unwrap_basic()
                     .into_int_value();
                 build
                     .build_conditional_branch(had_next, fetch, none_left)
@@ -1283,7 +1285,7 @@ pub fn generate_next<'a>(
                     .build_call(values_access, &[val_iter.into(), next_key.into()], "value")
                     .unwrap()
                     .try_as_basic_value()
-                    .unwrap_left();
+                    .unwrap_basic();
                 build.build_store(out_ptr, value).unwrap();
                 build
                     .build_return(Some(&bool_type.const_int(1, false)))
@@ -1364,7 +1366,7 @@ pub fn generate_next<'a>(
                     .build_call(val_access, &[val_iter_ptr.into(), curr_pos.into()], "value")
                     .unwrap()
                     .try_as_basic_value()
-                    .unwrap_left();
+                    .unwrap_basic();
                 build.build_store(out_ptr, val).unwrap();
                 arr.llvm_dec_remaining(ctx, &build, iter_ptr, i64_type.const_int(1, false));
                 arr.llvm_inc_logical_pos(ctx, &build, iter_ptr, i64_type.const_int(1, false));
@@ -1391,7 +1393,7 @@ pub fn generate_next<'a>(
                     .build_call(re_access, &[re_iter_ptr.into(), curr_pos.into()], "my_end")
                     .unwrap()
                     .try_as_basic_value()
-                    .unwrap_left()
+                    .unwrap_basic()
                     .into_int_value();
                 let prev_end = build
                     .build_call(
@@ -1407,7 +1409,7 @@ pub fn generate_next<'a>(
                     )
                     .unwrap()
                     .try_as_basic_value()
-                    .unwrap_left()
+                    .unwrap_basic()
                     .into_int_value();
                 let new_remaining = build
                     .build_int_sub(my_end, prev_end, "new_remaining")
@@ -1708,20 +1710,33 @@ pub fn generate_blocked_random_access<'a>(
                 .unwrap()
                 .into_vector_value();
 
-            let result = build
-                .build_call(
-                    gather_fn,
-                    &[
-                        ptr_vec.into(),
-                        ctx.i32_type().const_zero().into(),
-                        mask_vec.into(),
-                        passthru.into(),
-                    ],
-                    "gather",
-                )
-                .unwrap()
+            let result = if get_major_version() >= 22 {
+                let result = build
+                    .build_call(
+                        gather_fn,
+                        &[ptr_vec.into(), mask_vec.into(), passthru.into()],
+                        "gather",
+                    )
+                    .unwrap();
+                result.set_alignment_attribute(AttributeLoc::Param(0), ptype.width() as u32);
+                result
+            } else {
+                build
+                    .build_call(
+                        gather_fn,
+                        &[
+                            ptr_vec.into(),
+                            ctx.i32_type().const_int(ptype.width() as u64, false).into(),
+                            mask_vec.into(),
+                            passthru.into(),
+                        ],
+                        "gather",
+                    )
+                    .unwrap()
+            };
+            let result = result
                 .try_as_basic_value()
-                .unwrap_left()
+                .unwrap_basic()
                 .into_vector_value();
             build.build_return(Some(&result)).unwrap();
             Some(func)
@@ -1809,20 +1824,34 @@ pub fn generate_blocked_random_access<'a>(
                 .unwrap()
                 .into_vector_value();
 
-            let gathered = build
-                .build_call(
-                    gather_fn,
-                    &[
-                        ptr_vec.into(),
-                        ctx.i32_type().const_zero().into(),
-                        mask_vec.into(),
-                        passthru.into(),
-                    ],
-                    "gather_bytes",
-                )
-                .unwrap()
+            let result = if get_major_version() >= 22 {
+                let result = build
+                    .build_call(
+                        gather_fn,
+                        &[ptr_vec.into(), mask_vec.into(), passthru.into()],
+                        "gather",
+                    )
+                    .unwrap();
+                result.set_alignment_attribute(AttributeLoc::Param(0), 1);
+                result
+            } else {
+                build
+                    .build_call(
+                        gather_fn,
+                        &[
+                            ptr_vec.into(),
+                            ctx.i32_type().const_int(1, false).into(),
+                            mask_vec.into(),
+                            passthru.into(),
+                        ],
+                        "gather",
+                    )
+                    .unwrap()
+            };
+
+            let gathered = result
                 .try_as_basic_value()
-                .unwrap_left()
+                .unwrap_basic()
                 .into_vector_value();
 
             let bit_mask_vals = vec![i64_type.const_int(7, false); lanes as usize];
@@ -2156,7 +2185,7 @@ pub fn generate_random_access<'a>(
                     )
                     .unwrap()
                     .try_as_basic_value()
-                    .unwrap_left()
+                    .unwrap_basic()
                     .into_int_value();
                 let key_conv = build
                     .build_int_cast(key, ctx.i64_type(), "key_conv")
@@ -2173,7 +2202,7 @@ pub fn generate_random_access<'a>(
                     )
                     .unwrap()
                     .try_as_basic_value()
-                    .unwrap_left();
+                    .unwrap_basic();
                 build.build_return(Some(&value)).unwrap();
 
                 Some(access_f)
@@ -2214,7 +2243,7 @@ pub fn generate_random_access<'a>(
                     )
                     .unwrap()
                     .try_as_basic_value()
-                    .unwrap_left()
+                    .unwrap_basic()
                     .into_int_value();
                 let v = build
                     .build_call(
@@ -2227,7 +2256,7 @@ pub fn generate_random_access<'a>(
                     )
                     .unwrap()
                     .try_as_basic_value()
-                    .unwrap_left();
+                    .unwrap_basic();
                 build.build_return(Some(&v)).unwrap();
                 Some(access_f)
             }
@@ -2242,4 +2271,19 @@ pub fn generate_random_access<'a>(
             Some(access_f)
         }
     }
+}
+
+fn get_major_version() -> usize {
+    let mut major: u32 = 0;
+    let mut minor: u32 = 0;
+    let mut patch: u32 = 0;
+
+    unsafe {
+        LLVMGetVersion(
+            &mut major as *mut u32,
+            &mut minor as *mut u32,
+            &mut patch as *mut u32,
+        );
+    }
+    major as usize
 }

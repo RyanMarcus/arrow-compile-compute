@@ -465,7 +465,7 @@ impl<const MIN: bool> Aggregation for MinMaxAgg<MIN> {
                     .build_call(memcmp, &[cur_val.into(), value.into()], "cmp")
                     .unwrap()
                     .try_as_basic_value()
-                    .unwrap_left()
+                    .unwrap_basic()
                     .into_int_value();
                 let cmp = b
                     .build_int_compare(
@@ -597,13 +597,13 @@ impl<const MIN: bool> Aggregation for MinMaxAgg<MIN> {
                         .build_call(ftoi, &[value.into()], "val_to_i")
                         .unwrap()
                         .try_as_basic_value()
-                        .unwrap_left()
+                        .unwrap_basic()
                         .into_int_value();
                     let tmp2 = b
                         .build_call(ftoi, &[cur_val.into()], "cur_to_i")
                         .unwrap()
                         .try_as_basic_value()
-                        .unwrap_left()
+                        .unwrap_basic()
                         .into_int_value();
                     b.build_int_compare(
                         if MIN {

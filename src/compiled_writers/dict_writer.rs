@@ -156,7 +156,7 @@ impl<'a, K: ArrowDictionaryKeyType, VW: ArrayWriter<'a>> ArrayWriter<'a> for Dic
                 .build_call(hash_func, &[value.into()], "hash")
                 .unwrap()
                 .try_as_basic_value()
-                .unwrap_left()
+                .unwrap_basic()
                 .into_int_value();
             let is_new_ptr = b.build_alloca(ctx.i8_type(), "is_new_ptr").unwrap();
             let ticket_val = b
@@ -167,7 +167,7 @@ impl<'a, K: ArrowDictionaryKeyType, VW: ArrayWriter<'a>> ArrayWriter<'a> for Dic
                 )
                 .unwrap()
                 .try_as_basic_value()
-                .unwrap_left()
+                .unwrap_basic()
                 .into_int_value();
             let status = b
                 .build_load(i8_type, is_new_ptr, "status")

@@ -676,7 +676,7 @@ fn build_kernel_with_writer<'a, W: ArrayWriter<'a>>(
         .build_call(func_inner, &ptr_params, "num_produced")
         .unwrap()
         .try_as_basic_value()
-        .unwrap_left();
+        .unwrap_basic();
     builder.build_return(Some(&num_produced)).unwrap();
 
     //
@@ -928,7 +928,7 @@ fn build_kernel_with_writer<'a, W: ArrayWriter<'a>>(
                                 )
                                 .unwrap()
                                 .try_as_basic_value()
-                                .unwrap_left()
+                                .unwrap_basic()
                                 .into_int_value(),
                         );
                     }
@@ -982,7 +982,7 @@ fn build_kernel_with_writer<'a, W: ArrayWriter<'a>>(
                 )
                 .unwrap()
                 .try_as_basic_value()
-                .unwrap_left()
+                .unwrap_basic()
                 .into_int_value(),
         );
     }

@@ -206,7 +206,7 @@ fn generate_single_cmp<'a>(
             )
             .unwrap()
             .try_as_basic_value()
-            .unwrap_left()
+            .unwrap_basic()
             .into_int_value();
         b.build_store(lhs_is_valid, validity_bit).unwrap();
     }
@@ -222,7 +222,7 @@ fn generate_single_cmp<'a>(
             )
             .unwrap()
             .try_as_basic_value()
-            .unwrap_left()
+            .unwrap_basic()
             .into_int_value();
         b.build_store(rhs_is_valid, validity_bit).unwrap();
     }
@@ -292,12 +292,12 @@ fn generate_single_cmp<'a>(
         .build_call(access1, &[data_ptr1.into(), idx1.into()], "val1")
         .unwrap()
         .try_as_basic_value()
-        .unwrap_left();
+        .unwrap_basic();
     let val2 = b
         .build_call(access2, &[data_ptr2.into(), idx2.into()], "val2")
         .unwrap()
         .try_as_basic_value()
-        .unwrap_left();
+        .unwrap_basic();
 
     let cmp_f = match pt {
         PrimitiveType::I8 | PrimitiveType::I16 | PrimitiveType::I32 | PrimitiveType::I64 => {
@@ -323,7 +323,7 @@ fn generate_single_cmp<'a>(
                 .build_call(memcmp, &[v1.into(), v2.into()], "memcmp")
                 .unwrap()
                 .try_as_basic_value()
-                .unwrap_left()
+                .unwrap_basic()
                 .into_int_value();
             let res = b2
                 .build_call(
@@ -333,7 +333,7 @@ fn generate_single_cmp<'a>(
                 )
                 .unwrap()
                 .try_as_basic_value()
-                .unwrap_left()
+                .unwrap_basic()
                 .into_int_value();
             b2.build_return(Some(&res)).unwrap();
             cmp_f
@@ -355,13 +355,13 @@ fn generate_single_cmp<'a>(
                 .build_call(f_to_i, &[v1.into()], "f_to_i1")
                 .unwrap()
                 .try_as_basic_value()
-                .unwrap_left()
+                .unwrap_basic()
                 .into_int_value();
             let v2_int = b2
                 .build_call(f_to_i, &[v2.into()], "f_to_i2")
                 .unwrap()
                 .try_as_basic_value()
-                .unwrap_left()
+                .unwrap_basic()
                 .into_int_value();
             let res = b2
                 .build_call(
@@ -375,7 +375,7 @@ fn generate_single_cmp<'a>(
                 )
                 .unwrap()
                 .try_as_basic_value()
-                .unwrap_left()
+                .unwrap_basic()
                 .into_int_value();
             b2.build_return(Some(&res)).unwrap();
             cmp_f
@@ -390,7 +390,7 @@ fn generate_single_cmp<'a>(
     }
     .unwrap()
     .try_as_basic_value()
-    .unwrap_left()
+    .unwrap_basic()
     .into_int_value();
 
     b.build_return(Some(&cmp)).unwrap();
@@ -486,7 +486,7 @@ fn fill_in_cmp<'a>(
             )
             .unwrap()
             .try_as_basic_value()
-            .unwrap_left()
+            .unwrap_basic()
             .into_int_value();
         let is_zero = b
             .build_int_compare(IntPredicate::EQ, res, i8_type.const_zero(), "is_zero")
@@ -514,7 +514,7 @@ fn fill_in_cmp<'a>(
                 .build_call(f, &[idx1.into(), idx2.into()], "idx_cmp")
                 .unwrap()
                 .try_as_basic_value()
-                .unwrap_left()
+                .unwrap_basic()
                 .into_int_value();
             b.build_return(Some(&res)).unwrap();
         }

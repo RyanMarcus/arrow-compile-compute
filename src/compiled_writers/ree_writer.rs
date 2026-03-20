@@ -224,7 +224,7 @@ impl<'a, K: RunEndIndexType, VW: ArrayWriter<'a>> ArrayWriter<'a> for REEWriter<
                         )
                         .unwrap()
                         .try_as_basic_value()
-                        .unwrap_left()
+                        .unwrap_basic()
                         .into_int_value();
                     b2.build_int_compare(IntPredicate::EQ, cmp, i64_type.const_zero(), "matches")
                         .unwrap()

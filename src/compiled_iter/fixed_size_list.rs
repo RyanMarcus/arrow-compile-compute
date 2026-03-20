@@ -139,7 +139,7 @@ mod test {
             .build_call(access_fn, &[iter_ptr.into(), idx.into()], "vec")
             .unwrap()
             .try_as_basic_value()
-            .unwrap_left()
+            .unwrap_basic()
             .into_vector_value();
         let vec_type = vec_value.get_type();
         let lanes = vec_type.get_size();
@@ -221,7 +221,7 @@ mod test {
             .build_call(next_fn, &[iter_ptr.into(), tmp.into()], "call")
             .unwrap()
             .try_as_basic_value()
-            .unwrap_left()
+            .unwrap_basic()
             .into_int_value();
 
         let store_block = ctx.append_basic_block(wrap_fn, "store");

@@ -275,7 +275,7 @@ fn build_partition<'a, W: ArrayWriter<'a>>(
         .build_call(arr_next, &[arr_iter_ptr.into(), arr_buf_ptr.into()], "next")
         .unwrap()
         .try_as_basic_value()
-        .unwrap_left()
+        .unwrap_basic()
         .into_int_value();
     b.build_call(
         idx_next,

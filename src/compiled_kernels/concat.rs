@@ -157,7 +157,7 @@ fn build_concat<'a, W: ArrayWriter<'a>>(
         .build_call(next, &[iter_ptr.into(), buf_ptr.into()], "next")
         .unwrap()
         .try_as_basic_value()
-        .unwrap_left()
+        .unwrap_basic()
         .into_int_value();
     b.build_conditional_branch(had_next, loop_body, exit)
         .unwrap();

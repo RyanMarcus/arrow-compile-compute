@@ -200,7 +200,7 @@ impl Kernel for RangeKernel {
                     .build_call(next_func, &[iter_ptr.into(), buf_ptr.into()], "has_next")
                     .unwrap()
                     .try_as_basic_value()
-                    .unwrap_left()
+                    .unwrap_basic()
                     .into_int_value();
                 builder
                     .build_conditional_branch(has_next, loop_body, exit)

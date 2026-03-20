@@ -81,7 +81,7 @@ pub fn add_str_startswith<'a>(ctx: &'a Context, llvm_mod: &Module<'a>) -> Functi
         )
         .unwrap()
         .try_as_basic_value()
-        .unwrap_left()
+        .unwrap_basic()
         .into_int_value();
     let res = b
         .build_int_compare(
@@ -168,7 +168,7 @@ pub fn add_str_endswith<'a>(ctx: &'a Context, llvm_mod: &Module<'a>) -> Function
         )
         .unwrap()
         .try_as_basic_value()
-        .unwrap_left()
+        .unwrap_basic()
         .into_int_value();
     let res = b
         .build_int_compare(
@@ -249,7 +249,7 @@ mod tests {
                 "strncmp",
             )
             .unwrap();
-        let res = call.try_as_basic_value().unwrap_left().into_int_value();
+        let res = call.try_as_basic_value().unwrap_basic().into_int_value();
         builder.build_return(Some(&res)).unwrap();
 
         module.verify().unwrap();
@@ -371,7 +371,7 @@ mod tests {
                 "strncmp",
             )
             .unwrap();
-        let res = call.try_as_basic_value().unwrap_left().into_int_value();
+        let res = call.try_as_basic_value().unwrap_basic().into_int_value();
         builder.build_return(Some(&res)).unwrap();
 
         module.verify().unwrap();

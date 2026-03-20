@@ -684,7 +684,7 @@ impl<'a> KernelExpression<'a> {
                     )
                     .unwrap()
                     .try_as_basic_value()
-                    .unwrap_left()
+                    .unwrap_basic()
                     .into_vector_value();
                 call.as_instruction_value().unwrap().set_fast_math_flags(
                     LLVMFastMathAllowContract
@@ -723,7 +723,7 @@ impl<'a> KernelExpression<'a> {
                     .build_call(func, &[inp.into()], "sqrt")
                     .unwrap()
                     .try_as_basic_value()
-                    .unwrap_left()
+                    .unwrap_basic()
                     .into_vector_value();
                 call.as_instruction().unwrap().set_fast_math_flags(
                     LLVMFastMathAllowContract
@@ -791,7 +791,7 @@ impl<'a> KernelExpression<'a> {
                     )
                     .unwrap()
                     .try_as_basic_value()
-                    .unwrap_left()
+                    .unwrap_basic()
                     .into_vector_value();
 
                 if gathered.get_type() != vec_type {
@@ -845,7 +845,7 @@ impl<'a> KernelExpression<'a> {
                             .build_call(memcmp, &[lhs_v.into(), rhs_v.into()], "memcmp_res")
                             .unwrap()
                             .try_as_basic_value()
-                            .unwrap_left()
+                            .unwrap_basic()
                             .into_int_value();
                         build
                             .build_int_compare(
@@ -900,13 +900,13 @@ impl<'a> KernelExpression<'a> {
                                     .build_call(convert, &[clhs.into()], "lhs_converted")
                                     .unwrap()
                                     .try_as_basic_value()
-                                    .unwrap_left()
+                                    .unwrap_basic()
                                     .into_vector_value();
                                 let rhs = build
                                     .build_call(convert, &[crhs.into()], "rhs_converted")
                                     .unwrap()
                                     .try_as_basic_value()
-                                    .unwrap_left()
+                                    .unwrap_basic()
                                     .into_vector_value();
                                 build
                                     .build_int_compare(predicate.as_int_pred(true), lhs, rhs, "cmp")
@@ -1007,7 +1007,7 @@ impl<'a> KernelExpression<'a> {
                     .build_call(acessor, &[iter_ptr.into(), idx.into()], "at")
                     .unwrap()
                     .try_as_basic_value()
-                    .unwrap_left())
+                    .unwrap_basic())
             }
             KernelExpression::Convert(expr, pt) => {
                 let to_convert = expr.compile(compilation)?;
@@ -1168,7 +1168,7 @@ impl<'a> KernelExpression<'a> {
                     )
                     .unwrap()
                     .try_as_basic_value()
-                    .unwrap_left();
+                    .unwrap_basic();
 
                 call.as_instruction_value().unwrap().set_fast_math_flags(
                     LLVMFastMathAllowContract
@@ -1204,7 +1204,7 @@ impl<'a> KernelExpression<'a> {
                     .build_call(func, &[inp.into()], "sqrt")
                     .unwrap()
                     .try_as_basic_value()
-                    .unwrap_left();
+                    .unwrap_basic();
                 call.as_instruction_value().unwrap().set_fast_math_flags(
                     LLVMFastMathAllowContract
                         | LLVMFastMathAllowReassoc
@@ -1229,7 +1229,7 @@ impl<'a> KernelExpression<'a> {
                                 .build_call(reducer, &[input.into()], "vec_sum")
                                 .unwrap()
                                 .try_as_basic_value()
-                                .unwrap_left())
+                                .unwrap_basic())
                         }
                         PrimitiveSuperType::Float => {
                             let reducer = Intrinsic::find("llvm.vector.reduce.fadd").unwrap();
@@ -1245,7 +1245,7 @@ impl<'a> KernelExpression<'a> {
                                 )
                                 .unwrap()
                                 .try_as_basic_value()
-                                .unwrap_left();
+                                .unwrap_basic();
 
                             call.as_instruction_value().unwrap().set_fast_math_flags(
                                 LLVMFastMathAllowContract
@@ -1312,7 +1312,7 @@ impl<'a> KernelExpression<'a> {
                     .build_call(func, &[haystack.into(), needle.into()], "starts_with")
                     .unwrap()
                     .try_as_basic_value()
-                    .unwrap_left())
+                    .unwrap_basic())
             }
             KernelExpression::EndsWith(haystack, needle) => {
                 if !haystack.is_string() || !needle.is_string() {
@@ -1329,7 +1329,7 @@ impl<'a> KernelExpression<'a> {
                     .build_call(func, &[haystack.into(), needle.into()], "ends_with")
                     .unwrap()
                     .try_as_basic_value()
-                    .unwrap_left())
+                    .unwrap_basic())
             }
             KernelExpression::StrLen(expr) => {
                 if !expr.is_string() {

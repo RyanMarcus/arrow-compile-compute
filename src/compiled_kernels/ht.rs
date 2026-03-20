@@ -1,6 +1,6 @@
 use arrow_array::{Datum, UInt64Array};
 use arrow_schema::DataType;
-use inkwell::attributes::AttributeLoc;
+use inkwell::attributes::{Attribute, AttributeLoc};
 use inkwell::execution_engine::JitFunction;
 use inkwell::values::BasicValue;
 use inkwell::OptimizationLevel;
@@ -26,6 +26,12 @@ use crate::{
 use crate::{logical_nulls, set_noalias_params};
 
 use super::{ArrowKernelError, Kernel};
+
+fn add_noinline<'a>(ctx: &'a Context, func: &FunctionValue<'a>) {
+    let kind_id = Attribute::get_named_enum_kind_id("noinline");
+    let attr = ctx.create_enum_attribute(kind_id, 0);
+    func.add_attribute(AttributeLoc::Function, attr);
+}
 
 #[repr(C)]
 #[derive(ReprOffset, Debug)]
@@ -316,7 +322,7 @@ pub fn generate_lookup_or_insert<'a>(
                 .build_call(memcmp, &[key.into(), kvalue.into()], "memcmp")
                 .unwrap()
                 .try_as_basic_value()
-                .unwrap_left()
+                .unwrap_basic()
                 .into_int_value();
             build
                 .build_int_compare(
@@ -572,6 +578,7 @@ fn generate_unchained_hash32<'a>(ctx: &'a Context, llvm_mod: &Module<'a>) -> Fun
     );
     let feat = ctx.create_string_attribute("target-features", "+crc32");
     func.add_attribute(AttributeLoc::Function, feat);
+    add_noinline(ctx, &func);
 
     let input = func.get_nth_param(0).unwrap().into_int_value();
 
@@ -587,7 +594,7 @@ fn generate_unchained_hash32<'a>(ctx: &'a Context, llvm_mod: &Module<'a>) -> Fun
         .build_call(crc_f, &[seed.into(), input.into()], "crc")
         .unwrap()
         .try_as_basic_value()
-        .unwrap_left()
+        .unwrap_basic()
         .into_int_value();
     let crc = build
         .build_int_z_extend(crc, i64_type, "extended_crc")
@@ -608,6 +615,7 @@ fn generate_unchained_hash64<'a>(ctx: &'a Context, llvm_mod: &Module<'a>) -> Fun
     );
     let feat = ctx.create_string_attribute("target-features", "+crc32");
     func.add_attribute(AttributeLoc::Function, feat);
+    add_noinline(ctx, &func);
     let input = func.get_nth_param(0).unwrap().into_int_value();
 
     let crc_f = crc32.get_declaration(llvm_mod, &[]).unwrap();
@@ -623,14 +631,14 @@ fn generate_unchained_hash64<'a>(ctx: &'a Context, llvm_mod: &Module<'a>) -> Fun
         .build_call(crc_f, &[seed1.into(), input.into()], "crc1")
         .unwrap()
         .try_as_basic_value()
-        .unwrap_left()
+        .unwrap_basic()
         .into_int_value();
 
     let crc2 = build
         .build_call(crc_f, &[seed2.into(), input.into()], "crc2")
         .unwrap()
         .try_as_basic_value()
-        .unwrap_left()
+        .unwrap_basic()
         .into_int_value();
 
     let combined = build
@@ -763,7 +771,7 @@ impl Kernel for HashKernel {
                     .build_call(next_func, &[iter_ptr.into(), buf_ptr.into()], "next")
                     .unwrap()
                     .try_as_basic_value()
-                    .unwrap_left()
+                    .unwrap_basic()
                     .into_int_value();
                 b.build_conditional_branch(res, loop_body, exit).unwrap();
 
@@ -773,7 +781,7 @@ impl Kernel for HashKernel {
                     .build_call(hash_func, &[item.into()], "hashed")
                     .unwrap()
                     .try_as_basic_value()
-                    .unwrap_left()
+                    .unwrap_basic()
                     .into_int_value();
                 writer.llvm_ingest(ctx, &b, hashed.into());
                 b.build_unconditional_branch(loop_cond).unwrap();

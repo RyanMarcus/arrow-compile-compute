@@ -357,14 +357,14 @@ fn generate_call<'a>(
             )
             .unwrap()
             .try_as_basic_value()
-            .unwrap_left()
+            .unwrap_basic()
             .into_int_value()
     } else {
         build
             .build_call(next, &[iter_ptr.into(), buf.into()], "had_next")
             .unwrap()
             .try_as_basic_value()
-            .unwrap_left()
+            .unwrap_basic()
             .into_int_value()
     };
 
@@ -393,7 +393,7 @@ fn generate_call<'a>(
             .build_call(access, &[iter_ptr.into(), next_bit.into()], "access_el")
             .unwrap()
             .try_as_basic_value()
-            .unwrap_left()
+            .unwrap_basic()
     } else {
         build.build_load(input_type, buf, "val").unwrap()
     };

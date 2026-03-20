@@ -728,7 +728,7 @@ pub mod aggregate {
     pub use crate::compiled_kernels::{
         CountAggregator, MaxAggregator, MinAggregator, SumAggregator,
     };
-    use crate::ArrowKernelError;
+    use crate::{compiled_kernels::MostRecentAggregator, ArrowKernelError};
 
     /// Creates a new sum aggregator. Final results are 64-bit versions of their
     /// inputs (e.g., `f32` is summed to `f64`).
@@ -758,6 +758,17 @@ pub mod aggregate {
     /// Creates a new count aggregator. Final results will be `u64`.
     pub fn count(expected_unique: Option<usize>) -> Result<CountAggregator, ArrowKernelError> {
         Ok(CountAggregator::new(&[], expected_unique.unwrap_or(1024)))
+    }
+
+    /// Creates a new most recent aggregator. Final result will match the input type.
+    pub fn most_recent(
+        ty: &DataType,
+        expected_unique: Option<usize>,
+    ) -> Result<MostRecentAggregator, ArrowKernelError> {
+        Ok(MostRecentAggregator::new(
+            &[ty],
+            expected_unique.unwrap_or(1024),
+        ))
     }
 }
 
