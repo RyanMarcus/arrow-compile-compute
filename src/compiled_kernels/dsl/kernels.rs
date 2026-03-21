@@ -947,8 +947,7 @@ fn build_kernel_with_writer<'a, W: ArrayWriter<'a>>(
 
                     uses_blocks = true;
                 }
-                Err(e) => {
-                    println!("Unable to compile blocked version of kernel: {}", e);
+                Err(_e) => {
                     for buf in vec_bufs.into_values() {
                         buf.as_instruction().unwrap().remove_from_basic_block();
                     }

@@ -35,6 +35,7 @@ pub mod cmp {
     use arrow_array::Datum;
 
     use crate::compiled_kernels;
+    use crate::compiled_kernels::cmp::BetweenKernel;
     pub use crate::compiled_kernels::ComparisonKernel;
     use crate::compiled_kernels::KernelCache;
     use crate::compiled_kernels::StringKernelType;
@@ -43,6 +44,9 @@ pub mod cmp {
     use crate::Predicate;
 
     static CMP_PROGRAM_CACHE: LazyLock<KernelCache<ComparisonKernel>> =
+        LazyLock::new(KernelCache::new);
+
+    static BETWEEN_PROGRAM_CACHE: LazyLock<KernelCache<BetweenKernel>> =
         LazyLock::new(KernelCache::new);
 
     static STR_STARTEND_CACHE: LazyLock<KernelCache<StringStartEndKernel>> =
@@ -76,6 +80,15 @@ pub mod cmp {
     /// Compute a bitvector for `lhs != rhs`
     pub fn neq(lhs: &dyn Datum, rhs: &dyn Datum) -> Result<BooleanArray, ArrowKernelError> {
         CMP_PROGRAM_CACHE.get((lhs, rhs), Predicate::Ne)
+    }
+
+    /// Compute a bitvector for `lb <= arr < ub`
+    pub fn between(
+        arr: &dyn Array,
+        lb: &dyn Datum,
+        ub: &dyn Datum,
+    ) -> Result<BooleanArray, ArrowKernelError> {
+        BETWEEN_PROGRAM_CACHE.get((arr, lb, ub), ())
     }
 
     /// String prefix check.
@@ -475,7 +488,7 @@ pub mod select {
 
     /// Extract the elements in `data` at the indices specified in `idxes`.
     ///
-    /// This function computes `data[idxes]`. No bounds checking is performed.
+    /// This function computes `data[idxes]`.
     ///
     /// ```
     /// use arrow_array::{StringArray, Int32Array, Array};

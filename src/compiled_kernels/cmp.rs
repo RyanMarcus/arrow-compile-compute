@@ -1,4 +1,5 @@
-use arrow_array::{BooleanArray, Datum};
+use arrow_array::cast::AsArray;
+use arrow_array::{Array, BooleanArray, Datum};
 use arrow_buffer::NullBuffer;
 use arrow_schema::DataType;
 use inkwell::execution_engine::JitFunction;
@@ -12,6 +13,7 @@ use ouroboros::self_referencing;
 use std::ffi::c_void;
 
 use crate::compiled_iter::{datum_to_iter, generate_next, generate_next_block, IteratorHolder};
+use crate::compiled_kernels::dsl::{DSLKernel, KernelOutputType};
 use crate::compiled_kernels::{gen_convert_numeric_vec, link_req_helpers, optimize_module};
 use crate::compiled_writers::{ArrayWriter, BooleanWriter, WriterAllocation};
 use crate::{
@@ -766,6 +768,56 @@ pub fn add_memcmp<'a>(ctx: &'a Context, module: &Module<'a>) -> FunctionValue<'a
     function
 }
 
+pub struct BetweenKernel(DSLKernel);
+unsafe impl Sync for BetweenKernel {}
+unsafe impl Send for BetweenKernel {}
+
+impl Kernel for BetweenKernel {
+    type Key = (DataType, DataType, bool, DataType, bool);
+    type Input<'a>
+        = (&'a dyn Array, &'a dyn Datum, &'a dyn Datum)
+    where
+        Self: 'a;
+
+    type Params = ();
+
+    type Output = BooleanArray;
+
+    fn call(&self, inp: Self::Input<'_>) -> Result<Self::Output, ArrowKernelError> {
+        self.0
+            .call(&[&inp.0, inp.1, inp.2])
+            .map(|arr| arr.as_boolean().clone())
+    }
+
+    fn compile(inp: &Self::Input<'_>, _params: Self::Params) -> Result<Self, ArrowKernelError> {
+        let (inp, lb, ub) = inp;
+        Ok(BetweenKernel(
+            DSLKernel::compile(&[inp, *lb, *ub], |ctx| {
+                let x = ctx.get_input(0)?;
+                let lb = ctx.get_input(1)?;
+                let ub = ctx.get_input(2)?;
+                ctx.iter_over(vec![x, lb, ub])
+                    .map(|i| vec![i[0].cmp(Predicate::Gte, &i[1]).and(&i[0].lt(&i[2]))])
+                    .collect(KernelOutputType::Boolean)
+            })
+            .map_err(ArrowKernelError::DSLError)?,
+        ))
+    }
+
+    fn get_key_for_input(
+        i: &Self::Input<'_>,
+        _p: &Self::Params,
+    ) -> Result<Self::Key, ArrowKernelError> {
+        Ok((
+            i.0.data_type().clone(),
+            i.1.get().0.data_type().clone(),
+            i.1.get().1,
+            i.2.get().0.data_type().clone(),
+            i.2.get().1,
+        ))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::cmp::Ordering;
@@ -778,7 +830,10 @@ mod tests {
     use itertools::Itertools;
 
     use crate::{
-        compiled_kernels::{cmp::ComparisonKernel, Kernel},
+        compiled_kernels::{
+            cmp::{BetweenKernel, ComparisonKernel},
+            Kernel,
+        },
         dictionary_data_type, Predicate,
     };
 
@@ -979,6 +1034,19 @@ mod tests {
         assert_eq!(
             res.true_count(),
             (0..2048).filter(|i| ((i + 3) % 1024) == 127).count()
+        );
+    }
+
+    #[test]
+    fn test_between_kernel_scalar_bounds() {
+        let a = Int32Array::from(vec![0, 1, 2, 3, 4, 5]);
+        let lb = Scalar::new(Int32Array::from(vec![2]));
+        let ub = Scalar::new(Int32Array::from(vec![5]));
+        let k = BetweenKernel::compile(&(&a, &lb, &ub), ()).unwrap();
+        let r = k.call((&a, &lb, &ub)).unwrap();
+        assert_eq!(
+            r,
+            BooleanArray::from(vec![false, false, true, true, true, false])
         );
     }
 }

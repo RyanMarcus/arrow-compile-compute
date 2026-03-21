@@ -71,6 +71,9 @@ pub enum ArrowKernelError {
     #[error("unsupported argument: {0}")]
     UnsupportedArguments(String),
 
+    #[error("out of bounds index for array of length {0}")]
+    OutOfBounds(usize),
+
     #[error("unsupported scalar type: {0}")]
     UnsupportedScalar(DataType),
 

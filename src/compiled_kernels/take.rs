@@ -1,10 +1,10 @@
 use arrow_array::cast::AsArray;
-use arrow_array::{Array, ArrayRef, BooleanArray};
+use arrow_array::{Array, ArrayRef, BooleanArray, UInt64Array};
 use arrow_buffer::NullBuffer;
 use arrow_schema::DataType;
 
 use crate::compiled_kernels::dsl::{base_type, DSLKernel, KernelOutputType};
-use crate::{logical_nulls, ArrowKernelError, PrimitiveType};
+use crate::{arrow_interface, logical_nulls, ArrowKernelError, PrimitiveType};
 
 use crate::compiled_kernels::{replace_nulls, Kernel};
 
@@ -35,6 +35,18 @@ impl Kernel for TakeKernel {
                 "indexes for take must not be nullable".to_string(),
             ));
         }
+
+        // bounds checking
+        let in_bounds = arrow_interface::cmp::between(
+            idx,
+            &UInt64Array::new_scalar(0),
+            &UInt64Array::new_scalar(arr.len() as u64),
+        )?;
+        if in_bounds.true_count() != idx.len() {
+            println!("{:?}", in_bounds);
+            return Err(ArrowKernelError::OutOfBounds(arr.len()));
+        }
+
         let mut res = self.0.call(&[&arr, &idx])?;
 
         if let Some(nulls) = logical_nulls(arr)? {
