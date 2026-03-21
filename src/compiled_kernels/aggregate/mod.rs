@@ -581,7 +581,10 @@ mod tests {
     use arrow_schema::DataType;
     use itertools::Itertools;
 
-    use crate::compiled_kernels::{CountAggregator, MaxAggregator, MinAggregator, SumAggregator};
+    use crate::{
+        aggregate::MostRecentAggregator,
+        compiled_kernels::{CountAggregator, MaxAggregator, MinAggregator, SumAggregator},
+    };
 
     fn assert_send<T: Send>() {}
 
@@ -591,6 +594,7 @@ mod tests {
         assert_send::<SumAggregator>();
         assert_send::<MinAggregator>();
         assert_send::<MaxAggregator>();
+        assert_send::<MostRecentAggregator>();
     }
 
     #[test]

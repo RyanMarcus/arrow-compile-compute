@@ -20,6 +20,8 @@ pub struct PtrHolder {
     ss_ptr: *const c_void,
 }
 
+unsafe impl Send for PtrHolder {}
+
 #[repr(C)]
 pub struct MostRecentAlloc {
     data: Vec<u8>,
