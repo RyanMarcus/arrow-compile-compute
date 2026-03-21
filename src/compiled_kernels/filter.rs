@@ -25,6 +25,10 @@ impl Kernel for FilterKernel {
     type Output = ArrayRef;
 
     fn call(&self, inp: Self::Input<'_>) -> Result<Self::Output, ArrowKernelError> {
+        if inp.0.len() != inp.1.len() {
+            return Err(ArrowKernelError::SizeMismatch);
+        }
+
         let mut res = self.0.call(&[&inp.0, &inp.1])?;
         if let Some(nulls) = logical_nulls(inp.0)? {
             let ba = BooleanArray::new(nulls.into_inner(), None);

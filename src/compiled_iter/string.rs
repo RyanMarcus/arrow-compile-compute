@@ -150,6 +150,7 @@ pub struct LargeStringIterator {
     data: *const u8,
     pos: u64,
     len: u64,
+    array_ref: Arc<dyn Array>,
 }
 
 impl LargeStringIterator {
@@ -238,6 +239,7 @@ impl From<&GenericStringArray<i64>> for Box<LargeStringIterator> {
             data: value.values().as_ptr(),
             pos: value.offset() as u64,
             len: (value.len() + value.offset()) as u64,
+            array_ref: Arc::new(value.clone()),
         })
     }
 }
@@ -249,6 +251,7 @@ impl From<&GenericBinaryArray<i64>> for Box<LargeStringIterator> {
             data: value.values().as_ptr(),
             pos: value.offset() as u64,
             len: (value.len() + value.offset()) as u64,
+            array_ref: Arc::new(value.clone()),
         })
     }
 }
@@ -662,6 +665,44 @@ mod tests {
             assert_eq!(pointers_to_bytes(b), b"test".to_vec());
 
             assert!(!func.call(iter.get_mut_ptr(), &mut b));
+        }
+    }
+
+    #[test]
+    fn test_large_binary_iter_owns_array_after_source_drop() {
+        let expected_len = 8 * 1024 * 1024;
+        let mut iter = {
+            let bytes = vec![0x5a_u8; expected_len];
+            let data = LargeBinaryArray::from(vec![Some(bytes.as_slice())]);
+            datum_to_iter(&data).unwrap()
+        };
+
+        let _scratch = vec![0_u8; expected_len];
+
+        let ctx = Context::create();
+        let module = ctx.create_module("test_large_binary_keeps_array_alive");
+        let func_next =
+            generate_next(&ctx, &module, "next", &arrow_schema::DataType::LargeBinary, &iter)
+                .unwrap();
+        let fname = func_next.get_name().to_str().unwrap();
+
+        module.verify().unwrap();
+        let ee = module
+            .create_jit_execution_engine(OptimizationLevel::None)
+            .unwrap();
+
+        let func = unsafe {
+            ee.get_function::<unsafe extern "C" fn(*mut c_void, *mut u128) -> bool>(fname)
+                .unwrap()
+        };
+
+        unsafe {
+            let mut out: u128 = 0;
+            assert!(func.call(iter.get_mut_ptr(), &mut out));
+            let bytes = pointers_to_bytes(out);
+            assert_eq!(bytes.len(), expected_len);
+            assert_eq!(bytes[0], 0x5a);
+            assert_eq!(bytes[expected_len - 1], 0x5a);
         }
     }
 }

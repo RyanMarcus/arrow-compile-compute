@@ -510,8 +510,8 @@ pub mod select {
 
     /// Extracts the elements corresponding with the true elements of `filter`.
     ///
-    /// This function computes `data[filter]`. Panics if `data` and `filter` do
-    /// not have the same length.
+    /// This function computes `data[filter]`. Returns an error if `data` and
+    /// `filter` do not have the same length.
     ///
     /// ```
     /// use arrow_array::{StringArray, BooleanArray, Int32Array, Array};
