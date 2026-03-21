@@ -739,9 +739,9 @@ pub mod aggregate {
     use arrow_schema::DataType;
 
     pub use crate::compiled_kernels::{
-        CountAggregator, MaxAggregator, MinAggregator, SumAggregator,
+        CountAggregator, MaxAggregator, MinAggregator, MostRecentAggregator, SumAggregator,
     };
-    use crate::{compiled_kernels::MostRecentAggregator, ArrowKernelError};
+    use crate::ArrowKernelError;
 
     /// Creates a new sum aggregator. Final results are 64-bit versions of their
     /// inputs (e.g., `f32` is summed to `f64`).
