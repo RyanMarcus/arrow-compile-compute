@@ -9,7 +9,9 @@ use ouroboros::self_referencing;
 use crate::{
     compiled_iter::{datum_to_iter, generate_next},
     compiled_kernels::{cast::coalesce_type, link_req_helpers, optimize_module, KernelCache},
-    compiled_writers::{ArrayWriter, PrimitiveArrayWriter, StringViewWriter, WriterAllocation},
+    compiled_writers::{
+        ArrayWriter, FixedSizeListWriter, PrimitiveArrayWriter, StringViewWriter, WriterAllocation,
+    },
     declare_blocks, logical_arrow_type, logical_nulls, ArrowKernelError, Kernel, PrimitiveType,
 };
 
@@ -104,6 +106,7 @@ impl Kernel for ConcatKernel {
             dtype: arr.data_type().clone(),
             func_builder: |ctx| match PrimitiveType::for_arrow_type(arr.data_type()) {
                 PrimitiveType::P64x2 => build_concat::<StringViewWriter>(ctx, *arr),
+                PrimitiveType::List(_ty, _sz) => build_concat::<FixedSizeListWriter>(ctx, *arr),
                 _ => build_concat::<PrimitiveArrayWriter>(ctx, *arr),
             },
         }
@@ -188,13 +191,18 @@ fn build_concat<'a, W: ArrayWriter<'a>>(
 
 #[cfg(test)]
 mod tests {
-    use arrow_array::{Int32Array, StringArray};
+    use std::sync::Arc;
+
+    use arrow_array::{Array, FixedSizeListArray, Float32Array, Int32Array, StringArray};
 
     use itertools::Itertools;
 
     use crate::{
         compiled_kernels::concat::ConcatKernel,
-        compiled_writers::{ArrayWriter, PrimitiveArrayWriter, StringViewWriter, WriterAllocation},
+        compiled_writers::{
+            ArrayWriter, FixedSizeListWriter, PrimitiveArrayWriter, StringViewWriter,
+            WriterAllocation,
+        },
         Kernel,
     };
 
@@ -245,6 +253,44 @@ mod tests {
                 "!",
                 "!",
                 "this is a longer string that is more than 12 chars"
+            ]
+        );
+    }
+
+    #[test]
+    fn test_concat_fixed_size_list_f32x4() {
+        let d1_values = Float32Array::from(vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0]);
+        let d2_values = Float32Array::from(vec![9.0, 10.0, 11.0, 12.0, 13.0, 14.0, 15.0, 16.0]);
+
+        let field = Arc::new(arrow_schema::Field::new_list_field(
+            arrow_schema::DataType::Float32,
+            false,
+        ));
+
+        let d1 = FixedSizeListArray::try_new(field.clone(), 4, Arc::new(d1_values), None).unwrap();
+        let d2 = FixedSizeListArray::try_new(field, 4, Arc::new(d2_values), None).unwrap();
+
+        let mut alloc =
+            FixedSizeListWriter::allocate(4, crate::PrimitiveType::for_arrow_type(d1.data_type()));
+
+        let k = ConcatKernel::compile(&(&d1, alloc.get_ptr()), ()).unwrap();
+        k.call((&d1, alloc.get_ptr())).unwrap();
+        alloc.add_last_written_offset(2);
+        k.call((&d2, alloc.get_ptr())).unwrap();
+        alloc.add_last_written_offset(2);
+
+        let res = alloc.to_array_ref(4, None);
+        let res = res.as_any().downcast_ref::<FixedSizeListArray>().unwrap();
+
+        let values = res.values();
+        let values = values.as_any().downcast_ref::<Float32Array>().unwrap();
+        let values = values.iter().map(|x| x.unwrap()).collect_vec();
+
+        assert_eq!(
+            values,
+            vec![
+                1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0, 9.0, 10.0, 11.0, 12.0, 13.0, 14.0, 15.0,
+                16.0
             ]
         );
     }
