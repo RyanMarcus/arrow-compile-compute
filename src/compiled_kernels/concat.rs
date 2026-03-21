@@ -18,6 +18,7 @@ use crate::{
 pub fn concat_all(data: &[&dyn Array]) -> Result<ArrayRef, ArrowKernelError> {
     match PrimitiveType::for_arrow_type(data[0].data_type()) {
         PrimitiveType::P64x2 => concat_with_writer::<StringViewWriter>(data),
+        PrimitiveType::List(_, _) => concat_with_writer::<FixedSizeListWriter>(data),
         _ => concat_with_writer::<PrimitiveArrayWriter>(data),
     }
 }
