@@ -88,6 +88,11 @@ pub fn coalesce_type(res: ArrayRef, tar: &DataType) -> Result<ArrayRef, ArrowKer
                     .build_unchecked()
             }))
         }
+        (DataType::FixedSizeList(src, src_len), DataType::FixedSizeList(tar, tar_len))
+            if src_len == tar_len && src.data_type() == tar.data_type() =>
+        {
+            Ok(res)
+        }
 
         _ => todo!("unable to coalesce {} into {}", res.data_type(), tar),
     }
@@ -387,5 +392,37 @@ mod tests {
         )
         .unwrap();
         assert!(k.call(&data).is_err());
+    }
+
+    #[test]
+    fn test_fixed_size_list_f16_to_f32() {
+        let mut builder = arrow_array::builder::FixedSizeListBuilder::new(
+            arrow_array::builder::Float16Builder::new(),
+            4,
+        );
+        for _ in 0..2 {
+            for value in [1.0_f32, 2.5, 3.25, 4.0] {
+                builder.values().append_value(half::f16::from_f32(value));
+            }
+            builder.append(true);
+        }
+        let data = builder.finish();
+
+        let k = CastKernel::compile(
+            &(&data as &dyn Array),
+            DataType::FixedSizeList(
+                Arc::new(arrow_schema::Field::new("item", DataType::Float32, true)),
+                4,
+            ),
+        )
+        .unwrap();
+        let res = k.call(&data).unwrap();
+        let res = res.as_fixed_size_list();
+        let values = res
+            .values()
+            .as_primitive::<arrow_array::types::Float32Type>();
+
+        assert_eq!(res.len(), 2);
+        assert_eq!(values.values(), &[1.0, 2.5, 3.25, 4.0, 1.0, 2.5, 3.25, 4.0]);
     }
 }

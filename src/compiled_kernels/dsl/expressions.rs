@@ -1016,6 +1016,15 @@ impl<'a> KernelExpression<'a> {
 
                 if src_pt == dst_pt {
                     Ok(to_convert)
+                } else if let PrimitiveType::List(_ty, _d) = src_pt {
+                    Ok(gen_convert_numeric_vec(
+                        ctx,
+                        build,
+                        to_convert.into_vector_value(),
+                        src_pt.list_type_into_inner(),
+                        dst_pt.list_type_into_inner(),
+                    )
+                    .as_basic_value_enum())
                 } else {
                     let singleton_vec = build
                         .build_bit_cast(
