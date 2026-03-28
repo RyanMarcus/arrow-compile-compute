@@ -11,8 +11,8 @@ use crate::{
 use arrow_array::{
     cast::AsArray,
     make_array,
-    types::{Int16Type, Int32Type, Int64Type, Int8Type},
-    Array, ArrayRef, StringArray, StringViewArray,
+    types::{Int16Type, Int32Type, Int64Type, Int8Type, UInt8Type},
+    Array, ArrayRef, BooleanArray, StringArray, StringViewArray,
 };
 use arrow_data::ArrayDataBuilder;
 use arrow_schema::DataType;
@@ -24,6 +24,11 @@ pub fn coalesce_type(res: ArrayRef, tar: &DataType) -> Result<ArrayRef, ArrowKer
 
     // might need to translate binary type to string type
     match (res.data_type(), tar) {
+        (DataType::UInt8, DataType::Boolean) => {
+            let res = res.as_primitive::<UInt8Type>();
+            let res = BooleanArray::from_unary(res, |x| x > 0);
+            Ok(Arc::new(res))
+        }
         (DataType::Binary, DataType::Utf8) => {
             let res = res.as_binary();
             let (offsets, data, nulls) = res.clone().into_parts();
