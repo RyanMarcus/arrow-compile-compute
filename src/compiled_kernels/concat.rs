@@ -49,7 +49,6 @@ where
 
     for arr in data {
         CONCAT_PROGRAM_CACHE.get((*arr, alloc.get_ptr()), ())?;
-        alloc.add_last_written_offset(arr.len());
     }
 
     let arr = alloc.to_array_ref(total_els, nulls);
@@ -216,9 +215,7 @@ mod tests {
         let k = ConcatKernel::compile(&(&d1, alloc.get_ptr()), ()).unwrap();
 
         k.call((&d1, alloc.get_ptr())).unwrap();
-        alloc.add_last_written_offset(4);
         k.call((&d2, alloc.get_ptr())).unwrap();
-        alloc.add_last_written_offset(4);
 
         let res: Int32Array = alloc.into_primitive_array(8, None);
         let res = res.iter().map(|x| x.unwrap()).collect_vec();
@@ -237,9 +234,7 @@ mod tests {
 
         let k = ConcatKernel::compile(&(&d1, alloc.get_ptr()), ()).unwrap();
         k.call((&d1, alloc.get_ptr())).unwrap();
-        alloc.add_last_written_offset(2);
         k.call((&d2, alloc.get_ptr())).unwrap();
-        alloc.add_last_written_offset(3);
 
         let res = alloc.to_array(5, None);
         let res = res
@@ -276,9 +271,7 @@ mod tests {
 
         let k = ConcatKernel::compile(&(&d1, alloc.get_ptr()), ()).unwrap();
         k.call((&d1, alloc.get_ptr())).unwrap();
-        alloc.add_last_written_offset(2);
         k.call((&d2, alloc.get_ptr())).unwrap();
-        alloc.add_last_written_offset(2);
 
         let res = alloc.to_array_ref(4, None);
         let res = res.as_any().downcast_ref::<FixedSizeListArray>().unwrap();

@@ -35,7 +35,7 @@ impl WriterAllocation for ArrayOutput {
     type Output = ArrayRef;
 
     fn get_ptr(&mut self) -> *mut c_void {
-        self.out_ptr
+        (&mut self.out_ptr as *mut *mut c_void) as *mut c_void
     }
 
     fn to_array(self, len: usize, nulls: Option<NullBuffer>) -> Self::Output {
@@ -53,10 +53,6 @@ impl WriterAllocation for ArrayOutput {
 
     fn to_array_ref(self, len: usize, nulls: Option<arrow_buffer::NullBuffer>) -> ArrayRef {
         self.to_array(len, nulls)
-    }
-
-    fn add_last_written_offset(&mut self, offset: usize) {
-        self.out_ptr = self.out_ptr.wrapping_add(self.pt.width() * offset);
     }
 }
 
@@ -118,14 +114,18 @@ impl<'a> ArrayWriter<'a> for PrimitiveArrayWriter<'a> {
             b2.position_at_end(entry);
             let val = func.get_nth_param(0).unwrap();
 
+            let alloc_ptr = b2
+                .build_load(ptr_type, global_alloc_ptr_ptr, "alloc_ptr")
+                .unwrap()
+                .into_pointer_value();
             let curr_ptr = b2
-                .build_load(ptr_type, global_alloc_ptr_ptr, "curr_ptr")
+                .build_load(ptr_type, alloc_ptr, "curr_ptr")
                 .unwrap()
                 .into_pointer_value();
 
             b2.build_store(curr_ptr, val).unwrap();
             let new_ptr = increment_pointer!(ctx, b2, curr_ptr, width);
-            b2.build_store(global_alloc_ptr_ptr, new_ptr).unwrap();
+            b2.build_store(alloc_ptr, new_ptr).unwrap();
             b2.build_return(None).unwrap();
             func
         };
@@ -140,14 +140,18 @@ impl<'a> ArrayWriter<'a> for PrimitiveArrayWriter<'a> {
             b2.position_at_end(entry);
             let val = func.get_nth_param(0).unwrap();
 
+            let alloc_ptr = b2
+                .build_load(ptr_type, global_alloc_ptr_ptr, "alloc_ptr")
+                .unwrap()
+                .into_pointer_value();
             let curr_ptr = b2
-                .build_load(ptr_type, global_alloc_ptr_ptr, "curr_ptr")
+                .build_load(ptr_type, alloc_ptr, "curr_ptr")
                 .unwrap()
                 .into_pointer_value();
 
             b2.build_store(curr_ptr, val).unwrap();
             let new_ptr = increment_pointer!(ctx, b2, curr_ptr, width * 64);
-            b2.build_store(global_alloc_ptr_ptr, new_ptr).unwrap();
+            b2.build_store(alloc_ptr, new_ptr).unwrap();
             b2.build_return(None).unwrap();
             func
         };
