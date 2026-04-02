@@ -42,7 +42,6 @@ impl<'a, K: ArrowDictionaryKeyType, VW: ArrayWriter<'a>> WriterAllocation
     }
 
     fn reserve_for_additional(&mut self, count: usize) {
-        self.tt.reserve_for_additional(count);
         self.keys.reserve_for_additional(count);
         self.values.reserve_for_additional(count);
 
@@ -309,7 +308,12 @@ mod tests {
         unsafe {
             f.call(data.get_ptr());
         }
-        let data = data.to_array(100, None);
+        data.reserve_for_additional(100);
+        unsafe {
+            f.call(data.get_ptr());
+        }
+        expected.extend(expected.clone());
+        let data = data.to_array(200, None);
         let data = data.downcast_dict::<Int32Array>().unwrap();
         let data: Vec<i32> = data.into_iter().map(|x| x.unwrap()).collect_vec();
 

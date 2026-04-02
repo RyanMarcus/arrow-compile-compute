@@ -55,6 +55,15 @@ impl WriterAllocation for FixedSizeListWriterAlloc {
         }
     }
 
+    fn rewind_one(&mut self) {
+        unsafe {
+            let width = self.element_pt.width() * self.list_size;
+            let base = self.out.as_mut_ptr() as *mut c_void;
+            let bytes_written = self.out_ptr.offset_from_unsigned(base);
+            self.out_ptr = base.byte_add(bytes_written - width);
+        }
+    }
+
     fn to_array(self, len: usize, nulls: Option<NullBuffer>) -> Self::Output {
         let buf = Buffer::from(self.out);
         let buf = buf.slice_with_length(0, len * self.element_pt.width() * self.list_size);
@@ -258,11 +267,15 @@ mod tests {
         unsafe {
             f.call(data.get_ptr());
         }
-        let data = data.to_array(10, None);
+        data.reserve_for_additional(10);
+        unsafe {
+            f.call(data.get_ptr());
+        }
+        let data = data.to_array(20, None);
 
-        for i in 0..10 {
+        for i in 0..20 {
             let el = data.value(i);
-            let i = i as i32;
+            let i = (i % 10) as i32;
             assert_eq!(
                 el.as_primitive::<Int32Type>().values(),
                 &[i, i + 1, i + 2, i + 3]

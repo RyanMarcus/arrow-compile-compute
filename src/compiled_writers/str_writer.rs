@@ -49,10 +49,27 @@ impl<T: OffsetSizeTrait> WriterAllocation for StringAllocation<T> {
                 .offsets_ptr
                 .offset_from_unsigned(self.offsets.as_mut_ptr() as *mut c_void)
                 / offset_width;
-            self.offsets.set_len(offset_items_written);
-            self.offsets.reserve(count);
+            let offsets_to_preserve = offset_items_written + 1;
+            self.offsets.set_len(offsets_to_preserve);
+            self.offsets.resize(offsets_to_preserve + count, T::zero());
             self.offsets_ptr =
                 self.offsets.as_mut_ptr().wrapping_add(offset_items_written) as *mut c_void;
+        }
+    }
+
+    fn rewind_one(&mut self) {
+        let offset_width = if T::IS_LARGE { 8 } else { 4 };
+        unsafe {
+            let offset_items_written = self
+                .offsets_ptr
+                .offset_from_unsigned(self.offsets.as_mut_ptr() as *mut c_void)
+                / offset_width;
+            let prev_offset = self.offsets[offset_items_written - 1].as_usize();
+            self.data.truncate(prev_offset);
+            self.offsets_ptr = self
+                .offsets
+                .as_mut_ptr()
+                .wrapping_add(offset_items_written - 1) as *mut c_void;
         }
     }
 
@@ -287,10 +304,15 @@ mod tests {
             f.call(alloc.get_ptr());
         }
 
-        let arr = alloc.to_array(4, None);
+        alloc.reserve_for_additional(strs.len());
+        unsafe {
+            f.call(alloc.get_ptr());
+        }
+
+        let arr = alloc.to_array(2 * strs.len(), None);
         let arr = StringArray::from(arr);
         let arr = arr.iter().map(|s| s.unwrap()).collect_vec();
-        assert_eq!(arr, strs);
+        assert_eq!(arr, strs.into_iter().chain(strs).collect_vec());
     }
 
     #[test]
@@ -356,9 +378,14 @@ mod tests {
             f.call(alloc.get_ptr());
         }
 
-        let arr = alloc.to_array(4, None);
+        alloc.reserve_for_additional(strs.len());
+        unsafe {
+            f.call(alloc.get_ptr());
+        }
+
+        let arr = alloc.to_array(2 * strs.len(), None);
         let arr = LargeStringArray::from(arr);
         let arr = arr.iter().map(|s| s.unwrap()).collect_vec();
-        assert_eq!(arr, strs);
+        assert_eq!(arr, strs.into_iter().chain(strs).collect_vec());
     }
 }

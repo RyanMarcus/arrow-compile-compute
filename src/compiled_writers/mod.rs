@@ -65,6 +65,25 @@ pub trait WriterAllocation {
 
     fn reserve_for_additional(&mut self, count: usize);
 
+    /// Undo exactly one previously written logical element and move the write
+    /// cursor back so the next ingest overwrites that element.
+    ///
+    /// This must only remove the final element that was most recently appended
+    /// to the backing storage. After the call, all earlier elements must remain
+    /// unchanged, and a subsequent write must land at the same location that the
+    /// removed element previously occupied.
+    ///
+    /// This hook is needed for allocations that can back an [`REEWriter`]:
+    /// `REEWriter::llvm_flush` materializes the current terminal run, and if the
+    /// caller later reserves more capacity and continues writing, that terminal
+    /// run must be withdrawn before new values are appended. Implement this for
+    /// any allocation that can serve as the run-end array or value array of an
+    /// REE writer. Allocations that can never be used by `REEWriter` may keep
+    /// the default panic.
+    fn rewind_one(&mut self) {
+        panic!("rewind_one unsupported for this writer allocation");
+    }
+
     fn to_array(self, len: usize, nulls: Option<NullBuffer>) -> Self::Output;
     fn to_array_ref(self, len: usize, nulls: Option<NullBuffer>) -> ArrayRef;
 }

@@ -42,6 +42,10 @@ impl<'a, K: RunEndIndexType, VW: ArrayWriter<'a>> WriterAllocation for REEAlloca
     }
 
     fn reserve_for_additional(&mut self, count: usize) {
+        if self.curr_run_end > 0 && self.num_unique > 0 {
+            self.res.rewind_one();
+            self.values.rewind_one();
+        }
         self.res.reserve_for_additional(count);
         self.values.reserve_for_additional(count);
         self.res_ptr = self.res.get_ptr();
@@ -442,10 +446,14 @@ mod tests {
         unsafe {
             f.call(alloc.get_ptr());
         }
-        let ree = alloc.to_array(11, None);
+        alloc.reserve_for_additional(data.len());
+        unsafe {
+            f.call(alloc.get_ptr());
+        }
+        let ree = alloc.to_array(2 * data.len(), None);
         let ree = ree.downcast::<Int32Array>().unwrap();
         let ree_vec = ree.into_iter().map(|x| x.unwrap()).collect_vec();
-        assert_eq!(ree_vec, data);
+        assert_eq!(ree_vec, data.iter().chain(data.iter()).copied().collect_vec());
     }
 
     #[test]
@@ -593,12 +601,16 @@ mod tests {
         unsafe {
             f.call(alloc.get_ptr());
         }
-        let ree = alloc.to_array(6, None);
+        alloc.reserve_for_additional(data.len());
+        unsafe {
+            f.call(alloc.get_ptr());
+        }
+        let ree = alloc.to_array(2 * data.len(), None);
         let ree = ree.downcast::<BinaryArray>().unwrap();
         let ree_vec = ree
             .into_iter()
             .map(|x| std::str::from_utf8(x.unwrap()).unwrap())
             .collect_vec();
-        assert_eq!(ree_vec, data);
+        assert_eq!(ree_vec, data.iter().chain(data.iter()).copied().collect_vec());
     }
 }

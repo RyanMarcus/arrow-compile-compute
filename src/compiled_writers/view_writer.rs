@@ -78,8 +78,15 @@ impl WriterAllocation for StringViewAllocation {
         unsafe {
             let ptrs_written = self.views_ptr.offset_from_unsigned(self.views.as_mut_ptr());
             self.views.set_len(ptrs_written);
-            self.views.reserve(count);
-            self.views_ptr = self.views.as_mut_ptr();
+            self.views.resize(ptrs_written + count, 0);
+            self.views_ptr = self.views.as_mut_ptr().add(ptrs_written);
+        }
+    }
+
+    fn rewind_one(&mut self) {
+        unsafe {
+            let ptrs_written = self.views_ptr.offset_from_unsigned(self.views.as_mut_ptr());
+            self.views_ptr = self.views.as_mut_ptr().add(ptrs_written - 1);
         }
     }
 
@@ -379,11 +386,16 @@ mod tests {
             f.call(alloc.get_ptr());
         }
 
-        let arr = alloc.to_array(strs.len(), None);
+        alloc.reserve_for_additional(strs.len());
+        unsafe {
+            f.call(alloc.get_ptr());
+        }
+
+        let arr = alloc.to_array(2 * strs.len(), None);
         let arr = arr
             .iter()
             .map(|s| std::str::from_utf8(s.unwrap()).unwrap())
             .collect_vec();
-        assert_eq!(arr, strs);
+        assert_eq!(arr, strs.into_iter().chain(strs).collect_vec());
     }
 }

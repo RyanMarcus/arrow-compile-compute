@@ -45,9 +45,26 @@ impl WriterAllocation for BooleanAllocation {
             let bytes_written = self
                 .data_ptr
                 .offset_from_unsigned(self.data.as_ptr() as *const c_void);
-            self.data.set_len(bytes_written);
-            self.data.reserve(count.div_ceil(8));
+            let bytes_to_preserve = bytes_written + usize::from(self.buf_idx > 0);
+            self.data.set_len(bytes_to_preserve);
+            self.data
+                .resize(bytes_written + (usize::from(self.buf_idx) + count).div_ceil(8), 0);
             self.data_ptr = self.data.as_mut_ptr().byte_add(bytes_written) as *mut c_void;
+        }
+    }
+
+    fn rewind_one(&mut self) {
+        unsafe {
+            if self.buf_idx > 0 {
+                self.buf_idx -= 1;
+            } else {
+                self.data_ptr = self.data_ptr.byte_sub(1);
+                self.buf = *(self.data_ptr as *mut u8);
+                self.buf_idx = 7;
+            }
+
+            self.buf &= !(1 << self.buf_idx);
+            *(self.data_ptr as *mut u8) = self.buf;
         }
     }
 
@@ -86,28 +103,11 @@ impl<'a> ArrayWriter<'a> for BooleanWriter<'a> {
         assert_eq!(ty, PrimitiveType::U8);
         let ptr_type = ctx.ptr_type(AddressSpace::default());
 
-        let buf_ptr = build.build_alloca(ctx.i8_type(), "bool_buf_ptr").unwrap();
-        build
-            .build_store(buf_ptr, ctx.i8_type().const_zero())
-            .unwrap();
-        let buf_idx_ptr = build
-            .build_alloca(ctx.i8_type(), "bool_buf_idx_ptr")
-            .unwrap();
-        build
-            .build_store(buf_idx_ptr, ctx.i8_type().const_zero())
-            .unwrap();
-        let out_ptr_ptr = build
-            .build_alloca(ctx.ptr_type(AddressSpace::default()), "bool_out_ptr_ptr")
-            .unwrap();
-        let base_out_ptr = build
-            .build_load(
-                ptr_type,
-                increment_pointer!(ctx, build, alloc_ptr, BooleanAllocation::OFFSET_DATA_PTR),
-                "base_out_ptr",
-            )
-            .unwrap()
-            .into_pointer_value();
-        build.build_store(out_ptr_ptr, base_out_ptr).unwrap();
+        let buf_ptr = increment_pointer!(ctx, build, alloc_ptr, BooleanAllocation::OFFSET_BUF);
+        let buf_idx_ptr =
+            increment_pointer!(ctx, build, alloc_ptr, BooleanAllocation::OFFSET_BUF_IDX);
+        let out_ptr_ptr =
+            increment_pointer!(ctx, build, alloc_ptr, BooleanAllocation::OFFSET_DATA_PTR);
 
         let ingest_func = llvm_mod.get_function("ingest_boolean").unwrap_or_else(|| {
             let build = ctx.create_builder();
@@ -424,7 +424,6 @@ mod tests {
         unsafe {
             f.call(data.get_ptr() as *mut c_void);
         }
-        let res = data.to_array(25, None);
         let expected = BooleanArray::from(
             [true]
                 .repeat(10)
@@ -432,6 +431,18 @@ mod tests {
                 .chain([false].repeat(5).iter())
                 .chain([true].repeat(10).iter())
                 .copied()
+                .collect_vec(),
+        );
+        data.reserve_for_additional(25);
+        unsafe {
+            f.call(data.get_ptr() as *mut c_void);
+        }
+        let res = data.to_array(50, None);
+        let expected = BooleanArray::from(
+            expected
+                .iter()
+                .chain(expected.iter())
+                .map(|x| x.unwrap())
                 .collect_vec(),
         );
         assert_eq!(res, expected);

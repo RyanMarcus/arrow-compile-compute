@@ -54,6 +54,14 @@ impl WriterAllocation for ArrayOutput {
         }
     }
 
+    fn rewind_one(&mut self) {
+        unsafe {
+            let base = self.out.as_mut_ptr() as *mut c_void;
+            let bytes_written = self.out_ptr.offset_from_unsigned(base);
+            self.out_ptr = base.byte_add(bytes_written - self.pt.width());
+        }
+    }
+
     fn to_array(self, len: usize, nulls: Option<NullBuffer>) -> Self::Output {
         let buf = Buffer::from(self.out);
         let buf = buf.slice_with_length(0, len * self.pt.width());
