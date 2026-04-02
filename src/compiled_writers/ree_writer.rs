@@ -1,6 +1,7 @@
 use std::{ffi::c_void, marker::PhantomData, sync::Arc};
 
 use arrow_array::{cast::AsArray, types::RunEndIndexType, Array, ArrayRef, RunArray};
+use arrow_buffer::NullBuffer;
 use arrow_data::ArrayDataBuilder;
 use arrow_schema::{DataType, Field};
 use inkwell::{
@@ -40,7 +41,14 @@ impl<'a, K: RunEndIndexType, VW: ArrayWriter<'a>> WriterAllocation for REEAlloca
         self as *mut Self as *mut c_void
     }
 
-    fn to_array(self, len: usize, nulls: Option<arrow_buffer::NullBuffer>) -> Self::Output {
+    fn reserve_for_additional(&mut self, count: usize) {
+        self.res.reserve_for_additional(count);
+        self.values.reserve_for_additional(count);
+        self.res_ptr = self.res.get_ptr();
+        self.values_ptr = self.values.get_ptr();
+    }
+
+    fn to_array(self, len: usize, nulls: Option<NullBuffer>) -> Self::Output {
         let run_ends = self.res.to_array(self.num_unique as usize, None);
         let res = run_ends.as_primitive::<K>();
         let values = self.values.to_array(self.num_unique as usize, nulls);

@@ -38,6 +38,22 @@ impl WriterAllocation for ArrayOutput {
         (&mut self.out_ptr as *mut *mut c_void) as *mut c_void
     }
 
+    fn reserve_for_additional(&mut self, count: usize) {
+        unsafe {
+            let bytes_written = self
+                .out_ptr
+                .offset_from_unsigned(self.out.as_ptr() as *mut c_void);
+            let items_to_preserve = bytes_written.div_ceil(16);
+            self.out.set_len(items_to_preserve);
+            self.out.resize(
+                items_to_preserve + (count * self.pt.width()).div_ceil(16),
+                0,
+            );
+            let new_base = self.out.as_mut_ptr() as *mut c_void;
+            self.out_ptr = new_base.byte_add(bytes_written);
+        }
+    }
+
     fn to_array(self, len: usize, nulls: Option<NullBuffer>) -> Self::Output {
         let buf = Buffer::from(self.out);
         let buf = buf.slice_with_length(0, len * self.pt.width());
@@ -247,10 +263,14 @@ mod tests {
         unsafe {
             f.call(data.get_ptr());
         }
-        let data = data.to_array(10, None);
+        data.reserve_for_additional(10);
+        unsafe {
+            f.call(data.get_ptr());
+        }
+        let data = data.to_array(20, None);
         let data = data.as_primitive::<Int32Type>().values();
 
-        assert_eq!(data, &(0..10).collect::<Vec<_>>());
+        assert_eq!(data, &(0..10).chain(0..10).collect::<Vec<_>>());
     }
 
     #[test]

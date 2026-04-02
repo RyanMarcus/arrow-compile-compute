@@ -67,6 +67,10 @@ impl TicketTable {
         }
     }
 
+    pub fn reserve_for_additional(&mut self, count: usize) {
+        todo!()
+    }
+
     /// Returns the number of elements in the table (not the maximum size of the
     /// table)
     pub fn len(&self) -> usize {

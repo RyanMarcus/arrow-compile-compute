@@ -63,6 +63,8 @@ pub trait WriterAllocation {
     type Output: Array;
     fn get_ptr(&mut self) -> *mut c_void;
 
+    fn reserve_for_additional(&mut self, count: usize);
+
     fn to_array(self, len: usize, nulls: Option<NullBuffer>) -> Self::Output;
     fn to_array_ref(self, len: usize, nulls: Option<NullBuffer>) -> ArrayRef;
 }

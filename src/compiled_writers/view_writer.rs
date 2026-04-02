@@ -74,6 +74,15 @@ impl WriterAllocation for StringViewAllocation {
         self as *mut Self as *mut c_void
     }
 
+    fn reserve_for_additional(&mut self, count: usize) {
+        unsafe {
+            let ptrs_written = self.views_ptr.offset_from_unsigned(self.views.as_mut_ptr());
+            self.views.set_len(ptrs_written);
+            self.views.reserve(count);
+            self.views_ptr = self.views.as_mut_ptr();
+        }
+    }
+
     fn to_array(mut self, len: usize, nulls: Option<NullBuffer>) -> Self::Output {
         self.views.truncate(len);
         let buffers = self.data.into_buffers();

@@ -41,6 +41,15 @@ impl<'a, K: ArrowDictionaryKeyType, VW: ArrayWriter<'a>> WriterAllocation
         self as *mut Self as *mut c_void
     }
 
+    fn reserve_for_additional(&mut self, count: usize) {
+        self.tt.reserve_for_additional(count);
+        self.keys.reserve_for_additional(count);
+        self.values.reserve_for_additional(count);
+
+        self.keys_ptr = self.keys.get_ptr();
+        self.values_ptr = self.values.get_ptr();
+    }
+
     fn to_array(self, len: usize, nulls: Option<arrow_buffer::NullBuffer>) -> Self::Output {
         let keys = self.keys.to_array(len, nulls);
         let keys = keys.as_primitive::<K>().clone();

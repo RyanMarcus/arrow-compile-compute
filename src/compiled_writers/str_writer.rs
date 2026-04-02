@@ -8,7 +8,6 @@ use crate::{
 
 use arrow_array::{ArrayRef, GenericBinaryArray, GenericByteArray, OffsetSizeTrait};
 use arrow_buffer::{Buffer, OffsetBuffer, ScalarBuffer};
-use inkwell::values::BasicValue;
 use inkwell::{
     builder::Builder,
     context::Context,
@@ -43,6 +42,20 @@ impl<T: OffsetSizeTrait> WriterAllocation for StringAllocation<T> {
         self as *mut Self as *mut c_void
     }
 
+    fn reserve_for_additional(&mut self, count: usize) {
+        let offset_width = if T::IS_LARGE { 8 } else { 4 };
+        unsafe {
+            let offset_items_written = self
+                .offsets_ptr
+                .offset_from_unsigned(self.offsets.as_mut_ptr() as *mut c_void)
+                / offset_width;
+            self.offsets.set_len(offset_items_written);
+            self.offsets.reserve(count);
+            self.offsets_ptr =
+                self.offsets.as_mut_ptr().wrapping_add(offset_items_written) as *mut c_void;
+        }
+    }
+
     fn to_array(mut self, len: usize, nulls: Option<arrow_buffer::NullBuffer>) -> Self::Output {
         self.offsets.truncate(len + 1);
         let last_offset = self.offsets.last().map(|o| o.as_usize()).unwrap_or(0);
@@ -69,7 +82,7 @@ impl<'a, T: OffsetSizeTrait> ArrayWriter<'a> for StringArrayWriter<'a, T> {
     fn allocate(expected_count: usize, ty: PrimitiveType) -> Self::Allocation {
         assert_eq!(ty, PrimitiveType::P64x2, "string writer type must be P64x2");
         let data = Vec::with_capacity(expected_count);
-        let mut offsets = vec![T::zero(); (expected_count + 1) * T::get_byte_width()];
+        let mut offsets = vec![T::zero(); expected_count + 1];
         let offsets_ptr = offsets.as_mut_ptr() as *mut c_void;
         StringAllocation {
             offsets_ptr,
@@ -95,35 +108,9 @@ impl<'a, T: OffsetSizeTrait> ArrayWriter<'a> for StringArrayWriter<'a, T> {
             ctx.i32_type()
         };
 
-        let offset_ptr_ptr = increment_pointer!(
-            ctx,
-            build,
-            alloc_ptr,
-            StringAllocation::<T>::OFFSET_OFFSETS_PTR
-        );
-        let offset_ptr = build
-            .build_load(ptr_type, offset_ptr_ptr, "offset_base")
-            .unwrap()
-            .into_pointer_value();
-
-        let global_offsets_ptr_ptr =
-            declare_global_pointer!(llvm_mod, STRING_WRITER_OFFSETS_PTR_PTR).as_pointer_value();
-        let global_data_ptr_ptr =
-            declare_global_pointer!(llvm_mod, STRING_WRITER_DATA_PTR_PTR).as_pointer_value();
-        build
-            .build_store(
-                global_data_ptr_ptr,
-                increment_pointer!(ctx, build, alloc_ptr, StringAllocation::<T>::OFFSET_DATA),
-            )
-            .unwrap();
-        build
-            .build_store(global_offsets_ptr_ptr, offset_ptr)
-            .unwrap();
-
-        // write the initial zero -- each call to ingest will just write the end point
-        build
-            .build_store(offset_ptr, offset_element_type.const_zero())
-            .unwrap();
+        let global_alloc_ptr_ptr =
+            declare_global_pointer!(llvm_mod, STRING_WRITER_ALLOC_PTR_PTR).as_pointer_value();
+        build.build_store(global_alloc_ptr_ptr, alloc_ptr).unwrap();
 
         let extend_f = llvm_mod
             .get_function("str_writer_append_bytes")
@@ -158,19 +145,27 @@ impl<'a, T: OffsetSizeTrait> ArrayWriter<'a> for StringArrayWriter<'a, T> {
                 .into_pointer_value();
             let len = pointer_diff!(ctx, b2, ptr1, ptr2);
 
-            let global_data_ptr = b2
-                .build_load(ptr_type, global_data_ptr_ptr, "global_data_ptr")
+            let alloc_ptr = b2
+                .build_load(ptr_type, global_alloc_ptr_ptr, "alloc_ptr")
                 .unwrap()
                 .into_pointer_value();
-            global_data_ptr
-                .as_instruction_value()
+            let offset_ptr_ptr = increment_pointer!(
+                ctx,
+                b2,
+                alloc_ptr,
+                StringAllocation::<T>::OFFSET_OFFSETS_PTR
+            );
+            let offset_ptr = b2
+                .build_load(ptr_type, offset_ptr_ptr, "offset_ptr")
                 .unwrap()
-                .set_metadata(ctx.metadata_node(&[]), ctx.get_kind_id("invariant.load"))
-                .unwrap();
+                .into_pointer_value();
+
+            let data_ptr =
+                increment_pointer!(ctx, b2, alloc_ptr, StringAllocation::<T>::OFFSET_DATA);
 
             b2.build_call(
                 extend_f,
-                &[ptr1.into(), len.into(), global_data_ptr.into()],
+                &[ptr1.into(), len.into(), data_ptr.into()],
                 "extend",
             )
             .unwrap();
@@ -178,24 +173,19 @@ impl<'a, T: OffsetSizeTrait> ArrayWriter<'a> for StringArrayWriter<'a, T> {
                 .build_int_truncate_or_bit_cast(len, offset_element_type, "trunc_len")
                 .unwrap();
 
-            let offset_out_ptr = b2
-                .build_load(ptr_type, global_offsets_ptr_ptr, "offset_out_ptr")
-                .unwrap()
-                .into_pointer_value();
             let prev_offset = b2
-                .build_load(offset_element_type, offset_out_ptr, "last_offset")
+                .build_load(offset_element_type, offset_ptr, "last_offset")
                 .unwrap()
                 .into_int_value();
             let curr_offset = b2.build_int_add(prev_offset, len, "curr_offset").unwrap();
             let curr_offset = b2
                 .build_int_truncate_or_bit_cast(curr_offset, offset_element_type, "curr_offset")
                 .unwrap();
-            let next_offset_ptr = increment_pointer!(ctx, b2, offset_out_ptr, T::get_byte_width());
+            let next_offset_ptr = increment_pointer!(ctx, b2, offset_ptr, T::get_byte_width());
             b2.build_store(next_offset_ptr, curr_offset).unwrap();
 
             // update pointers
-            b2.build_store(global_offsets_ptr_ptr, next_offset_ptr)
-                .unwrap();
+            b2.build_store(offset_ptr_ptr, next_offset_ptr).unwrap();
             b2.build_return(None).unwrap();
             func
         });

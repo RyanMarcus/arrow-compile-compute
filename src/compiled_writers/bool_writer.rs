@@ -29,6 +29,8 @@ pub struct BooleanWriter<'a> {
 pub struct BooleanAllocation {
     data_ptr: *mut c_void,
     data: Vec<u8>,
+    buf: u8,
+    buf_idx: u8,
 }
 
 impl WriterAllocation for BooleanAllocation {
@@ -36,6 +38,17 @@ impl WriterAllocation for BooleanAllocation {
 
     fn get_ptr(&mut self) -> *mut c_void {
         self as *mut Self as *mut c_void
+    }
+
+    fn reserve_for_additional(&mut self, count: usize) {
+        unsafe {
+            let bytes_written = self
+                .data_ptr
+                .offset_from_unsigned(self.data.as_ptr() as *const c_void);
+            self.data.set_len(bytes_written);
+            self.data.reserve(count.div_ceil(8));
+            self.data_ptr = self.data.as_mut_ptr().byte_add(bytes_written) as *mut c_void;
+        }
     }
 
     fn to_array(self, len: usize, nulls: Option<arrow_buffer::NullBuffer>) -> Self::Output {
@@ -58,6 +71,8 @@ impl<'a> ArrayWriter<'a> for BooleanWriter<'a> {
         BooleanAllocation {
             data_ptr: data.as_mut_ptr() as *mut c_void,
             data,
+            buf: 0,
+            buf_idx: 0,
         }
     }
 
