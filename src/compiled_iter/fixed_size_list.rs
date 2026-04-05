@@ -1,6 +1,6 @@
 use std::{ffi::c_void, sync::Arc};
 
-use crate::{increment_pointer, mark_load_invariant, PrimitiveType};
+use crate::{increment_pointer, mark_load_invariant, ListItemType, PrimitiveType};
 use arrow_array::{
     cast::AsArray,
     types::{
@@ -27,49 +27,50 @@ pub struct FixedSizeListIterator {
     pos: u64,
     len: u64,
     list_size: usize,
-    list_ptype: PrimitiveType,
+    list_ptype: ListItemType,
     array_ref: Arc<dyn Array>,
 }
 
 impl From<&FixedSizeListArray> for Box<FixedSizeListIterator> {
     fn from(arr: &FixedSizeListArray) -> Self {
-        let list_ptype = PrimitiveType::for_arrow_type(&arr.value_type());
+        let list_ptype: ListItemType = PrimitiveType::for_arrow_type(&arr.value_type())
+            .try_into()
+            .unwrap();
         let data_ptr = match list_ptype {
-            PrimitiveType::I8 => {
+            ListItemType::I8 => {
                 arr.values().as_primitive::<Int8Type>().values().as_ptr() as *const c_void
             }
-            PrimitiveType::I16 => {
+            ListItemType::I16 => {
                 arr.values().as_primitive::<Int16Type>().values().as_ptr() as *const c_void
             }
-            PrimitiveType::I32 => {
+            ListItemType::I32 => {
                 arr.values().as_primitive::<Int32Type>().values().as_ptr() as *const c_void
             }
-            PrimitiveType::I64 => {
+            ListItemType::I64 => {
                 arr.values().as_primitive::<Int64Type>().values().as_ptr() as *const c_void
             }
-            PrimitiveType::U8 => {
+            ListItemType::U8 => {
                 arr.values().as_primitive::<UInt8Type>().values().as_ptr() as *const c_void
             }
-            PrimitiveType::U16 => {
+            ListItemType::U16 => {
                 arr.values().as_primitive::<UInt16Type>().values().as_ptr() as *const c_void
             }
-            PrimitiveType::U32 => {
+            ListItemType::U32 => {
                 arr.values().as_primitive::<UInt32Type>().values().as_ptr() as *const c_void
             }
-            PrimitiveType::U64 => {
+            ListItemType::U64 => {
                 arr.values().as_primitive::<UInt64Type>().values().as_ptr() as *const c_void
             }
-            PrimitiveType::F16 => {
+            ListItemType::F16 => {
                 arr.values().as_primitive::<Float16Type>().values().as_ptr() as *const c_void
             }
-            PrimitiveType::F32 => {
+            ListItemType::F32 => {
                 arr.values().as_primitive::<Float32Type>().values().as_ptr() as *const c_void
             }
-            PrimitiveType::F64 => {
+            ListItemType::F64 => {
                 arr.values().as_primitive::<Float64Type>().values().as_ptr() as *const c_void
             }
-            PrimitiveType::P64x2 => todo!(),
-            PrimitiveType::List(_, _) => todo!(),
+            ListItemType::P64x2 => todo!(),
         };
 
         Box::new(FixedSizeListIterator {
@@ -80,6 +81,12 @@ impl From<&FixedSizeListArray> for Box<FixedSizeListIterator> {
             list_ptype,
             array_ref: Arc::new(arr.clone()),
         })
+    }
+}
+
+impl FixedSizeListIterator {
+    pub fn ptype(&self) -> PrimitiveType {
+        PrimitiveType::List(self.list_ptype, self.list_size)
     }
 }
 

@@ -56,8 +56,13 @@ impl<'a, K: ArrowDictionaryKeyType, VW: ArrayWriter<'a>> WriterAllocation
         unsafe { DictionaryArray::<K>::new_unchecked(keys, values) }
     }
 
-    fn to_array_ref(self, len: usize, nulls: Option<arrow_buffer::NullBuffer>) -> ArrayRef {
+    fn to_array_ref(self, nulls: Option<arrow_buffer::NullBuffer>) -> ArrayRef {
+        let len = self.len();
         Arc::new(self.to_array(len, nulls))
+    }
+
+    fn len(&self) -> usize {
+        self.values.len()
     }
 }
 

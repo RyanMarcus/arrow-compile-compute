@@ -75,8 +75,16 @@ impl WriterAllocation for ArrayOutput {
         make_array(ad)
     }
 
-    fn to_array_ref(self, len: usize, nulls: Option<arrow_buffer::NullBuffer>) -> ArrayRef {
+    fn to_array_ref(self, nulls: Option<arrow_buffer::NullBuffer>) -> ArrayRef {
+        let len = self.len();
         self.to_array(len, nulls)
+    }
+
+    fn len(&self) -> usize {
+        let offset = unsafe { self.out_ptr.byte_offset_from(self.out.as_ptr()) };
+        let offset = usize::try_from(offset).unwrap();
+        assert_eq!(offset % self.pt.width(), 0);
+        offset / self.pt.width()
     }
 }
 
@@ -210,6 +218,12 @@ impl<'a> ArrayWriter<'a> for PrimitiveArrayWriter<'a> {
 
     fn llvm_flush(&self, _ctx: &'a Context, _build: &Builder<'a>) {
         // no-op
+    }
+}
+
+impl<'a> PrimitiveArrayWriter<'a> {
+    pub fn primitive_type(&self) -> PrimitiveType {
+        self.pt
     }
 }
 

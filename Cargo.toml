@@ -21,6 +21,8 @@ strum = "0.27.2"
 strum_macros = "0.27.2"
 memchr = "2.7.6"
 paste = "1.0.15"
+num-rational = { version = "0.4.2" }
+lincomdb = { git = "https://github.com/RyanMarcus/lincomdb" }
 
 [dev-dependencies]
 float-ord = "0.3.2"

@@ -1,83 +1,3 @@
-#[repr(C)]
-#[derive(ReprOffset, Debug)]
-#[roff(usize_offsets)]
-pub struct ScalarPrimitiveIterator {
-    /// the scalar value, packed to the right of a u64
-    val: u64,
-
-    /// the width, in bytes, of the scalar
-    pub width: u8,
-}
-
-impl ScalarPrimitiveIterator {
-    pub fn new(val: u64, width: u8) -> Self {
-        Self { val, width }
-    }
-
-    pub fn llvm_val_ptr<'a>(
-        &self,
-        ctx: &'a Context,
-        builder: &'a Builder,
-        ptr: PointerValue<'a>,
-    ) -> PointerValue<'a> {
-        increment_pointer!(ctx, builder, ptr, ScalarPrimitiveIterator::OFFSET_VAL)
-    }
-}
-
-impl From<i8> for IteratorHolder {
-    fn from(val: i8) -> Self {
-        IteratorHolder::ScalarPrimitive(Box::new(ScalarPrimitiveIterator::new(val as u8 as u64, 1)))
-    }
-}
-
-impl From<i16> for IteratorHolder {
-    fn from(val: i16) -> Self {
-        IteratorHolder::ScalarPrimitive(Box::new(ScalarPrimitiveIterator::new(
-            val as u16 as u64,
-            2,
-        )))
-    }
-}
-
-impl From<i32> for IteratorHolder {
-    fn from(val: i32) -> Self {
-        IteratorHolder::ScalarPrimitive(Box::new(ScalarPrimitiveIterator::new(
-            val as u32 as u64,
-            4,
-        )))
-    }
-}
-
-impl From<i64> for IteratorHolder {
-    fn from(val: i64) -> Self {
-        IteratorHolder::ScalarPrimitive(Box::new(ScalarPrimitiveIterator::new(val as u64, 8)))
-    }
-}
-
-impl From<u8> for IteratorHolder {
-    fn from(val: u8) -> Self {
-        IteratorHolder::ScalarPrimitive(Box::new(ScalarPrimitiveIterator::new(val as u64, 1)))
-    }
-}
-
-impl From<u16> for IteratorHolder {
-    fn from(val: u16) -> Self {
-        IteratorHolder::ScalarPrimitive(Box::new(ScalarPrimitiveIterator::new(val as u64, 2)))
-    }
-}
-
-impl From<u32> for IteratorHolder {
-    fn from(val: u32) -> Self {
-        IteratorHolder::ScalarPrimitive(Box::new(ScalarPrimitiveIterator::new(val as u64, 4)))
-    }
-}
-
-impl From<u64> for IteratorHolder {
-    fn from(val: u64) -> Self {
-        IteratorHolder::ScalarPrimitive(Box::new(ScalarPrimitiveIterator::new(val, 8)))
-    }
-}
-
 use arrow_array::{Array, ArrowPrimitiveType, PrimitiveArray};
 use arrow_buffer::ToByteSlice;
 use half::f16;
@@ -92,11 +12,121 @@ use repr_offset::ReprOffset;
 use crate::{increment_pointer, mark_load_invariant, ListItemType, PrimitiveType};
 
 use super::IteratorHolder;
+
+#[repr(C)]
+#[derive(ReprOffset, Debug)]
+#[roff(usize_offsets)]
+pub struct ScalarPrimitiveIterator {
+    /// the scalar value, packed to the right of a u64
+    val: u64,
+
+    /// the width, in bytes, of the scalar
+    pub width: u8,
+
+    pub ptype: PrimitiveType,
+}
+
+impl ScalarPrimitiveIterator {
+    pub fn new(val: u64, width: u8, ptype: PrimitiveType) -> Self {
+        Self { val, width, ptype }
+    }
+
+    pub fn llvm_val_ptr<'a>(
+        &self,
+        ctx: &'a Context,
+        builder: &'a Builder,
+        ptr: PointerValue<'a>,
+    ) -> PointerValue<'a> {
+        increment_pointer!(ctx, builder, ptr, ScalarPrimitiveIterator::OFFSET_VAL)
+    }
+}
+
+impl From<i8> for IteratorHolder {
+    fn from(val: i8) -> Self {
+        IteratorHolder::ScalarPrimitive(Box::new(ScalarPrimitiveIterator::new(
+            val as u8 as u64,
+            1,
+            PrimitiveType::I8,
+        )))
+    }
+}
+
+impl From<i16> for IteratorHolder {
+    fn from(val: i16) -> Self {
+        IteratorHolder::ScalarPrimitive(Box::new(ScalarPrimitiveIterator::new(
+            val as u16 as u64,
+            2,
+            PrimitiveType::I16,
+        )))
+    }
+}
+
+impl From<i32> for IteratorHolder {
+    fn from(val: i32) -> Self {
+        IteratorHolder::ScalarPrimitive(Box::new(ScalarPrimitiveIterator::new(
+            val as u32 as u64,
+            4,
+            PrimitiveType::I32,
+        )))
+    }
+}
+
+impl From<i64> for IteratorHolder {
+    fn from(val: i64) -> Self {
+        IteratorHolder::ScalarPrimitive(Box::new(ScalarPrimitiveIterator::new(
+            val as u64,
+            8,
+            PrimitiveType::I64,
+        )))
+    }
+}
+
+impl From<u8> for IteratorHolder {
+    fn from(val: u8) -> Self {
+        IteratorHolder::ScalarPrimitive(Box::new(ScalarPrimitiveIterator::new(
+            val as u64,
+            1,
+            PrimitiveType::U8,
+        )))
+    }
+}
+
+impl From<u16> for IteratorHolder {
+    fn from(val: u16) -> Self {
+        IteratorHolder::ScalarPrimitive(Box::new(ScalarPrimitiveIterator::new(
+            val as u64,
+            2,
+            PrimitiveType::U16,
+        )))
+    }
+}
+
+impl From<u32> for IteratorHolder {
+    fn from(val: u32) -> Self {
+        IteratorHolder::ScalarPrimitive(Box::new(ScalarPrimitiveIterator::new(
+            val as u64,
+            4,
+            PrimitiveType::U32,
+        )))
+    }
+}
+
+impl From<u64> for IteratorHolder {
+    fn from(val: u64) -> Self {
+        IteratorHolder::ScalarPrimitive(Box::new(ScalarPrimitiveIterator::new(
+            val,
+            8,
+            PrimitiveType::U64,
+        )))
+    }
+}
+
 impl From<f16> for IteratorHolder {
     fn from(val: f16) -> Self {
         IteratorHolder::ScalarPrimitive(Box::new(ScalarPrimitiveIterator::new(
             (val.to_f64()).to_bits(),
             2,
+            PrimitiveType::F16,
         )))
     }
 }
@@ -106,13 +136,18 @@ impl From<f32> for IteratorHolder {
         IteratorHolder::ScalarPrimitive(Box::new(ScalarPrimitiveIterator::new(
             val.to_bits() as u64,
             4,
+            PrimitiveType::F32,
         )))
     }
 }
 
 impl From<f64> for IteratorHolder {
     fn from(val: f64) -> Self {
-        IteratorHolder::ScalarPrimitive(Box::new(ScalarPrimitiveIterator::new(val.to_bits(), 8)))
+        IteratorHolder::ScalarPrimitive(Box::new(ScalarPrimitiveIterator::new(
+            val.to_bits(),
+            8,
+            PrimitiveType::F64,
+        )))
     }
 }
 
@@ -232,6 +267,10 @@ impl ScalarVectorIterator {
         mark_load_invariant!(ctx, val);
 
         val
+    }
+
+    pub fn ptype(&self) -> PrimitiveType {
+        PrimitiveType::List(self.ptype, self.l)
     }
 }
 

@@ -66,10 +66,10 @@ impl<T: OffsetSizeTrait> WriterAllocation for StringAllocation<T> {
                 / offset_width;
             let prev_offset = self.offsets[offset_items_written - 1].as_usize();
             self.data.truncate(prev_offset);
-            self.offsets_ptr = self
-                .offsets
-                .as_mut_ptr()
-                .wrapping_add(offset_items_written - 1) as *mut c_void;
+            self.offsets_ptr =
+                self.offsets
+                    .as_mut_ptr()
+                    .wrapping_add(offset_items_written - 1) as *mut c_void;
         }
     }
 
@@ -88,8 +88,13 @@ impl<T: OffsetSizeTrait> WriterAllocation for StringAllocation<T> {
         GenericByteArray::new(offsets, data, nulls)
     }
 
-    fn to_array_ref(self, len: usize, nulls: Option<arrow_buffer::NullBuffer>) -> ArrayRef {
+    fn to_array_ref(self, nulls: Option<arrow_buffer::NullBuffer>) -> ArrayRef {
+        let len = self.len();
         Arc::new(self.to_array(len, nulls))
+    }
+
+    fn len(&self) -> usize {
+        self.offsets.len()
     }
 }
 

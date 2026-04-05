@@ -19,6 +19,7 @@ pub struct BooleanWriter<'a> {
     ingest_u64_func: FunctionValue<'a>,
     flush_func: FunctionValue<'a>,
     buf_ptr: PointerValue<'a>,
+    len_ptr: PointerValue<'a>,
     buf_idx_ptr: PointerValue<'a>,
     out_ptr_ptr: PointerValue<'a>,
 }
@@ -29,6 +30,7 @@ pub struct BooleanWriter<'a> {
 pub struct BooleanAllocation {
     data_ptr: *mut c_void,
     data: Vec<u8>,
+    num_written: u64,
     buf: u8,
     buf_idx: u8,
 }
@@ -47,8 +49,10 @@ impl WriterAllocation for BooleanAllocation {
                 .offset_from_unsigned(self.data.as_ptr() as *const c_void);
             let bytes_to_preserve = bytes_written + usize::from(self.buf_idx > 0);
             self.data.set_len(bytes_to_preserve);
-            self.data
-                .resize(bytes_written + (usize::from(self.buf_idx) + count).div_ceil(8), 0);
+            self.data.resize(
+                bytes_written + (usize::from(self.buf_idx) + count).div_ceil(8),
+                0,
+            );
             self.data_ptr = self.data.as_mut_ptr().byte_add(bytes_written) as *mut c_void;
         }
     }
@@ -74,8 +78,13 @@ impl WriterAllocation for BooleanAllocation {
         BooleanArray::new(bb, nulls)
     }
 
-    fn to_array_ref(self, len: usize, nulls: Option<arrow_buffer::NullBuffer>) -> ArrayRef {
+    fn to_array_ref(self, nulls: Option<arrow_buffer::NullBuffer>) -> ArrayRef {
+        let len = self.len();
         Arc::new(self.to_array(len, nulls))
+    }
+
+    fn len(&self) -> usize {
+        self.num_written as usize
     }
 }
 
@@ -89,6 +98,7 @@ impl<'a> ArrayWriter<'a> for BooleanWriter<'a> {
             data_ptr: data.as_mut_ptr() as *mut c_void,
             data,
             buf: 0,
+            num_written: 0,
             buf_idx: 0,
         }
     }
@@ -108,6 +118,8 @@ impl<'a> ArrayWriter<'a> for BooleanWriter<'a> {
             increment_pointer!(ctx, build, alloc_ptr, BooleanAllocation::OFFSET_BUF_IDX);
         let out_ptr_ptr =
             increment_pointer!(ctx, build, alloc_ptr, BooleanAllocation::OFFSET_DATA_PTR);
+        let len_ptr =
+            increment_pointer!(ctx, build, alloc_ptr, BooleanAllocation::OFFSET_NUM_WRITTEN);
 
         let ingest_func = llvm_mod.get_function("ingest_boolean").unwrap_or_else(|| {
             let build = ctx.create_builder();
@@ -117,6 +129,7 @@ impl<'a> ArrayWriter<'a> for BooleanWriter<'a> {
                 "ingest_boolean",
                 ctx.void_type().fn_type(
                     &[
+                        ptr_type.into(),
                         ptr_type.into(),
                         ptr_type.into(),
                         ptr_type.into(),
@@ -132,7 +145,8 @@ impl<'a> ArrayWriter<'a> for BooleanWriter<'a> {
             let buf_ptr = func.get_nth_param(0).unwrap().into_pointer_value();
             let buf_idx_ptr = func.get_nth_param(1).unwrap().into_pointer_value();
             let out_ptr_ptr = func.get_nth_param(2).unwrap().into_pointer_value();
-            let val = func.get_nth_param(3).unwrap().into_int_value();
+            let len_ptr = func.get_nth_param(3).unwrap().into_pointer_value();
+            let val = func.get_nth_param(4).unwrap().into_int_value();
 
             let curr_buf_idx = build
                 .build_load(i8_type, buf_idx_ptr, "curr_buf_idx")
@@ -171,6 +185,14 @@ impl<'a> ArrayWriter<'a> for BooleanWriter<'a> {
                 .unwrap();
 
             build.position_at_end(flush_buff);
+            let curr_len = build
+                .build_load(ctx.i64_type(), len_ptr, "curr_len")
+                .unwrap()
+                .into_int_value();
+            let new_len = build
+                .build_int_add(curr_len, ctx.i64_type().const_int(8, false), "new_len")
+                .unwrap();
+            build.build_store(len_ptr, new_len).unwrap();
             let curr_out_ptr = build
                 .build_load(ptr_type, out_ptr_ptr, "curr_out_ptr")
                 .unwrap()
@@ -227,8 +249,15 @@ impl<'a> ArrayWriter<'a> for BooleanWriter<'a> {
             let i8_type = ctx.i8_type();
             let func = llvm_mod.add_function(
                 "flush_boolean",
-                ctx.void_type()
-                    .fn_type(&[ptr_type.into(), ptr_type.into(), ptr_type.into()], false),
+                ctx.void_type().fn_type(
+                    &[
+                        ptr_type.into(),
+                        ptr_type.into(),
+                        ptr_type.into(),
+                        ptr_type.into(),
+                    ],
+                    false,
+                ),
                 Some(Linkage::Private),
             );
 
@@ -237,6 +266,7 @@ impl<'a> ArrayWriter<'a> for BooleanWriter<'a> {
             let buf_ptr = func.get_nth_param(0).unwrap().into_pointer_value();
             let buf_idx_ptr = func.get_nth_param(1).unwrap().into_pointer_value();
             let out_ptr_ptr = func.get_nth_param(2).unwrap().into_pointer_value();
+            let len_ptr = func.get_nth_param(3).unwrap().into_pointer_value();
 
             let buf_idx = build
                 .build_load(i8_type, buf_idx_ptr, "buf_idx")
@@ -255,6 +285,21 @@ impl<'a> ArrayWriter<'a> for BooleanWriter<'a> {
                 .unwrap();
 
             build.position_at_end(flush_buff);
+            let curr_len = build
+                .build_load(ctx.i64_type(), len_ptr, "curr_len")
+                .unwrap()
+                .into_int_value();
+            let new_len = build
+                .build_int_add(
+                    curr_len,
+                    build
+                        .build_int_z_extend(buf_idx, ctx.i64_type(), "ext_buf_idx")
+                        .unwrap(),
+                    "new_len",
+                )
+                .unwrap();
+            build.build_store(len_ptr, new_len).unwrap();
+
             let curr_out_ptr = build
                 .build_load(ptr_type, out_ptr_ptr, "curr_out_ptr")
                 .unwrap()
@@ -276,6 +321,7 @@ impl<'a> ArrayWriter<'a> for BooleanWriter<'a> {
             buf_ptr,
             buf_idx_ptr,
             out_ptr_ptr,
+            len_ptr,
             ingest_func,
             ingest_u64_func,
             flush_func,
@@ -295,6 +341,7 @@ impl<'a> ArrayWriter<'a> for BooleanWriter<'a> {
                     self.buf_ptr.into(),
                     self.buf_idx_ptr.into(),
                     self.out_ptr_ptr.into(),
+                    self.len_ptr.into(),
                     val.into(),
                 ],
                 "ingest",
@@ -323,6 +370,7 @@ impl<'a> ArrayWriter<'a> for BooleanWriter<'a> {
                     self.buf_ptr.into(),
                     self.buf_idx_ptr.into(),
                     self.out_ptr_ptr.into(),
+                    self.len_ptr.into(),
                 ],
                 "flush",
             )

@@ -86,8 +86,17 @@ impl WriterAllocation for FixedSizeListWriterAlloc {
         )
     }
 
-    fn to_array_ref(self, len: usize, nulls: Option<arrow_buffer::NullBuffer>) -> ArrayRef {
+    fn to_array_ref(self, nulls: Option<arrow_buffer::NullBuffer>) -> ArrayRef {
+        let len = self.len();
         Arc::new(self.to_array(len, nulls))
+    }
+
+    fn len(&self) -> usize {
+        let offset = unsafe { self.out_ptr.byte_offset_from(self.out.as_ptr()) };
+        let offset = usize::try_from(offset).unwrap();
+        let width = self.element_pt.width() * self.list_size;
+        assert_eq!(offset % width, 0);
+        offset / width
     }
 }
 
@@ -169,6 +178,12 @@ impl<'a> ArrayWriter<'a> for FixedSizeListWriter<'a> {
 
     fn llvm_flush(&self, _ctx: &'a Context, _build: &Builder<'a>) {
         // no-op
+    }
+}
+
+impl<'a> FixedSizeListWriter<'a> {
+    pub fn primitive_type(&self) -> PrimitiveType {
+        self.pt
     }
 }
 

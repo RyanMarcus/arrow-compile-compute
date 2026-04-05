@@ -73,8 +73,13 @@ impl<'a, K: RunEndIndexType, VW: ArrayWriter<'a>> WriterAllocation for REEAlloca
         array_data.into()
     }
 
-    fn to_array_ref(self, len: usize, nulls: Option<arrow_buffer::NullBuffer>) -> ArrayRef {
+    fn to_array_ref(self, nulls: Option<arrow_buffer::NullBuffer>) -> ArrayRef {
+        let len = self.len();
         Arc::new(self.to_array(len, nulls))
+    }
+
+    fn len(&self) -> usize {
+        self.values.len()
     }
 }
 
@@ -453,7 +458,10 @@ mod tests {
         let ree = alloc.to_array(2 * data.len(), None);
         let ree = ree.downcast::<Int32Array>().unwrap();
         let ree_vec = ree.into_iter().map(|x| x.unwrap()).collect_vec();
-        assert_eq!(ree_vec, data.iter().chain(data.iter()).copied().collect_vec());
+        assert_eq!(
+            ree_vec,
+            data.iter().chain(data.iter()).copied().collect_vec()
+        );
     }
 
     #[test]
@@ -611,6 +619,9 @@ mod tests {
             .into_iter()
             .map(|x| std::str::from_utf8(x.unwrap()).unwrap())
             .collect_vec();
-        assert_eq!(ree_vec, data.iter().chain(data.iter()).copied().collect_vec());
+        assert_eq!(
+            ree_vec,
+            data.iter().chain(data.iter()).copied().collect_vec()
+        );
     }
 }

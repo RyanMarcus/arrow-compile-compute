@@ -203,7 +203,7 @@ fn call_kernel_with_writer<'a, W: ArrayWriter<'a>>(
     Ok(allocs
         .into_iter()
         .zip(part_sizes)
-        .map(|(a, size)| a.to_array_ref(size, None))
+        .map(|(a, size)| a.to_array_ref(None))
         .collect_vec())
 }
 

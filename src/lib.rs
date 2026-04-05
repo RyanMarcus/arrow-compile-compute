@@ -7,13 +7,15 @@ use arrow_array::{
     make_array,
     types::{Int16Type, Int32Type, Int64Type, RunEndIndexType},
     Array, ArrayRef, BinaryArray, BinaryViewArray, BooleanArray, Date32Array, Date64Array, Datum,
-    FixedSizeBinaryArray, Float16Array, Float32Array, Float64Array, Int16Array, Int32Array,
-    Int64Array, Int8Array, LargeBinaryArray, LargeStringArray, NullArray, PrimitiveArray,
-    StringArray, StringViewArray, UInt16Array, UInt32Array, UInt64Array, UInt8Array,
+    FixedSizeBinaryArray, FixedSizeListArray, Float16Array, Float32Array, Float64Array, Int16Array,
+    Int32Array, Int64Array, Int8Array, LargeBinaryArray, LargeStringArray, NullArray,
+    PrimitiveArray, Scalar, StringArray, StringViewArray, UInt16Array, UInt32Array, UInt64Array,
+    UInt8Array,
 };
 use arrow_buffer::NullBuffer;
 use arrow_data::ArrayDataBuilder;
-use arrow_schema::{DataType, Field};
+use arrow_schema::{DataType, Field, FieldRef};
+use half::f16;
 use inkwell::{
     attributes::{Attribute, AttributeLoc},
     context::Context,
@@ -535,6 +537,23 @@ impl PrimitiveType {
             _ => *self,
         }
     }
+
+    fn as_numeric_primitive_type(&self) -> Option<NumericPrimitiveType> {
+        match self {
+            PrimitiveType::I8 => Some(NumericPrimitiveType::I8),
+            PrimitiveType::I16 => Some(NumericPrimitiveType::I16),
+            PrimitiveType::I32 => Some(NumericPrimitiveType::I32),
+            PrimitiveType::I64 => Some(NumericPrimitiveType::I64),
+            PrimitiveType::U8 => Some(NumericPrimitiveType::U8),
+            PrimitiveType::U16 => Some(NumericPrimitiveType::U16),
+            PrimitiveType::U32 => Some(NumericPrimitiveType::U32),
+            PrimitiveType::U64 => Some(NumericPrimitiveType::U64),
+            PrimitiveType::F16 => Some(NumericPrimitiveType::F16),
+            PrimitiveType::F32 => Some(NumericPrimitiveType::F32),
+            PrimitiveType::F64 => Some(NumericPrimitiveType::F64),
+            _ => None,
+        }
+    }
 }
 
 impl From<ListItemType> for PrimitiveType {
@@ -553,6 +572,62 @@ impl From<ListItemType> for PrimitiveType {
             ListItemType::F64 => PrimitiveType::F64,
             ListItemType::P64x2 => PrimitiveType::P64x2,
         }
+    }
+}
+
+impl From<NumericPrimitiveType> for PrimitiveType {
+    fn from(value: NumericPrimitiveType) -> Self {
+        match value {
+            NumericPrimitiveType::U8 => PrimitiveType::U8,
+            NumericPrimitiveType::U16 => PrimitiveType::U16,
+            NumericPrimitiveType::U32 => PrimitiveType::U32,
+            NumericPrimitiveType::U64 => PrimitiveType::U64,
+            NumericPrimitiveType::I8 => PrimitiveType::I8,
+            NumericPrimitiveType::I16 => PrimitiveType::I16,
+            NumericPrimitiveType::I32 => PrimitiveType::I32,
+            NumericPrimitiveType::I64 => PrimitiveType::I64,
+            NumericPrimitiveType::F16 => PrimitiveType::F16,
+            NumericPrimitiveType::F32 => PrimitiveType::F32,
+            NumericPrimitiveType::F64 => PrimitiveType::F64,
+        }
+    }
+}
+
+#[derive(Copy, Clone, Hash, PartialEq, Eq, Debug)]
+pub enum NumericPrimitiveType {
+    U8,
+    U16,
+    U32,
+    U64,
+    I8,
+    I16,
+    I32,
+    I64,
+    F16,
+    F32,
+    F64,
+}
+
+impl NumericPrimitiveType {
+    pub fn width(&self) -> usize {
+        PrimitiveType::from(*self).width()
+    }
+
+    pub fn is_signed(&self) -> bool {
+        PrimitiveType::from(*self).is_signed()
+    }
+
+    pub fn is_float(&self) -> bool {
+        match self {
+            NumericPrimitiveType::F16 => true,
+            NumericPrimitiveType::F32 => true,
+            NumericPrimitiveType::F64 => true,
+            _ => false,
+        }
+    }
+
+    pub fn is_integer(&self) -> bool {
+        !self.is_float()
     }
 }
 

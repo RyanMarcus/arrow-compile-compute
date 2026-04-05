@@ -475,7 +475,7 @@ impl DSLKernel {
                 let mut kp = KernelParameters::new(ptrs);
 
                 let num_results = unsafe { self.borrow_func().1.call(kp.get_mut_ptr()) } as usize;
-                Ok(alloc.to_array_ref(num_results, None))
+                Ok(alloc.to_array_ref(None))
             }
         }
     }

@@ -1,4 +1,4 @@
-use std::ffi::c_void;
+use std::{ffi::c_void, sync::Arc};
 
 use arrow_array::{Array, ArrayRef};
 use arrow_buffer::NullBuffer;
@@ -18,12 +18,17 @@ mod ree_writer;
 mod str_writer;
 mod view_writer;
 
+pub(crate) use array_writer::ArrayOutput;
 pub use array_writer::PrimitiveArrayWriter;
+pub(crate) use bool_writer::BooleanAllocation;
 pub use bool_writer::BooleanWriter;
 pub use dict_writer::DictWriter;
 pub use fixed_size_list_writer::FixedSizeListWriter;
+pub(crate) use fixed_size_list_writer::FixedSizeListWriterAlloc;
 pub use ree_writer::REEWriter;
+pub(crate) use str_writer::StringAllocation;
 pub use str_writer::StringArrayWriter;
+pub(crate) use view_writer::StringViewAllocation;
 pub use view_writer::StringViewWriter;
 pub(crate) use view_writer::ViewBufferWriter;
 
@@ -84,6 +89,9 @@ pub trait WriterAllocation {
         panic!("rewind_one unsupported for this writer allocation");
     }
 
+    /// Returns the number of logical elements written to this allocation.
+    fn len(&self) -> usize;
+
     fn to_array(self, len: usize, nulls: Option<NullBuffer>) -> Self::Output;
-    fn to_array_ref(self, len: usize, nulls: Option<NullBuffer>) -> ArrayRef;
+    fn to_array_ref(self, nulls: Option<NullBuffer>) -> ArrayRef;
 }

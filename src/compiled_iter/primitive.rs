@@ -2,6 +2,7 @@ use std::{ffi::c_void, sync::Arc};
 
 use crate::increment_pointer;
 use arrow_array::{Array, ArrowPrimitiveType, PrimitiveArray};
+use arrow_schema::DataType;
 use inkwell::{
     builder::Builder,
     context::Context,
@@ -137,6 +138,10 @@ impl PrimitiveIterator {
         )
         .unwrap();
         new_ptr
+    }
+
+    pub fn data_type(&self) -> &DataType {
+        &self.array_ref.data_type()
     }
 }
 

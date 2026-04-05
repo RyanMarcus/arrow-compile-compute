@@ -30,7 +30,7 @@ use inkwell::{
     llvm_sys::core::LLVMGetVersion,
     module::{Linkage, Module},
     types::{BasicType, VectorType},
-    values::{BasicValue, FunctionValue, PointerValue},
+    values::{BasicValue, FunctionValue, IntValue, PointerValue},
     AddressSpace, IntPredicate,
 };
 use primitive::PrimitiveIterator;
@@ -2270,6 +2270,38 @@ pub fn generate_random_access<'a>(
             build.build_return(Some(&val)).unwrap();
             Some(access_f)
         }
+    }
+}
+
+/// Generates code to fetch the length of an iterator. Useful for calling
+/// `@llvm.assume` when two iterators have equal length.
+pub fn get_iterator_length<'a>(
+    ctx: &'a Context,
+    builder: &'a Builder,
+    ih: &IteratorHolder,
+    iter_ptr: PointerValue<'a>,
+) -> Option<IntValue<'a>> {
+    match ih {
+        IteratorHolder::Primitive(iter) => Some(iter.llvm_len(ctx, builder, iter_ptr)),
+        IteratorHolder::String(iter) => Some(iter.llvm_len(ctx, builder, iter_ptr)),
+        IteratorHolder::LargeString(iter) => Some(iter.llvm_len(ctx, builder, iter_ptr)),
+        IteratorHolder::View(iter) => Some(iter.llvm_len(ctx, builder, iter_ptr)),
+        IteratorHolder::Bitmap(iter) => Some(iter.llvm_len(ctx, builder, iter_ptr)),
+        IteratorHolder::SetBit(..) => None,
+        IteratorHolder::Dictionary { arr, values, .. } => {
+            let values_ptr = arr.llvm_val_iter_ptr(ctx, builder, iter_ptr);
+            get_iterator_length(ctx, builder, values, values_ptr)
+        }
+        IteratorHolder::RunEnd {
+            arr,
+            run_ends,
+            values,
+        } => None,
+        IteratorHolder::FixedSizeList(iter) => Some(iter.llvm_len(ctx, builder, iter_ptr)),
+        IteratorHolder::ScalarPrimitive(..) => None,
+        IteratorHolder::ScalarString(..) => None,
+        IteratorHolder::ScalarBinary(..) => None,
+        IteratorHolder::ScalarVec(..) => None,
     }
 }
 

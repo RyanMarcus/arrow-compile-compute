@@ -100,8 +100,13 @@ impl WriterAllocation for StringViewAllocation {
         unsafe { GenericByteViewArray::new_unchecked(self.views.into(), buffers, nulls) }
     }
 
-    fn to_array_ref(self, len: usize, nulls: Option<arrow_buffer::NullBuffer>) -> ArrayRef {
+    fn to_array_ref(self, nulls: Option<arrow_buffer::NullBuffer>) -> ArrayRef {
+        let len = self.len();
         Arc::new(self.to_array(len, nulls))
+    }
+
+    fn len(&self) -> usize {
+        self.views.len()
     }
 }
 

@@ -1,0 +1,37 @@
+fn lt<T>(lhs: [n]T, rhs: [n?]T) -> [n]bool {
+    for (el1, el2) in zip(lhs, rhs) {
+        emit 0, el1 < el2
+    }
+}
+
+fn concat<T>(arr: [n]T) -> [n]T {
+    for el in arr {
+        emit 0, el
+    }
+}
+
+fn take<T>(arr: [n]T, idxes: [k]usize) -> [k]T {
+    for idx in idxes {
+        emit 0, arr[idx]
+    }
+}
+
+fn partition<T>(arr: [n]T, idxes: [n]usize) -> [k][q]T {
+    for (arr, idx) in zip(arr, idxes) {
+        emit idx, arr
+    }
+}
+
+fn merge<T>(arrs: [k][n]T, outer_idx: [n]usize, inner_idx: [n]usize) -> [n]T {
+    for (o, i) in zip(outer_idx, inner_idx) {
+        emit 0, arrs[o][i]
+    }
+}
+
+fn max_agg<T>(arr: [n]T, tickets: [n]usize, data: mut [k]T) {
+    for (x, t) in zip(arr, tickets) {
+        if data[t] < x {
+            set data[t], x
+        }
+    }
+}

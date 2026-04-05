@@ -51,7 +51,7 @@ where
         CONCAT_PROGRAM_CACHE.get((*arr, alloc.get_ptr()), ())?;
     }
 
-    let arr = alloc.to_array_ref(total_els, nulls);
+    let arr = alloc.to_array_ref(nulls);
     coalesce_type(
         arr,
         &match logical_arrow_type(data[0].data_type()) {
@@ -273,7 +273,7 @@ mod tests {
         k.call((&d1, alloc.get_ptr())).unwrap();
         k.call((&d2, alloc.get_ptr())).unwrap();
 
-        let res = alloc.to_array_ref(4, None);
+        let res = alloc.to_array_ref(None);
         let res = res.as_any().downcast_ref::<FixedSizeListArray>().unwrap();
 
         let values = res.values();

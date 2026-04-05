@@ -3,7 +3,11 @@ use arrow_array::{Array, ArrayRef, BooleanArray, UInt64Array};
 use arrow_buffer::NullBuffer;
 use arrow_schema::DataType;
 
+use crate::compiled_iter::datum_to_iter;
 use crate::compiled_kernels::dsl::{base_type, DSLKernel, KernelOutputType};
+use crate::compiled_kernels::dsl2::{
+    self, dsl_args, DSLContext, DSLFunction, DSLStmt, DSLType, WriterSpec,
+};
 use crate::{arrow_interface, logical_nulls, ArrowKernelError, PrimitiveType};
 
 use crate::compiled_kernels::{replace_nulls, Kernel};
@@ -43,7 +47,6 @@ impl Kernel for TakeKernel {
             &UInt64Array::new_scalar(arr.len() as u64),
         )?;
         if in_bounds.true_count() != idx.len() {
-            println!("{:?}", in_bounds);
             return Err(ArrowKernelError::OutOfBounds(arr.len()));
         }
 
@@ -60,7 +63,8 @@ impl Kernel for TakeKernel {
     }
 
     fn compile(inp: &Self::Input<'_>, _params: Self::Params) -> Result<Self, ArrowKernelError> {
-        let (arr, idx) = inp;
+        let (arr, idx) = *inp;
+
         if !PrimitiveType::for_arrow_type(idx.data_type()).is_int() {
             return Err(ArrowKernelError::UnsupportedArguments(format!(
                 "indexes for take must be integer, got {}",
@@ -68,9 +72,26 @@ impl Kernel for TakeKernel {
             )));
         }
 
+        // let mut ctx = DSLContext::new();
+        // let mut func = DSLFunction::new("take");
+        // let arg_arr = func.add_arg(&mut ctx, DSLType::array_like(&arr, "n"));
+        // let arg_idx = func.add_arg(&mut ctx, DSLType::array_like(&idx, "m"));
+        // func.add_ret(WriterSpec::for_base_type_of_datum(&arr), "m");
+
+        // func.add_body(
+        //     DSLStmt::for_each(&mut ctx, &[arg_idx], |loop_vars| {
+        //         let idx = loop_vars[0].expr().cast(PrimitiveType::U64)?;
+        //         DSLStmt::emit(0, arg_arr.expr().at(&idx)?)
+        //     })
+        //     .unwrap(),
+        // );
+
+        // let _func = dsl2::compile(func, dsl_args![arr, idx]).unwrap();
+        // // TODO we will port this fully later
+
         let out_type = KernelOutputType::for_data_type(&base_type(arr.data_type()))?;
         Ok(TakeKernel(
-            DSLKernel::compile(&[arr, idx], |ctx| {
+            DSLKernel::compile(&[&arr, &idx], |ctx| {
                 let arr = ctx.get_input(0)?;
                 let idx = ctx.get_input(1)?;
                 ctx.iter_over(vec![idx])
