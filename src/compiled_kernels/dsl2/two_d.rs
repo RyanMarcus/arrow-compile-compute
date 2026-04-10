@@ -1,6 +1,6 @@
-use std::{os::raw::c_void, sync::Arc};
+use std::os::raw::c_void;
 
-use arrow_array::{Datum, PrimitiveArray};
+use arrow_array::Datum;
 use inkwell::{
     context::Context, module::Module, types::BasicType, values::FunctionValue, AddressSpace,
 };
@@ -8,8 +8,7 @@ use itertools::Itertools;
 
 use crate::{
     compiled_iter::{datum_to_iter, generate_random_access, IteratorHolder},
-    compiled_kernels::dsl2::{compiler::DSLCompilationContext, DSL2Error, DSLType},
-    increment_pointer, mark_load_invariant, PrimitiveType,
+    increment_pointer, mark_load_invariant, ArrowKernelError, PrimitiveType,
 };
 
 pub struct TwoDArrayRuntime {
@@ -18,7 +17,7 @@ pub struct TwoDArrayRuntime {
 }
 
 impl TwoDArrayRuntime {
-    pub fn new(arrs: &[&dyn Datum]) -> Result<Self, DSL2Error> {
+    pub fn new(arrs: &[&dyn Datum]) -> Result<Self, ArrowKernelError> {
         let ihs: Vec<IteratorHolder> = arrs.iter().map(|arr| datum_to_iter(*arr)).try_collect()?;
         let ptrs = ihs.iter().map(|x| x.get_ptr()).collect_vec();
         Ok(Self { ptrs, ihs })
@@ -33,13 +32,13 @@ pub fn generate_two_d_access<'ctx, 'args>(
     ctx: &'ctx Context,
     module: &Module<'ctx>,
     arrs: &[&'args dyn Datum],
-) -> Result<FunctionValue<'ctx>, DSL2Error> {
+) -> Result<FunctionValue<'ctx>, ArrowKernelError> {
     let witness_type = PrimitiveType::for_arrow_type(arrs[0].get().0.data_type());
     let mut funcs = Vec::new();
     for (idx, arr) in arrs.iter().copied().enumerate() {
         let ty = PrimitiveType::for_arrow_type(arr.get().0.data_type());
         if witness_type != ty {
-            return Err(DSL2Error::Inconsistent2DArray(witness_type, ty));
+            return Err(ArrowKernelError::Inconsistent2DArray(witness_type, ty));
         }
 
         let ih = datum_to_iter(arr)?;

@@ -8,7 +8,7 @@ use arrow_array::{
         ArrowDictionaryKeyType, Int16Type, Int32Type, Int64Type, Int8Type, RunEndIndexType,
         UInt16Type, UInt32Type, UInt64Type, UInt8Type,
     },
-    Array, ArrayRef, Datum, DictionaryArray, RunArray, StringArray,
+    Array, ArrayRef, Datum, LargeStringArray, StringArray,
 };
 use arrow_schema::DataType;
 use inkwell::{
@@ -36,10 +36,7 @@ use crate::{
         generate_next_block, generate_random_access, IteratorHolder,
     },
     compiled_kernels::{link_req_helpers, optimize_module, ArrowKernelError},
-    compiled_writers::{
-        ArrayWriter, BooleanWriter, DictWriter, FixedSizeListWriter, PrimitiveArrayWriter,
-        REEWriter, StringArrayWriter, StringViewWriter, WriterAllocation,
-    },
+    compiled_writers::{DictionaryKeyType, RunEndType as WriterRunEndType, WriterSpec},
     declare_blocks, increment_pointer, set_noalias_params, PrimitiveType,
 };
 
@@ -388,147 +385,38 @@ impl DSLKernel {
             .try_collect()?;
         let mut ptrs = Vec::new();
         ptrs.extend(ihs.iter_mut().map(|ih| ih.get_mut_ptr()));
-        let p_out_type = PrimitiveType::for_arrow_type(self.borrow_out_type());
+        let writer_spec = writer_spec_for_output(*self.borrow_output_strategy(), self.borrow_out_type())
+            .map_err(ArrowKernelError::DSLError)?;
+        let mut alloc = writer_spec.allocate(max_len);
+        ptrs.push(alloc.get_ptr());
+        let mut kp = KernelParameters::new(ptrs);
+        let num_results = unsafe { self.borrow_func().1.call(kp.get_mut_ptr()) } as usize;
+        let arr = alloc.into_array_ref_with_len(num_results, None);
 
         match self.borrow_output_strategy() {
-            KernelOutputType::Array => {
-                let mut alloc = PrimitiveArrayWriter::allocate(max_len, p_out_type);
-                ptrs.push(alloc.get_ptr());
-                let mut kp = KernelParameters::new(ptrs);
-
-                let num_results = unsafe { self.borrow_func().1.call(kp.get_mut_ptr()) } as usize;
-                Ok(alloc.to_array(num_results, None))
-            }
-            KernelOutputType::String => {
-                let mut alloc = StringArrayWriter::<i32>::allocate(max_len, p_out_type);
-                ptrs.push(alloc.get_ptr());
-                let mut kp = KernelParameters::new(ptrs);
-
-                let num_results = unsafe { self.borrow_func().1.call(kp.get_mut_ptr()) } as usize;
-                let arr = alloc.to_array(num_results, None);
-
-                let data = unsafe {
-                    arr.into_data()
-                        .into_builder()
-                        .data_type(DataType::Utf8)
-                        .build_unchecked()
-                };
-
-                Ok(Arc::new(StringArray::from(data)))
-            }
-            KernelOutputType::Boolean => {
-                let mut alloc = BooleanWriter::allocate(max_len, p_out_type);
-                ptrs.push(alloc.get_ptr());
-                let mut kp = KernelParameters::new(ptrs);
-
-                let num_results = unsafe { self.borrow_func().1.call(kp.get_mut_ptr()) };
-                Ok(Arc::new(alloc.to_array(num_results as usize, None)))
-            }
-            KernelOutputType::View => {
-                let mut alloc = StringViewWriter::allocate(max_len, p_out_type);
-                ptrs.push(alloc.get_ptr());
-                let mut kp = KernelParameters::new(ptrs);
-
-                let num_results = unsafe { self.borrow_func().1.call(kp.get_mut_ptr()) };
-                Ok(Arc::new(alloc.to_array(num_results as usize, None)))
-            }
-            KernelOutputType::Dictionary(key) => Ok(match key {
-                DictKeyType::Int8 => {
-                    Arc::new(self.exec_to_dict::<Int8Type>(ptrs, max_len, p_out_type))
+            KernelOutputType::String => match arr.data_type() {
+                DataType::LargeBinary => {
+                    let arr = arr.as_binary::<i64>().clone();
+                    let data = unsafe {
+                        arr.into_data()
+                            .into_builder()
+                            .data_type(DataType::LargeUtf8)
+                            .build_unchecked()
+                    };
+                    Ok(Arc::new(LargeStringArray::from(data)))
                 }
-                DictKeyType::Int16 => {
-                    Arc::new(self.exec_to_dict::<Int16Type>(ptrs, max_len, p_out_type))
+                _ => {
+                    let arr = arr.as_binary::<i32>().clone();
+                    let data = unsafe {
+                        arr.into_data()
+                            .into_builder()
+                            .data_type(DataType::Utf8)
+                            .build_unchecked()
+                    };
+                    Ok(Arc::new(StringArray::from(data)))
                 }
-                DictKeyType::Int32 => {
-                    Arc::new(self.exec_to_dict::<Int32Type>(ptrs, max_len, p_out_type))
-                }
-                DictKeyType::Int64 => {
-                    Arc::new(self.exec_to_dict::<Int64Type>(ptrs, max_len, p_out_type))
-                }
-                DictKeyType::UInt8 => {
-                    Arc::new(self.exec_to_dict::<UInt8Type>(ptrs, max_len, p_out_type))
-                }
-                DictKeyType::UInt16 => {
-                    Arc::new(self.exec_to_dict::<UInt16Type>(ptrs, max_len, p_out_type))
-                }
-                DictKeyType::UInt32 => {
-                    Arc::new(self.exec_to_dict::<UInt32Type>(ptrs, max_len, p_out_type))
-                }
-                DictKeyType::UInt64 => {
-                    Arc::new(self.exec_to_dict::<UInt64Type>(ptrs, max_len, p_out_type))
-                }
-            }),
-            KernelOutputType::RunEnd(re_type) => Ok(match re_type {
-                RunEndType::Int16 => {
-                    Arc::new(self.exec_to_ree::<Int16Type>(ptrs, max_len, p_out_type))
-                }
-                RunEndType::Int32 => {
-                    Arc::new(self.exec_to_ree::<Int32Type>(ptrs, max_len, p_out_type))
-                }
-                RunEndType::Int64 => {
-                    Arc::new(self.exec_to_ree::<Int64Type>(ptrs, max_len, p_out_type))
-                }
-            }),
-            KernelOutputType::FixedSizeList(_s) => {
-                let mut alloc = FixedSizeListWriter::allocate(max_len, p_out_type);
-                ptrs.push(alloc.get_ptr());
-                let mut kp = KernelParameters::new(ptrs);
-
-                let num_results = unsafe { self.borrow_func().1.call(kp.get_mut_ptr()) } as usize;
-                Ok(alloc.to_array_ref(None))
-            }
-        }
-    }
-
-    fn exec_to_dict<K: ArrowDictionaryKeyType>(
-        &self,
-        mut ptrs: Vec<*mut c_void>,
-        max_len: usize,
-        pt: PrimitiveType,
-    ) -> DictionaryArray<K> {
-        match pt {
-            PrimitiveType::P64x2 => {
-                let mut alloc = DictWriter::<K, StringArrayWriter<i32>>::allocate(max_len, pt);
-                ptrs.push(alloc.get_ptr());
-                let mut kp = KernelParameters::new(ptrs);
-
-                let num_results = unsafe { self.borrow_func().1.call(kp.get_mut_ptr()) };
-                alloc.to_array(num_results as usize, None)
-            }
-            _ => {
-                let mut alloc = DictWriter::<K, PrimitiveArrayWriter>::allocate(max_len, pt);
-                ptrs.push(alloc.get_ptr());
-                let mut kp = KernelParameters::new(ptrs);
-
-                let num_results = unsafe { self.borrow_func().1.call(kp.get_mut_ptr()) };
-                alloc.to_array(num_results as usize, None)
-            }
-        }
-    }
-
-    fn exec_to_ree<K: RunEndIndexType>(
-        &self,
-        mut ptrs: Vec<*mut c_void>,
-        max_len: usize,
-        pt: PrimitiveType,
-    ) -> RunArray<K> {
-        match pt {
-            PrimitiveType::P64x2 => {
-                let mut alloc = REEWriter::<K, StringArrayWriter<i32>>::allocate(max_len, pt);
-                ptrs.push(alloc.get_ptr());
-                let mut kp = KernelParameters::new(ptrs);
-
-                let num_results = unsafe { self.borrow_func().1.call(kp.get_mut_ptr()) };
-                alloc.to_array(num_results as usize, None)
-            }
-            _ => {
-                let mut alloc = REEWriter::<K, PrimitiveArrayWriter>::allocate(max_len, pt);
-                ptrs.push(alloc.get_ptr());
-                let mut kp = KernelParameters::new(ptrs);
-
-                let num_results = unsafe { self.borrow_func().1.call(kp.get_mut_ptr()) };
-                alloc.to_array(num_results as usize, None)
-            }
+            },
+            _ => Ok(arr),
         }
     }
 }
@@ -544,100 +432,15 @@ fn build_kernel<'a>(
     ),
     DSLError,
 > {
-    match program.strategy() {
-        KernelOutputType::Array => {
-            build_kernel_with_writer::<PrimitiveArrayWriter>(ctx, inputs, program)
-        }
-        KernelOutputType::String => {
-            build_kernel_with_writer::<StringArrayWriter<i32>>(ctx, inputs, program)
-        }
-        KernelOutputType::Boolean => {
-            build_kernel_with_writer::<BooleanWriter>(ctx, inputs, program)
-        }
-        KernelOutputType::View => {
-            build_kernel_with_writer::<StringViewWriter>(ctx, inputs, program)
-        }
-        KernelOutputType::FixedSizeList(_s) => {
-            build_kernel_with_writer::<FixedSizeListWriter>(ctx, inputs, program)
-        }
-        KernelOutputType::Dictionary(key) => match key {
-            DictKeyType::Int8 => build_dict_kernel::<Int8Type>(ctx, inputs, program),
-            DictKeyType::Int16 => build_dict_kernel::<Int16Type>(ctx, inputs, program),
-            DictKeyType::Int32 => build_dict_kernel::<Int32Type>(ctx, inputs, program),
-            DictKeyType::Int64 => build_dict_kernel::<Int64Type>(ctx, inputs, program),
-            DictKeyType::UInt8 => build_dict_kernel::<UInt8Type>(ctx, inputs, program),
-            DictKeyType::UInt16 => build_dict_kernel::<UInt16Type>(ctx, inputs, program),
-            DictKeyType::UInt32 => build_dict_kernel::<UInt32Type>(ctx, inputs, program),
-            DictKeyType::UInt64 => build_dict_kernel::<UInt64Type>(ctx, inputs, program),
-        },
-        KernelOutputType::RunEnd(key) => match key {
-            RunEndType::Int16 => build_ree_kernel::<Int16Type>(ctx, inputs, program),
-            RunEndType::Int32 => build_ree_kernel::<Int32Type>(ctx, inputs, program),
-            RunEndType::Int64 => build_ree_kernel::<Int64Type>(ctx, inputs, program),
-        },
-    }
+    let writer_spec = writer_spec_for_output(program.strategy(), program.out_type())?;
+    build_kernel_with_writer_spec(ctx, inputs, program, &writer_spec)
 }
 
-fn build_dict_kernel<'a, T: ArrowDictionaryKeyType>(
+fn build_kernel_with_writer_spec<'a>(
     ctx: &'a Context,
     inputs: &[&dyn Datum],
     program: SealedKernelProgram<'_>,
-) -> Result<
-    (
-        Vec<KernelInputType>,
-        JitFunction<'a, unsafe extern "C" fn(*mut c_void) -> u64>,
-    ),
-    DSLError,
-> {
-    if program.out_type().is_primitive() {
-        build_kernel_with_writer::<DictWriter<T, PrimitiveArrayWriter>>(ctx, inputs, program)
-    } else {
-        match program.out_type() {
-            DataType::Binary | DataType::Utf8 => build_kernel_with_writer::<
-                DictWriter<T, StringArrayWriter<i32>>,
-            >(ctx, inputs, program),
-            DataType::LargeBinary | DataType::LargeUtf8 => build_kernel_with_writer::<
-                DictWriter<T, StringArrayWriter<i64>>,
-            >(ctx, inputs, program),
-            _ => Err(DSLError::UnsupportedDictionaryValueType(
-                program.out_type().clone(),
-            )),
-        }
-    }
-}
-
-fn build_ree_kernel<'a, T: RunEndIndexType>(
-    ctx: &'a Context,
-    inputs: &[&dyn Datum],
-    program: SealedKernelProgram<'_>,
-) -> Result<
-    (
-        Vec<KernelInputType>,
-        JitFunction<'a, unsafe extern "C" fn(*mut c_void) -> u64>,
-    ),
-    DSLError,
-> {
-    if program.out_type().is_primitive() {
-        build_kernel_with_writer::<REEWriter<T, PrimitiveArrayWriter>>(ctx, inputs, program)
-    } else {
-        match program.out_type() {
-            DataType::Binary | DataType::Utf8 => build_kernel_with_writer::<
-                REEWriter<T, StringArrayWriter<i32>>,
-            >(ctx, inputs, program),
-            DataType::LargeBinary | DataType::LargeUtf8 => build_kernel_with_writer::<
-                REEWriter<T, StringArrayWriter<i64>>,
-            >(ctx, inputs, program),
-            _ => Err(DSLError::UnsupportedDictionaryValueType(
-                program.out_type().clone(),
-            )),
-        }
-    }
-}
-
-fn build_kernel_with_writer<'a, W: ArrayWriter<'a>>(
-    ctx: &'a Context,
-    inputs: &[&dyn Datum],
-    program: SealedKernelProgram<'_>,
+    writer_spec: &WriterSpec,
 ) -> Result<
     (
         Vec<KernelInputType>,
@@ -678,12 +481,6 @@ fn build_kernel_with_writer<'a, W: ArrayWriter<'a>>(
         .try_as_basic_value()
         .unwrap_basic();
     builder.build_return(Some(&num_produced)).unwrap();
-
-    //
-    // Inner function
-    //
-    let out_type = program.out_type();
-    let out_prim_type = PrimitiveType::for_arrow_type(out_type);
 
     let indexes_to_iter = program.iterated_indexes();
     if indexes_to_iter.is_empty() {
@@ -816,7 +613,7 @@ fn build_kernel_with_writer<'a, W: ArrayWriter<'a>>(
         .get_nth_param(inputs.len() as u32)
         .unwrap()
         .into_pointer_value();
-    let writer = W::llvm_init(ctx, &llvm_mod, &builder, out_prim_type, out_ptr);
+    let writer = writer_spec.llvm_init(ctx, &llvm_mod, &builder, out_ptr);
 
     let bufs: HashMap<usize, PointerValue> = indexes_to_iter
         .iter()
@@ -1093,4 +890,69 @@ fn build_kernel_with_writer<'a, W: ArrayWriter<'a>>(
         )
         .unwrap()
     }))
+}
+
+fn writer_spec_for_output(strategy: KernelOutputType, out_type: &DataType) -> Result<WriterSpec, DSLError> {
+    fn value_writer_spec(out_type: &DataType) -> Result<WriterSpec, DSLError> {
+        Ok(match out_type {
+            DataType::Boolean => WriterSpec::Boolean,
+            DataType::Binary | DataType::Utf8 => WriterSpec::String,
+            DataType::LargeBinary | DataType::LargeUtf8 => WriterSpec::LargeString,
+            DataType::BinaryView | DataType::Utf8View => WriterSpec::StringView,
+            DataType::FixedSizeList(field, size) => WriterSpec::FixedSizeList(
+                PrimitiveType::for_arrow_type(field.data_type())
+                    .try_into()
+                    .map_err(|_| {
+                        DSLError::TypeMismatch(format!(
+                            "unsupported fixed-size list element type {}",
+                            field.data_type()
+                        ))
+                    })?,
+                *size as usize,
+            ),
+            _ => WriterSpec::Primitive(PrimitiveType::for_arrow_type(out_type)),
+        })
+    }
+
+    Ok(match strategy {
+        KernelOutputType::Array => WriterSpec::Primitive(PrimitiveType::for_arrow_type(out_type)),
+        KernelOutputType::String => match out_type {
+            DataType::LargeBinary | DataType::LargeUtf8 => WriterSpec::LargeString,
+            _ => WriterSpec::String,
+        },
+        KernelOutputType::View => WriterSpec::StringView,
+        KernelOutputType::Boolean => WriterSpec::Boolean,
+        KernelOutputType::FixedSizeList(size) => match value_writer_spec(out_type)? {
+            WriterSpec::FixedSizeList(item, actual_size) if actual_size == size => {
+                WriterSpec::FixedSizeList(item, actual_size)
+            }
+            _ => {
+                return Err(DSLError::TypeMismatch(format!(
+                    "cannot collect type {} into fixed size list<{}>",
+                    out_type, size
+                )));
+            }
+        },
+        KernelOutputType::Dictionary(key) => WriterSpec::Dictionary(
+            match key {
+                DictKeyType::Int8 => DictionaryKeyType::Int8,
+                DictKeyType::Int16 => DictionaryKeyType::Int16,
+                DictKeyType::Int32 => DictionaryKeyType::Int32,
+                DictKeyType::Int64 => DictionaryKeyType::Int64,
+                DictKeyType::UInt8 => DictionaryKeyType::UInt8,
+                DictKeyType::UInt16 => DictionaryKeyType::UInt16,
+                DictKeyType::UInt32 => DictionaryKeyType::UInt32,
+                DictKeyType::UInt64 => DictionaryKeyType::UInt64,
+            },
+            Box::new(value_writer_spec(out_type)?),
+        ),
+        KernelOutputType::RunEnd(run_end) => WriterSpec::RunEndEncoded(
+            match run_end {
+                RunEndType::Int16 => WriterRunEndType::Int16,
+                RunEndType::Int32 => WriterRunEndType::Int32,
+                RunEndType::Int64 => WriterRunEndType::Int64,
+            },
+            Box::new(value_writer_spec(out_type)?),
+        ),
+    })
 }

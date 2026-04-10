@@ -3,7 +3,7 @@ use std::{cmp::Ordering, collections::HashMap, ffi::c_void};
 use arrow_array::{
     cast::AsArray,
     types::{UInt32Type, UInt64Type},
-    BooleanArray, Datum,
+    BooleanArray,
 };
 use arrow_schema::DataType;
 use inkwell::{
@@ -12,8 +12,8 @@ use inkwell::{
     execution_engine::JitFunction,
     intrinsics::Intrinsic,
     module::{Linkage, Module},
-    types::{BasicType, BasicTypeEnum, PointerType},
-    values::{BasicValue, BasicValueEnum, FunctionValue, PointerValue},
+    types::{BasicType, BasicTypeEnum},
+    values::{BasicValue, BasicValueEnum, FunctionValue},
     AddressSpace, IntPredicate, OptimizationLevel,
 };
 use itertools::Itertools;
@@ -26,19 +26,14 @@ use crate::{
     },
     compiled_kernels::{
         cmp::add_memcmp,
-        dsl::{DSLError, KernelParameters},
         dsl2::{
-            buffer,
-            runtime::RunnableDSLFunction,
-            two_d,
-            writers::{OutputSlot, OutputWriter},
-            DSL2Error, DSLArgument, DSLArgumentType, DSLComparison, DSLExpr, DSLFunction, DSLStmt,
-            DSLType, DSLValue,
+            buffer, runtime::RunnableDSLFunction, two_d, writers::accepted_type, DSLArgument,
+            DSLArgumentType, DSLArithBinOp, DSLExpr, DSLFunction, DSLStmt, DSLType, DSLValue,
         },
         link_req_helpers, optimize_module,
     },
-    compiled_writers::{ArrayWriter, PrimitiveArrayWriter},
-    increment_pointer, set_noalias_params, NumericPrimitiveType, PrimitiveSuperType, PrimitiveType,
+    compiled_writers::Writer,
+    increment_pointer, set_noalias_params, ArrowKernelError, PrimitiveType,
 };
 
 pub enum KernelReturnCode {
@@ -96,7 +91,8 @@ pub struct DSLCompilationContext<'ctx, 'a> {
     pub access_funcs: HashMap<usize, FunctionValue<'a>>,
     pub next_funcs: HashMap<usize, FunctionValue<'a>>,
     pub writer_funcs: HashMap<usize, FunctionValue<'a>>,
-    pub outputs: Vec<OutputWriter<'a>>,
+    pub output_specs: Vec<crate::compiled_writers::WriterSpec>,
+    pub outputs: Vec<Writer<'a>>,
 }
 
 #[self_referencing]
@@ -113,7 +109,7 @@ pub struct CompiledDSLFunction {
 pub fn compile<'a>(
     f: DSLFunction,
     args: impl IntoIterator<Item = DSLArgument<'a>>,
-) -> Result<RunnableDSLFunction, DSL2Error> {
+) -> Result<RunnableDSLFunction, ArrowKernelError> {
     let ctx = Context::create();
     let args = args.into_iter().collect_vec();
     let arg_types = args
@@ -136,7 +132,7 @@ pub fn compile_inner<'ctx, 'args>(
     ctx: &'ctx Context,
     f: &DSLFunction,
     args: impl IntoIterator<Item = DSLArgument<'args>>,
-) -> Result<JitFunction<'ctx, unsafe extern "C" fn(*mut c_void) -> u64>, DSL2Error> {
+) -> Result<JitFunction<'ctx, unsafe extern "C" fn(*mut c_void) -> u64>, ArrowKernelError> {
     let module = ctx.create_module("dsl2");
     let args: Vec<_> = args.into_iter().collect();
 
@@ -144,7 +140,7 @@ pub fn compile_inner<'ctx, 'args>(
     assert_eq!(args.len(), f.params.len());
     for (i, (arg, param)) in args.iter().zip(f.params.iter()).enumerate() {
         if !arg.is_compatible_with(&param.ty) {
-            return Err(DSL2Error::ArgumentTypeMismatch(
+            return Err(ArrowKernelError::ArgumentTypeMismatch(
                 i,
                 format!("{:?}", arg),
                 param.ty.clone(),
@@ -206,7 +202,7 @@ pub fn compile_inner<'ctx, 'args>(
 
                 let detected_dtype = DSLType::of_iterator_holder(&ih).iter_type().unwrap();
                 if &detected_dtype != t.as_ref() {
-                    return Err(DSL2Error::TypeMismatch(
+                    return Err(ArrowKernelError::DSLTypeMismatch(
                         "accessed parameters",
                         *t.clone(),
                         detected_dtype,
@@ -239,7 +235,7 @@ pub fn compile_inner<'ctx, 'args>(
                     two_d::generate_two_d_access(&ctx, &module, arg.as_two_d().unwrap())?,
                 );
             }
-            _ => return Err(DSL2Error::NonRandomAccessType(param.ty.clone())),
+            _ => return Err(ArrowKernelError::NonRandomAccessType(param.ty.clone())),
         };
     }
 
@@ -253,14 +249,14 @@ pub fn compile_inner<'ctx, 'args>(
             DSLType::Scalar(t) | DSLType::Array(t, ..) => {
                 let ih = datum_to_iter(
                     arg.as_datum()
-                        .ok_or_else(|| DSL2Error::NonIterableType(param.ty.clone()))?,
+                        .ok_or_else(|| ArrowKernelError::NonIterableType(param.ty.clone()))?,
                 )?;
 
                 let ptr = ih.localize_struct(&ctx, &b, st[&param.name].into_pointer_value());
                 st.insert(param.name, ptr.as_basic_value_enum());
                 let detected_dtype = DSLType::of_iterator_holder(&ih).iter_type().unwrap();
                 if &detected_dtype != t.as_ref() {
-                    return Err(DSL2Error::TypeMismatch(
+                    return Err(ArrowKernelError::DSLTypeMismatch(
                         "iterated parameters",
                         *t.clone(),
                         detected_dtype,
@@ -284,7 +280,7 @@ pub fn compile_inner<'ctx, 'args>(
                 st.insert(param.name, ptr.as_basic_value_enum());
 
                 if arg.data_type() != DataType::Boolean {
-                    return Err(DSL2Error::InvalidSetBitType(arg.data_type()));
+                    return Err(ArrowKernelError::InvalidSetBitType(arg.data_type()));
                 }
 
                 let next_func = generate_next(
@@ -297,7 +293,7 @@ pub fn compile_inner<'ctx, 'args>(
                 .unwrap();
                 next_funcs.insert(param.name, next_func);
             }
-            _ => return Err(DSL2Error::NonIterableType(param.ty.clone())),
+            _ => return Err(ArrowKernelError::NonIterableType(param.ty.clone())),
         };
     }
 
@@ -343,10 +339,12 @@ pub fn compile_inner<'ctx, 'args>(
     }
 
     // setup outputs
+    let mut output_specs = Vec::new();
     let mut writers = Vec::new();
     let output_param_offset = func.count_params() as usize - f.ret.len();
     for (idx, ret) in f.ret.iter().enumerate() {
         let os = ret.allocate(0);
+        output_specs.push(ret.spec().clone());
         let w = os.llvm_init(
             &ctx,
             &module,
@@ -367,6 +365,7 @@ pub fn compile_inner<'ctx, 'args>(
         access_funcs,
         next_funcs,
         writer_funcs,
+        output_specs,
         outputs: writers,
     };
 
@@ -433,17 +432,21 @@ pub fn compile_inner<'ctx, 'args>(
 fn compile_stmt<'ctx, 'a>(
     ctx: &mut DSLCompilationContext<'ctx, 'a>,
     stmt: &DSLStmt,
-) -> Result<(), DSL2Error> {
+) -> Result<(), ArrowKernelError> {
     match stmt {
         DSLStmt::Emit { index, value } => {
             if ctx.outputs.is_empty() {
-                return Err(DSL2Error::EmitWithNoOutputs);
+                return Err(ArrowKernelError::EmitWithNoOutputs);
             }
 
             if let Some(idx) = index.as_u32() {
-                let accepted = ctx.outputs[idx as usize].accepted_type();
+                let accepted = accepted_type(&ctx.output_specs[idx as usize]);
                 if value.get_type() != accepted {
-                    return Err(DSL2Error::TypeMismatch("emit", accepted, value.get_type()));
+                    return Err(ArrowKernelError::DSLTypeMismatch(
+                        "emit",
+                        accepted,
+                        value.get_type(),
+                    ));
                 }
             }
             let index = compile_expr(ctx, index)?;
@@ -571,12 +574,29 @@ fn compile_stmt<'ctx, 'a>(
                         &format!("load{}", loop_var.name),
                     )
                     .unwrap();
+
+                // truncate to boolean if neeeded
+                let val = match loop_var.ty {
+                    DSLType::Boolean => ctx
+                        .b
+                        .build_int_truncate(val.into_int_value(), ctx.ctx.bool_type(), "to_bool")
+                        .unwrap()
+                        .as_basic_value_enum(),
+                    _ => val,
+                };
+
                 ctx.st.insert(loop_var.name, val);
             }
             for stmt in floop.body.iter() {
                 compile_stmt(ctx, &stmt)?;
             }
-            ctx.b.build_unconditional_branch(loop_header).unwrap();
+
+            // if every loop variable is a scalar, just do one iteration
+            if floop.iterators.iter().all(|it| it.ty.is_infinite()) {
+                ctx.b.build_unconditional_branch(loop_end).unwrap();
+            } else {
+                ctx.b.build_unconditional_branch(loop_header).unwrap();
+            }
 
             ctx.b.position_at_end(loop_end);
         }
@@ -587,14 +607,18 @@ fn compile_stmt<'ctx, 'a>(
 fn compile_expr<'ctx, 'a>(
     ctx: &DSLCompilationContext<'ctx, 'a>,
     expr: &DSLExpr,
-) -> Result<BasicValueEnum<'a>, DSL2Error> {
+) -> Result<BasicValueEnum<'a>, ArrowKernelError> {
     match expr {
         DSLExpr::Compare(op, lhs, rhs) => {
             let lhs_type = lhs.get_type();
             let rhs_type = rhs.get_type();
 
             if lhs_type != rhs_type {
-                return Err(DSL2Error::TypeMismatch("comparison", lhs_type, rhs_type));
+                return Err(ArrowKernelError::DSLTypeMismatch(
+                    "comparison",
+                    lhs_type,
+                    rhs_type,
+                ));
             }
 
             let signed = lhs_type.is_signed().unwrap();
@@ -647,67 +671,78 @@ fn compile_expr<'ctx, 'a>(
                 todo!()
             }
         }
-        DSLExpr::At(v, i) => match &v.ty {
-            DSLType::Scalar(..) | DSLType::Array(..) | DSLType::Buffer(..) => {
-                if i.len() != 1 {
-                    return Err(DSL2Error::InvalidIndex(
-                        "non 2D-array should have a single index",
-                    ));
-                }
-                let i = i.first().unwrap();
-                let access_func = ctx.access_funcs[&v.name];
-                let iter_ptr = ctx.st[&v.name];
-                if i.get_type() != DSLType::Primitive(PrimitiveType::U64) {
-                    return Err(DSL2Error::TypeMismatch(
-                        "indexing requires unsigned 64 bit integers",
-                        DSLType::Primitive(PrimitiveType::U64),
-                        i.get_type(),
-                    ));
-                }
-                let idx = compile_expr(ctx, i)?;
-                Ok(ctx
-                    .b
-                    .build_call(
-                        access_func,
-                        &[iter_ptr.into(), idx.into()],
-                        "access_by_index",
-                    )
-                    .unwrap()
-                    .try_as_basic_value()
-                    .unwrap_basic())
-            }
-            DSLType::TwoDArray(..) => {
-                if i.len() != 2 {
-                    return Err(DSL2Error::InvalidIndex("2D array needs two indices"));
-                }
-
-                let access_func = ctx.access_funcs[&v.name];
-                let arr_ptr = ctx.st[&v.name];
-                for idx in i {
-                    if idx.get_type() != DSLType::Primitive(PrimitiveType::U64) {
-                        return Err(DSL2Error::TypeMismatch(
-                            "indexing requires unsigned 64 bit integers",
-                            DSLType::Primitive(PrimitiveType::U64),
-                            idx.get_type(),
+        DSLExpr::At(v, i) => {
+            let res = match &v.ty {
+                DSLType::Scalar(..) | DSLType::Array(..) | DSLType::Buffer(..) => {
+                    if i.len() != 1 {
+                        return Err(ArrowKernelError::InvalidIndex(
+                            "non 2D-array should have a single index",
                         ));
                     }
+                    let i = i.first().unwrap();
+                    let access_func = ctx.access_funcs[&v.name];
+                    let iter_ptr = ctx.st[&v.name];
+                    if i.get_type() != DSLType::Primitive(PrimitiveType::U64) {
+                        return Err(ArrowKernelError::DSLTypeMismatch(
+                            "indexing requires unsigned 64 bit integers",
+                            DSLType::Primitive(PrimitiveType::U64),
+                            i.get_type(),
+                        ));
+                    }
+                    let idx = compile_expr(ctx, i)?;
+                    ctx.b
+                        .build_call(
+                            access_func,
+                            &[iter_ptr.into(), idx.into()],
+                            "access_by_index",
+                        )
+                        .unwrap()
+                        .try_as_basic_value()
+                        .unwrap_basic()
                 }
+                DSLType::TwoDArray(..) => {
+                    if i.len() != 2 {
+                        return Err(ArrowKernelError::InvalidIndex("2D array needs two indices"));
+                    }
 
-                let idx0 = compile_expr(ctx, &i[0])?;
-                let idx1 = compile_expr(ctx, &i[1])?;
-                Ok(ctx
+                    let access_func = ctx.access_funcs[&v.name];
+                    let arr_ptr = ctx.st[&v.name];
+                    for idx in i {
+                        if idx.get_type() != DSLType::Primitive(PrimitiveType::U64) {
+                            return Err(ArrowKernelError::DSLTypeMismatch(
+                                "indexing requires unsigned 64 bit integers",
+                                DSLType::Primitive(PrimitiveType::U64),
+                                idx.get_type(),
+                            ));
+                        }
+                    }
+
+                    let idx0 = compile_expr(ctx, &i[0])?;
+                    let idx1 = compile_expr(ctx, &i[1])?;
+                    ctx.b
+                        .build_call(
+                            access_func,
+                            &[arr_ptr.into(), idx0.into(), idx1.into()],
+                            "access_2d_by_index",
+                        )
+                        .unwrap()
+                        .try_as_basic_value()
+                        .unwrap_basic()
+                }
+                _ => todo!(),
+            };
+
+            if let Some(DSLType::Boolean) = v.ty.iter_type() {
+                // truncate to boolean
+                let res = ctx
                     .b
-                    .build_call(
-                        access_func,
-                        &[arr_ptr.into(), idx0.into(), idx1.into()],
-                        "access_2d_by_index",
-                    )
-                    .unwrap()
-                    .try_as_basic_value()
-                    .unwrap_basic())
+                    .build_int_truncate(res.into_int_value(), ctx.ctx.bool_type(), "trunc_to_bool")
+                    .unwrap();
+                Ok(res.into())
+            } else {
+                Ok(res)
             }
-            _ => todo!(),
-        },
+        }
         DSLExpr::Value(v) => match &v.ty {
             DSLType::ConstScalar(v) => {
                 let v = v.get().0;
@@ -830,6 +865,54 @@ fn compile_expr<'ctx, 'a>(
                 }
                 _ => unimplemented!("invalid cast"),
             }
+        }
+        DSLExpr::ArithBinOp(op, lhs, rhs) => {
+            let lhs_v = compile_expr(ctx, lhs)?;
+            let rhs_v = compile_expr(ctx, rhs)?;
+
+            if lhs_v.get_type() != rhs_v.get_type() {
+                return Err(ArrowKernelError::DSLTypeMismatch(
+                    "arith operator",
+                    lhs.get_type(),
+                    rhs.get_type(),
+                ));
+            }
+
+            Ok(if lhs_v.is_float_value() {
+                let lhs_v = lhs_v.into_float_value();
+                let rhs_v = rhs_v.into_float_value();
+                match op {
+                    DSLArithBinOp::Add => ctx.b.build_float_add(lhs_v, rhs_v, "fadd").unwrap(),
+                    DSLArithBinOp::Sub => ctx.b.build_float_sub(lhs_v, rhs_v, "fadd").unwrap(),
+                    DSLArithBinOp::Mul => ctx.b.build_float_mul(lhs_v, rhs_v, "fadd").unwrap(),
+                    DSLArithBinOp::Div => ctx.b.build_float_div(lhs_v, rhs_v, "fadd").unwrap(),
+                    DSLArithBinOp::Rem => ctx.b.build_float_rem(lhs_v, rhs_v, "fadd").unwrap(),
+                }
+                .as_basic_value_enum()
+            } else {
+                let lhs_v = lhs_v.into_int_value();
+                let rhs_v = rhs_v.into_int_value();
+                match op {
+                    DSLArithBinOp::Add => ctx.b.build_int_add(lhs_v, rhs_v, "iadd").unwrap(),
+                    DSLArithBinOp::Sub => ctx.b.build_int_sub(lhs_v, rhs_v, "isub").unwrap(),
+                    DSLArithBinOp::Mul => ctx.b.build_int_mul(lhs_v, rhs_v, "isub").unwrap(),
+                    DSLArithBinOp::Div => {
+                        if lhs.get_type().is_signed().unwrap() {
+                            ctx.b.build_int_signed_div(lhs_v, rhs_v, "idiv").unwrap()
+                        } else {
+                            ctx.b.build_int_unsigned_div(lhs_v, rhs_v, "udiv").unwrap()
+                        }
+                    }
+                    DSLArithBinOp::Rem => {
+                        if lhs.get_type().is_signed().unwrap() {
+                            ctx.b.build_int_signed_rem(lhs_v, rhs_v, "irem").unwrap()
+                        } else {
+                            ctx.b.build_int_unsigned_rem(lhs_v, rhs_v, "urem").unwrap()
+                        }
+                    }
+                }
+                .as_basic_value_enum()
+            })
         }
     }
 }

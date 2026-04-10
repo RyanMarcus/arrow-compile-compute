@@ -2,13 +2,13 @@ mod aggregate;
 mod arith;
 mod cast;
 pub(crate) mod cmp;
-pub(crate) mod cmp2;
 mod concat;
 pub mod dsl;
 mod dsl2;
 mod filter;
 pub(crate) mod ht;
 mod llvm_utils;
+mod null_utils;
 mod partition;
 mod range;
 mod rust_iter;
@@ -16,13 +16,13 @@ mod sort;
 mod string;
 mod take;
 mod vec;
+use std::hash::Hash;
 use std::sync::Arc;
 use std::{collections::HashMap, sync::RwLock};
 
 pub use aggregate::{
     CountAggregator, MaxAggregator, MinAggregator, MostRecentAggregator, SumAggregator,
 };
-pub use arith::BinOp;
 pub use arith::BinOpKernel;
 use arrow_array::make_array;
 use arrow_array::Array;
@@ -32,10 +32,13 @@ use arrow_schema::DataType;
 pub use cast::CastKernel;
 pub use cmp::ComparisonKernel;
 pub use concat::concat_all;
+pub use dsl2::DSLArithBinOp;
 pub use filter::FilterKernel;
 pub use ht::{HashFunction, HashKernel};
 use inkwell::execution_engine::ExecutionEngine;
+use itertools::Itertools;
 use llvm_utils::str_writer_append_bytes;
+pub use null_utils::intersect_and_copy_nulls;
 pub use partition::PartitionKernel;
 pub use range::RangeKernel;
 pub use rust_iter::{ArrowIter, ArrowNullableIter, IterFuncHolder};
@@ -44,7 +47,10 @@ pub use string::{compile_string_like, string_contains, StringKernelType, StringS
 pub use take::TakeKernel;
 pub use vec::{DotKernel, NormVecKernel};
 
-use dsl::DSLError;
+use self::{
+    dsl::DSLError,
+    dsl2::{DSLExpr, DSLType},
+};
 use inkwell::{
     builder::Builder,
     context::Context,
@@ -56,6 +62,7 @@ use inkwell::{
 };
 use thiserror::Error;
 
+use crate::compiled_kernels::dsl2::{DSLContext, DSLFunction};
 use crate::compiled_kernels::llvm_utils::save_to_string_saver;
 use crate::compiled_kernels::llvm_utils::str_view_writer_append_bytes;
 use crate::llvm_debug::debug_i64;
@@ -90,6 +97,48 @@ pub enum ArrowKernelError {
 
     #[error("Type mismatch: expected {0:?}, got {1:?}")]
     TypeMismatch(PrimitiveType, PrimitiveType),
+
+    #[error("non-iterable type: {0:?}")]
+    NonIterableType(DSLType),
+
+    #[error("non-random-access type: {0:?}")]
+    NonRandomAccessType(DSLType),
+
+    #[error("invalid at source: {0:?}")]
+    InvalidAtSource(DSLExpr),
+
+    #[error("type mismatch in {0}: expected {1:?}, got {2:?}")]
+    DSLTypeMismatch(&'static str, DSLType, DSLType),
+
+    #[error("argument type mismatch at index {0}: {1:?} is not compatible with {2:?}")]
+    ArgumentTypeMismatch(usize, String, DSLType),
+
+    #[error("runtime argument type mismatch at index {0}: {1}")]
+    RuntimeArgumentTypeMismatch(usize, String),
+
+    #[error("invalid index: {0}")]
+    InvalidIndex(&'static str),
+
+    #[error("emit with no outputs")]
+    EmitWithNoOutputs,
+
+    #[error("invalid cast: {0:?} to {1:?}")]
+    InvalidCast(DSLType, DSLType),
+
+    #[error("inconsistent 2D array: expected {0:?}, got {1:?}")]
+    Inconsistent2DArray(PrimitiveType, PrimitiveType),
+
+    #[error("invalid set bit type: {0:?}")]
+    InvalidSetBitType(DataType),
+
+    #[error("error resolving size tags: {0}")]
+    ResolveError(String),
+
+    #[error("invalid emit index during kernel runtime")]
+    RuntimeInvalidEmitIndex,
+
+    #[error("unknown kernel runtime return code: {0}")]
+    RuntimeUnknownReturnCode(u64),
 
     #[error("Atomic aggregation not supported")]
     AtomicAggNotSupported,
@@ -280,11 +329,6 @@ fn gen_convert_numeric_vec<'ctx>(
     }
 }
 
-pub fn replace_nulls(arr: Arc<dyn Array>, nulls: Option<NullBuffer>) -> ArrayRef {
-    let data = arr.into_data().into_builder().nulls(nulls);
-    make_array(unsafe { data.build_unchecked() })
-}
-
 #[cfg(test)]
 mod tests {
     use std::sync::Arc;
@@ -295,56 +339,9 @@ mod tests {
     use arrow_buffer::NullBuffer;
     use itertools::Itertools;
 
-    use crate::{compiled_kernels::replace_nulls, Predicate};
+    use crate::{compiled_kernels::null_utils::replace_nulls, Predicate};
 
     use super::{ComparisonKernel, KernelCache};
-
-    #[test]
-    fn test_replace_nulls() {
-        let arr = Arc::new(Int32Array::from(vec![0, 1, 2, 3, 4]));
-        let with_nulls = replace_nulls(
-            arr,
-            Some(NullBuffer::from(vec![true, false, true, true, true])),
-        );
-        let with_nulls = with_nulls.as_primitive::<Int32Type>();
-        assert_eq!(
-            with_nulls.iter().collect_vec(),
-            vec![Some(0), None, Some(2), Some(3), Some(4)]
-        );
-    }
-
-    #[test]
-    fn test_replace_nulls_dict() {
-        let arr = Arc::new(DictionaryArray::<Int32Type>::new(
-            Int32Array::from(vec![0, 0, 1, 1, 2, 2]),
-            Arc::new(Int32Array::from(vec![10, 20, 30])),
-        ));
-        let with_nulls = replace_nulls(
-            arr,
-            Some(NullBuffer::from(vec![true, false, true, true, true, false])),
-        );
-        let with_nulls = with_nulls.as_dictionary::<Int32Type>();
-        let with_nulls = with_nulls.downcast_dict::<Int32Array>().unwrap();
-        assert_eq!(
-            with_nulls.into_iter().collect_vec(),
-            vec![Some(10), None, Some(20), Some(20), Some(30), None]
-        );
-
-        let arr = Arc::new(DictionaryArray::<Int32Type>::new(
-            Int32Array::from(vec![0, 0, 1, 1, 2, 2]),
-            Arc::new(Int32Array::from(vec![Some(10), None, Some(30)])),
-        ));
-        let with_nulls = replace_nulls(
-            arr,
-            Some(NullBuffer::from(vec![true, false, true, true, true, false])),
-        );
-        let with_nulls = with_nulls.as_dictionary::<Int32Type>();
-        let with_nulls = with_nulls.downcast_dict::<Int32Array>().unwrap();
-        assert_eq!(
-            with_nulls.into_iter().collect_vec(),
-            vec![Some(10), None, None, None, Some(30), None]
-        );
-    }
 
     #[test]
     fn test_kernel_cache_cmp() {

@@ -791,7 +791,7 @@ pub mod arith {
     use arrow_array::{ArrayRef, Datum};
 
     use crate::{
-        compiled_kernels::{BinOp, BinOpKernel, KernelCache},
+        compiled_kernels::{BinOpKernel, DSLArithBinOp, KernelCache},
         ArrowKernelError,
     };
 
@@ -799,23 +799,23 @@ pub mod arith {
         LazyLock::new(KernelCache::new);
 
     pub fn add(left: &dyn Datum, right: &dyn Datum) -> Result<ArrayRef, ArrowKernelError> {
-        BINOP_PROGRAM_CACHE.get((left, right), BinOp::Add)
+        BINOP_PROGRAM_CACHE.get((left, right), DSLArithBinOp::Add)
     }
 
     pub fn sub_wrapping(left: &dyn Datum, right: &dyn Datum) -> Result<ArrayRef, ArrowKernelError> {
-        BINOP_PROGRAM_CACHE.get((left, right), BinOp::Sub)
+        BINOP_PROGRAM_CACHE.get((left, right), DSLArithBinOp::Sub)
     }
 
     pub fn mul_wrapping(left: &dyn Datum, right: &dyn Datum) -> Result<ArrayRef, ArrowKernelError> {
-        BINOP_PROGRAM_CACHE.get((left, right), BinOp::Mul)
+        BINOP_PROGRAM_CACHE.get((left, right), DSLArithBinOp::Mul)
     }
 
     pub fn div(left: &dyn Datum, right: &dyn Datum) -> Result<ArrayRef, ArrowKernelError> {
-        BINOP_PROGRAM_CACHE.get((left, right), BinOp::Div)
+        BINOP_PROGRAM_CACHE.get((left, right), DSLArithBinOp::Div)
     }
 
     pub fn rem(left: &dyn Datum, right: &dyn Datum) -> Result<ArrayRef, ArrowKernelError> {
-        BINOP_PROGRAM_CACHE.get((left, right), BinOp::Rem)
+        BINOP_PROGRAM_CACHE.get((left, right), DSLArithBinOp::Rem)
     }
 }
 

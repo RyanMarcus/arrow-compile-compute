@@ -1,21 +1,22 @@
-use std::any::TypeId;
 use std::collections::HashSet;
-use std::fmt::{Debug, Display};
+use std::fmt::Debug;
 use std::sync::Arc;
 
 use arrow_array::cast::AsArray;
-use arrow_array::types::{UInt32Type, UInt64Type};
-use arrow_array::{ArrayRef, Datum, UInt32Array, UInt64Array};
+use arrow_array::types::UInt32Type;
+#[cfg(test)]
+use arrow_array::ArrayRef;
+use arrow_array::{Datum, UInt32Array, UInt64Array};
 use arrow_buffer::MutableBuffer;
 use arrow_schema::DataType;
 use inkwell::context::Context;
 use inkwell::types::{BasicType, BasicTypeEnum};
 use inkwell::{FloatPredicate, IntPredicate};
 use itertools::Itertools;
-use thiserror::Error;
+use strum_macros::EnumIter;
 
 use crate::compiled_iter::IteratorHolder;
-use crate::compiled_kernels::dsl2::resolver::ResolveResult;
+use crate::compiled_kernels::dsl::base_type;
 use crate::compiled_kernels::dsl2::writers::OutputSpec;
 use crate::{ArrowKernelError, PrimitiveType};
 
@@ -27,6 +28,7 @@ mod two_d;
 mod writers;
 
 pub use compiler::compile;
+pub use runtime::RunnableDSLFunction;
 pub use writers::WriterSpec;
 
 pub struct DSLContext {
@@ -43,57 +45,6 @@ impl DSLContext {
         self.symbol_counter += 1;
         sym
     }
-}
-
-#[derive(Error, Debug)]
-pub enum DSL2Error {
-    #[error("non-iterable type: {0:?}")]
-    NonIterableType(DSLType),
-
-    #[error("non-random-access type: {0:?}")]
-    NonRandomAccessType(DSLType),
-
-    #[error("invalid at source: {0:?}")]
-    InvalidAtSource(DSLExpr),
-
-    #[error("invalid arg type: {0:?}")]
-    InvalidArgType(DSLValue),
-
-    #[error("Arrow kernel error: {0}")]
-    ArrowKernelError(#[from] ArrowKernelError),
-
-    #[error("type mismatch in {0}: expected {1:?}, got {2:?}")]
-    TypeMismatch(&'static str, DSLType, DSLType),
-
-    #[error("argument type mismatch at index {0}: {1:?} is not compatible with {2:?}")]
-    ArgumentTypeMismatch(usize, String, DSLType),
-
-    #[error("runtime argument type mismatch at index {0}: {1}")]
-    RuntimeArgumentTypeMismatch(usize, String),
-
-    #[error("invalid index: {0}")]
-    InvalidIndex(&'static str),
-
-    #[error("emit with no outputs")]
-    EmitWithNoOutputs,
-
-    #[error("invalid cast: {0:?} to {1:?}")]
-    InvalidCast(DSLType, DSLType),
-
-    #[error("inconsistent 2D array: expected {0:?}, got {1:?}")]
-    Inconsistent2DArray(PrimitiveType, PrimitiveType),
-
-    #[error("invalid set bit type: {0:?}")]
-    InvalidSetBitType(DataType),
-
-    #[error("Error resolving size tags: {0}")]
-    ResolveError(String),
-
-    #[error("invalid emit index during kernel runtime")]
-    RuntimeInvalidEmitIndex,
-
-    #[error("unknown kernel runtime return code: {0}")]
-    RuntimeUnknownReturnCode(u64),
 }
 
 #[derive(Debug)]
@@ -274,6 +225,11 @@ macro_rules! dsl_args {
     () => {
         Vec::new()
     };
+    ([$($value:expr),* $(,)?]) => {
+        vec![$crate::compiled_kernels::dsl2::DSLArgument::two_d([
+            $(&$value as &dyn arrow_array::Datum),*
+        ])]
+    };
     ([$($value:expr),* $(,)?] $(, $($rest:tt)*)?) => {{
         let mut args = vec![
             $crate::compiled_kernels::dsl2::DSLArgument::two_d([
@@ -283,12 +239,18 @@ macro_rules! dsl_args {
         $(args.extend(dsl_args![$($rest)*]);)?
         args
     }};
+    (($buffer:expr, $primitive_type:expr)) => {
+        vec![$crate::compiled_kernels::dsl2::DSLArgument::buffer(&mut $buffer, $primitive_type)]
+    };
     (($buffer:expr, $primitive_type:expr) $(, $($rest:tt)*)?) => {{
         let mut args =
             vec![$crate::compiled_kernels::dsl2::DSLArgument::buffer(&mut $buffer, $primitive_type)];
         $(args.extend(dsl_args![$($rest)*]);)?
         args
     }};
+    ($value:expr) => {
+        vec![$crate::compiled_kernels::dsl2::DSLArgument::datum(&$value)]
+    };
     ($value:expr $(, $($rest:tt)*)?) => {{
         let mut args = vec![$crate::compiled_kernels::dsl2::DSLArgument::datum(&$value)];
         $(args.extend(dsl_args![$($rest)*]);)?
@@ -407,6 +369,14 @@ impl DSLType {
         }
     }
 
+    /// True if the resulting type, when iterated, never ends (scalars)
+    pub fn is_infinite(&self) -> bool {
+        match self {
+            DSLType::ConstScalar(..) | DSLType::Scalar(..) => true,
+            _ => false,
+        }
+    }
+
     pub fn llvm_type<'a>(&self, ctx: &'a Context) -> Option<BasicTypeEnum<'a>> {
         match self {
             DSLType::Boolean => Some(ctx.bool_type().as_basic_type_enum()),
@@ -447,8 +417,25 @@ impl DSLType {
     }
 
     pub fn array_like<S: Into<String>>(arr: &dyn Datum, len_expr: S) -> Self {
-        let pt = PrimitiveType::for_arrow_type(arr.get().0.data_type());
-        DSLType::Array(Box::new(DSLType::Primitive(pt)), len_expr.into())
+        let (arr, is_scalar) = arr.get();
+        match base_type(arr.data_type()) {
+            DataType::Null => todo!(),
+            DataType::Boolean => {
+                if is_scalar {
+                    DSLType::Scalar(Box::new(DSLType::Boolean))
+                } else {
+                    DSLType::Array(Box::new(DSLType::Boolean), len_expr.into())
+                }
+            }
+            _ => {
+                let pt = PrimitiveType::for_arrow_type(arr.data_type());
+                if is_scalar {
+                    Self::scalar_of(pt)
+                } else {
+                    DSLType::Array(Box::new(DSLType::Primitive(pt)), len_expr.into())
+                }
+            }
+        }
     }
 
     pub fn set_bits<S: Into<String>>(len_expr: S) -> Self {
@@ -461,6 +448,28 @@ impl DSLType {
 
     pub fn buffer_of(pt: PrimitiveType) -> Self {
         DSLType::Buffer(pt)
+    }
+}
+
+#[derive(Debug, Copy, Clone, Hash, PartialEq, Eq, EnumIter)]
+pub enum DSLArithBinOp {
+    Add,
+    Sub,
+    Mul,
+    Div,
+    Rem,
+}
+
+#[cfg(test)]
+impl DSLArithBinOp {
+    pub fn arrow_compute(&self, arr1: &dyn Datum, arr2: &dyn Datum) -> ArrayRef {
+        match self {
+            Self::Add => arrow_arith::numeric::add(arr1, arr2).unwrap(),
+            Self::Sub => arrow_arith::numeric::sub_wrapping(arr1, arr2).unwrap(),
+            Self::Mul => arrow_arith::numeric::mul_wrapping(arr1, arr2).unwrap(),
+            Self::Div => arrow_arith::numeric::div(arr1, arr2).unwrap(),
+            Self::Rem => arrow_arith::numeric::rem(arr1, arr2).unwrap(),
+        }
     }
 }
 
@@ -642,17 +651,20 @@ impl Into<Vec<DSLStmt>> for DSLStmt {
 }
 
 impl DSLStmt {
-    pub fn for_each<S: Into<Vec<DSLStmt>>, F: FnOnce(&[DSLValue]) -> Result<S, DSL2Error>>(
+    pub fn for_each<
+        S: Into<Vec<DSLStmt>>,
+        F: FnOnce(&[DSLValue]) -> Result<S, ArrowKernelError>,
+    >(
         ctx: &mut DSLContext,
         to_iter: &[DSLValue],
         f: F,
-    ) -> Result<DSLStmt, DSL2Error> {
+    ) -> Result<DSLStmt, ArrowKernelError> {
         let loop_vars: Vec<DSLValue> = to_iter
             .iter()
             .map(|dv| {
                 dv.ty
                     .iter_type()
-                    .ok_or_else(|| DSL2Error::NonIterableType(dv.ty.clone()))
+                    .ok_or_else(|| ArrowKernelError::NonIterableType(dv.ty.clone()))
                     .map(|dt| DSLValue::new(ctx, dt))
             })
             .try_collect()?;
@@ -666,25 +678,32 @@ impl DSLStmt {
         }))
     }
 
-    pub fn cond<S: Into<Vec<DSLStmt>>>(cond: DSLExpr, then: S) -> Result<DSLStmt, DSL2Error> {
+    pub fn cond<S: Into<Vec<DSLStmt>>>(
+        cond: DSLExpr,
+        then: S,
+    ) -> Result<DSLStmt, ArrowKernelError> {
         Ok(DSLStmt::If {
             cond,
             then: then.into(),
         })
     }
 
-    pub fn emit(index: u32, value: DSLExpr) -> Result<DSLStmt, DSL2Error> {
+    pub fn emit(index: u32, value: DSLExpr) -> Result<DSLStmt, ArrowKernelError> {
         Ok(DSLStmt::Emit {
             index: DSLExpr::Value(DSLValue::u32(index)),
             value,
         })
     }
 
-    pub fn emit_dynamic(index: DSLExpr, value: DSLExpr) -> Result<DSLStmt, DSL2Error> {
+    pub fn emit_dynamic(index: DSLExpr, value: DSLExpr) -> Result<DSLStmt, ArrowKernelError> {
         Ok(DSLStmt::Emit { index, value })
     }
 
-    pub fn set(buf_idx: usize, index: &DSLExpr, value: &DSLExpr) -> Result<DSLStmt, DSL2Error> {
+    pub fn set(
+        buf_idx: usize,
+        index: &DSLExpr,
+        value: &DSLExpr,
+    ) -> Result<DSLStmt, ArrowKernelError> {
         Ok(DSLStmt::Set {
             buf_idx,
             index: index.clone(),
@@ -745,10 +764,11 @@ pub enum DSLExpr {
     At(Box<DSLValue>, Vec<Box<DSLExpr>>),
     Value(DSLValue),
     Cast(Box<DSLExpr>, PrimitiveType),
+    ArithBinOp(DSLArithBinOp, Box<DSLExpr>, Box<DSLExpr>),
 }
 
 impl DSLExpr {
-    pub fn cmp(&self, other: &DSLExpr, op: DSLComparison) -> Result<DSLExpr, DSL2Error> {
+    pub fn cmp(&self, other: &DSLExpr, op: DSLComparison) -> Result<DSLExpr, ArrowKernelError> {
         Ok(DSLExpr::Compare(
             op,
             Box::new(self.clone()),
@@ -756,7 +776,7 @@ impl DSLExpr {
         ))
     }
 
-    pub fn at(&self, index: &DSLExpr) -> Result<DSLExpr, DSL2Error> {
+    pub fn at(&self, index: &DSLExpr) -> Result<DSLExpr, ArrowKernelError> {
         match self {
             DSLExpr::Value(v) => Ok(DSLExpr::At(
                 Box::new(v.clone()),
@@ -764,16 +784,16 @@ impl DSLExpr {
             )),
             DSLExpr::At(base2d, outer_idx) => {
                 if outer_idx.len() != 1 {
-                    return Err(DSL2Error::InvalidAtSource(self.clone()));
+                    return Err(ArrowKernelError::InvalidAtSource(self.clone()));
                 }
                 let idxes = vec![outer_idx[0].clone(), Box::new(index.clone())];
                 Ok(DSLExpr::At(base2d.clone(), idxes))
             }
-            _ => Err(DSL2Error::InvalidAtSource(self.clone())),
+            _ => Err(ArrowKernelError::InvalidAtSource(self.clone())),
         }
     }
 
-    pub fn cast(&self, ty: PrimitiveType) -> Result<DSLExpr, DSL2Error> {
+    pub fn cast(&self, ty: PrimitiveType) -> Result<DSLExpr, ArrowKernelError> {
         if self.get_type() == DSLType::Primitive(ty) {
             return Ok(self.clone());
         }
@@ -782,11 +802,27 @@ impl DSLExpr {
             DSLType::ConstScalar(_) | DSLType::Boolean | DSLType::Primitive(_) => {
                 Ok(DSLExpr::Cast(Box::new(self.clone()), ty))
             }
-            _ => Err(DSL2Error::InvalidCast(
+            _ => Err(ArrowKernelError::InvalidCast(
                 self.get_type(),
                 DSLType::Primitive(ty),
             )),
         }
+    }
+
+    pub fn arith(&self, op: DSLArithBinOp, rhs: DSLExpr) -> Result<DSLExpr, ArrowKernelError> {
+        if self.get_type() != rhs.get_type() {
+            return Err(ArrowKernelError::DSLTypeMismatch(
+                "arith bin op",
+                self.get_type(),
+                rhs.get_type(),
+            ));
+        }
+
+        Ok(DSLExpr::ArithBinOp(
+            op,
+            Box::new(self.clone()),
+            Box::new(rhs.clone()),
+        ))
     }
 
     pub fn get_type(&self) -> DSLType {
@@ -802,13 +838,14 @@ impl DSLExpr {
                 t
             }
             DSLExpr::Value(v) => v.ty.clone(),
+            DSLExpr::ArithBinOp(_, v, _) => v.get_type().clone(),
             DSLExpr::Cast(_, pt) => DSLType::Primitive(*pt),
         }
     }
 
     fn accessed_parameters(&self, params: &mut HashSet<usize>) {
         match self {
-            DSLExpr::Compare(_, l, r) => {
+            DSLExpr::Compare(_, l, r) | DSLExpr::ArithBinOp(_, l, r) => {
                 l.accessed_parameters(params);
                 r.accessed_parameters(params);
             }

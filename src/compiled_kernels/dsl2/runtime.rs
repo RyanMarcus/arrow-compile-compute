@@ -1,18 +1,17 @@
 use std::ffi::c_void;
 
-use arrow_array::{cast::AsArray, ArrayRef, Datum};
-use arrow_buffer::MutableBuffer;
+use arrow_array::{cast::AsArray, ArrayRef};
 use itertools::Itertools;
 
 use crate::{
     compiled_iter::{array_to_setbit_iter, datum_to_iter},
     compiled_kernels::dsl2::{
         compiler::{CompiledDSLFunction, KernelReturnCode},
-        resolver::{Resolver, SizeTerm},
+        resolver::{ResolveResult, Resolver, SizeTerm},
         two_d::TwoDArrayRuntime,
-        DSL2Error, DSLArgument,
+        DSLArgument,
     },
-    PrimitiveType,
+    ArrowKernelError,
 };
 
 pub struct RunnableDSLFunction {
@@ -21,7 +20,7 @@ pub struct RunnableDSLFunction {
 }
 
 impl RunnableDSLFunction {
-    pub fn new(compiled: CompiledDSLFunction) -> Result<Self, DSL2Error> {
+    pub fn new(compiled: CompiledDSLFunction) -> Result<Self, ArrowKernelError> {
         let inputs = compiled
             .borrow_f()
             .params
@@ -38,12 +37,15 @@ impl RunnableDSLFunction {
             .map(|t| SizeTerm::parse(t).unwrap())
             .collect_vec();
 
-        let resolver = Resolver::new(inputs, outputs).map_err(DSL2Error::ResolveError)?;
+        let resolver = Resolver::new(inputs, outputs).map_err(ArrowKernelError::ResolveError)?;
 
         Ok(Self { compiled, resolver })
     }
 
-    pub fn run<'args>(&self, inputs: &[DSLArgument<'args>]) -> Result<Vec<ArrayRef>, DSL2Error> {
+    pub fn run<'args>(
+        &self,
+        inputs: &[DSLArgument<'args>],
+    ) -> Result<Vec<ArrayRef>, ArrowKernelError> {
         let mut ptrs = Vec::new();
         let mut ihs = Vec::new();
         let mut twods = Vec::new();
@@ -58,7 +60,7 @@ impl RunnableDSLFunction {
         {
             arg_type
                 .matches(input)
-                .map_err(|s| DSL2Error::RuntimeArgumentTypeMismatch(idx, s))?;
+                .map_err(|s| ArrowKernelError::RuntimeArgumentTypeMismatch(idx, s))?;
 
             match input {
                 DSLArgument::Datum(datum) => {
@@ -85,21 +87,34 @@ impl RunnableDSLFunction {
         }
 
         // resolve lengths
-        let output_lenghts = self
+        let output_lengths = self
             .resolver
             .resolve(&input_lengths)
-            .map_err(DSL2Error::ResolveError)?;
+            .map_err(ArrowKernelError::ResolveError)?;
+
+        assert_eq!(output_lengths.len(), self.compiled.borrow_f().ret.len());
 
         // allocate and check outputs
         let mut outputs = Vec::new();
-        for (os, len) in self
+        for (os, &len) in self
             .compiled
             .borrow_f()
             .ret
             .iter()
-            .zip(output_lenghts.iter())
+            .zip(output_lengths.iter())
         {
-            outputs.push(os.allocate(*len));
+            let len = match len {
+                ResolveResult::Exact(len) => len,
+                ResolveResult::AtLeast(len) => len,
+                ResolveResult::Unknown => {
+                    // We can get an unknown result if a kernel is only over
+                    // scalar inputs. In this case, we allocate with a length of
+                    // 1 -- there might be other cases as well, we should revist
+                    // this. TODO
+                    1
+                }
+            };
+            outputs.push(os.allocate(len));
             ptrs.push(outputs.last_mut().unwrap().get_ptr());
         }
 
@@ -114,8 +129,8 @@ impl RunnableDSLFunction {
                 .into_iter()
                 .map(|o| o.into_array_ref(None))
                 .collect_vec()),
-            KernelReturnCode::InvalidEmitIndex => Err(DSL2Error::RuntimeInvalidEmitIndex),
-            KernelReturnCode::Unknown(c) => Err(DSL2Error::RuntimeUnknownReturnCode(c)),
+            KernelReturnCode::InvalidEmitIndex => Err(ArrowKernelError::RuntimeInvalidEmitIndex),
+            KernelReturnCode::Unknown(c) => Err(ArrowKernelError::RuntimeUnknownReturnCode(c)),
         }
     }
 }

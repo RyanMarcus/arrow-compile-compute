@@ -1,6 +1,10 @@
-use std::{ffi::c_void, marker::PhantomData, sync::Arc};
+use std::{ffi::c_void, sync::Arc};
 
-use arrow_array::{cast::AsArray, types::RunEndIndexType, Array, ArrayRef, RunArray};
+use arrow_array::{
+    cast::AsArray,
+    types::{Int16Type, Int32Type, Int64Type, RunEndIndexType},
+    Array, ArrayRef, BinaryArray, RunArray,
+};
 use arrow_buffer::NullBuffer;
 use arrow_data::ArrayDataBuilder;
 use arrow_schema::{DataType, Field};
@@ -11,8 +15,10 @@ use inkwell::{
 };
 use repr_offset::ReprOffset;
 
-use super::array_writer::ArrayOutput;
-use super::{ArrayWriter, PrimitiveArrayWriter, WriterAllocation};
+use super::{
+    ArrayOutput, LeafWriter, LeafWriterAllocation, PrimitiveArrayWriter, RunEndType,
+    WriterAllocation, WriterSpec,
+};
 use crate::{
     compiled_kernels::cmp::add_memcmp, declare_blocks, declare_global_pointer, increment_pointer,
     ComparisonType, PrimitiveType,
@@ -21,27 +27,43 @@ use crate::{
 #[repr(C)]
 #[derive(ReprOffset)]
 #[roff(usize_offsets)]
-pub struct REEAllocation<'a, K: RunEndIndexType, VW: ArrayWriter<'a>> {
+pub struct REEAllocation {
     res_ptr: *mut c_void,
     values_ptr: *mut c_void,
     last_val: Box<[u8]>,
     num_unique: u64,
     curr_run_end: u64,
     res: Box<ArrayOutput>,
-    values: Box<VW::Allocation>,
-
-    #[roff(offset = "OFFSET_MARKER")]
-    _marker: PhantomData<K>,
+    values: Box<WriterAllocation>,
+    run_end_type: RunEndType,
 }
 
-impl<'a, K: RunEndIndexType, VW: ArrayWriter<'a>> WriterAllocation for REEAllocation<'a, K, VW> {
-    type Output = RunArray<K>;
+impl REEAllocation {
+    pub fn allocate(expected_count: usize, run_end_type: RunEndType, value_spec: &WriterSpec) -> Self {
+        let value_type = value_spec.storage_type();
+        let mut run_ends = Box::new(PrimitiveArrayWriter::allocate(
+            expected_count,
+            run_end_type.primitive_type(),
+        ));
+        let mut values = Box::new(value_spec.allocate(expected_count));
+        let last_val = vec![0; value_type.width()].into_boxed_slice();
+        Self {
+            res_ptr: run_ends.get_ptr(),
+            values_ptr: values.get_ptr(),
+            last_val,
+            num_unique: 0,
+            curr_run_end: 0,
+            res: run_ends,
+            values,
+            run_end_type,
+        }
+    }
 
-    fn get_ptr(&mut self) -> *mut c_void {
+    pub fn get_ptr(&mut self) -> *mut c_void {
         self as *mut Self as *mut c_void
     }
 
-    fn reserve_for_additional(&mut self, count: usize) {
+    pub fn reserve_for_additional(&mut self, count: usize) {
         if self.curr_run_end > 0 && self.num_unique > 0 {
             self.res.rewind_one();
             self.values.rewind_one();
@@ -52,110 +74,146 @@ impl<'a, K: RunEndIndexType, VW: ArrayWriter<'a>> WriterAllocation for REEAlloca
         self.values_ptr = self.values.get_ptr();
     }
 
-    fn to_array(self, len: usize, nulls: Option<NullBuffer>) -> Self::Output {
-        let run_ends = self.res.to_array(self.num_unique as usize, None);
-        let res = run_ends.as_primitive::<K>();
-        let values = self.values.to_array(self.num_unique as usize, nulls);
+    pub fn len(&self) -> usize {
+        usize::try_from(self.curr_run_end).unwrap()
+    }
+
+    pub fn into_array_ref_with_len(self, len: usize, nulls: Option<NullBuffer>) -> ArrayRef {
+        match self.run_end_type {
+            RunEndType::Int16 => Arc::new(self.into_typed_array::<Int16Type>(len, nulls)),
+            RunEndType::Int32 => Arc::new(self.into_typed_array::<Int32Type>(len, nulls)),
+            RunEndType::Int64 => Arc::new(self.into_typed_array::<Int64Type>(len, nulls)),
+        }
+    }
+
+    pub fn into_array_ref(self, nulls: Option<NullBuffer>) -> ArrayRef {
+        let len = self.len();
+        self.into_array_ref_with_len(len, nulls)
+    }
+
+    fn into_typed_array<K: RunEndIndexType>(self, len: usize, nulls: Option<NullBuffer>) -> RunArray<K> {
+        let run_ends = (*self.res).to_array(self.num_unique as usize, None);
+        let run_ends = run_ends.as_primitive::<K>();
+        let values = self
+            .values
+            .into_array_ref_with_len(self.num_unique as usize, nulls);
 
         let ree_array_type = DataType::RunEndEncoded(
             Arc::new(Field::new("run_ends", K::DATA_TYPE, false)),
             Arc::new(Field::new("values", values.data_type().clone(), true)),
         );
 
-        let rec_len = RunArray::logical_len(res);
-        assert_eq!(rec_len, len);
+        let logical_len = RunArray::logical_len(run_ends);
+        assert_eq!(logical_len, len);
         let builder = ArrayDataBuilder::new(ree_array_type)
             .len(len)
-            .add_child_data(res.to_data())
+            .add_child_data(run_ends.to_data())
             .add_child_data(values.to_data());
-
         let array_data = unsafe { builder.build_unchecked() };
         array_data.into()
     }
-
-    fn to_array_ref(self, nulls: Option<arrow_buffer::NullBuffer>) -> ArrayRef {
-        let len = self.len();
-        Arc::new(self.to_array(len, nulls))
-    }
-
-    fn len(&self) -> usize {
-        self.values.len()
-    }
 }
 
-pub struct REEWriter<'a, K: RunEndIndexType, VW: ArrayWriter<'a>> {
+pub struct REEWriter<'a> {
     ingest_func: FunctionValue<'a>,
     flush_func: FunctionValue<'a>,
     pt: PrimitiveType,
-    _phantom1: PhantomData<K>,
-    _phantom2: PhantomData<VW>,
 }
 
-impl<'a, K: RunEndIndexType, VW: ArrayWriter<'a>> ArrayWriter<'a> for REEWriter<'a, K, VW> {
-    type Allocation = REEAllocation<'a, K, VW>;
-
-    fn allocate(expected_count: usize, ty: PrimitiveType) -> Self::Allocation {
-        let mut rw = Box::new(PrimitiveArrayWriter::allocate(
-            expected_count,
-            PrimitiveType::for_arrow_type(&K::DATA_TYPE),
-        ));
-        let mut vw = Box::new(VW::allocate(expected_count, ty));
-        let last_val = vec![0; ty.width()].into_boxed_slice();
-        REEAllocation {
-            res_ptr: rw.get_ptr(),
-            values_ptr: vw.get_ptr(),
-            last_val,
-            num_unique: 0,
-            curr_run_end: 0,
-            res: rw,
-            values: vw,
-            _marker: PhantomData,
-        }
-    }
-
-    fn llvm_init(
+impl<'a> REEWriter<'a> {
+    pub fn llvm_init(
         ctx: &'a inkwell::context::Context,
         llvm_mod: &inkwell::module::Module<'a>,
         build: &inkwell::builder::Builder<'a>,
-        ty: crate::PrimitiveType,
+        run_end_type: RunEndType,
+        value_spec: &WriterSpec,
+        alloc_ptr: PointerValue<'a>,
+    ) -> Self {
+        match run_end_type {
+            RunEndType::Int16 => {
+                Self::llvm_init_typed::<Int16Type>(ctx, llvm_mod, build, value_spec, alloc_ptr)
+            }
+            RunEndType::Int32 => {
+                Self::llvm_init_typed::<Int32Type>(ctx, llvm_mod, build, value_spec, alloc_ptr)
+            }
+            RunEndType::Int64 => {
+                Self::llvm_init_typed::<Int64Type>(ctx, llvm_mod, build, value_spec, alloc_ptr)
+            }
+        }
+    }
+
+    pub fn llvm_ingest_type(
+        &self,
+        ctx: &'a inkwell::context::Context,
+    ) -> inkwell::types::BasicTypeEnum<'a> {
+        self.pt.llvm_type(ctx)
+    }
+
+    pub fn llvm_ingest(
+        &self,
+        _ctx: &'a inkwell::context::Context,
+        build: &inkwell::builder::Builder<'a>,
+        val: inkwell::values::BasicValueEnum<'a>,
+    ) {
+        build
+            .build_call(self.ingest_func, &[val.into()], "ingest_ree")
+            .unwrap();
+    }
+
+    pub fn llvm_flush(
+        &self,
+        _ctx: &'a inkwell::context::Context,
+        build: &inkwell::builder::Builder<'a>,
+    ) {
+        build.build_call(self.flush_func, &[], "flush").unwrap();
+    }
+
+    fn llvm_init_typed<K: RunEndIndexType>(
+        ctx: &'a inkwell::context::Context,
+        llvm_mod: &inkwell::module::Module<'a>,
+        build: &inkwell::builder::Builder<'a>,
+        value_spec: &WriterSpec,
         alloc_ptr: PointerValue<'a>,
     ) -> Self {
         let ptr_type = ctx.ptr_type(AddressSpace::default());
+        let value_type = value_spec.storage_type();
         let alloc_ptr_ptr = declare_global_pointer!(llvm_mod, REE_ALLOC_PTR);
         build
             .build_store(alloc_ptr_ptr.as_pointer_value(), alloc_ptr)
             .unwrap();
-        let re_ptr = build
+
+        let run_end_ptr = build
             .build_load(
                 ptr_type,
-                increment_pointer!(ctx, build, alloc_ptr, Self::Allocation::OFFSET_RES_PTR),
+                increment_pointer!(ctx, build, alloc_ptr, REEAllocation::OFFSET_RES_PTR),
                 "re_ptr",
             )
             .unwrap()
             .into_pointer_value();
-        let re_writer = PrimitiveArrayWriter::llvm_init(
+        let run_end_writer = PrimitiveArrayWriter::llvm_init(
             ctx,
             llvm_mod,
             build,
             PrimitiveType::for_arrow_type(&K::DATA_TYPE),
-            re_ptr,
+            run_end_ptr,
         );
-        let val_ptr = build
+
+        let value_ptr = build
             .build_load(
                 ptr_type,
-                increment_pointer!(ctx, build, alloc_ptr, Self::Allocation::OFFSET_VALUES_PTR),
+                increment_pointer!(ctx, build, alloc_ptr, REEAllocation::OFFSET_VALUES_PTR),
                 "val_ptr",
             )
             .unwrap()
             .into_pointer_value();
-        let val_writer = VW::llvm_init(ctx, llvm_mod, build, ty, val_ptr);
+        let value_writer = value_spec.llvm_init(ctx, llvm_mod, build, value_ptr);
 
         let ingest_func = {
             let i64_type = ctx.i64_type();
-            let llvm_ty = ty.llvm_type(ctx);
+            let llvm_ty = value_type.llvm_type(ctx);
             let func_type = ctx.void_type().fn_type(&[llvm_ty.into()], false);
             let func = llvm_mod.add_function(
-                &format!("ingest_ree_{}", ty),
+                &format!("ingest_ree_{}_{}", K::DATA_TYPE, value_type),
                 func_type,
                 Some(Linkage::Private),
             );
@@ -176,7 +234,7 @@ impl<'a, K: RunEndIndexType, VW: ArrayWriter<'a>> ArrayWriter<'a> for REEWriter<
                 .unwrap()
                 .into_pointer_value();
             let curr_run_end_ptr =
-                increment_pointer!(ctx, b2, alloc_ptr, Self::Allocation::OFFSET_CURR_RUN_END);
+                increment_pointer!(ctx, b2, alloc_ptr, REEAllocation::OFFSET_CURR_RUN_END);
             let curr_run_end = b2
                 .build_load(i64_type, curr_run_end_ptr, "curr_run_end")
                 .unwrap()
@@ -185,7 +243,7 @@ impl<'a, K: RunEndIndexType, VW: ArrayWriter<'a>> ArrayWriter<'a> for REEWriter<
                 .build_int_add(curr_run_end, i64_type.const_int(1, true), "new_run_end")
                 .unwrap();
             b2.build_store(curr_run_end_ptr, new_run_end).unwrap();
-            let cmp = b2
+            let have_prev = b2
                 .build_int_compare(
                     IntPredicate::NE,
                     curr_run_end,
@@ -194,24 +252,22 @@ impl<'a, K: RunEndIndexType, VW: ArrayWriter<'a>> ArrayWriter<'a> for REEWriter<
                 )
                 .unwrap();
             let last_val_ptr =
-                increment_pointer!(ctx, b2, alloc_ptr, Self::Allocation::OFFSET_LAST_VAL);
+                increment_pointer!(ctx, b2, alloc_ptr, REEAllocation::OFFSET_LAST_VAL);
             let last_val_ptr = b2
                 .build_load(ptr_type, last_val_ptr, "last_val_ptr")
                 .unwrap()
                 .into_pointer_value();
-            b2.build_conditional_branch(cmp, has_value, insert_first)
+            b2.build_conditional_branch(have_prev, has_value, insert_first)
                 .unwrap();
 
             b2.position_at_end(has_value);
-            // check to see if the value-to-insert matches the previous
             let last_val = b2.build_load(llvm_ty, last_val_ptr, "last_val").unwrap();
-
-            let cmp = match ty.comparison_type() {
+            let matches = match value_type.comparison_type() {
                 ComparisonType::Int { .. } | ComparisonType::Float => {
                     let last_val_int = b2
                         .build_bit_cast(
                             last_val,
-                            PrimitiveType::int_with_width(ty.width()).llvm_type(ctx),
+                            PrimitiveType::int_with_width(value_type.width()).llvm_type(ctx),
                             "last_val_int",
                         )
                         .unwrap()
@@ -219,7 +275,7 @@ impl<'a, K: RunEndIndexType, VW: ArrayWriter<'a>> ArrayWriter<'a> for REEWriter<
                     let new_val_int = b2
                         .build_bit_cast(
                             val_to_insert,
-                            PrimitiveType::int_with_width(ty.width()).llvm_type(ctx),
+                            PrimitiveType::int_with_width(value_type.width()).llvm_type(ctx),
                             "new_val_int",
                         )
                         .unwrap()
@@ -230,11 +286,7 @@ impl<'a, K: RunEndIndexType, VW: ArrayWriter<'a>> ArrayWriter<'a> for REEWriter<
                 ComparisonType::String => {
                     let memcmp = add_memcmp(ctx, llvm_mod);
                     let cmp = b2
-                        .build_call(
-                            memcmp,
-                            &[last_val.into(), val_to_insert.into()],
-                            "memcmp_res",
-                        )
+                        .build_call(memcmp, &[last_val.into(), val_to_insert.into()], "memcmp_res")
                         .unwrap()
                         .try_as_basic_value()
                         .unwrap_basic()
@@ -244,7 +296,7 @@ impl<'a, K: RunEndIndexType, VW: ArrayWriter<'a>> ArrayWriter<'a> for REEWriter<
                 }
                 ComparisonType::List => todo!("implement list ree writer"),
             };
-            b2.build_conditional_branch(cmp, matches_prev, insert_next)
+            b2.build_conditional_branch(matches, matches_prev, insert_next)
                 .unwrap();
 
             b2.position_at_end(matches_prev);
@@ -257,11 +309,11 @@ impl<'a, K: RunEndIndexType, VW: ArrayWriter<'a>> ArrayWriter<'a> for REEWriter<
             let converted = b2
                 .build_int_truncate_or_bit_cast(curr_run_end, llvm_run_end_type, "casted_run_end")
                 .unwrap();
-            re_writer.llvm_ingest(ctx, &b2, converted.into());
-            val_writer.llvm_ingest(ctx, &b2, last_val);
+            run_end_writer.llvm_ingest(ctx, &b2, converted.into());
+            value_writer.llvm_ingest(ctx, &b2, last_val);
             b2.build_store(last_val_ptr, val_to_insert).unwrap();
             let num_unique_ptr =
-                increment_pointer!(ctx, b2, alloc_ptr, Self::Allocation::OFFSET_NUM_UNIQUE);
+                increment_pointer!(ctx, b2, alloc_ptr, REEAllocation::OFFSET_NUM_UNIQUE);
             let curr_unique = b2
                 .build_load(i64_type, num_unique_ptr, "curr_unique")
                 .unwrap()
@@ -275,7 +327,7 @@ impl<'a, K: RunEndIndexType, VW: ArrayWriter<'a>> ArrayWriter<'a> for REEWriter<
             b2.position_at_end(insert_first);
             b2.build_store(last_val_ptr, val_to_insert).unwrap();
             let num_unique_ptr =
-                increment_pointer!(ctx, b2, alloc_ptr, Self::Allocation::OFFSET_NUM_UNIQUE);
+                increment_pointer!(ctx, b2, alloc_ptr, REEAllocation::OFFSET_NUM_UNIQUE);
             let curr_unique = b2
                 .build_load(i64_type, num_unique_ptr, "curr_unique")
                 .unwrap()
@@ -290,10 +342,10 @@ impl<'a, K: RunEndIndexType, VW: ArrayWriter<'a>> ArrayWriter<'a> for REEWriter<
 
         let flush_func = {
             let i64_type = ctx.i64_type();
-            let llvm_ty = ty.llvm_type(ctx);
+            let llvm_ty = value_type.llvm_type(ctx);
             let func_type = ctx.void_type().fn_type(&[], false);
             let func = llvm_mod.add_function(
-                &format!("flush_ree_{}", ty),
+                &format!("flush_ree_{}_{}", K::DATA_TYPE, value_type),
                 func_type,
                 Some(Linkage::Private),
             );
@@ -305,12 +357,12 @@ impl<'a, K: RunEndIndexType, VW: ArrayWriter<'a>> ArrayWriter<'a> for REEWriter<
                 .unwrap()
                 .into_pointer_value();
             let curr_run_end_ptr =
-                increment_pointer!(ctx, b2, alloc_ptr, Self::Allocation::OFFSET_CURR_RUN_END);
+                increment_pointer!(ctx, b2, alloc_ptr, REEAllocation::OFFSET_CURR_RUN_END);
             let curr_run_end = b2
                 .build_load(i64_type, curr_run_end_ptr, "curr_run_end")
                 .unwrap()
                 .into_int_value();
-            let cmp = b2
+            let is_empty = b2
                 .build_int_compare(
                     IntPredicate::EQ,
                     curr_run_end,
@@ -318,12 +370,12 @@ impl<'a, K: RunEndIndexType, VW: ArrayWriter<'a>> ArrayWriter<'a> for REEWriter<
                     "no_value",
                 )
                 .unwrap();
-            b2.build_conditional_branch(cmp, no_value, has_value)
+            b2.build_conditional_branch(is_empty, no_value, has_value)
                 .unwrap();
 
             b2.position_at_end(has_value);
             let last_val_ptr =
-                increment_pointer!(ctx, b2, alloc_ptr, Self::Allocation::OFFSET_LAST_VAL);
+                increment_pointer!(ctx, b2, alloc_ptr, REEAllocation::OFFSET_LAST_VAL);
             let last_val_ptr = b2
                 .build_load(ptr_type, last_val_ptr, "last_val_ptr")
                 .unwrap()
@@ -335,13 +387,13 @@ impl<'a, K: RunEndIndexType, VW: ArrayWriter<'a>> ArrayWriter<'a> for REEWriter<
                 .build_int_truncate_or_bit_cast(curr_run_end, llvm_run_end_type, "casted_run_end")
                 .unwrap();
             let last_val = b2.build_load(llvm_ty, last_val_ptr, "last_val").unwrap();
-            re_writer.llvm_ingest(ctx, &b2, converted_run_end.into());
-            val_writer.llvm_ingest(ctx, &b2, last_val);
+            run_end_writer.llvm_ingest(ctx, &b2, converted_run_end.into());
+            value_writer.llvm_ingest(ctx, &b2, last_val);
             b2.build_unconditional_branch(no_value).unwrap();
 
             b2.position_at_end(no_value);
-            re_writer.llvm_flush(ctx, &b2);
-            val_writer.llvm_flush(ctx, &b2);
+            run_end_writer.llvm_flush(ctx, &b2);
+            value_writer.llvm_flush(ctx, &b2);
             b2.build_return(None).unwrap();
             func
         };
@@ -349,36 +401,8 @@ impl<'a, K: RunEndIndexType, VW: ArrayWriter<'a>> ArrayWriter<'a> for REEWriter<
         Self {
             ingest_func,
             flush_func,
-            pt: ty,
-            _phantom1: PhantomData,
-            _phantom2: PhantomData,
+            pt: value_type,
         }
-    }
-
-    fn llvm_ingest_type(
-        &self,
-        ctx: &'a inkwell::context::Context,
-    ) -> inkwell::types::BasicTypeEnum<'a> {
-        self.pt.llvm_type(ctx)
-    }
-
-    fn llvm_ingest(
-        &self,
-        _ctx: &'a inkwell::context::Context,
-        build: &inkwell::builder::Builder<'a>,
-        val: inkwell::values::BasicValueEnum<'a>,
-    ) {
-        build
-            .build_call(self.ingest_func, &[val.into()], "ingest_ree")
-            .unwrap();
-    }
-
-    fn llvm_flush(
-        &self,
-        _ctx: &'a inkwell::context::Context,
-        build: &inkwell::builder::Builder<'a>,
-    ) {
-        build.build_call(self.flush_func, &[], "flush").unwrap();
     }
 }
 
@@ -386,17 +410,14 @@ impl<'a, K: RunEndIndexType, VW: ArrayWriter<'a>> ArrayWriter<'a> for REEWriter<
 mod tests {
     use std::ffi::c_void;
 
-    use arrow_array::{
-        types::{Int32Type, Int64Type},
-        BinaryArray, Int32Array,
-    };
+    use arrow_array::{cast::AsArray, types::Int32Type, BinaryArray, Int32Array, RunArray};
     use inkwell::{context::Context, AddressSpace, OptimizationLevel};
     use itertools::Itertools;
 
-    use super::{ArrayWriter, PrimitiveArrayWriter, REEWriter, WriterAllocation};
     use crate::{
-        compiled_kernels::link_req_helpers, compiled_writers::StringArrayWriter, declare_blocks,
-        PrimitiveType,
+        compiled_kernels::link_req_helpers,
+        compiled_writers::{RunEndType, WriterSpec},
+        declare_blocks, PrimitiveType,
     };
 
     #[test]
@@ -406,6 +427,10 @@ mod tests {
         let llvm_mod = ctx.create_module("test_primitive_array_writer");
         let build = ctx.create_builder();
         let ptr_type = ctx.ptr_type(AddressSpace::default());
+        let spec = WriterSpec::RunEndEncoded(
+            RunEndType::Int32,
+            Box::new(WriterSpec::Primitive(PrimitiveType::I32)),
+        );
 
         let func = llvm_mod.add_function(
             "test",
@@ -416,15 +441,9 @@ mod tests {
         declare_blocks!(ctx, func, entry);
         build.position_at_end(entry);
         let dest = func.get_nth_param(0).unwrap().into_pointer_value();
-        let writer = REEWriter::<Int32Type, PrimitiveArrayWriter>::llvm_init(
-            &ctx,
-            &llvm_mod,
-            &build,
-            crate::PrimitiveType::I32,
-            dest,
-        );
+        let writer = spec.llvm_init(&ctx, &llvm_mod, &build, dest);
 
-        for el in data.iter() {
+        for el in &data {
             writer.llvm_ingest(
                 &ctx,
                 &build,
@@ -445,9 +464,7 @@ mod tests {
                 .unwrap()
         };
 
-        let mut alloc =
-            REEWriter::<Int32Type, PrimitiveArrayWriter>::allocate(100, PrimitiveType::I32);
-
+        let mut alloc = spec.allocate(100);
         unsafe {
             f.call(alloc.get_ptr());
         }
@@ -455,7 +472,8 @@ mod tests {
         unsafe {
             f.call(alloc.get_ptr());
         }
-        let ree = alloc.to_array(2 * data.len(), None);
+        let ree = alloc.into_array_ref_with_len(2 * data.len(), None);
+        let ree = ree.as_any().downcast_ref::<RunArray<Int32Type>>().unwrap();
         let ree = ree.downcast::<Int32Array>().unwrap();
         let ree_vec = ree.into_iter().map(|x| x.unwrap()).collect_vec();
         assert_eq!(
@@ -470,6 +488,10 @@ mod tests {
         let llvm_mod = ctx.create_module("test_primitive_array_writer");
         let build = ctx.create_builder();
         let ptr_type = ctx.ptr_type(AddressSpace::default());
+        let spec = WriterSpec::RunEndEncoded(
+            RunEndType::Int64,
+            Box::new(WriterSpec::Primitive(PrimitiveType::I32)),
+        );
 
         let func = llvm_mod.add_function(
             "test",
@@ -482,13 +504,7 @@ mod tests {
         build.position_at_end(entry);
         let dest = func.get_nth_param(0).unwrap().into_pointer_value();
         let val = func.get_nth_param(1).unwrap().into_int_value();
-        let writer = REEWriter::<Int32Type, PrimitiveArrayWriter>::llvm_init(
-            &ctx,
-            &llvm_mod,
-            &build,
-            crate::PrimitiveType::I32,
-            dest,
-        );
+        let writer = spec.llvm_init(&ctx, &llvm_mod, &build, dest);
 
         writer.llvm_ingest(&ctx, &build, val.into());
         build.build_return(None).unwrap();
@@ -506,59 +522,66 @@ mod tests {
             .unwrap()
         };
 
-        let mut data =
-            REEWriter::<Int64Type, PrimitiveArrayWriter>::allocate(100, PrimitiveType::I32);
+        let mut alloc = spec.allocate(100);
 
         unsafe {
-            f.call(data.get_ptr(), 1);
+            f.call(alloc.get_ptr(), 1);
         }
-        assert_eq!(data.curr_run_end, 1);
-        assert_eq!(
-            i32::from_le_bytes(data.last_val[0..4].try_into().unwrap()),
-            1
-        );
-        assert_eq!(data.num_unique, 1);
+        match &alloc {
+            crate::compiled_writers::WriterAllocation::RunEndEncoded(alloc) => {
+                assert_eq!(alloc.curr_run_end, 1);
+                assert_eq!(i32::from_le_bytes(alloc.last_val[0..4].try_into().unwrap()), 1);
+                assert_eq!(alloc.num_unique, 1);
+            }
+            _ => unreachable!(),
+        }
 
         unsafe {
-            f.call(data.get_ptr(), 1);
+            f.call(alloc.get_ptr(), 1);
         }
-        assert_eq!(data.curr_run_end, 2);
-        assert_eq!(
-            i32::from_le_bytes(data.last_val[0..4].try_into().unwrap()),
-            1
-        );
-        assert_eq!(data.num_unique, 1);
+        match &alloc {
+            crate::compiled_writers::WriterAllocation::RunEndEncoded(alloc) => {
+                assert_eq!(alloc.curr_run_end, 2);
+                assert_eq!(i32::from_le_bytes(alloc.last_val[0..4].try_into().unwrap()), 1);
+                assert_eq!(alloc.num_unique, 1);
+            }
+            _ => unreachable!(),
+        }
 
         unsafe {
-            f.call(data.get_ptr(), 1);
+            f.call(alloc.get_ptr(), 1);
         }
-        assert_eq!(data.curr_run_end, 3);
-        assert_eq!(
-            i32::from_le_bytes(data.last_val[0..4].try_into().unwrap()),
-            1
-        );
-        assert_eq!(data.num_unique, 1);
+        match &alloc {
+            crate::compiled_writers::WriterAllocation::RunEndEncoded(alloc) => {
+                assert_eq!(alloc.curr_run_end, 3);
+                assert_eq!(i32::from_le_bytes(alloc.last_val[0..4].try_into().unwrap()), 1);
+                assert_eq!(alloc.num_unique, 1);
+            }
+            _ => unreachable!(),
+        }
 
         unsafe {
-            f.call(data.get_ptr(), 2);
+            f.call(alloc.get_ptr(), 2);
         }
-        assert_eq!(data.curr_run_end, 4);
-        assert_eq!(
-            i32::from_le_bytes(data.last_val[0..4].try_into().unwrap()),
-            2
-        );
-        assert_eq!(data.num_unique, 2);
+        match &alloc {
+            crate::compiled_writers::WriterAllocation::RunEndEncoded(alloc) => {
+                assert_eq!(alloc.curr_run_end, 4);
+                assert_eq!(i32::from_le_bytes(alloc.last_val[0..4].try_into().unwrap()), 2);
+                assert_eq!(alloc.num_unique, 2);
+            }
+            _ => unreachable!(),
+        }
     }
 
     #[test]
     fn test_ree_writer_str_full() {
         let data: Vec<&str> = vec!["hello", "this", "this", "is", "is", "a test"];
-
         let ctx = Context::create();
         let i64_type = ctx.i64_type();
         let llvm_mod = ctx.create_module("test_array_writer");
         let build = ctx.create_builder();
         let ptr_type = ctx.ptr_type(AddressSpace::default());
+        let spec = WriterSpec::RunEndEncoded(RunEndType::Int32, Box::new(WriterSpec::String));
 
         let func = llvm_mod.add_function(
             "test",
@@ -569,15 +592,9 @@ mod tests {
         declare_blocks!(ctx, func, entry);
         build.position_at_end(entry);
         let dest = func.get_nth_param(0).unwrap().into_pointer_value();
-        let writer = REEWriter::<Int32Type, StringArrayWriter<i32>>::llvm_init(
-            &ctx,
-            &llvm_mod,
-            &build,
-            PrimitiveType::P64x2,
-            dest,
-        );
+        let writer = spec.llvm_init(&ctx, &llvm_mod, &build, dest);
 
-        for el in data.iter() {
+        for el in &data {
             let start = el.as_ptr();
             let end = start.wrapping_add(el.len());
             let px2 = PrimitiveType::P64x2
@@ -603,8 +620,7 @@ mod tests {
                 .unwrap()
         };
 
-        let mut alloc =
-            REEWriter::<Int32Type, StringArrayWriter<i32>>::allocate(100, PrimitiveType::P64x2);
+        let mut alloc = spec.allocate(100);
 
         unsafe {
             f.call(alloc.get_ptr());
@@ -613,7 +629,8 @@ mod tests {
         unsafe {
             f.call(alloc.get_ptr());
         }
-        let ree = alloc.to_array(2 * data.len(), None);
+        let ree = alloc.into_array_ref_with_len(2 * data.len(), None);
+        let ree = ree.as_any().downcast_ref::<RunArray<Int32Type>>().unwrap();
         let ree = ree.downcast::<BinaryArray>().unwrap();
         let ree_vec = ree
             .into_iter()
@@ -623,5 +640,63 @@ mod tests {
             ree_vec,
             data.iter().chain(data.iter()).copied().collect_vec()
         );
+    }
+
+    #[test]
+    fn test_ree_writer_to_array_ref_uses_logical_len() {
+        let data: Vec<i32> = vec![1, 1, 1, 2, 3, 3, 4, 4, 4, 4, 50];
+        let ctx = Context::create();
+        let llvm_mod = ctx.create_module("test_ree_writer_to_array_ref");
+        let build = ctx.create_builder();
+        let ptr_type = ctx.ptr_type(AddressSpace::default());
+        let spec = WriterSpec::RunEndEncoded(
+            RunEndType::Int32,
+            Box::new(WriterSpec::Primitive(PrimitiveType::I32)),
+        );
+
+        let func = llvm_mod.add_function(
+            "test",
+            ctx.void_type().fn_type(&[ptr_type.into()], false),
+            None,
+        );
+
+        declare_blocks!(ctx, func, entry);
+        build.position_at_end(entry);
+        let dest = func.get_nth_param(0).unwrap().into_pointer_value();
+        let writer = spec.llvm_init(&ctx, &llvm_mod, &build, dest);
+
+        for el in &data {
+            writer.llvm_ingest(
+                &ctx,
+                &build,
+                ctx.i32_type().const_int(*el as u64, true).into(),
+            );
+        }
+        writer.llvm_flush(&ctx, &build);
+        build.build_return(None).unwrap();
+
+        llvm_mod.verify().unwrap();
+        let ee = llvm_mod
+            .create_jit_execution_engine(OptimizationLevel::None)
+            .unwrap();
+        link_req_helpers(&llvm_mod, &ee).unwrap();
+
+        let f = unsafe {
+            ee.get_function::<unsafe extern "C" fn(*mut c_void)>(func.get_name().to_str().unwrap())
+                .unwrap()
+        };
+
+        let mut alloc = spec.allocate(data.len());
+
+        unsafe {
+            f.call(alloc.get_ptr());
+        }
+
+        let ree = alloc.into_array_ref(None);
+        let ree = ree.as_any().downcast_ref::<RunArray<Int32Type>>().unwrap();
+        let ree = ree.downcast::<Int32Array>().unwrap();
+        let ree_vec = ree.into_iter().map(|x| x.unwrap()).collect_vec();
+
+        assert_eq!(ree_vec, data);
     }
 }

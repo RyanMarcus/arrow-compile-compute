@@ -1,9 +1,13 @@
-use std::{ffi::c_void, marker::PhantomData, sync::Arc};
+use std::{ffi::c_void, sync::Arc};
 
 use arrow_array::{
-    cast::AsArray, make_array, types::ArrowDictionaryKeyType, Array, ArrayRef, DictionaryArray,
+    cast::AsArray,
+    types::{
+        ArrowDictionaryKeyType, Int16Type, Int32Type, Int64Type, Int8Type, UInt16Type, UInt32Type,
+        UInt64Type, UInt8Type,
+    },
+    ArrayRef, DictionaryArray,
 };
-
 use inkwell::{
     module::Linkage,
     values::{FunctionValue, PointerValue},
@@ -11,8 +15,10 @@ use inkwell::{
 };
 use repr_offset::ReprOffset;
 
-use super::array_writer::ArrayOutput;
-use super::{ArrayWriter, PrimitiveArrayWriter, WriterAllocation};
+use super::{
+    ArrayOutput, DictionaryKeyType, LeafWriter, LeafWriterAllocation, PrimitiveArrayWriter,
+    WriterAllocation, WriterSpec,
+};
 use crate::{
     compiled_kernels::ht::{generate_hash_func, generate_lookup_or_insert, TicketTable},
     declare_blocks, increment_pointer, PrimitiveType,
@@ -21,88 +27,166 @@ use crate::{
 #[repr(C)]
 #[derive(ReprOffset)]
 #[roff(usize_offsets)]
-pub struct DictAllocation<'a, K: ArrowDictionaryKeyType, VW: ArrayWriter<'a>> {
+pub struct DictAllocation {
     tt: TicketTable,
     keys_ptr: *mut c_void,
     values_ptr: *mut c_void,
     keys: Box<ArrayOutput>,
-    values: Box<VW::Allocation>,
-
-    #[roff(offset = "OFFSET_MARKER")]
-    _marker: PhantomData<K>,
+    values: Box<WriterAllocation>,
+    key_type: DictionaryKeyType,
 }
 
-impl<'a, K: ArrowDictionaryKeyType, VW: ArrayWriter<'a>> WriterAllocation
-    for DictAllocation<'a, K, VW>
-{
-    type Output = DictionaryArray<K>;
+impl DictAllocation {
+    pub fn allocate(expected_count: usize, key_type: DictionaryKeyType, value_spec: &WriterSpec) -> Self {
+        let mut keys = Box::new(PrimitiveArrayWriter::allocate(
+            expected_count,
+            key_type.primitive_type(),
+        ));
+        let mut values = Box::new(value_spec.allocate(expected_count));
+        Self {
+            tt: TicketTable::new(
+                expected_count * 2,
+                value_spec.storage_type().as_arrow_type(),
+                key_type.data_type(),
+            ),
+            keys_ptr: keys.get_ptr(),
+            values_ptr: values.get_ptr(),
+            keys,
+            values,
+            key_type,
+        }
+    }
 
-    fn get_ptr(&mut self) -> *mut c_void {
+    pub fn get_ptr(&mut self) -> *mut c_void {
         self as *mut Self as *mut c_void
     }
 
-    fn reserve_for_additional(&mut self, count: usize) {
+    pub fn reserve_for_additional(&mut self, count: usize) {
         self.keys.reserve_for_additional(count);
         self.values.reserve_for_additional(count);
-
         self.keys_ptr = self.keys.get_ptr();
         self.values_ptr = self.values.get_ptr();
     }
 
-    fn to_array(self, len: usize, nulls: Option<arrow_buffer::NullBuffer>) -> Self::Output {
-        let keys = self.keys.to_array(len, nulls);
-        let keys = keys.as_primitive::<K>().clone();
-        let values = make_array(self.values.to_array(self.tt.len(), None).to_data());
-        unsafe { DictionaryArray::<K>::new_unchecked(keys, values) }
+    pub fn len(&self) -> usize {
+        self.keys.len()
     }
 
-    fn to_array_ref(self, nulls: Option<arrow_buffer::NullBuffer>) -> ArrayRef {
-        let len = self.len();
-        Arc::new(self.to_array(len, nulls))
-    }
-
-    fn len(&self) -> usize {
-        self.values.len()
-    }
-}
-
-pub struct DictWriter<'a, K: ArrowDictionaryKeyType, VW: ArrayWriter<'a>> {
-    ht_ptr: PointerValue<'a>,
-    ingest_func: FunctionValue<'a>,
-    pt: PrimitiveType,
-    _phantom1: std::marker::PhantomData<K>,
-    _phantom2: std::marker::PhantomData<VW>,
-}
-
-impl<'a, K: ArrowDictionaryKeyType, VW: ArrayWriter<'a>> ArrayWriter<'a> for DictWriter<'a, K, VW> {
-    type Allocation = DictAllocation<'a, K, VW>;
-
-    fn allocate(expected_count: usize, ty: PrimitiveType) -> Self::Allocation {
-        let tt = TicketTable::new(expected_count * 2, ty.as_arrow_type(), K::DATA_TYPE);
-        let mut kw = Box::new(PrimitiveArrayWriter::allocate(
-            expected_count,
-            PrimitiveType::for_arrow_type(&K::DATA_TYPE),
-        ));
-        let mut vw = Box::new(VW::allocate(expected_count, ty));
-        DictAllocation {
-            tt,
-            keys_ptr: kw.get_ptr(),
-            values_ptr: vw.get_ptr(),
-            keys: kw,
-            values: vw,
-            _marker: PhantomData,
+    pub fn into_array_ref_with_len(self, len: usize, nulls: Option<arrow_buffer::NullBuffer>) -> ArrayRef {
+        match self.key_type {
+            DictionaryKeyType::Int8 => Arc::new(self.into_typed_array::<Int8Type>(len, nulls)),
+            DictionaryKeyType::Int16 => Arc::new(self.into_typed_array::<Int16Type>(len, nulls)),
+            DictionaryKeyType::Int32 => Arc::new(self.into_typed_array::<Int32Type>(len, nulls)),
+            DictionaryKeyType::Int64 => Arc::new(self.into_typed_array::<Int64Type>(len, nulls)),
+            DictionaryKeyType::UInt8 => Arc::new(self.into_typed_array::<UInt8Type>(len, nulls)),
+            DictionaryKeyType::UInt16 => Arc::new(self.into_typed_array::<UInt16Type>(len, nulls)),
+            DictionaryKeyType::UInt32 => Arc::new(self.into_typed_array::<UInt32Type>(len, nulls)),
+            DictionaryKeyType::UInt64 => Arc::new(self.into_typed_array::<UInt64Type>(len, nulls)),
         }
     }
 
-    fn llvm_init(
+    pub fn into_array_ref(self, nulls: Option<arrow_buffer::NullBuffer>) -> ArrayRef {
+        let len = self.len();
+        self.into_array_ref_with_len(len, nulls)
+    }
+
+    fn into_typed_array<K: ArrowDictionaryKeyType>(
+        self,
+        len: usize,
+        nulls: Option<arrow_buffer::NullBuffer>,
+    ) -> DictionaryArray<K> {
+        let keys = (*self.keys).to_array(len, nulls);
+        let keys = keys.as_primitive::<K>().clone();
+        let values = self
+            .values
+            .into_array_ref_with_len(self.tt.len(), None);
+        unsafe { DictionaryArray::<K>::new_unchecked(keys, values) }
+    }
+}
+
+pub struct DictWriter<'a> {
+    ht_ptr: PointerValue<'a>,
+    ingest_func: FunctionValue<'a>,
+    pt: PrimitiveType,
+}
+
+impl<'a> DictWriter<'a> {
+    pub fn llvm_init(
         ctx: &'a inkwell::context::Context,
         llvm_mod: &inkwell::module::Module<'a>,
         build: &inkwell::builder::Builder<'a>,
-        ty: PrimitiveType,
+        key_type: DictionaryKeyType,
+        value_spec: &WriterSpec,
+        alloc_ptr: inkwell::values::PointerValue<'a>,
+    ) -> Self {
+        match key_type {
+            DictionaryKeyType::Int8 => {
+                Self::llvm_init_typed::<Int8Type>(ctx, llvm_mod, build, value_spec, alloc_ptr)
+            }
+            DictionaryKeyType::Int16 => {
+                Self::llvm_init_typed::<Int16Type>(ctx, llvm_mod, build, value_spec, alloc_ptr)
+            }
+            DictionaryKeyType::Int32 => {
+                Self::llvm_init_typed::<Int32Type>(ctx, llvm_mod, build, value_spec, alloc_ptr)
+            }
+            DictionaryKeyType::Int64 => {
+                Self::llvm_init_typed::<Int64Type>(ctx, llvm_mod, build, value_spec, alloc_ptr)
+            }
+            DictionaryKeyType::UInt8 => {
+                Self::llvm_init_typed::<UInt8Type>(ctx, llvm_mod, build, value_spec, alloc_ptr)
+            }
+            DictionaryKeyType::UInt16 => {
+                Self::llvm_init_typed::<UInt16Type>(ctx, llvm_mod, build, value_spec, alloc_ptr)
+            }
+            DictionaryKeyType::UInt32 => {
+                Self::llvm_init_typed::<UInt32Type>(ctx, llvm_mod, build, value_spec, alloc_ptr)
+            }
+            DictionaryKeyType::UInt64 => {
+                Self::llvm_init_typed::<UInt64Type>(ctx, llvm_mod, build, value_spec, alloc_ptr)
+            }
+        }
+    }
+
+    pub fn llvm_ingest_type(
+        &self,
+        ctx: &'a inkwell::context::Context,
+    ) -> inkwell::types::BasicTypeEnum<'a> {
+        self.pt.llvm_type(ctx)
+    }
+
+    pub fn llvm_ingest(
+        &self,
+        _ctx: &'a inkwell::context::Context,
+        build: &inkwell::builder::Builder<'a>,
+        val: inkwell::values::BasicValueEnum<'a>,
+    ) {
+        build
+            .build_call(
+                self.ingest_func,
+                &[self.ht_ptr.into(), val.into()],
+                "dict_ingest",
+            )
+            .unwrap();
+    }
+
+    pub fn llvm_flush(
+        &self,
+        _ctx: &'a inkwell::context::Context,
+        _build: &inkwell::builder::Builder<'a>,
+    ) {
+        // no-op for dictionary writers
+    }
+
+    fn llvm_init_typed<K: ArrowDictionaryKeyType>(
+        ctx: &'a inkwell::context::Context,
+        llvm_mod: &inkwell::module::Module<'a>,
+        build: &inkwell::builder::Builder<'a>,
+        value_spec: &WriterSpec,
         alloc_ptr: inkwell::values::PointerValue<'a>,
     ) -> Self {
         let ptr_type = ctx.ptr_type(AddressSpace::default());
-        let kw = PrimitiveArrayWriter::llvm_init(
+        let value_type = value_spec.storage_type();
+        let key_writer = PrimitiveArrayWriter::llvm_init(
             ctx,
             llvm_mod,
             build,
@@ -110,51 +194,39 @@ impl<'a, K: ArrowDictionaryKeyType, VW: ArrayWriter<'a>> ArrayWriter<'a> for Dic
             build
                 .build_load(
                     ptr_type,
-                    increment_pointer!(
-                        ctx,
-                        build,
-                        alloc_ptr,
-                        DictAllocation::<K, VW>::OFFSET_KEYS_PTR
-                    ),
+                    increment_pointer!(ctx, build, alloc_ptr, DictAllocation::OFFSET_KEYS_PTR),
                     "keys_ptr",
                 )
                 .unwrap()
                 .into_pointer_value(),
         );
-        let vw_ptr = build
+        let value_writer_ptr = build
             .build_load(
                 ptr_type,
-                increment_pointer!(
-                    ctx,
-                    build,
-                    alloc_ptr,
-                    DictAllocation::<K, VW>::OFFSET_VALUES_PTR
-                ),
+                increment_pointer!(ctx, build, alloc_ptr, DictAllocation::OFFSET_VALUES_PTR),
                 "values_ptr",
             )
             .unwrap()
             .into_pointer_value();
-        let vw = VW::llvm_init(ctx, llvm_mod, build, ty, vw_ptr);
+        let value_writer = value_spec.llvm_init(ctx, llvm_mod, build, value_writer_ptr);
 
-        let i8_type = ctx.i8_type();
-
-        let dummy_ht = TicketTable::new(0, ty.as_arrow_type(), K::DATA_TYPE);
-        let hash_func = generate_hash_func(ctx, llvm_mod, ty);
+        let dummy_ht = TicketTable::new(0, value_type.as_arrow_type(), K::DATA_TYPE);
+        let hash_func = generate_hash_func(ctx, llvm_mod, value_type);
         let ht_lookup = generate_lookup_or_insert(ctx, llvm_mod, &dummy_ht);
-
-        let ht_ptr = increment_pointer!(ctx, build, alloc_ptr, DictAllocation::<K, VW>::OFFSET_TT);
+        let ht_ptr = increment_pointer!(ctx, build, alloc_ptr, DictAllocation::OFFSET_TT);
+        let i8_type = ctx.i8_type();
 
         let ingest_func = {
             let b = ctx.create_builder();
             let func_type = ctx.bool_type().fn_type(
-                &[
-                    ptr_type.into(),          // pointer to HT
-                    ty.llvm_type(ctx).into(), // value to ingest
-                ],
+                &[ptr_type.into(), value_type.llvm_type(ctx).into()],
                 false,
             );
-            let func =
-                llvm_mod.add_function("dict_writer_ingest", func_type, Some(Linkage::Private));
+            let func = llvm_mod.add_function(
+                &format!("dict_writer_ingest_{}_{}", K::DATA_TYPE, value_type),
+                func_type,
+                Some(Linkage::Private),
+            );
 
             let ht_ptr = func.get_nth_param(0).unwrap().into_pointer_value();
             let value = func.get_nth_param(1).unwrap();
@@ -194,13 +266,13 @@ impl<'a, K: ArrowDictionaryKeyType, VW: ArrayWriter<'a>> ArrayWriter<'a> for Dic
             .unwrap();
 
             b.position_at_end(not_new);
-            kw.llvm_ingest(ctx, &b, ticket_val.into());
+            key_writer.llvm_ingest(ctx, &b, ticket_val.into());
             b.build_return(Some(&ctx.bool_type().const_int(1, false)))
                 .unwrap();
 
             b.position_at_end(is_new);
-            kw.llvm_ingest(ctx, &b, ticket_val.into());
-            vw.llvm_ingest(ctx, &b, value);
+            key_writer.llvm_ingest(ctx, &b, ticket_val.into());
+            value_writer.llvm_ingest(ctx, &b, value);
             b.build_return(Some(&ctx.bool_type().const_int(1, false)))
                 .unwrap();
 
@@ -211,43 +283,11 @@ impl<'a, K: ArrowDictionaryKeyType, VW: ArrayWriter<'a>> ArrayWriter<'a> for Dic
             func
         };
 
-        DictWriter {
+        Self {
             ht_ptr,
             ingest_func,
-            pt: ty,
-            _phantom1: std::marker::PhantomData,
-            _phantom2: std::marker::PhantomData,
+            pt: value_type,
         }
-    }
-
-    fn llvm_ingest_type(
-        &self,
-        ctx: &'a inkwell::context::Context,
-    ) -> inkwell::types::BasicTypeEnum<'a> {
-        self.pt.llvm_type(ctx)
-    }
-
-    fn llvm_ingest(
-        &self,
-        _ctx: &'a inkwell::context::Context,
-        build: &inkwell::builder::Builder<'a>,
-        val: inkwell::values::BasicValueEnum<'a>,
-    ) {
-        build
-            .build_call(
-                self.ingest_func,
-                &[self.ht_ptr.into(), val.into()],
-                "dict_ingest",
-            )
-            .unwrap();
-    }
-
-    fn llvm_flush(
-        &self,
-        _ctx: &'a inkwell::context::Context,
-        _build: &inkwell::builder::Builder<'a>,
-    ) {
-        // no-op for dictionary writer
     }
 }
 
@@ -255,12 +295,15 @@ impl<'a, K: ArrowDictionaryKeyType, VW: ArrayWriter<'a>> ArrayWriter<'a> for Dic
 mod tests {
     use std::ffi::c_void;
 
-    use arrow_array::{types::Int8Type, Int32Array};
+    use arrow_array::{cast::AsArray, types::Int8Type, Int32Array};
     use inkwell::{context::Context, AddressSpace, OptimizationLevel};
     use itertools::Itertools;
 
-    use super::{ArrayWriter, DictWriter, PrimitiveArrayWriter, WriterAllocation};
-    use crate::{compiled_kernels::link_req_helpers, declare_blocks, PrimitiveType};
+    use crate::{
+        compiled_kernels::link_req_helpers,
+        compiled_writers::{DictionaryKeyType, WriterSpec},
+        declare_blocks, PrimitiveType,
+    };
 
     #[test]
     fn test_dict_writer() {
@@ -268,6 +311,10 @@ mod tests {
         let llvm_mod = ctx.create_module("test_primitive_array_writer");
         let build = ctx.create_builder();
         let ptr_type = ctx.ptr_type(AddressSpace::default());
+        let spec = WriterSpec::Dictionary(
+            DictionaryKeyType::Int8,
+            Box::new(WriterSpec::Primitive(PrimitiveType::I32)),
+        );
 
         let func = llvm_mod.add_function(
             "test",
@@ -278,13 +325,7 @@ mod tests {
         declare_blocks!(ctx, func, entry);
         build.position_at_end(entry);
         let dest = func.get_nth_param(0).unwrap().into_pointer_value();
-        let writer = DictWriter::<Int8Type, PrimitiveArrayWriter>::llvm_init(
-            &ctx,
-            &llvm_mod,
-            &build,
-            PrimitiveType::I32,
-            dest,
-        );
+        let writer = spec.llvm_init(&ctx, &llvm_mod, &build, dest);
 
         let mut expected = Vec::new();
         for _ in 0..10 {
@@ -308,8 +349,7 @@ mod tests {
                 .unwrap()
         };
 
-        let mut data =
-            DictWriter::<Int8Type, PrimitiveArrayWriter>::allocate(100, PrimitiveType::I32);
+        let mut data = spec.allocate(100);
         unsafe {
             f.call(data.get_ptr());
         }
@@ -318,8 +358,70 @@ mod tests {
             f.call(data.get_ptr());
         }
         expected.extend(expected.clone());
-        let data = data.to_array(200, None);
-        let data = data.downcast_dict::<Int32Array>().unwrap();
+        let data = data.into_array_ref_with_len(200, None);
+        let data = data
+            .as_dictionary::<Int8Type>()
+            .downcast_dict::<Int32Array>()
+            .unwrap();
+        let data: Vec<i32> = data.into_iter().map(|x| x.unwrap()).collect_vec();
+
+        assert_eq!(data, expected);
+    }
+
+    #[test]
+    fn test_dict_writer_to_array_ref_uses_logical_len() {
+        let ctx = Context::create();
+        let llvm_mod = ctx.create_module("test_dict_writer_to_array_ref");
+        let build = ctx.create_builder();
+        let ptr_type = ctx.ptr_type(AddressSpace::default());
+        let spec = WriterSpec::Dictionary(
+            DictionaryKeyType::Int8,
+            Box::new(WriterSpec::Primitive(PrimitiveType::I32)),
+        );
+
+        let func = llvm_mod.add_function(
+            "test",
+            ctx.void_type().fn_type(&[ptr_type.into()], false),
+            None,
+        );
+
+        declare_blocks!(ctx, func, entry);
+        build.position_at_end(entry);
+        let dest = func.get_nth_param(0).unwrap().into_pointer_value();
+        let writer = spec.llvm_init(&ctx, &llvm_mod, &build, dest);
+
+        let mut expected = Vec::new();
+        for _ in 0..2 {
+            for i in 1000..1003 {
+                writer.llvm_ingest(&ctx, &build, ctx.i32_type().const_int(i, true).into());
+                expected.push(i as i32);
+            }
+        }
+
+        writer.llvm_flush(&ctx, &build);
+        build.build_return(None).unwrap();
+
+        llvm_mod.verify().unwrap();
+        let ee = llvm_mod
+            .create_jit_execution_engine(OptimizationLevel::None)
+            .unwrap();
+        link_req_helpers(&llvm_mod, &ee).unwrap();
+
+        let f = unsafe {
+            ee.get_function::<unsafe extern "C" fn(*mut c_void)>(func.get_name().to_str().unwrap())
+                .unwrap()
+        };
+
+        let mut data = spec.allocate(expected.len());
+        unsafe {
+            f.call(data.get_ptr());
+        }
+
+        let data = data.into_array_ref(None);
+        let data = data
+            .as_dictionary::<Int8Type>()
+            .downcast_dict::<Int32Array>()
+            .unwrap();
         let data: Vec<i32> = data.into_iter().map(|x| x.unwrap()).collect_vec();
 
         assert_eq!(data, expected);

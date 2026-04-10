@@ -2292,11 +2292,7 @@ pub fn get_iterator_length<'a>(
             let values_ptr = arr.llvm_val_iter_ptr(ctx, builder, iter_ptr);
             get_iterator_length(ctx, builder, values, values_ptr)
         }
-        IteratorHolder::RunEnd {
-            arr,
-            run_ends,
-            values,
-        } => None,
+        IteratorHolder::RunEnd { .. } => None,
         IteratorHolder::FixedSizeList(iter) => Some(iter.llvm_len(ctx, builder, iter_ptr)),
         IteratorHolder::ScalarPrimitive(..) => None,
         IteratorHolder::ScalarString(..) => None,

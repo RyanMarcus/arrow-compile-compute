@@ -13,7 +13,7 @@ use inkwell::{
 };
 use repr_offset::ReprOffset;
 
-use super::{ArrayWriter, WriterAllocation};
+use super::{LeafWriter, LeafWriterAllocation};
 
 /// Writer for primitive arrays (ints and floats).
 pub struct PrimitiveArrayWriter<'a> {
@@ -31,7 +31,7 @@ pub struct ArrayOutput {
     pt: PrimitiveType,
 }
 
-impl WriterAllocation for ArrayOutput {
+impl LeafWriterAllocation for ArrayOutput {
     type Output = ArrayRef;
 
     fn get_ptr(&mut self) -> *mut c_void {
@@ -108,7 +108,7 @@ impl ArrayOutput {
     }
 }
 
-impl<'a> ArrayWriter<'a> for PrimitiveArrayWriter<'a> {
+impl<'a> LeafWriter<'a> for PrimitiveArrayWriter<'a> {
     type Allocation = ArrayOutput;
     fn allocate(expected_count: usize, ty: PrimitiveType) -> Self::Allocation {
         let mut data = vec![0_u128; (ty.width() * expected_count).div_ceil(16)];
@@ -231,7 +231,7 @@ impl<'a> PrimitiveArrayWriter<'a> {
 mod tests {
     use super::PrimitiveArrayWriter;
     use crate::{
-        compiled_writers::{ArrayWriter, WriterAllocation},
+        compiled_writers::{LeafWriter, LeafWriterAllocation},
         declare_blocks, PrimitiveType,
     };
     use arrow_array::{

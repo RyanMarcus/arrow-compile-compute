@@ -1,34 +1,16 @@
 use std::ffi::c_void;
 
-use arrow_array::{ArrayRef, Datum};
+use arrow_array::ArrayRef;
 use arrow_buffer::NullBuffer;
-use inkwell::{
-    builder::Builder,
-    context::Context,
-    module::Module,
-    types::BasicTypeEnum,
-    values::{BasicValueEnum, PointerValue, VectorValue},
-};
+use inkwell::{builder::Builder, context::Context, module::Module, values::PointerValue};
 
 use crate::{
     compiled_kernels::dsl2::DSLType,
-    compiled_writers::{
-        ArrayOutput, ArrayWriter, BooleanAllocation, BooleanWriter, FixedSizeListWriter,
-        FixedSizeListWriterAlloc, PrimitiveArrayWriter, StringAllocation, StringArrayWriter,
-        StringViewAllocation, StringViewWriter, WriterAllocation,
-    },
-    ListItemType, PrimitiveType,
+    compiled_writers::{Writer, WriterAllocation},
+    PrimitiveType,
 };
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum WriterSpec {
-    Primitive(PrimitiveType),
-    Boolean,
-    String,
-    LargeString,
-    StringView,
-    FixedSizeList(ListItemType, usize),
-}
+pub use crate::compiled_writers::WriterSpec;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct OutputSpec {
@@ -44,8 +26,8 @@ impl OutputSpec {
         }
     }
 
-    pub fn spec(&self) -> WriterSpec {
-        self.spec
+    pub fn spec(&self) -> &WriterSpec {
+        &self.spec
     }
 
     pub fn length_tag(&self) -> &str {
@@ -53,58 +35,10 @@ impl OutputSpec {
     }
 
     pub fn allocate(&self, expected_count: usize) -> OutputSlot {
-        let alloc = match self.spec {
-            WriterSpec::Primitive(pt) => OutputWriterAllocation::Primitive(
-                PrimitiveArrayWriter::allocate(expected_count, pt),
-            ),
-            WriterSpec::Boolean => OutputWriterAllocation::Boolean(BooleanWriter::allocate(
-                expected_count,
-                self.spec.storage_type(),
-            )),
-            WriterSpec::String => OutputWriterAllocation::String(
-                StringArrayWriter::<i32>::allocate(expected_count, self.spec.storage_type()),
-            ),
-            WriterSpec::LargeString => OutputWriterAllocation::LargeString(
-                StringArrayWriter::<i64>::allocate(expected_count, self.spec.storage_type()),
-            ),
-            WriterSpec::StringView => OutputWriterAllocation::StringView(
-                StringViewWriter::allocate(expected_count, self.spec.storage_type()),
-            ),
-            WriterSpec::FixedSizeList(item, size) => OutputWriterAllocation::FixedSizeList(
-                FixedSizeListWriter::allocate(expected_count, PrimitiveType::List(item, size)),
-            ),
-        };
-
         OutputSlot {
-            spec: self.spec,
+            spec: self.spec.clone(),
             length_tag: self.length_tag.clone(),
-            alloc,
-        }
-    }
-}
-
-impl WriterSpec {
-    pub fn storage_type(self) -> PrimitiveType {
-        match self {
-            Self::Primitive(pt) => {
-                assert!(
-                    !matches!(pt, PrimitiveType::P64x2 | PrimitiveType::List(_, _)),
-                    "use a dedicated writer spec for strings and fixed-size lists",
-                );
-                pt
-            }
-            Self::Boolean => PrimitiveType::U8,
-            Self::String | Self::LargeString | Self::StringView => PrimitiveType::P64x2,
-            Self::FixedSizeList(item, size) => PrimitiveType::List(item, size),
-        }
-    }
-
-    pub fn for_base_type_of_datum(datum: &dyn Datum) -> Self {
-        let pt = PrimitiveType::for_arrow_type(datum.get().0.data_type());
-        match pt {
-            PrimitiveType::P64x2 => Self::String,
-            PrimitiveType::List(t, s) => Self::FixedSizeList(t, s),
-            _ => Self::Primitive(pt),
+            alloc: self.spec.allocate(expected_count),
         }
     }
 }
@@ -112,12 +46,12 @@ impl WriterSpec {
 pub struct OutputSlot {
     spec: WriterSpec,
     length_tag: String,
-    alloc: OutputWriterAllocation,
+    alloc: WriterAllocation,
 }
 
 impl OutputSlot {
-    pub fn spec(&self) -> WriterSpec {
-        self.spec
+    pub fn spec(&self) -> &WriterSpec {
+        &self.spec
     }
 
     pub fn length_tag(&self) -> &str {
@@ -142,153 +76,23 @@ impl OutputSlot {
         llvm_mod: &Module<'a>,
         build: &Builder<'a>,
         alloc_ptr: PointerValue<'a>,
-    ) -> OutputWriter<'a> {
-        let storage_type = self.spec.storage_type();
-        match self.spec {
-            WriterSpec::Primitive(_) => OutputWriter::Primitive(PrimitiveArrayWriter::llvm_init(
-                ctx,
-                llvm_mod,
-                build,
-                storage_type,
-                alloc_ptr,
-            )),
-            WriterSpec::Boolean => OutputWriter::Boolean(BooleanWriter::llvm_init(
-                ctx,
-                llvm_mod,
-                build,
-                storage_type,
-                alloc_ptr,
-            )),
-            WriterSpec::String => OutputWriter::String(StringArrayWriter::<i32>::llvm_init(
-                ctx,
-                llvm_mod,
-                build,
-                storage_type,
-                alloc_ptr,
-            )),
-            WriterSpec::LargeString => OutputWriter::LargeString(
-                StringArrayWriter::<i64>::llvm_init(ctx, llvm_mod, build, storage_type, alloc_ptr),
-            ),
-            WriterSpec::StringView => OutputWriter::StringView(StringViewWriter::llvm_init(
-                ctx,
-                llvm_mod,
-                build,
-                storage_type,
-                alloc_ptr,
-            )),
-            WriterSpec::FixedSizeList(_, _) => OutputWriter::FixedSizeList(
-                FixedSizeListWriter::llvm_init(ctx, llvm_mod, build, storage_type, alloc_ptr),
-            ),
-        }
+    ) -> Writer<'a> {
+        self.spec.llvm_init(ctx, llvm_mod, build, alloc_ptr)
     }
 }
 
-pub enum OutputWriterAllocation {
-    Primitive(ArrayOutput),
-    Boolean(BooleanAllocation),
-    String(StringAllocation<i32>),
-    LargeString(StringAllocation<i64>),
-    StringView(StringViewAllocation),
-    FixedSizeList(FixedSizeListWriterAlloc),
-}
-
-impl OutputWriterAllocation {
-    fn get_ptr(&mut self) -> *mut c_void {
-        match self {
-            Self::Primitive(alloc) => alloc.get_ptr(),
-            Self::Boolean(alloc) => alloc.get_ptr(),
-            Self::String(alloc) => alloc.get_ptr(),
-            Self::LargeString(alloc) => alloc.get_ptr(),
-            Self::StringView(alloc) => alloc.get_ptr(),
-            Self::FixedSizeList(alloc) => alloc.get_ptr(),
+pub fn accepted_type(spec: &WriterSpec) -> DSLType {
+    match spec {
+        WriterSpec::Primitive(pt) => DSLType::Primitive(*pt),
+        WriterSpec::Boolean => DSLType::Boolean,
+        WriterSpec::String | WriterSpec::LargeString | WriterSpec::StringView => {
+            DSLType::Primitive(PrimitiveType::P64x2)
         }
-    }
-
-    fn reserve_for_additional(&mut self, count: usize) {
-        match self {
-            Self::Primitive(alloc) => alloc.reserve_for_additional(count),
-            Self::Boolean(alloc) => alloc.reserve_for_additional(count),
-            Self::String(alloc) => alloc.reserve_for_additional(count),
-            Self::LargeString(alloc) => alloc.reserve_for_additional(count),
-            Self::StringView(alloc) => alloc.reserve_for_additional(count),
-            Self::FixedSizeList(alloc) => alloc.reserve_for_additional(count),
+        WriterSpec::FixedSizeList(item, size) => {
+            DSLType::Primitive(PrimitiveType::List(*item, *size))
         }
-    }
-
-    fn into_array_ref(self, nulls: Option<NullBuffer>) -> ArrayRef {
-        match self {
-            Self::Primitive(alloc) => alloc.to_array_ref(nulls),
-            Self::Boolean(alloc) => alloc.to_array_ref(nulls),
-            Self::String(alloc) => alloc.to_array_ref(nulls),
-            Self::LargeString(alloc) => alloc.to_array_ref(nulls),
-            Self::StringView(alloc) => alloc.to_array_ref(nulls),
-            Self::FixedSizeList(alloc) => alloc.to_array_ref(nulls),
-        }
-    }
-}
-
-pub enum OutputWriter<'a> {
-    Primitive(PrimitiveArrayWriter<'a>),
-    Boolean(BooleanWriter<'a>),
-    String(StringArrayWriter<'a, i32>),
-    LargeString(StringArrayWriter<'a, i64>),
-    StringView(StringViewWriter<'a>),
-    FixedSizeList(FixedSizeListWriter<'a>),
-}
-
-impl<'a> OutputWriter<'a> {
-    pub fn llvm_ingest_type(&self, ctx: &'a Context) -> BasicTypeEnum<'a> {
-        match self {
-            Self::Primitive(writer) => writer.llvm_ingest_type(ctx),
-            Self::Boolean(writer) => writer.llvm_ingest_type(ctx),
-            Self::String(writer) => writer.llvm_ingest_type(ctx),
-            Self::LargeString(writer) => writer.llvm_ingest_type(ctx),
-            Self::StringView(writer) => writer.llvm_ingest_type(ctx),
-            Self::FixedSizeList(writer) => writer.llvm_ingest_type(ctx),
-        }
-    }
-
-    pub fn llvm_ingest(&self, ctx: &'a Context, build: &Builder<'a>, val: BasicValueEnum<'a>) {
-        match self {
-            Self::Primitive(writer) => writer.llvm_ingest(ctx, build, val),
-            Self::Boolean(writer) => writer.llvm_ingest(ctx, build, val),
-            Self::String(writer) => writer.llvm_ingest(ctx, build, val),
-            Self::LargeString(writer) => writer.llvm_ingest(ctx, build, val),
-            Self::StringView(writer) => writer.llvm_ingest(ctx, build, val),
-            Self::FixedSizeList(writer) => writer.llvm_ingest(ctx, build, val),
-        }
-    }
-
-    pub fn llvm_ingest_block(&self, ctx: &'a Context, build: &Builder<'a>, vals: VectorValue<'a>) {
-        match self {
-            Self::Primitive(writer) => writer.llvm_ingest_block(ctx, build, vals),
-            Self::Boolean(writer) => writer.llvm_ingest_block(ctx, build, vals),
-            Self::String(writer) => writer.llvm_ingest_block(ctx, build, vals),
-            Self::LargeString(writer) => writer.llvm_ingest_block(ctx, build, vals),
-            Self::StringView(writer) => writer.llvm_ingest_block(ctx, build, vals),
-            Self::FixedSizeList(writer) => writer.llvm_ingest_block(ctx, build, vals),
-        }
-    }
-
-    pub fn llvm_flush(&self, ctx: &'a Context, build: &Builder<'a>) {
-        match self {
-            Self::Primitive(writer) => writer.llvm_flush(ctx, build),
-            Self::Boolean(writer) => writer.llvm_flush(ctx, build),
-            Self::String(writer) => writer.llvm_flush(ctx, build),
-            Self::LargeString(writer) => writer.llvm_flush(ctx, build),
-            Self::StringView(writer) => writer.llvm_flush(ctx, build),
-            Self::FixedSizeList(writer) => writer.llvm_flush(ctx, build),
-        }
-    }
-
-    pub fn accepted_type(&self) -> DSLType {
-        match self {
-            OutputWriter::Primitive(w) => DSLType::Primitive(w.primitive_type()),
-            OutputWriter::Boolean(_) => DSLType::Boolean,
-            OutputWriter::String(_) => DSLType::Primitive(PrimitiveType::P64x2),
-            OutputWriter::LargeString(_) => DSLType::Primitive(PrimitiveType::P64x2),
-            OutputWriter::StringView(_) => DSLType::Primitive(PrimitiveType::P64x2),
-            OutputWriter::FixedSizeList(w) => DSLType::Primitive(w.primitive_type()),
+        WriterSpec::Dictionary(_, values) | WriterSpec::RunEndEncoded(_, values) => {
+            accepted_type(values)
         }
     }
 }
@@ -297,30 +101,37 @@ impl<'a> OutputWriter<'a> {
 mod tests {
     use inkwell::{context::Context, values::BasicValue, AddressSpace};
 
-    use super::{OutputSpec, OutputWriter, OutputWriterAllocation, WriterSpec};
-    use crate::{declare_blocks, ListItemType};
+    use super::{accepted_type, OutputSpec, WriterSpec};
+    use crate::{
+        compiled_writers::{DictionaryKeyType, WriterAllocation},
+        declare_blocks, ListItemType,
+    };
 
     #[test]
     fn writer_spec_allocates_matching_variant() {
         let primitive =
             OutputSpec::new(WriterSpec::Primitive(crate::PrimitiveType::I32), "rows").allocate(8);
-        assert!(matches!(
-            primitive.alloc,
-            OutputWriterAllocation::Primitive(_)
-        ));
+        assert!(matches!(primitive.alloc, WriterAllocation::Primitive(_)));
 
         let boolean = OutputSpec::new(WriterSpec::Boolean, "rows").allocate(8);
-        assert!(matches!(boolean.alloc, OutputWriterAllocation::Boolean(_)));
+        assert!(matches!(boolean.alloc, WriterAllocation::Boolean(_)));
 
         let string = OutputSpec::new(WriterSpec::String, "rows").allocate(8);
-        assert!(matches!(string.alloc, OutputWriterAllocation::String(_)));
+        assert!(matches!(string.alloc, WriterAllocation::String(_)));
 
         let list =
             OutputSpec::new(WriterSpec::FixedSizeList(ListItemType::I32, 4), "rows").allocate(8);
-        assert!(matches!(
-            list.alloc,
-            OutputWriterAllocation::FixedSizeList(_)
-        ));
+        assert!(matches!(list.alloc, WriterAllocation::FixedSizeList(_)));
+
+        let dict = OutputSpec::new(
+            WriterSpec::Dictionary(
+                DictionaryKeyType::Int8,
+                Box::new(WriterSpec::Primitive(crate::PrimitiveType::I32)),
+            ),
+            "rows",
+        )
+        .allocate(8);
+        assert!(matches!(dict.alloc, WriterAllocation::Dictionary(_)));
     }
 
     #[test]
@@ -328,10 +139,22 @@ mod tests {
         let spec = OutputSpec::new(WriterSpec::Boolean, "n");
         let slot = spec.allocate(8);
 
-        assert_eq!(spec.spec(), WriterSpec::Boolean);
+        assert_eq!(spec.spec(), &WriterSpec::Boolean);
         assert_eq!(spec.length_tag(), "n");
-        assert_eq!(slot.spec(), WriterSpec::Boolean);
+        assert_eq!(slot.spec(), &WriterSpec::Boolean);
         assert_eq!(slot.length_tag(), "n");
+    }
+
+    #[test]
+    fn accepted_type_flattens_composite_writers() {
+        let dict = WriterSpec::Dictionary(
+            DictionaryKeyType::Int8,
+            Box::new(WriterSpec::Primitive(crate::PrimitiveType::I32)),
+        );
+        assert_eq!(
+            accepted_type(&dict),
+            crate::compiled_kernels::dsl2::DSLType::Primitive(crate::PrimitiveType::I32)
+        );
     }
 
     #[test]
@@ -352,13 +175,9 @@ mod tests {
         let dest = func.get_nth_param(0).unwrap().into_pointer_value();
         let slot =
             OutputSpec::new(WriterSpec::Primitive(crate::PrimitiveType::I32), "rows").allocate(4);
-        assert_eq!(
-            slot.spec(),
-            WriterSpec::Primitive(crate::PrimitiveType::I32)
-        );
+        assert_eq!(slot.spec(), &WriterSpec::Primitive(crate::PrimitiveType::I32));
 
         let writer = slot.llvm_init(&ctx, &llvm_mod, &build, dest);
-        assert!(matches!(writer, OutputWriter::Primitive(_)));
         writer.llvm_ingest(
             &ctx,
             &build,
@@ -391,7 +210,6 @@ mod tests {
 
         let string_slot = OutputSpec::new(WriterSpec::String, "rows").allocate(4);
         let string_writer = string_slot.llvm_init(&ctx, &llvm_mod, &build, string_dest);
-        assert!(matches!(string_writer, OutputWriter::String(_)));
         let string_type = crate::PrimitiveType::P64x2
             .llvm_type(&ctx)
             .into_struct_type();
@@ -402,7 +220,6 @@ mod tests {
 
         let bool_slot = OutputSpec::new(WriterSpec::Boolean, "rows").allocate(4);
         let bool_writer = bool_slot.llvm_init(&ctx, &llvm_mod, &build, bool_dest);
-        assert!(matches!(bool_writer, OutputWriter::Boolean(_)));
         bool_writer.llvm_ingest(
             &ctx,
             &build,

@@ -3,8 +3,9 @@ use std::{
     fmt::Error,
 };
 
+use inkwell::llvm_sys::orc2::LLVMOrcSymbolPredicate;
 use itertools::Itertools;
-use lincomdb::LinComDB;
+use lincomdb::{LinComDB, QueryError};
 use num_rational::{Ratio, Rational, Rational32};
 
 #[derive(Debug, Clone, PartialEq)]
@@ -95,26 +96,42 @@ impl SizeTerm {
             }
         }
     }
+
+    pub fn is_exact(&self) -> bool {
+        match self {
+            SizeTerm::Term(_) => true,
+            SizeTerm::Add(s1, s2) => s1.is_exact() && s2.is_exact(),
+            SizeTerm::AtLeast(_) => false,
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ResolveResult {
     Exact(usize),
     AtLeast(usize),
+    Unknown,
 }
 
 impl ResolveResult {
     pub fn as_exact(&self) -> Option<usize> {
         match self {
             ResolveResult::Exact(s) => Some(*s),
-            ResolveResult::AtLeast(_) => None,
+            _ => None,
         }
     }
 }
 
+enum Solution {
+    Known(Vec<Ratio<i128>>),
+    Unknown,
+}
+
 pub struct Resolver {
     st: BTreeMap<String, usize>,
-    solutions: Vec<Vec<Ratio<i128>>>,
+    solutions: Vec<Solution>,
+    is_input_exact: Vec<bool>,
+    is_output_exact: Vec<bool>,
 }
 
 impl Resolver {
@@ -142,36 +159,69 @@ impl Resolver {
         for out in outputs.iter() {
             let mut slice = vec![0; st.len()];
             out.to_vec(&st, &mut slice);
-            solutions.push(db.query(slice).unwrap());
+            solutions.push(match db.query(slice) {
+                Ok(s) => Solution::Known(s),
+                Err(QueryError::NotInRowSpace) => {
+                    return Err(format!("unable to resolve output: {:?}", out));
+                }
+                Err(QueryError::EmptyDatabase) => Solution::Unknown,
+                Err(e) => {
+                    panic!("unexpected error: {:?}", e)
+                }
+            });
         }
 
-        Ok(Self { st, solutions })
+        let is_input_exact = terms.iter().map(|x| x.is_exact()).collect_vec();
+        let is_output_exact = outputs.iter().map(|x| x.is_exact()).collect_vec();
+
+        Ok(Self {
+            st,
+            solutions,
+            is_input_exact,
+            is_output_exact,
+        })
     }
 
-    pub fn resolve(&self, known: &[usize]) -> Result<Vec<usize>, String> {
-        let result_sizes: Vec<usize> = self
+    pub fn resolve(&self, known: &[usize]) -> Result<Vec<ResolveResult>, String> {
+        let mut result_sizes: Vec<ResolveResult> = Vec::new();
+
+        for (idx, (soln, is_exact)) in self
             .solutions
             .iter()
-            .map(|soln| {
-                known
-                    .iter()
-                    .zip(soln.iter())
-                    .map(|(i, c)| Ratio::<i128>::from(*i as i128) * *c)
-                    .map(|s| {
-                        s.is_integer()
-                            .then(|| s.to_integer() as i64)
-                            .ok_or_else(|| format!("got non-integer final size {}", s))
-                    })
-                    .try_fold(0_i64, |acc, i| i.map(|i| acc + i))
-                    .and_then(|i| {
-                        if i < 0 {
-                            Err(format!("negative output size {}", i))
+            .zip(self.is_output_exact.iter())
+            .enumerate()
+        {
+            let mut is_exact = *is_exact;
+            match soln {
+                Solution::Known(ratios) => {
+                    let sum = ratios
+                        .iter()
+                        .zip(known.iter())
+                        .map(|(x, y)| Ratio::<i128>::from(*y as i128) * *x)
+                        .fold(Ratio::<i128>::from(0), |acc, v| acc + v);
+
+                    if ratios
+                        .iter()
+                        .enumerate()
+                        .any(|(idx, r)| r != &0.into() && !self.is_input_exact[idx])
+                    {
+                        is_exact = false;
+                    }
+
+                    if sum.is_integer() {
+                        let sum = sum.to_integer() as usize;
+                        if is_exact {
+                            result_sizes.push(ResolveResult::Exact(sum));
                         } else {
-                            Ok(i as usize)
+                            result_sizes.push(ResolveResult::AtLeast(sum));
                         }
-                    })
-            })
-            .try_collect()?;
+                    } else {
+                        return Err(format!("non-integer size for output {} ({})", idx, sum));
+                    }
+                }
+                Solution::Unknown => result_sizes.push(ResolveResult::Unknown),
+            }
+        }
 
         Ok(result_sizes)
     }
@@ -244,6 +294,13 @@ mod tests {
         ];
 
         let resolver = Resolver::new(terms, outputs).unwrap();
-        assert_eq!(resolver.resolve(&[3, 6, 4]).unwrap(), vec![1, 2, 5]);
+        assert_eq!(
+            resolver.resolve(&[3, 6, 4]).unwrap(),
+            vec![
+                ResolveResult::Exact(1),
+                ResolveResult::Exact(2),
+                ResolveResult::Exact(5)
+            ]
+        );
     }
 }

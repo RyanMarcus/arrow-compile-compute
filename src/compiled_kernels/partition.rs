@@ -16,9 +16,7 @@ use crate::{
         dsl::{base_type, KernelParameters},
         link_req_helpers, optimize_module,
     },
-    compiled_writers::{
-        ArrayWriter, BooleanWriter, PrimitiveArrayWriter, StringViewWriter, WriterAllocation,
-    },
+    compiled_writers::WriterSpec,
     declare_blocks, set_noalias_params, ArrowKernelError, Kernel, PrimitiveType,
 };
 
@@ -84,26 +82,18 @@ impl Kernel for PartitionKernel {
         };
 
         let base = base_type(arr.data_type());
-        let ptype = PrimitiveType::for_arrow_type(&base);
+        let spec = partition_writer_spec(&base);
         let res = match &base {
-            DataType::Utf8 => call_kernel_with_writer::<StringViewWriter>(
-                ptype,
+            DataType::Utf8 | DataType::Boolean => call_kernel_with_writer(
+                &spec,
                 arr_ih,
                 part_ih,
                 null_ih,
                 part_sizes,
                 self.borrow_func(),
             ),
-            DataType::Boolean => call_kernel_with_writer::<BooleanWriter>(
-                ptype,
-                arr_ih,
-                part_ih,
-                null_ih,
-                part_sizes,
-                self.borrow_func(),
-            ),
-            t if t.is_primitive() => call_kernel_with_writer::<PrimitiveArrayWriter>(
-                ptype,
+            t if t.is_primitive() => call_kernel_with_writer(
+                &spec,
                 arr_ih,
                 part_ih,
                 null_ih,
@@ -126,10 +116,12 @@ impl Kernel for PartitionKernel {
             nparts,
             func_builder: |ctx| {
                 let base = base_type(inp.0.data_type());
+                let spec = partition_writer_spec(&base);
                 match base {
-                    DataType::Utf8 => build_partition::<StringViewWriter>(
+                    DataType::Utf8 | DataType::Boolean => build_partition(
                         ctx,
                         nparts,
+                        &spec,
                         inp.0,
                         inp.0
                             .nulls()
@@ -137,19 +129,10 @@ impl Kernel for PartitionKernel {
                             .as_ref(),
                         inp.1,
                     ),
-                    DataType::Boolean => build_partition::<BooleanWriter>(
+                    t if t.is_primitive() => build_partition(
                         ctx,
                         nparts,
-                        inp.0,
-                        inp.0
-                            .nulls()
-                            .map(|b| BooleanArray::from(b.clone().into_inner()))
-                            .as_ref(),
-                        inp.1,
-                    ),
-                    t if t.is_primitive() => build_partition::<PrimitiveArrayWriter>(
-                        ctx,
-                        nparts,
+                        &spec,
                         inp.0,
                         inp.0
                             .nulls()
@@ -172,8 +155,8 @@ impl Kernel for PartitionKernel {
     }
 }
 
-fn call_kernel_with_writer<'a, W: ArrayWriter<'a>>(
-    ptype: PrimitiveType,
+fn call_kernel_with_writer<'a>(
+    spec: &WriterSpec,
     mut arr_ih: IteratorHolder,
     mut part_ih: IteratorHolder,
     mut null_ih: Option<IteratorHolder>,
@@ -185,7 +168,7 @@ fn call_kernel_with_writer<'a, W: ArrayWriter<'a>>(
 ) -> Result<Vec<ArrayRef>, ArrowKernelError> {
     let mut allocs = part_sizes
         .iter()
-        .map(|size| W::allocate(*size, ptype))
+        .map(|size| spec.allocate(*size))
         .collect_vec();
     let alloc_ptrs = allocs.iter_mut().map(|a| a.get_ptr()).collect_vec();
     let mut kp = KernelParameters::new(alloc_ptrs);
@@ -202,14 +185,14 @@ fn call_kernel_with_writer<'a, W: ArrayWriter<'a>>(
     }
     Ok(allocs
         .into_iter()
-        .zip(part_sizes)
-        .map(|(a, size)| a.to_array_ref(None))
+        .map(|a| a.into_array_ref(None))
         .collect_vec())
 }
 
-fn build_partition<'a, W: ArrayWriter<'a>>(
+fn build_partition<'a>(
     ctx: &'a Context,
     nparts: usize,
+    spec: &WriterSpec,
     arr: &dyn Array,
     nulls: Option<&BooleanArray>,
     partition_idxes: &dyn Array,
@@ -219,11 +202,10 @@ fn build_partition<'a, W: ArrayWriter<'a>>(
 > {
     let llvm_mod = ctx.create_module("partition");
     let ptr_type = ctx.ptr_type(AddressSpace::default());
-    let ptype = PrimitiveType::for_arrow_type(arr.data_type());
     let idx_ptype = PrimitiveType::for_arrow_type(partition_idxes.data_type());
     let idx_llvm_type = idx_ptype.llvm_type(ctx);
 
-    let llvm_type = ptype.llvm_type(ctx);
+    let llvm_type = spec.storage_type().llvm_type(ctx);
 
     let fn_type = ctx.void_type().fn_type(
         &[
@@ -258,7 +240,7 @@ fn build_partition<'a, W: ArrayWriter<'a>>(
     let writers = (0..nparts)
         .map(|writer_offset| {
             let alloc_ptr = KernelParameters::llvm_get(ctx, &b, writer_ptr_ptr, writer_offset);
-            W::llvm_init(ctx, &llvm_mod, &b, ptype, alloc_ptr)
+            spec.llvm_init(ctx, &llvm_mod, &b, alloc_ptr)
         })
         .collect_vec();
     let arr_buf_ptr = b.build_alloca(llvm_type, "arr_buf_ptr").unwrap();
@@ -363,6 +345,14 @@ fn build_partition<'a, W: ArrayWriter<'a>>(
     };
 
     Ok(partition_func)
+}
+
+fn partition_writer_spec(base: &DataType) -> WriterSpec {
+    match base {
+        DataType::Utf8 => WriterSpec::StringView,
+        DataType::Boolean => WriterSpec::Boolean,
+        dt => WriterSpec::Primitive(PrimitiveType::for_arrow_type(dt)),
+    }
 }
 
 #[cfg(test)]

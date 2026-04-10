@@ -1,7 +1,7 @@
 use std::ffi::c_void;
 use std::sync::Arc;
 
-use super::{ArrayWriter, WriterAllocation};
+use super::{LeafWriter, LeafWriterAllocation};
 use crate::{declare_blocks, increment_pointer, PrimitiveType};
 use arrow_array::{ArrayRef, BooleanArray};
 use arrow_buffer::{BooleanBuffer, Buffer};
@@ -35,7 +35,7 @@ pub struct BooleanAllocation {
     buf_idx: u8,
 }
 
-impl WriterAllocation for BooleanAllocation {
+impl LeafWriterAllocation for BooleanAllocation {
     type Output = BooleanArray;
 
     fn get_ptr(&mut self) -> *mut c_void {
@@ -88,7 +88,7 @@ impl WriterAllocation for BooleanAllocation {
     }
 }
 
-impl<'a> ArrayWriter<'a> for BooleanWriter<'a> {
+impl<'a> LeafWriter<'a> for BooleanWriter<'a> {
     type Allocation = BooleanAllocation;
 
     fn allocate(expected_count: usize, ty: PrimitiveType) -> Self::Allocation {
@@ -409,7 +409,7 @@ mod tests {
     use itertools::Itertools;
 
     use crate::{
-        compiled_writers::{ArrayWriter, WriterAllocation},
+        compiled_writers::{LeafWriter, LeafWriterAllocation},
         declare_blocks, PrimitiveType,
     };
 

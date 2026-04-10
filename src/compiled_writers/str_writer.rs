@@ -17,7 +17,7 @@ use inkwell::{
 };
 use repr_offset::ReprOffset;
 
-use super::{ArrayWriter, WriterAllocation};
+use super::{LeafWriter, LeafWriterAllocation};
 
 /// Writer for string arrays (utf8 or bytes)
 pub struct StringArrayWriter<'a, T: OffsetSizeTrait> {
@@ -35,7 +35,7 @@ pub struct StringAllocation<T: OffsetSizeTrait> {
     offset_type: PrimitiveType,
 }
 
-impl<T: OffsetSizeTrait> WriterAllocation for StringAllocation<T> {
+impl<T: OffsetSizeTrait> LeafWriterAllocation for StringAllocation<T> {
     type Output = GenericBinaryArray<T>;
 
     fn get_ptr(&mut self) -> *mut c_void {
@@ -98,7 +98,7 @@ impl<T: OffsetSizeTrait> WriterAllocation for StringAllocation<T> {
     }
 }
 
-impl<'a, T: OffsetSizeTrait> ArrayWriter<'a> for StringArrayWriter<'a, T> {
+impl<'a, T: OffsetSizeTrait> LeafWriter<'a> for StringArrayWriter<'a, T> {
     type Allocation = StringAllocation<T>;
 
     fn allocate(expected_count: usize, ty: PrimitiveType) -> Self::Allocation {
@@ -238,7 +238,7 @@ mod tests {
     use super::StringArrayWriter;
     use crate::{
         compiled_kernels::link_req_helpers,
-        compiled_writers::{ArrayWriter, WriterAllocation},
+        compiled_writers::{LeafWriter, LeafWriterAllocation},
         declare_blocks, PrimitiveType,
     };
     use arrow_array::{LargeStringArray, StringArray};

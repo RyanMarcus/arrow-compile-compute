@@ -9,7 +9,7 @@ use inkwell::{
 use repr_offset::ReprOffset;
 
 use crate::{
-    compiled_writers::{ArrayWriter, WriterAllocation},
+    compiled_writers::{LeafWriter, LeafWriterAllocation},
     declare_blocks, declare_global_pointer, increment_pointer, pointer_diff, PrimitiveType,
 };
 
@@ -67,7 +67,7 @@ pub struct StringViewAllocation {
     data: ViewBufferWriter,
 }
 
-impl WriterAllocation for StringViewAllocation {
+impl LeafWriterAllocation for StringViewAllocation {
     type Output = GenericByteViewArray<BinaryViewType>;
 
     fn get_ptr(&mut self) -> *mut c_void {
@@ -115,7 +115,7 @@ pub struct StringViewWriter<'a> {
     ingest_func: FunctionValue<'a>,
 }
 
-impl<'a> ArrayWriter<'a> for StringViewWriter<'a> {
+impl<'a> LeafWriter<'a> for StringViewWriter<'a> {
     type Allocation = StringViewAllocation;
 
     fn allocate(expected_count: usize, ty: crate::PrimitiveType) -> Self::Allocation {
@@ -299,7 +299,7 @@ mod tests {
     use inkwell::{context::Context, AddressSpace, OptimizationLevel};
     use itertools::Itertools;
 
-    use super::{ArrayWriter, StringViewWriter, ViewBufferWriter, WriterAllocation};
+    use super::{LeafWriter, LeafWriterAllocation, StringViewWriter, ViewBufferWriter};
     use crate::{compiled_kernels::link_req_helpers, declare_blocks, PrimitiveType};
 
     #[test]

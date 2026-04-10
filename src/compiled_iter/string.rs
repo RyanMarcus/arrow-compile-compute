@@ -681,9 +681,14 @@ mod tests {
 
         let ctx = Context::create();
         let module = ctx.create_module("test_large_binary_keeps_array_alive");
-        let func_next =
-            generate_next(&ctx, &module, "next", &arrow_schema::DataType::LargeBinary, &iter)
-                .unwrap();
+        let func_next = generate_next(
+            &ctx,
+            &module,
+            "next",
+            &arrow_schema::DataType::LargeBinary,
+            &iter,
+        )
+        .unwrap();
         let fname = func_next.get_name().to_str().unwrap();
 
         module.verify().unwrap();

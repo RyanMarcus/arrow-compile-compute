@@ -14,7 +14,7 @@ use inkwell::{
 };
 use repr_offset::ReprOffset;
 
-use super::{ArrayWriter, WriterAllocation};
+use super::{LeafWriter, LeafWriterAllocation};
 
 /// Writer for fixed-size lists of primitives
 pub struct FixedSizeListWriter<'a> {
@@ -32,7 +32,7 @@ pub struct FixedSizeListWriterAlloc {
     list_size: usize,
 }
 
-impl WriterAllocation for FixedSizeListWriterAlloc {
+impl LeafWriterAllocation for FixedSizeListWriterAlloc {
     type Output = FixedSizeListArray;
 
     fn get_ptr(&mut self) -> *mut c_void {
@@ -100,7 +100,7 @@ impl WriterAllocation for FixedSizeListWriterAlloc {
     }
 }
 
-impl<'a> ArrayWriter<'a> for FixedSizeListWriter<'a> {
+impl<'a> LeafWriter<'a> for FixedSizeListWriter<'a> {
     type Allocation = FixedSizeListWriterAlloc;
     fn allocate(expected_count: usize, ty: PrimitiveType) -> Self::Allocation {
         match ty {
@@ -196,7 +196,7 @@ mod tests {
 
     use crate::{
         compiled_writers::{
-            fixed_size_list_writer::FixedSizeListWriter, ArrayWriter, WriterAllocation,
+            fixed_size_list_writer::FixedSizeListWriter, LeafWriter, LeafWriterAllocation,
         },
         declare_blocks, ListItemType, PrimitiveType,
     };

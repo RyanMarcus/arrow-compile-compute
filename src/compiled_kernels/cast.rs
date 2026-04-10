@@ -4,7 +4,7 @@ use super::{ArrowKernelError, Kernel};
 use crate::{
     compiled_kernels::{
         dsl::{DSLKernel, KernelOutputType},
-        replace_nulls,
+        null_utils::replace_nulls,
     },
     logical_nulls, PrimitiveType,
 };

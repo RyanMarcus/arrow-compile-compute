@@ -4,9 +4,10 @@ use arrow_buffer::NullBuffer;
 use arrow_schema::DataType;
 
 use crate::compiled_kernels::dsl::{DSLKernel, KernelOutputType};
+use crate::compiled_kernels::null_utils::replace_nulls;
 use crate::{logical_nulls, ArrowKernelError, PrimitiveType};
 
-use crate::compiled_kernels::{replace_nulls, Kernel};
+use crate::compiled_kernels::Kernel;
 
 pub struct FilterKernel(DSLKernel);
 unsafe impl Sync for FilterKernel {}

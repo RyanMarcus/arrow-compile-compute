@@ -6,7 +6,7 @@ use arrow_schema::DataType;
 use crate::{
     compiled_kernels::{
         dsl::{DSLKernel, KernelOutputType},
-        replace_nulls,
+        null_utils::replace_nulls,
     },
     logical_nulls, ArrayDatum, ArrowKernelError, Kernel,
 };

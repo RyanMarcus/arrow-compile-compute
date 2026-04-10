@@ -18,7 +18,7 @@ use std::ffi::c_void;
 
 use crate::compiled_iter::{datum_to_iter, generate_next};
 use crate::compiled_kernels::{link_req_helpers, optimize_module};
-use crate::compiled_writers::{ArrayWriter, PrimitiveArrayWriter, WriterAllocation};
+use crate::compiled_writers::{LeafWriter, LeafWriterAllocation, PrimitiveArrayWriter};
 use crate::{
     compiled_kernels::cmp::add_memcmp, declare_blocks, increment_pointer, pointer_diff,
     PrimitiveType,
