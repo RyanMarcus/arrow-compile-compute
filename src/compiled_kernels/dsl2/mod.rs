@@ -4,7 +4,7 @@ use std::sync::Arc;
 
 use arrow_array::cast::AsArray;
 use arrow_array::types::UInt32Type;
-#[cfg(test)]
+
 use arrow_array::ArrayRef;
 use arrow_array::{Datum, UInt32Array, UInt64Array};
 use arrow_buffer::MutableBuffer;
@@ -764,6 +764,7 @@ pub enum DSLExpr {
     At(Box<DSLValue>, Vec<Box<DSLExpr>>),
     Value(DSLValue),
     Cast(Box<DSLExpr>, PrimitiveType),
+    CastToBool(Box<DSLExpr>),
     ArithBinOp(DSLArithBinOp, Box<DSLExpr>, Box<DSLExpr>),
 }
 
@@ -793,7 +794,7 @@ impl DSLExpr {
         }
     }
 
-    pub fn cast(&self, ty: PrimitiveType) -> Result<DSLExpr, ArrowKernelError> {
+    pub fn primitive_cast(&self, ty: PrimitiveType) -> Result<DSLExpr, ArrowKernelError> {
         if self.get_type() == DSLType::Primitive(ty) {
             return Ok(self.clone());
         }
@@ -805,6 +806,18 @@ impl DSLExpr {
             _ => Err(ArrowKernelError::InvalidCast(
                 self.get_type(),
                 DSLType::Primitive(ty),
+            )),
+        }
+    }
+
+    pub fn cast_to_bool(&self) -> Result<DSLExpr, ArrowKernelError> {
+        match self.get_type() {
+            DSLType::Boolean => Ok(self.clone()),
+            DSLType::Primitive(_) => Ok(DSLExpr::CastToBool(Box::new(self.clone()))),
+            DSLType::ConstScalar(_) => Ok(DSLExpr::CastToBool(Box::new(self.clone()))),
+            _ => Err(ArrowKernelError::DSLInvalidType(
+                "cannot cast type to bool",
+                self.get_type(),
             )),
         }
     }
@@ -840,6 +853,7 @@ impl DSLExpr {
             DSLExpr::Value(v) => v.ty.clone(),
             DSLExpr::ArithBinOp(_, v, _) => v.get_type().clone(),
             DSLExpr::Cast(_, pt) => DSLType::Primitive(*pt),
+            DSLExpr::CastToBool(_) => DSLType::Boolean,
         }
     }
 
@@ -855,6 +869,7 @@ impl DSLExpr {
             }
             DSLExpr::Value(_) => {}
             DSLExpr::Cast(val, _) => val.accessed_parameters(params),
+            DSLExpr::CastToBool(val) => val.accessed_parameters(params),
         }
     }
 
@@ -973,7 +988,9 @@ mod tests {
         func.add_body(
             DSLStmt::for_each(&mut ctx, &[idxs], |loop_vars| {
                 let idx = &loop_vars[0];
-                let val = arr1.expr().at(&idx.expr().cast(PrimitiveType::U64)?)?;
+                let val = arr1
+                    .expr()
+                    .at(&idx.expr().primitive_cast(PrimitiveType::U64)?)?;
                 DSLStmt::emit(0, val)
             })
             .unwrap(),
@@ -1096,8 +1113,8 @@ mod tests {
 
         func.add_body(
             DSLStmt::for_each(&mut ctx, &[part_idxes, elem_idxes], |loop_vars| {
-                let part_idx = &loop_vars[0].expr().cast(PrimitiveType::U64)?;
-                let elem_idx = &loop_vars[1].expr().cast(PrimitiveType::U64)?;
+                let part_idx = &loop_vars[0].expr().primitive_cast(PrimitiveType::U64)?;
+                let elem_idx = &loop_vars[1].expr().primitive_cast(PrimitiveType::U64)?;
                 let val = arr.expr().at(part_idx)?.at(elem_idx)?;
                 DSLStmt::emit(0, val)
             })
@@ -1141,7 +1158,7 @@ mod tests {
         func.add_body(
             DSLStmt::for_each(&mut ctx, &[arr, tic], |loop_vars| {
                 let new_val = loop_vars[0].expr();
-                let tic_val = loop_vars[1].expr().cast(PrimitiveType::U64)?;
+                let tic_val = loop_vars[1].expr().primitive_cast(PrimitiveType::U64)?;
                 let old_val = buf.expr().at(&tic_val)?;
 
                 let cmp = new_val.cmp(&old_val, DSLComparison::Gt)?;

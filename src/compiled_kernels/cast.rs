@@ -3,10 +3,15 @@ use std::sync::Arc;
 use super::{ArrowKernelError, Kernel};
 use crate::{
     compiled_kernels::{
-        dsl::{DSLKernel, KernelOutputType},
+        dsl::{base_type, DSLKernel, KernelOutputType},
+        dsl2::{
+            compile, dsl_args, DSLArgument, DSLContext, DSLFunction, DSLStmt, DSLType,
+            RunnableDSLFunction,
+        },
         null_utils::replace_nulls,
     },
-    logical_nulls, PrimitiveType,
+    compiled_writers::WriterSpec,
+    intersect_and_copy_nulls, logical_nulls, PrimitiveType,
 };
 use arrow_array::{
     cast::AsArray,
@@ -104,7 +109,7 @@ pub fn coalesce_type(res: ArrayRef, tar: &DataType) -> Result<ArrayRef, ArrowKer
 }
 
 pub struct CastKernel {
-    k: DSLKernel,
+    k: RunnableDSLFunction,
     tar: DataType,
 }
 unsafe impl Sync for CastKernel {}
@@ -123,12 +128,7 @@ impl Kernel for CastKernel {
     type Output = ArrayRef;
 
     fn call(&self, inp: Self::Input<'_>) -> Result<Self::Output, ArrowKernelError> {
-        if matches!(self.tar, DataType::RunEndEncoded(_, _)) && inp.is_nullable() {
-            return Err(ArrowKernelError::UnsupportedArguments(
-                "Cannot cast nullable array to run-end encoded array".to_string(),
-            ));
-        }
-        let res = self.k.call(&[&inp])?;
+        let res = self.k.run(&dsl_args![inp])?[0].clone();
         assert_eq!(
             inp.len(),
             res.len(),
@@ -136,24 +136,31 @@ impl Kernel for CastKernel {
             inp.len(),
             res.len()
         );
-        let res = replace_nulls(res, logical_nulls(inp)?);
+        let res = intersect_and_copy_nulls(&[&inp], res)?;
         coalesce_type(res, &self.tar)
     }
 
     fn compile(arr: &Self::Input<'_>, params: Self::Params) -> Result<Self, ArrowKernelError> {
         let tar = params;
-        let out_type = KernelOutputType::for_data_type(&tar).map_err(ArrowKernelError::DSLError)?;
 
-        Ok(CastKernel {
-            k: DSLKernel::compile(&[arr], |ctx| {
-                let arr = ctx.get_input(0)?;
-                ctx.iter_over(vec![arr])
-                    .map(|i| vec![i[0].convert(PrimitiveType::for_arrow_type(&tar))])
-                    .collect(out_type)
-            })
-            .map_err(ArrowKernelError::DSLError)?,
-            tar,
-        })
+        let w = WriterSpec::for_data_type(&tar);
+
+        let mut ctx = DSLContext::new();
+        let mut func = DSLFunction::new("cast");
+        let arg1 = func.add_arg(&mut ctx, DSLType::array_like(arr, "n"));
+        func.add_ret(w, "n");
+        func.add_body(DSLStmt::for_each(&mut ctx, &[arg1], |loop_vars| {
+            let v = &loop_vars[0].expr();
+            let v = if base_type(&tar) == DataType::Boolean {
+                v.cast_to_bool()?
+            } else {
+                v.primitive_cast(PrimitiveType::for_arrow_type(&tar))?
+            };
+            DSLStmt::emit(0, v)
+        })?);
+        let func = compile(func, [DSLArgument::Datum(arr)])?;
+
+        Ok(CastKernel { k: func, tar })
     }
 
     fn get_key_for_input(
@@ -174,7 +181,7 @@ mod tests {
         Array, ArrayRef, DictionaryArray, Int16Array, Int32Array, Int64Array, RunArray,
         StringArray, UInt8Array,
     };
-    use arrow_schema::DataType;
+    use arrow_schema::{DataType, Field, FieldRef};
     use itertools::Itertools;
 
     use crate::{
@@ -380,26 +387,6 @@ mod tests {
     }
 
     #[test]
-    fn test_to_ree_nulls() {
-        let data = Int32Array::from(vec![
-            Some(1),
-            Some(1),
-            None,
-            None,
-            Some(2),
-            Some(2),
-            Some(2),
-        ]);
-
-        let k = CastKernel::compile(
-            &(&data as &dyn Array),
-            run_end_data_type(&DataType::Int32, &DataType::Int32),
-        )
-        .unwrap();
-        assert!(k.call(&data).is_err());
-    }
-
-    #[test]
     fn test_fixed_size_list_f16_to_f32() {
         let mut builder = arrow_array::builder::FixedSizeListBuilder::new(
             arrow_array::builder::Float16Builder::new(),
@@ -415,10 +402,7 @@ mod tests {
 
         let k = CastKernel::compile(
             &(&data as &dyn Array),
-            DataType::FixedSizeList(
-                Arc::new(arrow_schema::Field::new("item", DataType::Float32, true)),
-                4,
-            ),
+            DataType::FixedSizeList(Arc::new(Field::new_list_field(DataType::Float32, true)), 4),
         )
         .unwrap();
         let res = k.call(&data).unwrap();

@@ -13,8 +13,8 @@ use inkwell::{
     intrinsics::Intrinsic,
     module::{Linkage, Module},
     types::{BasicType, BasicTypeEnum},
-    values::{BasicValue, BasicValueEnum, FunctionValue},
-    AddressSpace, IntPredicate, OptimizationLevel,
+    values::{BasicValue, BasicValueEnum, FunctionValue, VectorValue},
+    AddressSpace, FloatPredicate, IntPredicate, OptimizationLevel,
 };
 use itertools::Itertools;
 use ouroboros::self_referencing;
@@ -33,7 +33,7 @@ use crate::{
         link_req_helpers, optimize_module,
     },
     compiled_writers::Writer,
-    increment_pointer, set_noalias_params, ArrowKernelError, PrimitiveType,
+    increment_pointer, set_noalias_params, ArrowKernelError, NumericPrimitiveType, PrimitiveType,
 };
 
 pub enum KernelReturnCode {
@@ -764,7 +764,8 @@ fn compile_expr<'ctx, 'a>(
         },
         DSLExpr::Cast(val, tar_pt) => {
             let orig_type = val.get_type();
-            let tar_type = tar_pt.llvm_type(&ctx.ctx);
+            let tar_type = DSLType::Primitive(*tar_pt);
+            let tar_llvm_type = tar_pt.llvm_type(&ctx.ctx);
             let val = compile_expr(ctx, val)?;
 
             match orig_type {
@@ -772,7 +773,11 @@ fn compile_expr<'ctx, 'a>(
                     if tar_pt.is_int() {
                         Ok(ctx
                             .b
-                            .build_int_cast(val.into_int_value(), tar_type.into_int_type(), "cast")
+                            .build_int_cast(
+                                val.into_int_value(),
+                                tar_llvm_type.into_int_type(),
+                                "cast",
+                            )
                             .unwrap()
                             .as_basic_value_enum())
                     } else {
@@ -784,86 +789,101 @@ fn compile_expr<'ctx, 'a>(
                         orig_pt.as_numeric_primitive_type(),
                         tar_pt.as_numeric_primitive_type(),
                     ) {
-                        (None, None) => todo!(),
-                        (None, Some(_)) => todo!(),
-                        (Some(_), None) => todo!(),
-                        (Some(orig_pt), Some(tar_pt)) => {
-                            return Ok(match (orig_pt.is_integer(), tar_pt.is_integer()) {
-                                // int to int
-                                (true, true) => match tar_pt.width().cmp(&orig_pt.width()) {
-                                    Ordering::Less => ctx
-                                        .b
-                                        .build_int_truncate(
-                                            val.into_int_value(),
-                                            tar_type.into_int_type(),
-                                            "cast",
-                                        )
-                                        .unwrap()
-                                        .as_basic_value_enum(),
-                                    Ordering::Equal => val,
-                                    Ordering::Greater => if orig_pt.is_signed() {
-                                        ctx.b.build_int_s_extend(
-                                            val.into_int_value(),
-                                            tar_type.into_int_type(),
-                                            "cast",
-                                        )
-                                    } else {
-                                        ctx.b.build_int_z_extend(
-                                            val.into_int_value(),
-                                            tar_type.into_int_type(),
-                                            "cast",
-                                        )
-                                    }
-                                    .unwrap()
-                                    .as_basic_value_enum(),
-                                },
-                                // int to float
-                                (true, false) => if orig_pt.is_signed() {
-                                    ctx.b.build_signed_int_to_float(
-                                        val.into_int_value(),
-                                        tar_type.into_float_type(),
-                                        "cast",
-                                    )
-                                } else {
-                                    ctx.b.build_unsigned_int_to_float(
-                                        val.into_int_value(),
-                                        tar_type.into_float_type(),
-                                        "cast",
-                                    )
-                                }
-                                .unwrap()
-                                .as_basic_value_enum(),
-                                // float to int
-                                (false, true) => if orig_pt.is_signed() {
-                                    ctx.b.build_float_to_signed_int(
-                                        val.into_float_value(),
-                                        tar_type.into_int_type(),
-                                        "cast",
-                                    )
-                                } else {
-                                    ctx.b.build_float_to_unsigned_int(
-                                        val.into_float_value(),
-                                        tar_type.into_int_type(),
-                                        "cast",
-                                    )
-                                }
-                                .unwrap()
-                                .as_basic_value_enum(),
-                                // float to float
-                                (false, false) => ctx
-                                    .b
-                                    .build_float_cast(
-                                        val.into_float_value(),
-                                        tar_type.into_float_type(),
-                                        "cast",
-                                    )
-                                    .unwrap()
-                                    .as_basic_value_enum(),
-                            });
+                        (None, None) => {}
+                        (None, Some(_)) | (Some(_), None) => {
+                            return Err(ArrowKernelError::DSLTypeMismatch(
+                                "cannot cast numeric type to non-numeric",
+                                orig_type,
+                                tar_type,
+                            ))
                         }
+                        (Some(orig_pt), Some(tar_pt)) => {
+                            return cast_numeric(ctx, val, orig_pt, tar_pt)
+                        }
+                    }
+
+                    // neither type is numeric
+                    match (orig_pt, tar_pt) {
+                        (PrimitiveType::List(s_t, s_l), &PrimitiveType::List(t_t, t_l)) => {
+                            if s_l != t_l {
+                                return Err(ArrowKernelError::DSLTypeMismatch(
+                                    "cannot cast between vectors of different sizes",
+                                    orig_type,
+                                    tar_type,
+                                ));
+                            }
+
+                            match (
+                                PrimitiveType::from(s_t).as_numeric_primitive_type(),
+                                PrimitiveType::from(t_t).as_numeric_primitive_type(),
+                            ) {
+                                (Some(orig_pt), Some(tar_pt)) => {
+                                    return Ok(cast_numeric_vec(
+                                        ctx,
+                                        val.into_vector_value(),
+                                        orig_pt,
+                                        tar_pt,
+                                    )?
+                                    .as_basic_value_enum())
+                                }
+                                _ => {
+                                    return Err(ArrowKernelError::DSLTypeMismatch(
+                                        "cannot cast between string and non-string vectors",
+                                        orig_type,
+                                        tar_type,
+                                    ));
+                                }
+                            }
+                        }
+                        _ => Err(ArrowKernelError::DSLTypeMismatch(
+                            "unsupported primitive cast",
+                            orig_type,
+                            tar_type,
+                        )),
                     }
                 }
                 _ => unimplemented!("invalid cast"),
+            }
+        }
+        DSLExpr::CastToBool(v) => {
+            let child = compile_expr(ctx, v)?;
+            match v.get_type() {
+                DSLType::Boolean => Ok(child),
+                DSLType::Primitive(pt) => {
+                    let nt = pt.as_numeric_primitive_type().ok_or_else(|| {
+                        ArrowKernelError::DSLInvalidType(
+                            "cannot cast non-numeric type to bool",
+                            v.get_type(),
+                        )
+                    })?;
+
+                    let res = if nt.is_integer() {
+                        let child = child.into_int_value();
+                        ctx.b
+                            .build_int_compare(
+                                IntPredicate::NE,
+                                child,
+                                child.get_type().const_zero(),
+                                "ne_zero",
+                            )
+                            .unwrap()
+                    } else {
+                        let child = child.into_float_value();
+                        ctx.b
+                            .build_float_compare(
+                                FloatPredicate::ONE,
+                                child,
+                                child.get_type().const_zero(),
+                                "ne_zero",
+                            )
+                            .unwrap()
+                    };
+                    Ok(res.as_basic_value_enum())
+                }
+                _ => Err(ArrowKernelError::DSLInvalidType(
+                    "cannot cast type to bool",
+                    v.get_type(),
+                )),
             }
         }
         DSLExpr::ArithBinOp(op, lhs, rhs) => {
@@ -915,4 +935,111 @@ fn compile_expr<'ctx, 'a>(
             })
         }
     }
+}
+
+fn cast_numeric<'ctx, 'a>(
+    ctx: &DSLCompilationContext<'ctx, 'a>,
+    val: BasicValueEnum<'a>,
+    orig_pt: NumericPrimitiveType,
+    tar_pt: NumericPrimitiveType,
+) -> Result<BasicValueEnum<'a>, ArrowKernelError> {
+    let tar_type = PrimitiveType::from(tar_pt).llvm_type(ctx.ctx);
+    Ok(match (orig_pt.is_integer(), tar_pt.is_integer()) {
+        // int to int
+        (true, true) => match tar_pt.width().cmp(&orig_pt.width()) {
+            Ordering::Less => ctx
+                .b
+                .build_int_truncate(val.into_int_value(), tar_type.into_int_type(), "cast")
+                .unwrap()
+                .as_basic_value_enum(),
+            Ordering::Equal => val,
+            Ordering::Greater => if orig_pt.is_signed() {
+                ctx.b
+                    .build_int_s_extend(val.into_int_value(), tar_type.into_int_type(), "cast")
+            } else {
+                ctx.b
+                    .build_int_z_extend(val.into_int_value(), tar_type.into_int_type(), "cast")
+            }
+            .unwrap()
+            .as_basic_value_enum(),
+        },
+        // int to float
+        (true, false) => if orig_pt.is_signed() {
+            ctx.b.build_signed_int_to_float(
+                val.into_int_value(),
+                tar_type.into_float_type(),
+                "cast",
+            )
+        } else {
+            ctx.b.build_unsigned_int_to_float(
+                val.into_int_value(),
+                tar_type.into_float_type(),
+                "cast",
+            )
+        }
+        .unwrap()
+        .as_basic_value_enum(),
+        // float to int
+        (false, true) => if orig_pt.is_signed() {
+            ctx.b.build_float_to_signed_int(
+                val.into_float_value(),
+                tar_type.into_int_type(),
+                "cast",
+            )
+        } else {
+            ctx.b.build_float_to_unsigned_int(
+                val.into_float_value(),
+                tar_type.into_int_type(),
+                "cast",
+            )
+        }
+        .unwrap()
+        .as_basic_value_enum(),
+        // float to float
+        (false, false) => ctx
+            .b
+            .build_float_cast(val.into_float_value(), tar_type.into_float_type(), "cast")
+            .unwrap()
+            .as_basic_value_enum(),
+    })
+}
+
+fn cast_numeric_vec<'ctx, 'a>(
+    ctx: &DSLCompilationContext<'ctx, 'a>,
+    val: VectorValue<'a>,
+    orig_pt: NumericPrimitiveType,
+    tar_pt: NumericPrimitiveType,
+) -> Result<VectorValue<'a>, ArrowKernelError> {
+    let tar_type = PrimitiveType::from(tar_pt)
+        .llvm_vec_type(&ctx.ctx, val.get_type().get_size())
+        .unwrap();
+    Ok(match (orig_pt.is_integer(), tar_pt.is_integer()) {
+        // int to int
+        (true, true) => match tar_pt.width().cmp(&orig_pt.width()) {
+            Ordering::Less => ctx.b.build_int_truncate(val, tar_type, "cast").unwrap(),
+            Ordering::Equal => val,
+            Ordering::Greater => if orig_pt.is_signed() {
+                ctx.b.build_int_s_extend(val, tar_type, "cast")
+            } else {
+                ctx.b.build_int_z_extend(val, tar_type, "cast")
+            }
+            .unwrap(),
+        },
+        // int to float
+        (true, false) => if orig_pt.is_signed() {
+            ctx.b.build_signed_int_to_float(val, tar_type, "cast")
+        } else {
+            ctx.b.build_unsigned_int_to_float(val, tar_type, "cast")
+        }
+        .unwrap(),
+        // float to int
+        (false, true) => if orig_pt.is_signed() {
+            ctx.b.build_float_to_signed_int(val, tar_type, "cast")
+        } else {
+            ctx.b.build_float_to_unsigned_int(val, tar_type, "cast")
+        }
+        .unwrap(),
+        // float to float
+        (false, false) => ctx.b.build_float_cast(val, tar_type, "cast").unwrap(),
+    })
 }

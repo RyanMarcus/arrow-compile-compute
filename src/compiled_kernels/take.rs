@@ -81,7 +81,7 @@ impl Kernel for TakeKernel {
 
         func.add_body(
             DSLStmt::for_each(&mut ctx, &[arg_idx], |loop_vars| {
-                let idx = loop_vars[0].expr().cast(PrimitiveType::U64)?;
+                let idx = loop_vars[0].expr().primitive_cast(PrimitiveType::U64)?;
                 DSLStmt::emit(0, arg_arr.expr().at(&idx)?)
             })
             .unwrap(),

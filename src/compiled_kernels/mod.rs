@@ -110,6 +110,9 @@ pub enum ArrowKernelError {
     #[error("type mismatch in {0}: expected {1:?}, got {2:?}")]
     DSLTypeMismatch(&'static str, DSLType, DSLType),
 
+    #[error("invalid type {1:?}: {0:?}")]
+    DSLInvalidType(&'static str, DSLType),
+
     #[error("argument type mismatch at index {0}: {1:?} is not compatible with {2:?}")]
     ArgumentTypeMismatch(usize, String, DSLType),
 
