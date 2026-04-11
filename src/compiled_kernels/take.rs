@@ -42,7 +42,7 @@ impl Kernel for TakeKernel {
 
         // bounds checking
         let in_bounds = arrow_interface::cmp::between(
-            idx,
+            &idx,
             &UInt64Array::new_scalar(0),
             &UInt64Array::new_scalar(arr.len() as u64),
         )?;

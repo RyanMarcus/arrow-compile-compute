@@ -84,7 +84,7 @@ pub mod cmp {
 
     /// Compute a bitvector for `lb <= arr < ub`
     pub fn between(
-        arr: &dyn Array,
+        arr: &dyn Datum,
         lb: &dyn Datum,
         ub: &dyn Datum,
     ) -> Result<BooleanArray, ArrowKernelError> {

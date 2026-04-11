@@ -25,10 +25,11 @@ use crate::{
         get_iterator_length,
     },
     compiled_kernels::{
-        cmp::add_memcmp,
+        cmp::{add_float_to_int, add_memcmp},
         dsl2::{
             buffer, runtime::RunnableDSLFunction, two_d, writers::accepted_type, DSLArgument,
-            DSLArgumentType, DSLArithBinOp, DSLExpr, DSLFunction, DSLStmt, DSLType, DSLValue,
+            DSLArgumentType, DSLArithBinOp, DSLBitwiseBinOp, DSLExpr, DSLFunction, DSLStmt,
+            DSLType, DSLValue,
         },
         link_req_helpers, optimize_module,
     },
@@ -626,12 +627,25 @@ fn compile_expr<'ctx, 'a>(
             let rhs = compile_expr(ctx, rhs)?;
 
             if lhs.is_float_value() {
+                let cvt = add_float_to_int(ctx.ctx, ctx.module, lhs_type.as_primitive().unwrap());
+                let lhs = ctx
+                    .b
+                    .build_call(cvt, &[lhs.into()], "cvt_lhs_for_total_order")
+                    .unwrap()
+                    .try_as_basic_value()
+                    .unwrap_basic();
+                let rhs = ctx
+                    .b
+                    .build_call(cvt, &[rhs.into()], "cvt_rhs_for_total_order")
+                    .unwrap()
+                    .try_as_basic_value()
+                    .unwrap_basic();
                 Ok(ctx
                     .b
-                    .build_float_compare(
-                        op.as_float_predicate(),
-                        lhs.into_float_value(),
-                        rhs.into_float_value(),
+                    .build_int_compare(
+                        op.as_int_predicate(true),
+                        lhs.into_int_value(),
+                        rhs.into_int_value(),
                         "cmp",
                     )
                     .unwrap()
@@ -932,6 +946,43 @@ fn compile_expr<'ctx, 'a>(
                     }
                 }
                 .as_basic_value_enum()
+            })
+        }
+        DSLExpr::BitwiseBinOp(op, lhs, rhs) => {
+            let lhs_v = compile_expr(ctx, lhs)?;
+            let rhs_v = compile_expr(ctx, rhs)?;
+
+            if lhs_v.get_type() != rhs_v.get_type() {
+                return Err(ArrowKernelError::DSLTypeMismatch(
+                    "bitwise operator",
+                    lhs.get_type(),
+                    rhs.get_type(),
+                ));
+            }
+
+            Ok(if lhs_v.get_type().is_int_type() {
+                let lhs_v = lhs_v.into_int_value();
+                let rhs_v = rhs_v.into_int_value();
+                match op {
+                    DSLBitwiseBinOp::And => ctx.b.build_and(lhs_v, rhs_v, "band").unwrap(),
+                    DSLBitwiseBinOp::Or => ctx.b.build_or(lhs_v, rhs_v, "bor").unwrap(),
+                    DSLBitwiseBinOp::Xor => ctx.b.build_xor(lhs_v, rhs_v, "bxor").unwrap(),
+                }
+                .as_basic_value_enum()
+            } else if lhs_v.is_vector_value() {
+                let lhs_v = lhs_v.into_vector_value();
+                let rhs_v = rhs_v.into_vector_value();
+                match op {
+                    DSLBitwiseBinOp::And => ctx.b.build_and(lhs_v, rhs_v, "band").unwrap(),
+                    DSLBitwiseBinOp::Or => ctx.b.build_or(lhs_v, rhs_v, "bor").unwrap(),
+                    DSLBitwiseBinOp::Xor => ctx.b.build_xor(lhs_v, rhs_v, "bxor").unwrap(),
+                }
+                .as_basic_value_enum()
+            } else {
+                return Err(ArrowKernelError::DSLInvalidType(
+                    "bitwise ops require int or vec",
+                    lhs.get_type(),
+                ));
             })
         }
     }

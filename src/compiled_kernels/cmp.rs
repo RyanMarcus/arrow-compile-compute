@@ -14,126 +14,78 @@ use std::ffi::c_void;
 
 use crate::compiled_iter::{datum_to_iter, generate_next, generate_next_block, IteratorHolder};
 use crate::compiled_kernels::dsl::{DSLKernel, KernelOutputType};
-use crate::compiled_kernels::{gen_convert_numeric_vec, link_req_helpers, optimize_module};
-use crate::compiled_writers::{BooleanWriter, LeafWriter, LeafWriterAllocation};
+use crate::compiled_kernels::dsl2::{
+    compile, dsl_args, DSLArgument, DSLBitwiseBinOp, DSLComparison, DSLContext, DSLExpr,
+    DSLFunction, DSLStmt, DSLType, RunnableDSLFunction,
+};
+use crate::compiled_kernels::{
+    gen_convert_numeric_vec, link_req_helpers, optimize_module, DSLArithBinOp,
+};
+use crate::compiled_writers::{BooleanWriter, LeafWriter, LeafWriterAllocation, WriterSpec};
 use crate::{
-    declare_blocks, increment_pointer, pointer_diff, ComparisonType, Predicate, PrimitiveType,
+    declare_blocks, increment_pointer, intersect_and_copy_nulls, pointer_diff, ComparisonType,
+    Predicate, PrimitiveType,
 };
 
 use super::{ArrowKernelError, Kernel};
 
-#[self_referencing]
-pub struct ComparisonKernel {
-    context: Context,
-    lhs_data_type: DataType,
-    rhs_data_type: DataType,
-    rhs_scalar: bool,
-    pred: Predicate,
-
-    #[borrows(context)]
-    #[covariant]
-    func: JitFunction<'this, unsafe extern "C" fn(*mut c_void, *mut c_void, *mut c_void)>,
-}
-
+pub struct ComparisonKernel(RunnableDSLFunction);
 unsafe impl Sync for ComparisonKernel {}
 unsafe impl Send for ComparisonKernel {}
 
 impl Kernel for ComparisonKernel {
-    type Key = (DataType, DataType, bool, Predicate);
+    type Key = (DataType, bool, DataType, bool, Predicate);
     type Input<'a> = (&'a dyn Datum, &'a dyn Datum);
     type Params = Predicate;
     type Output = BooleanArray;
 
     fn call(&self, inp: Self::Input<'_>) -> Result<Self::Output, ArrowKernelError> {
         let (a, b) = inp;
-        let (a_arr, a_scalar) = a.get();
-        let (b_arr, b_scalar) = b.get();
-        assert!(
-            !a_scalar,
-            "should swap scalar to 2nd argument (this is a bug)"
-        );
 
-        if !b_scalar && (a_arr.len() != b_arr.len()) {
-            return Err(ArrowKernelError::SizeMismatch);
-        }
+        let res = self
+            .0
+            .run(&[DSLArgument::Datum(a), DSLArgument::Datum(b)])?[0]
+            .clone();
 
-        if a_arr.is_empty() {
-            return Ok(BooleanArray::new_null(0));
-        }
-
-        if !self.with_rhs_scalar(|rhs_scalar| b_scalar == *rhs_scalar) {
-            return Err(ArrowKernelError::ArgumentMismatch(
-                "Expected RHS to be scalar".to_string(),
-            ));
-        }
-
-        if !self.with_lhs_data_type(|lhs_dt| a_arr.data_type() == lhs_dt) {
-            return Err(ArrowKernelError::ArgumentMismatch(format!(
-                "LHS did not match, expected {:?}, found {:?}",
-                self.borrow_lhs_data_type(),
-                a_arr.data_type()
-            )));
-        }
-
-        if !self.with_rhs_data_type(|rhs_dt| b_arr.data_type() == rhs_dt) {
-            return Err(ArrowKernelError::ArgumentMismatch(format!(
-                "RHS did not match, expected {:?}, found {:?}",
-                self.borrow_rhs_data_type(),
-                b_arr.data_type()
-            )));
-        }
-
-        let mut a_iter = datum_to_iter(a)?;
-        let mut b_iter = datum_to_iter(b)?;
-        let mut alloc = BooleanWriter::allocate(a_arr.len(), PrimitiveType::U8);
-
-        self.with_func(|func| unsafe {
-            func.call(a_iter.get_mut_ptr(), b_iter.get_mut_ptr(), alloc.get_ptr())
-        });
-        let mut arr = alloc.to_array(a_arr.len(), None);
-
-        if let Some(nulls) = NullBuffer::union(a_arr.nulls(), b_arr.nulls()) {
-            arr = (&arr.into_parts().0 & nulls.inner()).into();
-        }
-
-        Ok(arr)
+        intersect_and_copy_nulls(&[a, b], res).map(|x| x.as_boolean().clone())
     }
 
     fn compile(inp: &Self::Input<'_>, pred: Predicate) -> Result<Self, ArrowKernelError> {
         let (lhs, rhs) = *inp;
-        let (lhs_arr, lhs_scalar) = lhs.get();
-        let (rhs_arr, rhs_scalar) = rhs.get();
+        let (lhs_arr, _lhs_scalar) = lhs.get();
+        let (rhs_arr, _rhs_scalar) = rhs.get();
 
-        if lhs_scalar && rhs_scalar {
-            return Err(ArrowKernelError::UnsupportedArguments(
-                "scalar-scalar comparison".to_string(),
-            ));
-        }
+        let dom_type = PrimitiveType::dominant(
+            PrimitiveType::for_arrow_type(lhs_arr.data_type()),
+            PrimitiveType::for_arrow_type(rhs_arr.data_type()),
+        )
+        .ok_or_else(|| {
+            ArrowKernelError::UnsupportedArguments(format!(
+                "could not compare values of {:?} and {:?}",
+                lhs_arr.data_type(),
+                rhs_arr.data_type()
+            ))
+        })?;
 
-        if lhs_scalar && !rhs_scalar {
-            return ComparisonKernel::compile(&(rhs, lhs), pred.flip());
-        }
+        let mut ctx = DSLContext::new();
+        let mut func = DSLFunction::new("cmp");
+        let arg_lhs = func.add_arg(&mut ctx, DSLType::array_like(lhs, "n"));
+        let arg_rhs = func.add_arg(&mut ctx, DSLType::array_like(rhs, "n"));
+        func.add_ret(WriterSpec::Boolean, "n");
 
-        let lhs_iter = datum_to_iter(lhs)?;
-        let rhs_iter = datum_to_iter(rhs)?;
-        let ctx = Context::create();
-        ComparisonKernelTryBuilder {
-            context: ctx,
-            lhs_data_type: lhs_arr.data_type().clone(),
-            rhs_data_type: rhs_arr.data_type().clone(),
-            rhs_scalar,
-            pred,
-            func_builder: |ctx| match generate_block_llvm_cmp_kernel(
-                ctx, lhs, &lhs_iter, rhs, &rhs_iter, pred,
-            ) {
-                Ok(k) => Ok(k),
-                Err(ArrowKernelError::NonVectorizableType(_)) => {
-                    generate_llvm_cmp_kernel(ctx, lhs, &lhs_iter, rhs, &rhs_iter, pred)
-                }
-                Err(e) => Err(e),
-            },
-        }
-        .try_build()
+        func.add_body(
+            DSLStmt::for_each(&mut ctx, &[arg_lhs, arg_rhs], |loop_vars| {
+                let lhs = loop_vars[0].expr().primitive_cast(dom_type)?;
+                let rhs = loop_vars[1].expr().primitive_cast(dom_type)?;
+
+                let cmp = lhs.cmp(&rhs, pred.into())?;
+                DSLStmt::emit(0, cmp)
+            })
+            .unwrap(),
+        );
+
+        let func = compile(func, [DSLArgument::Datum(lhs), DSLArgument::Datum(rhs)])?;
+        Ok(Self(func))
     }
 
     fn get_key_for_input(
@@ -141,17 +93,10 @@ impl Kernel for ComparisonKernel {
         p: &Predicate,
     ) -> Result<Self::Key, ArrowKernelError> {
         let (lhs, rhs) = *i;
-        if lhs.get().1 {
-            return Self::get_key_for_input(&(rhs, lhs), &p.flip());
-        }
 
-        if lhs.get().1 {
-            return Err(ArrowKernelError::UnsupportedArguments(
-                "scalar-scalar comparison".to_string(),
-            ));
-        }
         Ok((
             lhs.get().0.data_type().clone(),
+            lhs.get().1,
             rhs.get().0.data_type().clone(),
             rhs.get().1,
             *p,
@@ -159,344 +104,91 @@ impl Kernel for ComparisonKernel {
     }
 }
 
-fn generate_llvm_cmp_kernel<'a>(
-    ctx: &'a Context,
-    lhs: &dyn Datum,
-    lhs_iter: &IteratorHolder,
-    rhs: &dyn Datum,
-    rhs_iter: &IteratorHolder,
-    pred: Predicate,
-) -> Result<
-    JitFunction<'a, unsafe extern "C" fn(*mut c_void, *mut c_void, *mut c_void)>,
-    ArrowKernelError,
-> {
-    let (lhs_arr, _lhs_scalar) = lhs.get();
-    let (rhs_arr, _rhs_scalar) = rhs.get();
-    let lhs_dt = lhs_arr.data_type();
-    let rhs_dt = rhs_arr.data_type();
+pub struct BetweenKernel(RunnableDSLFunction);
+unsafe impl Sync for BetweenKernel {}
+unsafe impl Send for BetweenKernel {}
 
-    let module = ctx.create_module("cmp_kernel");
-    let build = ctx.create_builder();
-    let i64_type = ctx.i64_type();
-    let ptr_type = ctx.ptr_type(AddressSpace::default());
-    let void_type = ctx.void_type();
-    let lhs_prim = PrimitiveType::for_arrow_type(lhs_dt);
-    let rhs_prim = PrimitiveType::for_arrow_type(rhs_dt);
+impl Kernel for BetweenKernel {
+    type Key = (DataType, bool, DataType, bool, DataType, bool);
+    type Input<'a>
+        = (&'a dyn Datum, &'a dyn Datum, &'a dyn Datum)
+    where
+        Self: 'a;
 
-    if lhs_prim != rhs_prim {
-        return Err(ArrowKernelError::ArgumentMismatch(format!(
-            "nonblock cmp cannot do type conversion, saw {:?} and {:?}",
-            lhs_dt, rhs_dt
-        )));
+    type Params = ();
+
+    type Output = BooleanArray;
+
+    fn call(&self, inp: Self::Input<'_>) -> Result<Self::Output, ArrowKernelError> {
+        self.0
+            .run(&[
+                DSLArgument::Datum(inp.0),
+                DSLArgument::Datum(inp.1),
+                DSLArgument::Datum(inp.2),
+            ])
+            .map(|x| x[0].as_boolean().clone())
     }
 
-    let lhs_llvm = lhs_prim.llvm_type(ctx);
-    let rhs_llvm = rhs_prim.llvm_type(ctx);
+    fn compile(inp: &Self::Input<'_>, _params: Self::Params) -> Result<Self, ArrowKernelError> {
+        let (inp, lb, ub) = inp;
+        let inp_pt = PrimitiveType::for_arrow_type(inp.get().0.data_type());
+        let lb_pt = PrimitiveType::for_arrow_type(lb.get().0.data_type());
+        let ub_pt = PrimitiveType::for_arrow_type(ub.get().0.data_type());
 
-    let lhs_next = generate_next(ctx, &module, "next_lhs", lhs_dt, lhs_iter).unwrap();
-    let rhs_next = generate_next(ctx, &module, "next_rhs", rhs_dt, rhs_iter).unwrap();
+        let dom_pt = PrimitiveType::dominant(inp_pt, lb_pt)
+            .and_then(|pt| PrimitiveType::dominant(pt, ub_pt))
+            .ok_or_else(|| {
+                ArrowKernelError::UnsupportedArguments(format!(
+                    "could not compare values of {}, {}, and {}",
+                    inp_pt, lb_pt, ub_pt
+                ))
+            })?;
 
-    let fn_type = void_type.fn_type(&[ptr_type.into(), ptr_type.into(), ptr_type.into()], false);
-    let cmp = module.add_function("cmp", fn_type, None);
-    let lhs_ptr = cmp.get_nth_param(0).unwrap();
-    let rhs_ptr = cmp.get_nth_param(1).unwrap();
-    let out_ptr = cmp.get_nth_param(2).unwrap().into_pointer_value();
+        let mut ctx = DSLContext::new();
+        let mut func = DSLFunction::new("between");
+        let arg_inp = func.add_arg(&mut ctx, DSLType::array_like(*inp, "n"));
+        let arg_lb = func.add_arg(&mut ctx, DSLType::array_like(*lb, "n"));
+        let arg_ub = func.add_arg(&mut ctx, DSLType::array_like(*ub, "n"));
+        func.add_ret(WriterSpec::Boolean, "n");
 
-    declare_blocks!(ctx, cmp, entry, block_cond, block_body, exit);
+        func.add_body(
+            DSLStmt::for_each(&mut ctx, &[arg_inp, arg_lb, arg_ub], |loop_vars| {
+                let inp = loop_vars[0].expr().primitive_cast(dom_pt)?;
+                let lb = loop_vars[1].expr().primitive_cast(dom_pt)?;
+                let ub = loop_vars[2].expr().primitive_cast(dom_pt)?;
 
-    build.position_at_end(entry);
-    let lhs_ptr = lhs_iter.localize_struct(ctx, &build, lhs_ptr.into_pointer_value());
-    let rhs_ptr = rhs_iter.localize_struct(ctx, &build, rhs_ptr.into_pointer_value());
-    let lhs_buf = build.build_alloca(lhs_llvm, "lhs_single_buf").unwrap();
-    let rhs_buf = build.build_alloca(rhs_llvm, "rhs_single_buf").unwrap();
-    let bool_writer = BooleanWriter::llvm_init(ctx, &module, &build, PrimitiveType::U8, out_ptr);
-    build.build_unconditional_branch(block_cond).unwrap();
-
-    build.position_at_end(block_cond);
-    let had_lhs = build
-        .build_call(lhs_next, &[lhs_ptr.into(), lhs_buf.into()], "lhs_next")
-        .unwrap()
-        .try_as_basic_value()
-        .unwrap_basic()
-        .into_int_value();
-    build
-        .build_call(rhs_next, &[rhs_ptr.into(), rhs_buf.into()], "rhs_next")
-        .unwrap();
-    build
-        .build_conditional_branch(had_lhs, block_body, exit)
-        .unwrap();
-
-    build.position_at_end(block_body);
-    let lv = build.build_load(lhs_llvm, lhs_buf, "lv").unwrap();
-    let rv = build.build_load(rhs_llvm, rhs_buf, "rv").unwrap();
-
-    let res = match lhs_prim.comparison_type() {
-        ComparisonType::Int { .. } => unreachable!("ints should use block compare"),
-        ComparisonType::Float => unreachable!("floats should use block compare"),
-        ComparisonType::List => todo!("implement list comparison"),
-        ComparisonType::String => {
-            let memcmp = add_memcmp(ctx, &module);
-            let res = build
-                .build_call(memcmp, &[lv.into(), rv.into()], "res")
-                .unwrap()
-                .try_as_basic_value()
-                .unwrap_basic()
-                .into_int_value();
-            build
-                .build_int_compare(
-                    pred.as_int_pred(true),
-                    res,
-                    i64_type.const_zero(),
-                    "cmp_res",
-                )
-                .unwrap()
-        }
-    };
-    bool_writer.llvm_ingest(ctx, &build, res.as_basic_value_enum());
-    build.build_unconditional_branch(block_cond).unwrap();
-
-    build.position_at_end(exit);
-    bool_writer.llvm_flush(ctx, &build);
-    build.build_return(None).unwrap();
-
-    module.verify().unwrap();
-    optimize_module(&module)?;
-    let ee = module
-        .create_jit_execution_engine(OptimizationLevel::Aggressive)
-        .unwrap();
-
-    Ok(unsafe {
-        ee.get_function::<unsafe extern "C" fn(*mut c_void, *mut c_void, *mut c_void)>(
-            cmp.get_name().to_str().unwrap(),
-        )
-        .unwrap()
-    })
-}
-
-fn generate_block_llvm_cmp_kernel<'a>(
-    ctx: &'a Context,
-    lhs: &dyn Datum,
-    lhs_iter: &IteratorHolder,
-    rhs: &dyn Datum,
-    rhs_iter: &IteratorHolder,
-    pred: Predicate,
-) -> Result<
-    JitFunction<'a, unsafe extern "C" fn(*mut c_void, *mut c_void, *mut c_void)>,
-    ArrowKernelError,
-> {
-    let (lhs_arr, _lhs_scalar) = lhs.get();
-    let (rhs_arr, _rhs_scalar) = rhs.get();
-    let lhs_dt = lhs_arr.data_type();
-    let rhs_dt = rhs_arr.data_type();
-
-    let module = ctx.create_module("cmp_kernel");
-    let build = ctx.create_builder();
-    let i64_type = ctx.i64_type();
-    let ptr_type = ctx.ptr_type(AddressSpace::default());
-    let void_type = ctx.void_type();
-    let lhs_prim = PrimitiveType::for_arrow_type(lhs_dt);
-    let rhs_prim = PrimitiveType::for_arrow_type(rhs_dt);
-    let lhs_vec = lhs_prim
-        .llvm_vec_type(ctx, 64)
-        .ok_or_else(|| ArrowKernelError::NonVectorizableType(lhs_dt.clone()))?;
-    let rhs_vec = rhs_prim
-        .llvm_vec_type(ctx, 64)
-        .ok_or_else(|| ArrowKernelError::NonVectorizableType(rhs_dt.clone()))?;
-    let lhs_llvm = lhs_prim.llvm_type(ctx);
-    let rhs_llvm = rhs_prim.llvm_type(ctx);
-    let dom_prim_type = PrimitiveType::dominant(lhs_prim, rhs_prim).unwrap();
-    let dom_llvm = dom_prim_type.llvm_type(ctx);
-
-    let lhs_next_block =
-        generate_next_block::<64>(ctx, &module, "next_lhs_block", lhs_dt, lhs_iter).unwrap();
-    let rhs_next_block =
-        generate_next_block::<64>(ctx, &module, "next_rhs_block", rhs_dt, rhs_iter).unwrap();
-    let lhs_next = generate_next(ctx, &module, "next_lhs", lhs_dt, lhs_iter).unwrap();
-    let rhs_next = generate_next(ctx, &module, "next_rhs", rhs_dt, rhs_iter).unwrap();
-
-    let fn_type = void_type.fn_type(&[ptr_type.into(), ptr_type.into(), ptr_type.into()], false);
-    let cmp = module.add_function("cmp", fn_type, None);
-    let lhs_ptr = cmp.get_nth_param(0).unwrap();
-    let rhs_ptr = cmp.get_nth_param(1).unwrap();
-    let alloc_ptr = cmp.get_nth_param(2).unwrap().into_pointer_value();
-
-    declare_blocks!(ctx, cmp, entry, block_cond, block_body, tail_cond, tail_body, exit);
-
-    build.position_at_end(entry);
-
-    let writer = BooleanWriter::llvm_init(ctx, &module, &build, PrimitiveType::U8, alloc_ptr);
-    let lhs_vec_buf = build.build_alloca(lhs_vec, "lhs_vec_buf").unwrap();
-    let rhs_vec_buf = build.build_alloca(rhs_vec, "rhs_vec_buf").unwrap();
-    let lhs_single_buf = build.build_alloca(lhs_llvm, "lhs_single_buf").unwrap();
-    let rhs_single_buf = build.build_alloca(rhs_llvm, "rhs_single_buf").unwrap();
-    let tail_buf_ptr = build.build_alloca(i64_type, "tail_buf_ptr").unwrap();
-    build
-        .build_store(tail_buf_ptr, i64_type.const_zero())
-        .unwrap();
-    let tail_buf_idx_ptr = build.build_alloca(i64_type, "tail_buf_idx").unwrap();
-    build
-        .build_store(tail_buf_idx_ptr, i64_type.const_zero())
-        .unwrap();
-    build.build_unconditional_branch(block_cond).unwrap();
-
-    build.position_at_end(block_cond);
-    let had_lhs = build
-        .build_call(
-            lhs_next_block,
-            &[lhs_ptr.into(), lhs_vec_buf.into()],
-            "lhs_next",
-        )
-        .unwrap()
-        .try_as_basic_value()
-        .unwrap_basic()
-        .into_int_value();
-    build
-        .build_call(
-            rhs_next_block,
-            &[rhs_ptr.into(), rhs_vec_buf.into()],
-            "rhs_next",
-        )
-        .unwrap();
-    build
-        .build_conditional_branch(had_lhs, block_body, tail_cond)
-        .unwrap();
-
-    build.position_at_end(block_body);
-    let lvec = build
-        .build_load(lhs_vec, lhs_vec_buf, "lvec")
-        .unwrap()
-        .into_vector_value();
-    let rvec = build
-        .build_load(rhs_vec, rhs_vec_buf, "rvec")
-        .unwrap()
-        .into_vector_value();
-
-    let lvec = gen_convert_numeric_vec(ctx, &build, lvec, lhs_prim, dom_prim_type);
-    let rvec = gen_convert_numeric_vec(ctx, &build, rvec, rhs_prim, dom_prim_type);
-
-    let res = match dom_prim_type.comparison_type() {
-        ComparisonType::Int { signed } => build
-            .build_int_compare(pred.as_int_pred(signed), lvec, rvec, "block_cmp_result")
+                let is_above_lb = inp.cmp(&lb, DSLComparison::Gte)?;
+                let is_below_ub = inp.cmp(&ub, DSLComparison::Lt)?;
+                let cmp = is_above_lb.bitwise(DSLBitwiseBinOp::And, is_below_ub)?;
+                DSLStmt::emit(0, cmp)
+            })
             .unwrap(),
-        ComparisonType::Float => {
-            let convert = add_float_vec_to_int_vec(ctx, &module, 64, dom_prim_type);
-            let lhs = build
-                .build_call(convert, &[lvec.into()], "lhs_converted")
-                .unwrap()
-                .try_as_basic_value()
-                .unwrap_basic()
-                .into_vector_value();
-            let rhs = build
-                .build_call(convert, &[rvec.into()], "rhs_converted")
-                .unwrap()
-                .try_as_basic_value()
-                .unwrap_basic()
-                .into_vector_value();
-            build
-                .build_int_compare(pred.as_int_pred(true), lhs, rhs, "block_cmp_result")
-                .unwrap()
-        }
-        ComparisonType::String => unreachable!("no block comparison for strings"),
-        ComparisonType::List => unreachable!("no block comparison for lists"),
-    };
+        );
+        let func = compile(
+            func,
+            [
+                DSLArgument::Datum(*inp),
+                DSLArgument::Datum(*lb),
+                DSLArgument::Datum(*ub),
+            ],
+        )?;
 
-    let res = build.build_bit_cast(res, i64_type, "res_u64").unwrap();
-    writer.llvm_ingest_64_bools(ctx, &build, res);
-    build.build_unconditional_branch(block_cond).unwrap();
+        Ok(BetweenKernel(func))
+    }
 
-    build.position_at_end(tail_cond);
-    let had_lhs = build
-        .build_call(
-            lhs_next,
-            &[lhs_ptr.into(), lhs_single_buf.into()],
-            "lhs_next",
-        )
-        .unwrap()
-        .try_as_basic_value()
-        .unwrap_basic()
-        .into_int_value();
-    build
-        .build_call(
-            rhs_next,
-            &[rhs_ptr.into(), rhs_single_buf.into()],
-            "rhs_next",
-        )
-        .unwrap();
-    build
-        .build_conditional_branch(had_lhs, tail_body, exit)
-        .unwrap();
-
-    build.position_at_end(tail_body);
-    let lv = build.build_load(lhs_llvm, lhs_single_buf, "lv").unwrap();
-    let rv = build.build_load(rhs_llvm, rhs_single_buf, "rv").unwrap();
-
-    let lv_v = build
-        .build_bit_cast(lv, lhs_prim.llvm_vec_type(ctx, 1).unwrap(), "lv_v")
-        .unwrap()
-        .into_vector_value();
-    let rv_v = build
-        .build_bit_cast(rv, rhs_prim.llvm_vec_type(ctx, 1).unwrap(), "rv_v")
-        .unwrap()
-        .into_vector_value();
-    let lv_v = gen_convert_numeric_vec(ctx, &build, lv_v, lhs_prim, dom_prim_type);
-    let rv_v = gen_convert_numeric_vec(ctx, &build, rv_v, rhs_prim, dom_prim_type);
-    let lv = build.build_bit_cast(lv_v, dom_llvm, "lv").unwrap();
-    let rv = build.build_bit_cast(rv_v, dom_llvm, "rv").unwrap();
-
-    let res = match dom_prim_type.comparison_type() {
-        ComparisonType::Int { signed } => build
-            .build_int_compare(
-                pred.as_int_pred(signed),
-                lv.into_int_value(),
-                rv.into_int_value(),
-                "cmp_single",
-            )
-            .unwrap(),
-        ComparisonType::Float => {
-            let convert = add_float_to_int(ctx, &module, dom_prim_type);
-            let lhs = build
-                .build_call(convert, &[lv.into()], "lhs_converted")
-                .unwrap()
-                .try_as_basic_value()
-                .unwrap_basic();
-            let rhs = build
-                .build_call(convert, &[rv.into()], "rhs_converted")
-                .unwrap()
-                .try_as_basic_value()
-                .unwrap_basic();
-
-            build
-                .build_int_compare(
-                    pred.as_int_pred(true),
-                    lhs.into_int_value(),
-                    rhs.into_int_value(),
-                    "cmp_single",
-                )
-                .unwrap()
-        }
-        ComparisonType::String | ComparisonType::List => todo!(),
-    };
-
-    writer.llvm_ingest(ctx, &build, res.into());
-    build.build_unconditional_branch(tail_cond).unwrap();
-
-    build.position_at_end(exit);
-    writer.llvm_flush(ctx, &build);
-    build.build_return(None).unwrap();
-
-    module.verify().unwrap();
-    optimize_module(&module)?;
-    let ee = module
-        .create_jit_execution_engine(OptimizationLevel::Aggressive)
-        .unwrap();
-    link_req_helpers(&module, &ee).unwrap();
-
-    Ok(unsafe {
-        ee.get_function::<unsafe extern "C" fn(*mut c_void, *mut c_void, *mut c_void)>(
-            cmp.get_name().to_str().unwrap(),
-        )
-        .unwrap()
-    })
+    fn get_key_for_input(
+        i: &Self::Input<'_>,
+        _p: &Self::Params,
+    ) -> Result<Self::Key, ArrowKernelError> {
+        Ok((
+            i.0.get().0.data_type().clone(),
+            i.0.get().1,
+            i.1.get().0.data_type().clone(),
+            i.1.get().1,
+            i.2.get().0.data_type().clone(),
+            i.2.get().1,
+        ))
+    }
 }
 
 pub fn add_float_vec_to_int_vec<'a>(
@@ -581,13 +273,18 @@ pub fn add_float_to_int<'a>(
     // right ^= (((right >> 63) as u64) >> 1) as i64;
     // left.cmp(right)
 
+    let fn_name = format!("float_to_int_{}", ptype.width());
+    if let Some(func) = module.get_function(&fn_name) {
+        return func;
+    }
+
     let inp_type = ptype.llvm_type(ctx);
     let int_type = PrimitiveType::int_with_width(ptype.width())
         .llvm_type(ctx)
         .into_int_type();
 
     let func_type = int_type.fn_type(&[inp_type.into()], false);
-    let func = module.add_function("float_to_int", func_type, Some(Linkage::Private));
+    let func = module.add_function(&fn_name, func_type, Some(Linkage::Private));
     let float = func.get_nth_param(0).unwrap().into_float_value();
 
     declare_blocks!(ctx, func, entry);
@@ -768,56 +465,6 @@ pub fn add_memcmp<'a>(ctx: &'a Context, module: &Module<'a>) -> FunctionValue<'a
     function
 }
 
-pub struct BetweenKernel(DSLKernel);
-unsafe impl Sync for BetweenKernel {}
-unsafe impl Send for BetweenKernel {}
-
-impl Kernel for BetweenKernel {
-    type Key = (DataType, DataType, bool, DataType, bool);
-    type Input<'a>
-        = (&'a dyn Array, &'a dyn Datum, &'a dyn Datum)
-    where
-        Self: 'a;
-
-    type Params = ();
-
-    type Output = BooleanArray;
-
-    fn call(&self, inp: Self::Input<'_>) -> Result<Self::Output, ArrowKernelError> {
-        self.0
-            .call(&[&inp.0, inp.1, inp.2])
-            .map(|arr| arr.as_boolean().clone())
-    }
-
-    fn compile(inp: &Self::Input<'_>, _params: Self::Params) -> Result<Self, ArrowKernelError> {
-        let (inp, lb, ub) = inp;
-        Ok(BetweenKernel(
-            DSLKernel::compile(&[inp, *lb, *ub], |ctx| {
-                let x = ctx.get_input(0)?;
-                let lb = ctx.get_input(1)?;
-                let ub = ctx.get_input(2)?;
-                ctx.iter_over(vec![x, lb, ub])
-                    .map(|i| vec![i[0].cmp(Predicate::Gte, &i[1]).and(&i[0].lt(&i[2]))])
-                    .collect(KernelOutputType::Boolean)
-            })
-            .map_err(ArrowKernelError::DSLError)?,
-        ))
-    }
-
-    fn get_key_for_input(
-        i: &Self::Input<'_>,
-        _p: &Self::Params,
-    ) -> Result<Self::Key, ArrowKernelError> {
-        Ok((
-            i.0.data_type().clone(),
-            i.1.get().0.data_type().clone(),
-            i.1.get().1,
-            i.2.get().0.data_type().clone(),
-            i.2.get().1,
-        ))
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use std::cmp::Ordering;
@@ -852,7 +499,7 @@ mod tests {
         let b = UInt32Array::from(vec![Some(11), Some(0), Some(13)]);
         let k = ComparisonKernel::compile(&(&a, &b), Predicate::Lt).unwrap();
         let r = k.call((&a, &b)).unwrap();
-        assert_eq!(r, BooleanArray::from(vec![true, false, false]));
+        assert_eq!(r, BooleanArray::from(vec![Some(true), Some(false), None]));
     }
 
     #[test]

@@ -1,9 +1,13 @@
 use std::collections::HashSet;
 use std::fmt::Debug;
+#[cfg(test)]
+use std::ops::{BitAnd, BitOr, BitXor};
 use std::sync::Arc;
 
 use arrow_array::cast::AsArray;
 use arrow_array::types::UInt32Type;
+#[cfg(test)]
+use arrow_array::{ArrowPrimitiveType, PrimitiveArray};
 
 use arrow_array::ArrayRef;
 use arrow_array::{Datum, UInt32Array, UInt64Array};
@@ -18,7 +22,7 @@ use strum_macros::EnumIter;
 use crate::compiled_iter::IteratorHolder;
 use crate::compiled_kernels::dsl::base_type;
 use crate::compiled_kernels::dsl2::writers::OutputSpec;
-use crate::{ArrowKernelError, PrimitiveType};
+use crate::{ArrowKernelError, Predicate, PrimitiveType};
 
 mod buffer;
 mod compiler;
@@ -473,6 +477,33 @@ impl DSLArithBinOp {
     }
 }
 
+#[derive(Debug, Copy, Clone, Hash, PartialEq, Eq, EnumIter)]
+pub enum DSLBitwiseBinOp {
+    And,
+    Or,
+    Xor,
+}
+
+#[cfg(test)]
+impl DSLBitwiseBinOp {
+    pub fn arrow_compute<T>(
+        &self,
+        arr1: &PrimitiveArray<T>,
+        arr2: &PrimitiveArray<T>,
+    ) -> PrimitiveArray<T>
+    where
+        T: ArrowPrimitiveType,
+        T::Native:
+            BitAnd<Output = T::Native> + BitOr<Output = T::Native> + BitXor<Output = T::Native>,
+    {
+        match self {
+            Self::And => arrow_arith::bitwise::bitwise_and(arr1, arr2).unwrap(),
+            Self::Or => arrow_arith::bitwise::bitwise_or(arr1, arr2).unwrap(),
+            Self::Xor => arrow_arith::bitwise::bitwise_xor(arr1, arr2).unwrap(),
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy)]
 pub enum DSLComparison {
     Lt,
@@ -538,6 +569,19 @@ impl DSLComparison {
                     IntPredicate::UGE
                 }
             }
+        }
+    }
+}
+
+impl From<Predicate> for DSLComparison {
+    fn from(value: Predicate) -> Self {
+        match value {
+            Predicate::Eq => DSLComparison::Eq,
+            Predicate::Ne => DSLComparison::Neq,
+            Predicate::Lt => DSLComparison::Lt,
+            Predicate::Lte => DSLComparison::Lte,
+            Predicate::Gt => DSLComparison::Gt,
+            Predicate::Gte => DSLComparison::Gte,
         }
     }
 }
@@ -766,6 +810,7 @@ pub enum DSLExpr {
     Cast(Box<DSLExpr>, PrimitiveType),
     CastToBool(Box<DSLExpr>),
     ArithBinOp(DSLArithBinOp, Box<DSLExpr>, Box<DSLExpr>),
+    BitwiseBinOp(DSLBitwiseBinOp, Box<DSLExpr>, Box<DSLExpr>),
 }
 
 impl DSLExpr {
@@ -838,6 +883,22 @@ impl DSLExpr {
         ))
     }
 
+    pub fn bitwise(&self, op: DSLBitwiseBinOp, rhs: DSLExpr) -> Result<DSLExpr, ArrowKernelError> {
+        if self.get_type() != rhs.get_type() {
+            return Err(ArrowKernelError::DSLTypeMismatch(
+                "bitwise bin op",
+                self.get_type(),
+                rhs.get_type(),
+            ));
+        }
+
+        Ok(DSLExpr::BitwiseBinOp(
+            op,
+            Box::new(self.clone()),
+            Box::new(rhs.clone()),
+        ))
+    }
+
     pub fn get_type(&self) -> DSLType {
         match self {
             DSLExpr::Compare(..) => DSLType::Boolean,
@@ -851,7 +912,7 @@ impl DSLExpr {
                 t
             }
             DSLExpr::Value(v) => v.ty.clone(),
-            DSLExpr::ArithBinOp(_, v, _) => v.get_type().clone(),
+            DSLExpr::BitwiseBinOp(_, v, _) | DSLExpr::ArithBinOp(_, v, _) => v.get_type().clone(),
             DSLExpr::Cast(_, pt) => DSLType::Primitive(*pt),
             DSLExpr::CastToBool(_) => DSLType::Boolean,
         }
@@ -859,7 +920,9 @@ impl DSLExpr {
 
     fn accessed_parameters(&self, params: &mut HashSet<usize>) {
         match self {
-            DSLExpr::Compare(_, l, r) | DSLExpr::ArithBinOp(_, l, r) => {
+            DSLExpr::Compare(_, l, r)
+            | DSLExpr::ArithBinOp(_, l, r)
+            | DSLExpr::BitwiseBinOp(_, l, r) => {
                 l.accessed_parameters(params);
                 r.accessed_parameters(params);
             }
