@@ -289,9 +289,18 @@ impl<'a> LeafWriter<'a> for BooleanWriter<'a> {
                 .build_load(ctx.i64_type(), len_ptr, "curr_len")
                 .unwrap()
                 .into_int_value();
+            let partial_bits = build
+                .build_int_unsigned_rem(
+                    curr_len,
+                    ctx.i64_type().const_int(8, false),
+                    "partial_bits",
+                )
+                .unwrap();
             let new_len = build
                 .build_int_add(
-                    curr_len,
+                    build
+                        .build_int_sub(curr_len, partial_bits, "full_bytes_len")
+                        .unwrap(),
                     build
                         .build_int_z_extend(buf_idx, ctx.i64_type(), "ext_buf_idx")
                         .unwrap(),

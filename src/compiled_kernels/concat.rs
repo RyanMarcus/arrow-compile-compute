@@ -1,16 +1,20 @@
-use std::{ffi::c_void, sync::LazyLock};
+use std::sync::LazyLock;
 
-use arrow_array::{Array, ArrayRef};
+use arrow_array::{Array, ArrayRef, Datum};
 use arrow_buffer::{BooleanBufferBuilder, NullBuffer};
 use arrow_schema::DataType;
-use inkwell::{context::Context, execution_engine::JitFunction, AddressSpace, OptimizationLevel};
-use ouroboros::self_referencing;
 
 use crate::{
-    compiled_iter::{datum_to_iter, generate_next},
-    compiled_kernels::{cast::coalesce_type, link_req_helpers, optimize_module, KernelCache},
+    compiled_kernels::{
+        cast::coalesce_type,
+        dsl2::{
+            compile, DSLArgument, DSLContext, DSLFunction, DSLStmt, DSLType, OutputSlot,
+            OutputSpec, RunnableDSLFunction,
+        },
+        KernelCache,
+    },
     compiled_writers::WriterSpec,
-    declare_blocks, logical_arrow_type, logical_nulls, ArrowKernelError, Kernel, PrimitiveType,
+    logical_arrow_type, logical_nulls, ArrowKernelError, Kernel, PrimitiveType,
 };
 
 pub fn concat_all(data: &[&dyn Array]) -> Result<ArrayRef, ArrowKernelError> {
@@ -19,9 +23,8 @@ pub fn concat_all(data: &[&dyn Array]) -> Result<ArrayRef, ArrowKernelError> {
 
 fn concat_with_spec(data: &[&dyn Array], spec: &WriterSpec) -> Result<ArrayRef, ArrowKernelError> {
     let total_els = data.iter().map(|x| x.len()).sum::<usize>();
-    let mut alloc = spec.allocate(total_els);
+    let mut alloc = OutputSpec::new(spec.clone(), "n").allocate(total_els);
 
-    // create all the nulls, if needed
     let nulls = if data.iter().any(|arr| arr.is_nullable()) {
         let mut bb = BooleanBufferBuilder::new(total_els);
         for el in data.iter() {
@@ -36,7 +39,7 @@ fn concat_with_spec(data: &[&dyn Array], spec: &WriterSpec) -> Result<ArrayRef, 
     };
 
     for arr in data {
-        CONCAT_PROGRAM_CACHE.get((*arr, alloc.get_ptr()), concat_writer_spec(arr.data_type()))?;
+        CONCAT_PROGRAM_CACHE.get((*arr, &mut alloc), ())?;
     }
 
     let arr = alloc.into_array_ref(nulls);
@@ -54,130 +57,67 @@ fn concat_with_spec(data: &[&dyn Array], spec: &WriterSpec) -> Result<ArrayRef, 
 
 static CONCAT_PROGRAM_CACHE: LazyLock<KernelCache<ConcatKernel>> = LazyLock::new(KernelCache::new);
 
-#[self_referencing]
-pub struct ConcatKernel {
-    context: Context,
-    dtype: DataType,
-
-    #[borrows(context)]
-    #[covariant]
-    func: JitFunction<'this, unsafe extern "C" fn(*mut c_void, *mut c_void)>,
-}
+pub struct ConcatKernel(RunnableDSLFunction);
 
 unsafe impl Sync for ConcatKernel {}
 unsafe impl Send for ConcatKernel {}
 
 impl Kernel for ConcatKernel {
-    type Key = (DataType, WriterSpec);
+    type Key = DataType;
 
-    type Input<'a> = (&'a dyn Array, *mut c_void);
+    type Input<'a> = (&'a dyn Array, &'a mut OutputSlot);
 
-    type Params = WriterSpec;
+    type Params = ();
 
     type Output = ();
 
     fn call(&self, inp: Self::Input<'_>) -> Result<Self::Output, ArrowKernelError> {
-        let (arr, ptr) = inp;
-        let mut iter = datum_to_iter(&arr)?;
-
-        unsafe {
-            self.borrow_func().call(iter.get_mut_ptr(), ptr);
-        }
-
-        Ok(())
+        let (arr, output) = inp;
+        let datum = &arr as &dyn Datum;
+        self.0
+            .run_into(&[DSLArgument::Datum(datum)], std::slice::from_mut(output))
     }
 
-    fn compile(inp: &Self::Input<'_>, spec: Self::Params) -> Result<Self, ArrowKernelError> {
-        let (arr, _ptr) = inp;
-        ConcatKernelTryBuilder {
-            context: Context::create(),
-            dtype: arr.data_type().clone(),
-            func_builder: |ctx| build_concat(ctx, *arr, &spec),
-        }
-        .try_build()
+    fn compile(inp: &Self::Input<'_>, _params: Self::Params) -> Result<Self, ArrowKernelError> {
+        let (arr, _output) = inp;
+        let datum = &*arr as &dyn Datum;
+
+        let mut ctx = DSLContext::new();
+        let mut func = DSLFunction::new("concat");
+        let arg = func.add_arg(&mut ctx, DSLType::array_like(datum, "n"));
+        func.add_ret(concat_writer_spec(arr.data_type()), "n");
+        func.add_body(DSLStmt::for_each(&mut ctx, &[arg], |loop_vars| {
+            DSLStmt::emit(0, loop_vars[0].expr())
+        })?);
+
+        let func = compile(func, [DSLArgument::Datum(datum)])?;
+        Ok(Self(func))
     }
 
     fn get_key_for_input(
         i: &Self::Input<'_>,
-        p: &Self::Params,
+        _p: &Self::Params,
     ) -> Result<Self::Key, ArrowKernelError> {
-        Ok((i.0.data_type().clone(), p.clone()))
+        Ok(i.0.data_type().clone())
     }
 }
 
-fn build_concat<'a>(
-    ctx: &'a Context,
-    data: &dyn Array,
-    spec: &WriterSpec,
-) -> Result<JitFunction<'a, unsafe extern "C" fn(*mut c_void, *mut c_void)>, ArrowKernelError> {
-    let llvm_mod = ctx.create_module("concat");
-    let ptr_type = ctx.ptr_type(AddressSpace::default());
-    let func = llvm_mod.add_function(
-        "concat",
-        ctx.void_type()
-            .fn_type(&[ptr_type.into(), ptr_type.into()], false),
-        None,
-    );
-
-    let next = generate_next(
-        ctx,
-        &llvm_mod,
-        "next",
-        data.data_type(),
-        &datum_to_iter(&data)?,
-    )
-    .unwrap();
-
-    let b = ctx.create_builder();
-    declare_blocks!(ctx, func, entry, loop_cond, loop_body, exit);
-    let iter_ptr = func.get_nth_param(0).unwrap().into_pointer_value();
-    let alloc_ptr = func.get_nth_param(1).unwrap().into_pointer_value();
-    let llvm_type = spec.storage_type().llvm_type(ctx);
-
-    b.position_at_end(entry);
-    let writer = spec.llvm_init(ctx, &llvm_mod, &b, alloc_ptr);
-    let buf_ptr = b.build_alloca(llvm_type, "buf").unwrap();
-    b.build_unconditional_branch(loop_cond).unwrap();
-
-    b.position_at_end(loop_cond);
-    let had_next = b
-        .build_call(next, &[iter_ptr.into(), buf_ptr.into()], "next")
-        .unwrap()
-        .try_as_basic_value()
-        .unwrap_basic()
-        .into_int_value();
-    b.build_conditional_branch(had_next, loop_body, exit)
-        .unwrap();
-
-    b.position_at_end(loop_body);
-    let buf = b.build_load(llvm_type, buf_ptr, "buf").unwrap();
-    writer.llvm_ingest(ctx, &b, buf);
-    b.build_unconditional_branch(loop_cond).unwrap();
-
-    b.position_at_end(exit);
-    writer.llvm_flush(ctx, &b);
-    b.build_return(None).unwrap();
-
-    llvm_mod.verify().unwrap();
-    optimize_module(&llvm_mod)?;
-    let ee = llvm_mod
-        .create_jit_execution_engine(OptimizationLevel::Aggressive)
-        .unwrap();
-    link_req_helpers(&llvm_mod, &ee)?;
-
-    let concat_func = unsafe {
-        ee.get_function::<unsafe extern "C" fn(*mut c_void, *mut c_void)>("concat")
-            .unwrap()
-    };
-
-    Ok(concat_func)
-}
-
 fn concat_writer_spec(dt: &DataType) -> WriterSpec {
-    match PrimitiveType::for_arrow_type(dt) {
-        PrimitiveType::P64x2 => WriterSpec::StringView,
-        PrimitiveType::List(item, size) => WriterSpec::FixedSizeList(item, size),
-        pt => WriterSpec::Primitive(pt),
+    match logical_arrow_type(dt) {
+        DataType::Boolean => WriterSpec::Boolean,
+        DataType::Utf8
+        | DataType::LargeUtf8
+        | DataType::Utf8View
+        | DataType::Binary
+        | DataType::LargeBinary
+        | DataType::BinaryView => WriterSpec::StringView,
+        DataType::FixedSizeList(field, len) => WriterSpec::FixedSizeList(
+            PrimitiveType::for_arrow_type(field.data_type())
+                .try_into()
+                .unwrap(),
+            len as usize,
+        ),
+        dt => WriterSpec::Primitive(PrimitiveType::for_arrow_type(&dt)),
     }
 }
 
@@ -185,16 +125,15 @@ fn concat_writer_spec(dt: &DataType) -> WriterSpec {
 mod tests {
     use std::sync::Arc;
 
-    use arrow_array::{Array, FixedSizeListArray, Float32Array, Int32Array, StringArray};
+    use arrow_array::{
+        cast::AsArray, types::Int32Type, Array, BooleanArray, FixedSizeListArray, Float32Array,
+        Int32Array, StringArray,
+    };
 
     use itertools::Itertools;
 
     use crate::{
-        compiled_kernels::concat::ConcatKernel,
-        compiled_writers::{
-            FixedSizeListWriter, LeafWriter, LeafWriterAllocation, PrimitiveArrayWriter,
-            StringViewWriter,
-        },
+        compiled_kernels::{concat::ConcatKernel, dsl2::OutputSpec},
         Kernel,
     };
 
@@ -202,19 +141,16 @@ mod tests {
     fn test_concat_i32() {
         let d1 = Int32Array::from(vec![1, 2, 3, 4]);
         let d2 = Int32Array::from(vec![5, 6, 7, 8]);
-        let mut alloc = PrimitiveArrayWriter::allocate(8, crate::PrimitiveType::I32);
+        let mut alloc = OutputSpec::new(super::concat_writer_spec(d1.data_type()), "n").allocate(8);
 
-        let k = ConcatKernel::compile(
-            &(&d1, alloc.get_ptr()),
-            super::concat_writer_spec(d1.data_type()),
-        )
-        .unwrap();
+        let k = ConcatKernel::compile(&(&d1, &mut alloc), ()).unwrap();
 
-        k.call((&d1, alloc.get_ptr())).unwrap();
-        k.call((&d2, alloc.get_ptr())).unwrap();
+        k.call((&d1, &mut alloc)).unwrap();
+        k.call((&d2, &mut alloc)).unwrap();
 
-        let res: Int32Array = alloc.into_primitive_array(8, None);
-        let res = res.iter().map(|x| x.unwrap()).collect_vec();
+        let res = alloc.into_array_ref(None);
+        let res = res.as_primitive::<Int32Type>();
+        let res: Vec<i32> = res.iter().map(|x| x.unwrap()).collect_vec();
         assert_eq!(res, vec![1, 2, 3, 4, 5, 6, 7, 8]);
     }
 
@@ -226,29 +162,29 @@ mod tests {
             "!",
             "this is a longer string that is more than 12 chars",
         ]);
-        let mut alloc = StringViewWriter::allocate(5, crate::PrimitiveType::P64x2);
+        let mut alloc = OutputSpec::new(super::concat_writer_spec(d1.data_type()), "n").allocate(5);
 
-        let k = ConcatKernel::compile(
-            &(&d1, alloc.get_ptr()),
-            super::concat_writer_spec(d1.data_type()),
-        )
-        .unwrap();
-        k.call((&d1, alloc.get_ptr())).unwrap();
-        k.call((&d2, alloc.get_ptr())).unwrap();
+        let k = ConcatKernel::compile(&(&d1, &mut alloc), ()).unwrap();
+        k.call((&d1, &mut alloc)).unwrap();
+        k.call((&d2, &mut alloc)).unwrap();
 
-        let res = alloc.to_array(5, None);
-        let res = res
+        let res = alloc.into_array_ref(None);
+        let res =
+            crate::compiled_kernels::cast::coalesce_type(res, &arrow_schema::DataType::Utf8View)
+                .unwrap();
+        let res: Vec<String> = res
+            .as_string_view()
             .iter()
-            .map(|x| std::str::from_utf8(x.unwrap()).unwrap())
+            .map(|x| x.unwrap().to_string())
             .collect_vec();
         assert_eq!(
             res,
-            &[
-                "hello",
-                "world",
-                "!",
-                "!",
-                "this is a longer string that is more than 12 chars"
+            vec![
+                "hello".to_string(),
+                "world".to_string(),
+                "!".to_string(),
+                "!".to_string(),
+                "this is a longer string that is more than 12 chars".to_string()
             ]
         );
     }
@@ -266,23 +202,18 @@ mod tests {
         let d1 = FixedSizeListArray::try_new(field.clone(), 4, Arc::new(d1_values), None).unwrap();
         let d2 = FixedSizeListArray::try_new(field, 4, Arc::new(d2_values), None).unwrap();
 
-        let mut alloc =
-            FixedSizeListWriter::allocate(4, crate::PrimitiveType::for_arrow_type(d1.data_type()));
+        let mut alloc = OutputSpec::new(super::concat_writer_spec(d1.data_type()), "n").allocate(4);
 
-        let k = ConcatKernel::compile(
-            &(&d1, alloc.get_ptr()),
-            super::concat_writer_spec(d1.data_type()),
-        )
-        .unwrap();
-        k.call((&d1, alloc.get_ptr())).unwrap();
-        k.call((&d2, alloc.get_ptr())).unwrap();
+        let k = ConcatKernel::compile(&(&d1, &mut alloc), ()).unwrap();
+        k.call((&d1, &mut alloc)).unwrap();
+        k.call((&d2, &mut alloc)).unwrap();
 
-        let res = alloc.to_array_ref(None);
+        let res = alloc.into_array_ref(None);
         let res = res.as_any().downcast_ref::<FixedSizeListArray>().unwrap();
 
         let values = res.values();
         let values = values.as_any().downcast_ref::<Float32Array>().unwrap();
-        let values = values.iter().map(|x| x.unwrap()).collect_vec();
+        let values: Vec<f32> = values.iter().map(|x| x.unwrap()).collect_vec();
 
         assert_eq!(
             values,
@@ -290,6 +221,24 @@ mod tests {
                 1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0, 9.0, 10.0, 11.0, 12.0, 13.0, 14.0, 15.0,
                 16.0
             ]
+        );
+    }
+
+    #[test]
+    fn test_concat_bools() {
+        let d1 = BooleanArray::from(vec![true, false, true]);
+        let d2 = BooleanArray::from(vec![false, true]);
+        let mut alloc = OutputSpec::new(super::concat_writer_spec(d1.data_type()), "n").allocate(5);
+
+        let k = ConcatKernel::compile(&(&d1, &mut alloc), ()).unwrap();
+        k.call((&d1, &mut alloc)).unwrap();
+        k.call((&d2, &mut alloc)).unwrap();
+
+        let res = alloc.into_array_ref(None);
+        let res = res.as_boolean();
+        assert_eq!(
+            res.iter().map(|x| x.unwrap()).collect_vec(),
+            vec![true, false, true, false, true]
         );
     }
 }

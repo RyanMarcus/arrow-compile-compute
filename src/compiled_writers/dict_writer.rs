@@ -37,7 +37,11 @@ pub struct DictAllocation {
 }
 
 impl DictAllocation {
-    pub fn allocate(expected_count: usize, key_type: DictionaryKeyType, value_spec: &WriterSpec) -> Self {
+    pub fn allocate(
+        expected_count: usize,
+        key_type: DictionaryKeyType,
+        value_spec: &WriterSpec,
+    ) -> Self {
         let mut keys = Box::new(PrimitiveArrayWriter::allocate(
             expected_count,
             key_type.primitive_type(),
@@ -72,7 +76,11 @@ impl DictAllocation {
         self.keys.len()
     }
 
-    pub fn into_array_ref_with_len(self, len: usize, nulls: Option<arrow_buffer::NullBuffer>) -> ArrayRef {
+    pub fn into_array_ref_with_len(
+        self,
+        len: usize,
+        nulls: Option<arrow_buffer::NullBuffer>,
+    ) -> ArrayRef {
         match self.key_type {
             DictionaryKeyType::Int8 => Arc::new(self.into_typed_array::<Int8Type>(len, nulls)),
             DictionaryKeyType::Int16 => Arc::new(self.into_typed_array::<Int16Type>(len, nulls)),
@@ -97,9 +105,7 @@ impl DictAllocation {
     ) -> DictionaryArray<K> {
         let keys = (*self.keys).to_array(len, nulls);
         let keys = keys.as_primitive::<K>().clone();
-        let values = self
-            .values
-            .into_array_ref_with_len(self.tt.len(), None);
+        let values = self.values.into_array_ref_with_len(self.tt.len(), None);
         unsafe { DictionaryArray::<K>::new_unchecked(keys, values) }
     }
 }
@@ -218,10 +224,9 @@ impl<'a> DictWriter<'a> {
 
         let ingest_func = {
             let b = ctx.create_builder();
-            let func_type = ctx.bool_type().fn_type(
-                &[ptr_type.into(), value_type.llvm_type(ctx).into()],
-                false,
-            );
+            let func_type = ctx
+                .bool_type()
+                .fn_type(&[ptr_type.into(), value_type.llvm_type(ctx).into()], false);
             let func = llvm_mod.add_function(
                 &format!("dict_writer_ingest_{}_{}", K::DATA_TYPE, value_type),
                 func_type,

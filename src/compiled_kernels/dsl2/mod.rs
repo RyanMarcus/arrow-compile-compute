@@ -21,7 +21,6 @@ use strum_macros::EnumIter;
 
 use crate::compiled_iter::IteratorHolder;
 use crate::compiled_kernels::dsl::base_type;
-use crate::compiled_kernels::dsl2::writers::OutputSpec;
 use crate::{ArrowKernelError, Predicate, PrimitiveType};
 
 mod buffer;
@@ -31,9 +30,10 @@ mod runtime;
 mod two_d;
 mod writers;
 
+pub use self::writers::OutputSpec;
 pub use compiler::compile;
 pub use runtime::RunnableDSLFunction;
-pub use writers::WriterSpec;
+pub use writers::{OutputSlot, WriterSpec};
 
 pub struct DSLContext {
     symbol_counter: usize,
@@ -985,7 +985,7 @@ mod tests {
             dsl::DSLKernel,
             dsl2::{
                 compiler::compile, writers::WriterSpec, DSLArgument, DSLComparison, DSLContext,
-                DSLFor, DSLFunction, DSLStmt, DSLType,
+                DSLFor, DSLFunction, DSLStmt, DSLType, OutputSpec,
             },
         },
         PrimitiveType,
@@ -1035,6 +1035,40 @@ mod tests {
         assert_eq!(
             out.into_iter().map(|x| x.unwrap()).collect_vec(),
             vec![false, false, false, false]
+        );
+    }
+
+    #[test]
+    fn test_dsl2_run_into_appends() {
+        let mut ctx = DSLContext::new();
+        let mut func = DSLFunction::new("append");
+        let arr_input = Int32Array::new_null(0);
+
+        let arr = func.add_arg(&mut ctx, DSLType::array_of(PrimitiveType::I32, "n"));
+        func.add_body(
+            DSLStmt::for_each(&mut ctx, &[arr], |loop_vars| {
+                DSLStmt::emit(0, loop_vars[0].expr())
+            })
+            .unwrap(),
+        );
+        func.add_ret(WriterSpec::Primitive(PrimitiveType::I32), "n");
+
+        let func = compile(func, dsl_args![arr_input]).unwrap();
+        let arr1 = Int32Array::from(vec![1, 2, 3]);
+        let arr2 = Int32Array::from(vec![4, 5, 6]);
+        let mut output =
+            OutputSpec::new(WriterSpec::Primitive(PrimitiveType::I32), "n").allocate(6);
+
+        func.run_into(&dsl_args![arr1], std::slice::from_mut(&mut output))
+            .unwrap();
+        func.run_into(&dsl_args![arr2], std::slice::from_mut(&mut output))
+            .unwrap();
+
+        let out = output.into_array_ref(None);
+        let out = out.as_primitive::<Int32Type>();
+        assert_eq!(
+            out.into_iter().map(|x| x.unwrap()).collect_vec(),
+            vec![1, 2, 3, 4, 5, 6]
         );
     }
 

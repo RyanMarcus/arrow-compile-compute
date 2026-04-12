@@ -39,7 +39,11 @@ pub struct REEAllocation {
 }
 
 impl REEAllocation {
-    pub fn allocate(expected_count: usize, run_end_type: RunEndType, value_spec: &WriterSpec) -> Self {
+    pub fn allocate(
+        expected_count: usize,
+        run_end_type: RunEndType,
+        value_spec: &WriterSpec,
+    ) -> Self {
         let value_type = value_spec.storage_type();
         let mut run_ends = Box::new(PrimitiveArrayWriter::allocate(
             expected_count,
@@ -91,7 +95,11 @@ impl REEAllocation {
         self.into_array_ref_with_len(len, nulls)
     }
 
-    fn into_typed_array<K: RunEndIndexType>(self, len: usize, nulls: Option<NullBuffer>) -> RunArray<K> {
+    fn into_typed_array<K: RunEndIndexType>(
+        self,
+        len: usize,
+        nulls: Option<NullBuffer>,
+    ) -> RunArray<K> {
         let run_ends = (*self.res).to_array(self.num_unique as usize, None);
         let run_ends = run_ends.as_primitive::<K>();
         let values = self
@@ -286,7 +294,11 @@ impl<'a> REEWriter<'a> {
                 ComparisonType::String => {
                     let memcmp = add_memcmp(ctx, llvm_mod);
                     let cmp = b2
-                        .build_call(memcmp, &[last_val.into(), val_to_insert.into()], "memcmp_res")
+                        .build_call(
+                            memcmp,
+                            &[last_val.into(), val_to_insert.into()],
+                            "memcmp_res",
+                        )
                         .unwrap()
                         .try_as_basic_value()
                         .unwrap_basic()
@@ -530,7 +542,10 @@ mod tests {
         match &alloc {
             crate::compiled_writers::WriterAllocation::RunEndEncoded(alloc) => {
                 assert_eq!(alloc.curr_run_end, 1);
-                assert_eq!(i32::from_le_bytes(alloc.last_val[0..4].try_into().unwrap()), 1);
+                assert_eq!(
+                    i32::from_le_bytes(alloc.last_val[0..4].try_into().unwrap()),
+                    1
+                );
                 assert_eq!(alloc.num_unique, 1);
             }
             _ => unreachable!(),
@@ -542,7 +557,10 @@ mod tests {
         match &alloc {
             crate::compiled_writers::WriterAllocation::RunEndEncoded(alloc) => {
                 assert_eq!(alloc.curr_run_end, 2);
-                assert_eq!(i32::from_le_bytes(alloc.last_val[0..4].try_into().unwrap()), 1);
+                assert_eq!(
+                    i32::from_le_bytes(alloc.last_val[0..4].try_into().unwrap()),
+                    1
+                );
                 assert_eq!(alloc.num_unique, 1);
             }
             _ => unreachable!(),
@@ -554,7 +572,10 @@ mod tests {
         match &alloc {
             crate::compiled_writers::WriterAllocation::RunEndEncoded(alloc) => {
                 assert_eq!(alloc.curr_run_end, 3);
-                assert_eq!(i32::from_le_bytes(alloc.last_val[0..4].try_into().unwrap()), 1);
+                assert_eq!(
+                    i32::from_le_bytes(alloc.last_val[0..4].try_into().unwrap()),
+                    1
+                );
                 assert_eq!(alloc.num_unique, 1);
             }
             _ => unreachable!(),
@@ -566,7 +587,10 @@ mod tests {
         match &alloc {
             crate::compiled_writers::WriterAllocation::RunEndEncoded(alloc) => {
                 assert_eq!(alloc.curr_run_end, 4);
-                assert_eq!(i32::from_le_bytes(alloc.last_val[0..4].try_into().unwrap()), 2);
+                assert_eq!(
+                    i32::from_le_bytes(alloc.last_val[0..4].try_into().unwrap()),
+                    2
+                );
                 assert_eq!(alloc.num_unique, 2);
             }
             _ => unreachable!(),

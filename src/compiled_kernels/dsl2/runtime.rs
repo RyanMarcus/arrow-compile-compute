@@ -4,15 +4,22 @@ use arrow_array::{cast::AsArray, ArrayRef};
 use itertools::Itertools;
 
 use crate::{
-    compiled_iter::{array_to_setbit_iter, datum_to_iter},
+    compiled_iter::{array_to_setbit_iter, datum_to_iter, IteratorHolder},
     compiled_kernels::dsl2::{
         compiler::{CompiledDSLFunction, KernelReturnCode},
         resolver::{ResolveResult, Resolver, SizeTerm},
         two_d::TwoDArrayRuntime,
-        DSLArgument,
+        DSLArgument, OutputSlot,
     },
     ArrowKernelError,
 };
+
+struct PreparedInputs {
+    ptrs: Vec<*mut c_void>,
+    ihs: Vec<IteratorHolder>,
+    twods: Vec<TwoDArrayRuntime>,
+    input_lengths: Vec<usize>,
+}
 
 pub struct RunnableDSLFunction {
     compiled: CompiledDSLFunction,
@@ -46,13 +53,88 @@ impl RunnableDSLFunction {
         &self,
         inputs: &[DSLArgument<'args>],
     ) -> Result<Vec<ArrayRef>, ArrowKernelError> {
-        let mut ptrs = Vec::new();
-        let mut ihs = Vec::new();
-        let mut twods = Vec::new();
-        let mut buffers = Vec::new();
-        let mut input_lengths = Vec::new();
+        let mut prepared = self.prepare_inputs(inputs)?;
+        let output_lengths = self
+            .resolver
+            .resolve(&prepared.input_lengths)
+            .map_err(ArrowKernelError::ResolveError)?;
 
-        // allocate and check inputs
+        assert_eq!(output_lengths.len(), self.compiled.borrow_f().ret.len());
+
+        let mut outputs = Vec::new();
+        for (os, &len) in self
+            .compiled
+            .borrow_f()
+            .ret
+            .iter()
+            .zip(output_lengths.iter())
+        {
+            let len = resolved_len(len);
+            outputs.push(os.allocate(len));
+            prepared.ptrs.push(outputs.last_mut().unwrap().get_ptr());
+        }
+
+        self.execute(&mut prepared.ptrs)?;
+        Ok(outputs
+            .into_iter()
+            .map(|o| o.into_array_ref(None))
+            .collect_vec())
+    }
+
+    pub fn run_into<'args>(
+        &self,
+        inputs: &[DSLArgument<'args>],
+        outputs: &mut [OutputSlot],
+    ) -> Result<(), ArrowKernelError> {
+        if outputs.len() != self.compiled.borrow_f().ret.len() {
+            return Err(ArrowKernelError::ArgumentMismatch(format!(
+                "expected {} outputs, got {}",
+                self.compiled.borrow_f().ret.len(),
+                outputs.len()
+            )));
+        }
+
+        let mut prepared = self.prepare_inputs(inputs)?;
+        let output_lengths = self
+            .resolver
+            .resolve(&prepared.input_lengths)
+            .map_err(ArrowKernelError::ResolveError)?;
+
+        for (idx, ((expected, output), &len)) in self
+            .compiled
+            .borrow_f()
+            .ret
+            .iter()
+            .zip(outputs.iter_mut())
+            .zip(output_lengths.iter())
+            .enumerate()
+        {
+            if output.spec() != expected.spec() {
+                return Err(ArrowKernelError::ArgumentMismatch(format!(
+                    "output {idx} expected {:?}, got {:?}",
+                    expected.spec(),
+                    output.spec()
+                )));
+            }
+
+            output.reserve_for_additional(resolved_len(len));
+            prepared.ptrs.push(output.get_ptr());
+        }
+
+        self.execute(&mut prepared.ptrs)
+    }
+
+    fn prepare_inputs<'args>(
+        &self,
+        inputs: &[DSLArgument<'args>],
+    ) -> Result<PreparedInputs, ArrowKernelError> {
+        let mut prepared = PreparedInputs {
+            ptrs: Vec::new(),
+            ihs: Vec::new(),
+            twods: Vec::new(),
+            input_lengths: Vec::new(),
+        };
+
         for (idx, (input, arg_type)) in inputs
             .iter()
             .zip(self.compiled.borrow_arg_types().iter())
@@ -66,58 +148,33 @@ impl RunnableDSLFunction {
                 DSLArgument::Datum(datum) => {
                     if !arg_type.is_set_bit() {
                         let ih = datum_to_iter(*datum)?;
-                        ihs.push(ih);
+                        prepared.ihs.push(ih);
                     } else {
                         let ih = array_to_setbit_iter(datum.get().0.as_boolean())?;
-                        ihs.push(ih);
+                        prepared.ihs.push(ih);
                     }
-                    ptrs.push(ihs.last().unwrap().get_ptr() as *const c_void);
-                    input_lengths.push(datum.get().0.len());
+                    prepared
+                        .ptrs
+                        .push(prepared.ihs.last().unwrap().get_ptr() as *mut c_void);
+                    prepared.input_lengths.push(datum.get().0.len());
                 }
                 DSLArgument::TwoDArray(datums) => {
                     let twod = TwoDArrayRuntime::new(datums)?;
-                    twods.push(twod);
-                    ptrs.push(twods.last().unwrap().get_ptr() as *const c_void);
+                    prepared.twods.push(twod);
+                    prepared
+                        .ptrs
+                        .push(prepared.twods.last().unwrap().get_ptr() as *mut c_void);
                 }
                 DSLArgument::Buffer(buf, _pt) => {
-                    buffers.push(buf);
-                    ptrs.push(buffers.last().unwrap().as_ptr() as *const c_void);
+                    prepared.ptrs.push(buf.as_ptr() as *mut c_void);
                 }
             }
         }
 
-        // resolve lengths
-        let output_lengths = self
-            .resolver
-            .resolve(&input_lengths)
-            .map_err(ArrowKernelError::ResolveError)?;
+        Ok(prepared)
+    }
 
-        assert_eq!(output_lengths.len(), self.compiled.borrow_f().ret.len());
-
-        // allocate and check outputs
-        let mut outputs = Vec::new();
-        for (os, &len) in self
-            .compiled
-            .borrow_f()
-            .ret
-            .iter()
-            .zip(output_lengths.iter())
-        {
-            let len = match len {
-                ResolveResult::Exact(len) => len,
-                ResolveResult::AtLeast(len) => len,
-                ResolveResult::Unknown => {
-                    // We can get an unknown result if a kernel is only over
-                    // scalar inputs. In this case, we allocate with a length of
-                    // 1 -- there might be other cases as well, we should revist
-                    // this. TODO
-                    1
-                }
-            };
-            outputs.push(os.allocate(len));
-            ptrs.push(outputs.last_mut().unwrap().get_ptr());
-        }
-
+    fn execute(&self, ptrs: &mut Vec<*mut c_void>) -> Result<(), ArrowKernelError> {
         let result = KernelReturnCode::from(unsafe {
             self.compiled
                 .borrow_compiled()
@@ -125,12 +182,21 @@ impl RunnableDSLFunction {
         });
 
         match result {
-            KernelReturnCode::Success => Ok(outputs
-                .into_iter()
-                .map(|o| o.into_array_ref(None))
-                .collect_vec()),
+            KernelReturnCode::Success => Ok(()),
             KernelReturnCode::InvalidEmitIndex => Err(ArrowKernelError::RuntimeInvalidEmitIndex),
             KernelReturnCode::Unknown(c) => Err(ArrowKernelError::RuntimeUnknownReturnCode(c)),
+        }
+    }
+}
+
+fn resolved_len(res: ResolveResult) -> usize {
+    match res {
+        ResolveResult::Exact(len) => len,
+        ResolveResult::AtLeast(len) => len,
+        ResolveResult::Unknown => {
+            // We can get an unknown result if a kernel is only over scalar
+            // inputs. In that case, allocate capacity for a single result.
+            1
         }
     }
 }

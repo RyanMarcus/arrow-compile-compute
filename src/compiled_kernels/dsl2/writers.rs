@@ -175,7 +175,10 @@ mod tests {
         let dest = func.get_nth_param(0).unwrap().into_pointer_value();
         let slot =
             OutputSpec::new(WriterSpec::Primitive(crate::PrimitiveType::I32), "rows").allocate(4);
-        assert_eq!(slot.spec(), &WriterSpec::Primitive(crate::PrimitiveType::I32));
+        assert_eq!(
+            slot.spec(),
+            &WriterSpec::Primitive(crate::PrimitiveType::I32)
+        );
 
         let writer = slot.llvm_init(&ctx, &llvm_mod, &build, dest);
         writer.llvm_ingest(

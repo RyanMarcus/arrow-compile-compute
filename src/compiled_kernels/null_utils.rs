@@ -129,7 +129,9 @@ mod tests {
         let run_ends = Int16Array::from(vec![2i16, 5, 6, 9]);
         let values = Int32Array::from(vec![Some(10), None, Some(30), None]);
         let ree = RunArray::<Int16Type>::try_new(&run_ends, &values).unwrap();
-        let res = Arc::new(Int32Array::from(vec![100, 101, 102, 103, 104, 105, 106, 107, 108]));
+        let res = Arc::new(Int32Array::from(vec![
+            100, 101, 102, 103, 104, 105, 106, 107, 108,
+        ]));
 
         let result = intersect_and_copy_nulls(&[&ree], res).unwrap();
         let result = result.as_primitive::<Int32Type>();

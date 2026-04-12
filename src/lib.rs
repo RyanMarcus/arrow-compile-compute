@@ -41,8 +41,8 @@ pub use arrow_interface::sort;
 pub use arrow_interface::vec;
 
 pub use compiled_kernels::compile_string_like;
-pub use compiled_kernels::ArrowKernelError;
 pub use compiled_kernels::intersect_and_copy_nulls;
+pub use compiled_kernels::ArrowKernelError;
 pub use compiled_kernels::Kernel;
 pub use compiled_kernels::SortOptions;
 

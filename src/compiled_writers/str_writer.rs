@@ -94,7 +94,12 @@ impl<T: OffsetSizeTrait> LeafWriterAllocation for StringAllocation<T> {
     }
 
     fn len(&self) -> usize {
-        self.offsets.len()
+        let offset_width = if T::IS_LARGE { 8 } else { 4 };
+        unsafe {
+            self.offsets_ptr
+                .offset_from_unsigned(self.offsets.as_ptr() as *const c_void)
+                / offset_width
+        }
     }
 }
 

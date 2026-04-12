@@ -385,8 +385,9 @@ impl DSLKernel {
             .try_collect()?;
         let mut ptrs = Vec::new();
         ptrs.extend(ihs.iter_mut().map(|ih| ih.get_mut_ptr()));
-        let writer_spec = writer_spec_for_output(*self.borrow_output_strategy(), self.borrow_out_type())
-            .map_err(ArrowKernelError::DSLError)?;
+        let writer_spec =
+            writer_spec_for_output(*self.borrow_output_strategy(), self.borrow_out_type())
+                .map_err(ArrowKernelError::DSLError)?;
         let mut alloc = writer_spec.allocate(max_len);
         ptrs.push(alloc.get_ptr());
         let mut kp = KernelParameters::new(ptrs);
@@ -892,7 +893,10 @@ fn build_kernel_with_writer_spec<'a>(
     }))
 }
 
-fn writer_spec_for_output(strategy: KernelOutputType, out_type: &DataType) -> Result<WriterSpec, DSLError> {
+fn writer_spec_for_output(
+    strategy: KernelOutputType,
+    out_type: &DataType,
+) -> Result<WriterSpec, DSLError> {
     fn value_writer_spec(out_type: &DataType) -> Result<WriterSpec, DSLError> {
         Ok(match out_type {
             DataType::Boolean => WriterSpec::Boolean,
