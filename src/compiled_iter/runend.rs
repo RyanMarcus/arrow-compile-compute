@@ -27,6 +27,9 @@ pub struct RunEndIterator {
     /// the value iterator, not the raw value array
     val_iter: *const c_void,
 
+    /// the initial position within the run_ends iterator
+    initial_pos: u64,
+
     /// the position within the run_ends iterator (not the logical position)
     pos: u64,
 
@@ -38,6 +41,9 @@ pub struct RunEndIterator {
 
     /// logical length (total number produced)
     logical_len: u64,
+
+    /// the initial number of values remaining in the current run
+    initial_remaining: u64,
 
     /// the remaining number of values in the current run
     remaining: u64,
@@ -71,10 +77,12 @@ impl<R: RunEndIndexType + ArrowPrimitiveType> From<&RunArray<R>> for IteratorHol
         let iter = RunEndIterator {
             run_ends: run_ends.get_ptr(),
             val_iter: values.get_ptr(),
+            initial_pos: first_idx as u64,
             pos: first_idx as u64,
             len: re.len() as u64,
             logical_pos: 0,
             logical_len: arr.len() as u64,
+            initial_remaining: first_remaining as u64,
             remaining: first_remaining as u64,
             array_ref: Arc::new(arr.clone()),
         };
@@ -270,6 +278,40 @@ impl RunEndIterator {
         assert_eq!(amt.get_type().get_bit_width(), 64);
         let remaining_ptr = increment_pointer!(ctx, builder, ptr, RunEndIterator::OFFSET_REMAINING);
         builder.build_store(remaining_ptr, amt).unwrap();
+    }
+
+    pub fn llvm_reset<'a>(&self, ctx: &'a Context, builder: &'a Builder, ptr: PointerValue<'a>) {
+        let initial_pos_ptr =
+            increment_pointer!(ctx, builder, ptr, RunEndIterator::OFFSET_INITIAL_POS);
+        let initial_pos = builder
+            .build_load(ctx.i64_type(), initial_pos_ptr, "initial_pos")
+            .unwrap()
+            .into_int_value();
+        let initial_remaining_ptr =
+            increment_pointer!(ctx, builder, ptr, RunEndIterator::OFFSET_INITIAL_REMAINING);
+        let initial_remaining = builder
+            .build_load(ctx.i64_type(), initial_remaining_ptr, "initial_remaining")
+            .unwrap()
+            .into_int_value();
+
+        builder
+            .build_store(
+                increment_pointer!(ctx, builder, ptr, RunEndIterator::OFFSET_POS),
+                initial_pos,
+            )
+            .unwrap();
+        builder
+            .build_store(
+                increment_pointer!(ctx, builder, ptr, RunEndIterator::OFFSET_LOGICAL_POS),
+                ctx.i64_type().const_zero(),
+            )
+            .unwrap();
+        builder
+            .build_store(
+                increment_pointer!(ctx, builder, ptr, RunEndIterator::OFFSET_REMAINING),
+                initial_remaining,
+            )
+            .unwrap();
     }
 }
 

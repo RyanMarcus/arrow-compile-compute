@@ -7,15 +7,13 @@ use arrow_array::{
     make_array,
     types::{Int16Type, Int32Type, Int64Type, RunEndIndexType},
     Array, ArrayRef, BinaryArray, BinaryViewArray, BooleanArray, Date32Array, Date64Array, Datum,
-    FixedSizeBinaryArray, FixedSizeListArray, Float16Array, Float32Array, Float64Array, Int16Array,
-    Int32Array, Int64Array, Int8Array, LargeBinaryArray, LargeStringArray, NullArray,
-    PrimitiveArray, Scalar, StringArray, StringViewArray, UInt16Array, UInt32Array, UInt64Array,
-    UInt8Array,
+    FixedSizeBinaryArray, Float16Array, Float32Array, Float64Array, Int16Array, Int32Array,
+    Int64Array, Int8Array, LargeBinaryArray, LargeStringArray, NullArray, PrimitiveArray,
+    StringArray, StringViewArray, UInt16Array, UInt32Array, UInt64Array, UInt8Array,
 };
 use arrow_buffer::NullBuffer;
 use arrow_data::ArrayDataBuilder;
-use arrow_schema::{DataType, Field, FieldRef};
-use half::f16;
+use arrow_schema::{DataType, Field};
 use inkwell::{
     attributes::{Attribute, AttributeLoc},
     context::Context,

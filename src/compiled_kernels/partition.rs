@@ -1,358 +1,163 @@
-use std::ffi::c_void;
-
-use arrow_array::{Array, ArrayRef, BooleanArray};
-use arrow_schema::DataType;
-use inkwell::{
-    context::Context, execution_engine::JitFunction, values::BasicValue, AddressSpace,
-    OptimizationLevel,
-};
+use arrow_array::{Array, ArrayRef, UInt64Array};
 use itertools::Itertools;
-use ouroboros::self_referencing;
 
 use crate::{
-    compiled_iter::{datum_to_iter, generate_next, IteratorHolder},
     compiled_kernels::{
-        cast::coalesce_type,
-        dsl::{base_type, KernelParameters},
-        link_req_helpers, optimize_module,
+        dsl2::{
+            compile, DSLArgument, DSLBuffer, DSLContext, DSLExpr, DSLFunction, DSLStmt, DSLType,
+            DSLValue,
+        },
+        DSLArithBinOp,
     },
-    compiled_writers::WriterSpec,
-    declare_blocks, set_noalias_params, ArrowKernelError, Kernel, PrimitiveType,
+    iter, ArrowKernelError, PrimitiveType,
 };
 
-#[self_referencing]
-pub struct PartitionKernel {
-    context: Context,
-    nparts: usize,
-
-    #[borrows(context)]
-    #[covariant]
-    func: JitFunction<
-        'this,
-        unsafe extern "C" fn(*mut c_void, *mut c_void, *mut c_void, *mut c_void),
-    >,
-}
-
-unsafe impl Sync for PartitionKernel {}
-unsafe impl Send for PartitionKernel {}
-
-impl Kernel for PartitionKernel {
-    type Key = (DataType, bool, usize);
-
-    type Input<'a> = (&'a dyn Array, &'a dyn Array);
-
-    type Params = usize;
-
-    type Output = Vec<ArrayRef>;
-
-    fn call(&self, inp: Self::Input<'_>) -> Result<Self::Output, ArrowKernelError> {
-        let (arr, part) = inp;
-
-        if part.is_nullable() {
-            return Err(ArrowKernelError::UnsupportedArguments(
-                "Partition array must not be nullable".to_string(),
-            ));
-        }
-
-        if part.len() != arr.len() {
-            return Err(ArrowKernelError::SizeMismatch);
-        }
-
-        let arr_ih = datum_to_iter(&arr)?;
-        let part_ih = datum_to_iter(&part)?;
-        let null_ih = arr
-            .nulls()
-            .map(|b| BooleanArray::from(b.clone().into_inner()))
-            .map(|b| datum_to_iter(&b))
-            .transpose()?;
-
-        // compute the size of each partition
-        let mut part_sizes = vec![0_usize; *self.borrow_nparts()];
-        match arr.nulls() {
-            Some(nulls) => {
-                crate::iter::iter_nonnull_u64(part)?
-                    .zip(nulls.iter())
-                    .filter(|(_x, not_null)| *not_null)
-                    .map(|(x, _)| x)
-                    .for_each(|x| part_sizes[x as usize] += 1);
-            }
-            None => {
-                crate::iter::iter_nonnull_u64(part)?.for_each(|x| part_sizes[x as usize] += 1);
-            }
-        };
-
-        let base = base_type(arr.data_type());
-        let spec = partition_writer_spec(&base);
-        let res = match &base {
-            DataType::Utf8 | DataType::Boolean => call_kernel_with_writer(
-                &spec,
-                arr_ih,
-                part_ih,
-                null_ih,
-                part_sizes,
-                self.borrow_func(),
-            ),
-            t if t.is_primitive() => call_kernel_with_writer(
-                &spec,
-                arr_ih,
-                part_ih,
-                null_ih,
-                part_sizes,
-                self.borrow_func(),
-            ),
-            _ => todo!("cannot partition this type"),
-        };
-        let base = if base == DataType::Utf8 {
-            DataType::Utf8View
-        } else {
-            base
-        };
-        res?.into_iter().map(|x| coalesce_type(x, &base)).collect()
-    }
-
-    fn compile(inp: &Self::Input<'_>, nparts: Self::Params) -> Result<Self, ArrowKernelError> {
-        PartitionKernelTryBuilder {
-            context: Context::create(),
-            nparts,
-            func_builder: |ctx| {
-                let base = base_type(inp.0.data_type());
-                let spec = partition_writer_spec(&base);
-                match base {
-                    DataType::Utf8 | DataType::Boolean => build_partition(
-                        ctx,
-                        nparts,
-                        &spec,
-                        inp.0,
-                        inp.0
-                            .nulls()
-                            .map(|b| BooleanArray::from(b.clone().into_inner()))
-                            .as_ref(),
-                        inp.1,
-                    ),
-                    t if t.is_primitive() => build_partition(
-                        ctx,
-                        nparts,
-                        &spec,
-                        inp.0,
-                        inp.0
-                            .nulls()
-                            .map(|b| BooleanArray::from(b.clone().into_inner()))
-                            .as_ref(),
-                        inp.1,
-                    ),
-                    _ => todo!("cannot partition this type"),
-                }
-            },
-        }
-        .try_build()
-    }
-
-    fn get_key_for_input(
-        i: &Self::Input<'_>,
-        p: &Self::Params,
-    ) -> Result<Self::Key, ArrowKernelError> {
-        Ok((i.0.data_type().clone(), i.0.nulls().is_some(), *p))
-    }
-}
-
-fn call_kernel_with_writer<'a>(
-    spec: &WriterSpec,
-    mut arr_ih: IteratorHolder,
-    mut part_ih: IteratorHolder,
-    mut null_ih: Option<IteratorHolder>,
-    part_sizes: Vec<usize>,
-    func: &JitFunction<
-        'a,
-        unsafe extern "C" fn(*mut c_void, *mut c_void, *mut c_void, *mut c_void),
-    >,
-) -> Result<Vec<ArrayRef>, ArrowKernelError> {
-    let mut allocs = part_sizes
-        .iter()
-        .map(|size| spec.allocate(*size))
-        .collect_vec();
-    let alloc_ptrs = allocs.iter_mut().map(|a| a.get_ptr()).collect_vec();
-    let mut kp = KernelParameters::new(alloc_ptrs);
-    unsafe {
-        func.call(
-            arr_ih.get_mut_ptr(),
-            null_ih
-                .as_mut()
-                .map(|ih| ih.get_mut_ptr())
-                .unwrap_or(std::ptr::null_mut()),
-            part_ih.get_mut_ptr(),
-            kp.get_mut_ptr(),
-        );
-    }
-    Ok(allocs
-        .into_iter()
-        .map(|a| a.into_array_ref(None))
-        .collect_vec())
-}
-
-fn build_partition<'a>(
-    ctx: &'a Context,
-    nparts: usize,
-    spec: &WriterSpec,
+pub fn partition(
     arr: &dyn Array,
-    nulls: Option<&BooleanArray>,
-    partition_idxes: &dyn Array,
-) -> Result<
-    JitFunction<'a, unsafe extern "C" fn(*mut c_void, *mut c_void, *mut c_void, *mut c_void)>,
-    ArrowKernelError,
-> {
-    let llvm_mod = ctx.create_module("partition");
-    let ptr_type = ctx.ptr_type(AddressSpace::default());
-    let idx_ptype = PrimitiveType::for_arrow_type(partition_idxes.data_type());
-    let idx_llvm_type = idx_ptype.llvm_type(ctx);
+    part_idxes: &dyn Array,
+    nparts: Option<usize>,
+) -> Result<Vec<ArrayRef>, ArrowKernelError> {
+    if arr.len() != part_idxes.len() {
+        return Err(ArrowKernelError::SizeMismatch);
+    }
 
-    let llvm_type = spec.storage_type().llvm_type(ctx);
+    if part_idxes.is_nullable() {
+        return Err(ArrowKernelError::UnsupportedArguments(
+            "partition indexes cannot be nullable".to_string(),
+        ));
+    };
 
-    let fn_type = ctx.void_type().fn_type(
-        &[
-            ptr_type.into(), // array iterator
-            ptr_type.into(), // null iterator (optional)
-            ptr_type.into(), // partition iterator
-            ptr_type.into(), // pointer to writer pointers
-        ],
-        false,
-    );
-    let func = llvm_mod.add_function("partition", fn_type, None);
-    let b = ctx.create_builder();
+    let nparts = match nparts {
+        Some(x) => x,
+        None => iter::iter_nonnull_u64(part_idxes)?
+            .max()
+            .map(|x| x as usize + 1)
+            .unwrap_or(0),
+    };
 
-    let arr_ih = datum_to_iter(&arr)?;
-    let idx_ih = datum_to_iter(&partition_idxes)?;
-    let null_ih = nulls.map(|nulls| datum_to_iter(&&nulls)).transpose()?;
+    if nparts == 0 {
+        return Ok(vec![]);
+    }
 
-    let arr_next = generate_next(ctx, &llvm_mod, "arr", arr.data_type(), &arr_ih).unwrap();
-    let idx_next =
-        generate_next(ctx, &llvm_mod, "idx", partition_idxes.data_type(), &idx_ih).unwrap();
-    let null_next = null_ih
-        .as_ref()
-        .map(|ih| generate_next(ctx, &llvm_mod, "null", &DataType::Boolean, ih).unwrap());
-    let arr_iter_ptr = func.get_nth_param(0).unwrap().into_pointer_value();
-    let null_iter_ptr = func.get_nth_param(1).unwrap().into_pointer_value();
-    let idx_iter_ptr = func.get_nth_param(2).unwrap().into_pointer_value();
+    let mut part_offsets = vec![0_u64; nparts + 1];
+    for idx in iter::iter_nonnull_u64(part_idxes)? {
+        let idx = idx as usize;
+        if idx >= nparts {
+            return Err(ArrowKernelError::OutOfBounds(nparts));
+        }
+        part_offsets[idx + 1] += 1;
+    }
+    for idx in 1..part_offsets.len() {
+        part_offsets[idx] += part_offsets[idx - 1];
+    }
 
-    declare_blocks!(ctx, func, entry, loop_cond, null_check, loop_body, exit);
+    let mut indexes = vec![0; arr.len()];
+    iter::iter_nonnull_u64(part_idxes)?
+        .enumerate()
+        .for_each(|(arr_idx, part_idx)| {
+            let part_idx = part_idx as usize;
+            let new_pos = part_offsets[part_idx] as usize;
+            part_offsets[part_idx] += 1;
+            indexes[new_pos] = arr_idx as u64;
+        });
+    let indexes = UInt64Array::from(indexes);
 
-    b.position_at_end(entry);
-    let writer_ptr_ptr = func.get_nth_param(3).unwrap().into_pointer_value();
-    let writers = (0..nparts)
-        .map(|writer_offset| {
-            let alloc_ptr = KernelParameters::llvm_get(ctx, &b, writer_ptr_ptr, writer_offset);
-            spec.llvm_init(ctx, &llvm_mod, &b, alloc_ptr)
+    let mut res = crate::arrow_interface::select::take(arr, &indexes)?;
+    let mut consumed = 0;
+    let partitions = part_offsets[..part_offsets.len() - 1]
+        .into_iter()
+        .map(|offset| {
+            let offset = offset - consumed;
+            let part = res.slice(0, offset as usize);
+            res = res.slice(offset as usize, res.len() - offset as usize);
+            consumed += offset;
+            part
         })
         .collect_vec();
-    let arr_buf_ptr = b.build_alloca(llvm_type, "arr_buf_ptr").unwrap();
-    let idx_buf_ptr = b.build_alloca(idx_llvm_type, "idx_buf_ptr").unwrap();
-    let null_buf_ptr = b.build_alloca(ctx.bool_type(), "null_buf_ptr").unwrap();
 
-    let arr_iter_ptr = arr_ih.localize_struct(ctx, &b, arr_iter_ptr);
-    let idx_iter_ptr = idx_ih.localize_struct(ctx, &b, idx_iter_ptr);
+    Ok(partitions)
+}
 
-    b.build_unconditional_branch(loop_cond).unwrap();
+pub fn partition_kernel(arr: &ArrayRef, idxes: &ArrayRef) -> Result<(), ArrowKernelError> {
+    let mut ctx = DSLContext::new();
+    let mut func = DSLFunction::new("partition");
+    let arr_arg = func.add_arg(&mut ctx, DSLType::array_like(arr, "n"));
+    let idxes_arg = func.add_arg(&mut ctx, DSLType::array_like(idxes, "n"));
+    let sum_buf = func.add_arg(&mut ctx, DSLType::buffer_of(PrimitiveType::U64, "k"));
+    let out_buf = func.add_arg(
+        &mut ctx,
+        DSLType::buffer_of(PrimitiveType::for_arrow_type(arr.data_type()), "n"),
+    );
 
-    b.position_at_end(loop_cond);
-    let had_next = b
-        .build_call(arr_next, &[arr_iter_ptr.into(), arr_buf_ptr.into()], "next")
-        .unwrap()
-        .try_as_basic_value()
-        .unwrap_basic()
-        .into_int_value();
-    b.build_call(
-        idx_next,
-        &[idx_iter_ptr.into(), idx_buf_ptr.into()],
-        "next_idx",
+    // compute histogram of partition indexes (number of entries in each partition)
+    func.add_body(
+        DSLStmt::for_each(&mut ctx, &[idxes_arg.clone()], |loop_vars| {
+            let idx = loop_vars[0].expr().primitive_cast(PrimitiveType::U64)?;
+            let curr = sum_buf
+                .expr()
+                .at(&idx)?
+                .primitive_cast(PrimitiveType::U64)?;
+            let next = curr.arith(
+                DSLArithBinOp::Add,
+                DSLValue::u64(1).expr().primitive_cast(PrimitiveType::U64)?,
+            )?;
+            DSLStmt::set(&sum_buf, &idx, &next)
+        })
+        .unwrap(),
+    );
+
+    // compute cumulative sum of histogram, which become cursors
+    func.add_body(
+        DSLStmt::for_range(
+            &mut ctx,
+            DSLValue::u64(1).expr().primitive_cast(PrimitiveType::U64)?,
+            sum_buf.expr().len()?,
+            |i| {
+                let prev = sum_buf.expr().at(&i.expr().arith(
+                    DSLArithBinOp::Sub,
+                    DSLValue::u64(1).expr().primitive_cast(PrimitiveType::U64)?,
+                )?)?;
+                let curr = sum_buf.expr().at(&i.expr())?;
+                let new_val = prev.arith(DSLArithBinOp::Add, curr)?;
+                DSLStmt::set(&sum_buf, &i.expr(), &new_val)
+            },
+        )
+        .unwrap(),
+    );
+
+    // write into out buf
+    func.add_body(
+        DSLStmt::for_each(&mut ctx, &[arr_arg, idxes_arg], |loop_vars| {
+            let val = loop_vars[0].expr();
+            let part_idx = loop_vars[1].expr().primitive_cast(PrimitiveType::U64)?;
+            let cursor = sum_buf.expr().at(&part_idx)?;
+            let new_cursor = cursor.arith(
+                DSLArithBinOp::Add,
+                DSLValue::u64(1).expr().primitive_cast(PrimitiveType::U64)?,
+            )?;
+
+            Ok(vec![
+                DSLStmt::set(&out_buf, &cursor, &val)?,
+                DSLStmt::set(&sum_buf, &part_idx, &new_cursor)?,
+            ])
+        })
+        .unwrap(),
+    );
+
+    let mut sum_buf = DSLBuffer::new(PrimitiveType::U64, 128);
+    let mut out_buf = DSLBuffer::new(PrimitiveType::for_arrow_type(arr.data_type()), arr.len());
+    compile(
+        func,
+        [
+            DSLArgument::Datum(arr),
+            DSLArgument::Datum(idxes),
+            DSLArgument::buffer(&mut sum_buf),
+            DSLArgument::buffer(&mut out_buf),
+        ],
     )
     .unwrap();
-    b.build_conditional_branch(had_next, null_check, exit)
-        .unwrap();
 
-    b.position_at_end(null_check);
-    match null_next {
-        Some(null_next) => {
-            b.build_call(
-                null_next,
-                &[null_iter_ptr.into(), null_buf_ptr.into()],
-                "had_next_null",
-            )
-            .unwrap();
-            let was_nonnull = b
-                .build_load(ctx.bool_type(), null_buf_ptr, "was_nonnull")
-                .unwrap()
-                .into_int_value();
-            b.build_conditional_branch(was_nonnull, loop_body, loop_cond)
-                .unwrap();
-        }
-        None => {
-            b.build_unconditional_branch(loop_body).unwrap();
-        }
-    };
-
-    b.position_at_end(loop_body);
-    let part_idx = b
-        .build_load(idx_llvm_type, idx_buf_ptr, "part_idx")
-        .unwrap()
-        .into_int_value();
-    let part_idx = b
-        .build_int_z_extend_or_bit_cast(part_idx, ctx.i64_type(), "part_idx")
-        .unwrap();
-    let val = b.build_load(llvm_type, arr_buf_ptr, "val").unwrap();
-
-    let switch_blocks = writers
-        .iter()
-        .enumerate()
-        .map(|(writer_offset, writer)| {
-            let block = ctx.append_basic_block(func, &format!("write_to_{}", writer_offset));
-            let b = ctx.create_builder();
-            b.position_at_end(block);
-            if base_type(arr.data_type()) == DataType::Boolean {
-                writer.llvm_ingest(
-                    ctx,
-                    &b,
-                    b.build_int_truncate(val.into_int_value(), ctx.bool_type(), "trunc")
-                        .unwrap()
-                        .as_basic_value_enum(),
-                );
-            } else {
-                writer.llvm_ingest(ctx, &b, val);
-            }
-            b.build_unconditional_branch(loop_cond).unwrap();
-            (ctx.i64_type().const_int(writer_offset as u64, false), block)
-        })
-        .collect_vec();
-    b.build_switch(part_idx, exit, &switch_blocks).unwrap();
-
-    b.position_at_end(exit);
-    for writer in writers {
-        writer.llvm_flush(ctx, &b);
-    }
-    b.build_return(None).unwrap();
-
-    set_noalias_params(&func);
-    llvm_mod.verify().unwrap();
-    optimize_module(&llvm_mod)?;
-    let ee = llvm_mod
-        .create_jit_execution_engine(OptimizationLevel::Aggressive)
-        .unwrap();
-    link_req_helpers(&llvm_mod, &ee)?;
-
-    let partition_func = unsafe {
-        ee.get_function::<unsafe extern "C" fn(*mut c_void, *mut c_void, *mut c_void, *mut c_void)>(
-            "partition",
-        )
-        .unwrap()
-    };
-
-    Ok(partition_func)
-}
-
-fn partition_writer_spec(base: &DataType) -> WriterSpec {
-    match base {
-        DataType::Utf8 => WriterSpec::StringView,
-        DataType::Boolean => WriterSpec::Boolean,
-        dt => WriterSpec::Primitive(PrimitiveType::for_arrow_type(dt)),
-    }
+    todo!()
 }
 
 #[cfg(test)]
@@ -364,14 +169,23 @@ mod tests {
     };
     use itertools::Itertools;
 
-    use crate::{compiled_kernels::partition::PartitionKernel, Kernel};
+    use crate::{
+        compiled_kernels::partition::{partition, partition_kernel},
+        ArrowKernelError,
+    };
+
+    #[test]
+    fn test_part_dsl() {
+        let data: ArrayRef = Arc::new(Int32Array::from(vec![1, 2, 3, 4, 5, 6, 7, 8, 9, 10]));
+        let part: ArrayRef = Arc::new(UInt32Array::from(vec![0, 1, 0, 1, 0, 1, 0, 1, 0, 1]));
+        partition_kernel(&data, &part);
+    }
 
     #[test]
     fn test_part_i32_nonulls() {
         let data: ArrayRef = Arc::new(Int32Array::from(vec![1, 2, 3, 4, 5, 6, 7, 8, 9, 10]));
         let part: ArrayRef = Arc::new(UInt32Array::from(vec![0, 1, 0, 1, 0, 1, 0, 1, 0, 1]));
-        let k = PartitionKernel::compile(&(&data, &part), 2).unwrap();
-        let res = k.call((&data, &part)).unwrap();
+        let res = partition(&data, &part, None).unwrap();
 
         assert_eq!(res.len(), 2);
         assert_eq!(
@@ -399,12 +213,17 @@ mod tests {
             None,
         ]));
         let part: ArrayRef = Arc::new(UInt32Array::from(vec![0, 1, 0, 1, 0, 1, 0, 1, 0, 1]));
-        let k = PartitionKernel::compile(&(&data, &part), 2).unwrap();
-        let res = k.call((&data, &part)).unwrap();
+        let res = partition(&data, &part, None).unwrap();
 
         assert_eq!(res.len(), 2);
-        assert_eq!(res[0].as_primitive::<Int32Type>().values(), &[1, 5, 7, 9]);
-        assert_eq!(res[1].as_primitive::<Int32Type>().values(), &[2, 4, 8]);
+        assert_eq!(
+            res[0].as_primitive::<Int32Type>().iter().collect_vec(),
+            &[Some(1), None, Some(5), Some(7), Some(9)]
+        );
+        assert_eq!(
+            res[1].as_primitive::<Int32Type>().iter().collect_vec(),
+            &[Some(2), Some(4), None, Some(8), None]
+        );
     }
 
     #[test]
@@ -413,8 +232,7 @@ mod tests {
             true, true, true, true, true, false, false, false, false, false,
         ]));
         let part: ArrayRef = Arc::new(UInt32Array::from(vec![0, 1, 0, 1, 0, 1, 0, 1, 0, 1]));
-        let k = PartitionKernel::compile(&(&data, &part), 2).unwrap();
-        let res = k.call((&data, &part)).unwrap();
+        let res = partition(&data, &part, None).unwrap();
 
         assert_eq!(res.len(), 2);
         assert_eq!(
@@ -433,13 +251,12 @@ mod tests {
             "a", "b", "c", "d", "e", "f", "g", "h", "i", "j",
         ]));
         let part: ArrayRef = Arc::new(UInt32Array::from(vec![0, 1, 0, 1, 0, 1, 0, 1, 0, 1]));
-        let k = PartitionKernel::compile(&(&data, &part), 2).unwrap();
-        let res = k.call((&data, &part)).unwrap();
+        let res = partition(&data, &part, None).unwrap();
 
         assert_eq!(res.len(), 2);
         assert_eq!(
             res[0]
-                .as_string_view()
+                .as_string::<i32>()
                 .iter()
                 .map(|x| x.unwrap())
                 .collect_vec(),
@@ -447,11 +264,32 @@ mod tests {
         );
         assert_eq!(
             res[1]
-                .as_string_view()
+                .as_string::<i32>()
                 .iter()
                 .map(|x| x.unwrap())
                 .collect_vec(),
             &["b", "d", "f", "h", "j"]
         );
+    }
+
+    #[test]
+    fn test_part_infers_partition_count_from_max_index() {
+        let data: ArrayRef = Arc::new(Int32Array::from(vec![10, 20, 30]));
+        let part: ArrayRef = Arc::new(UInt32Array::from(vec![0, 2, 0]));
+        let res = partition(&data, &part, None).unwrap();
+
+        assert_eq!(res.len(), 3);
+        assert_eq!(res[0].as_primitive::<Int32Type>().values(), &[10, 30]);
+        assert!(res[1].is_empty());
+        assert_eq!(res[2].as_primitive::<Int32Type>().values(), &[20]);
+    }
+
+    #[test]
+    fn test_part_rejects_out_of_bounds_partition_index() {
+        let data: ArrayRef = Arc::new(Int32Array::from(vec![1, 2, 3]));
+        let part: ArrayRef = Arc::new(UInt32Array::from(vec![0, 2, 1]));
+        let err = partition(&data, &part, Some(2)).unwrap_err();
+
+        assert!(matches!(err, ArrowKernelError::OutOfBounds(2)));
     }
 }

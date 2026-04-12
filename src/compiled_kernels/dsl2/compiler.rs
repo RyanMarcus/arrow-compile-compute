@@ -2,8 +2,11 @@ use std::{cmp::Ordering, collections::HashMap, ffi::c_void};
 
 use arrow_array::{
     cast::AsArray,
-    types::{UInt32Type, UInt64Type},
-    BooleanArray,
+    types::{
+        Float16Type, Float32Type, Float64Type, Int16Type, Int32Type, Int64Type, Int8Type,
+        UInt16Type, UInt32Type, UInt64Type, UInt8Type,
+    },
+    BooleanArray, Datum,
 };
 use arrow_schema::DataType;
 use inkwell::{
@@ -13,7 +16,7 @@ use inkwell::{
     intrinsics::Intrinsic,
     module::{Linkage, Module},
     types::{BasicType, BasicTypeEnum},
-    values::{BasicValue, BasicValueEnum, FunctionValue, VectorValue},
+    values::{BasicValue, BasicValueEnum, FunctionValue, IntValue, VectorValue},
     AddressSpace, FloatPredicate, IntPredicate, OptimizationLevel,
 };
 use itertools::Itertools;
@@ -27,9 +30,9 @@ use crate::{
     compiled_kernels::{
         cmp::{add_float_to_int, add_memcmp},
         dsl2::{
-            buffer, runtime::RunnableDSLFunction, two_d, writers::accepted_type, DSLArgument,
-            DSLArgumentType, DSLArithBinOp, DSLBitwiseBinOp, DSLExpr, DSLFunction, DSLStmt,
-            DSLType, DSLValue,
+            buffer::DSLBuffer, runtime::RunnableDSLFunction, two_d, writers::accepted_type,
+            DSLArgument, DSLArgumentType, DSLArithBinOp, DSLBitwiseBinOp, DSLExpr, DSLFunction,
+            DSLStmt, DSLType, DSLValue,
         },
         link_req_helpers, optimize_module,
     },
@@ -92,6 +95,7 @@ pub struct DSLCompilationContext<'ctx, 'a> {
     pub access_funcs: HashMap<usize, FunctionValue<'a>>,
     pub next_funcs: HashMap<usize, FunctionValue<'a>>,
     pub writer_funcs: HashMap<usize, FunctionValue<'a>>,
+    pub lengths: HashMap<usize, Option<IntValue<'a>>>,
     pub output_specs: Vec<crate::compiled_writers::WriterSpec>,
     pub outputs: Vec<Writer<'a>>,
 }
@@ -179,6 +183,8 @@ pub fn compile_inner<'ctx, 'args>(
     let mut access_funcs = HashMap::new();
     let mut next_funcs = HashMap::new();
     let mut writer_funcs = HashMap::new();
+    let mut ihs = HashMap::new();
+    let mut lengths = HashMap::new();
 
     // load LLVM function parameters into the symbol table
     for (idx, param) in f.params.iter().enumerate() {
@@ -190,6 +196,33 @@ pub fn compile_inner<'ctx, 'args>(
     let b = ctx.create_builder();
     b.position_at_end(init_block);
 
+    // create all iterator holders
+    for param in f.params.iter() {
+        let arg = &names_to_args[&param.name];
+        match &param.ty {
+            DSLType::Scalar(_) | DSLType::Array(_, _) => {
+                let ih = datum_to_iter(
+                    arg.as_datum()
+                        .ok_or_else(|| ArrowKernelError::NonIterableType(param.ty.clone()))?,
+                )?;
+                let ptr = ih.localize_struct(&ctx, &b, st[&param.name].into_pointer_value());
+                st.insert(param.name, ptr.as_basic_value_enum());
+                ihs.insert(param.name, ih);
+            }
+            DSLType::SetBits(_) => {
+                if arg.data_type() != DataType::Boolean {
+                    return Err(ArrowKernelError::InvalidSetBitType(arg.data_type()));
+                }
+
+                let ih = array_to_setbit_iter(&BooleanArray::new_null(0))?;
+                let ptr = ih.localize_struct(&ctx, &b, st[&param.name].into_pointer_value());
+                st.insert(param.name, ptr.as_basic_value_enum());
+                ihs.insert(param.name, ih);
+            }
+            _ => {}
+        }
+    }
+
     // setup accessors (random access)
     for idx in f.accessed_parameters() {
         let param = names_to_params[&idx];
@@ -197,11 +230,8 @@ pub fn compile_inner<'ctx, 'args>(
 
         match &param.ty {
             DSLType::Scalar(t) | DSLType::Array(t, _) => {
-                let ih = datum_to_iter(arg.as_datum().unwrap())?;
-                let ptr = ih.localize_struct(&ctx, &b, st[&param.name].into_pointer_value());
-                st.insert(param.name, ptr.as_basic_value_enum());
-
-                let detected_dtype = DSLType::of_iterator_holder(&ih).iter_type().unwrap();
+                let ih = &ihs[&idx];
+                let detected_dtype = DSLType::of_iterator_holder(ih).iter_type().unwrap();
                 if &detected_dtype != t.as_ref() {
                     return Err(ArrowKernelError::DSLTypeMismatch(
                         "accessed parameters",
@@ -220,14 +250,14 @@ pub fn compile_inner<'ctx, 'args>(
                 .unwrap();
                 access_funcs.insert(param.name, access_func);
             }
-            DSLType::Buffer(t) => {
+            DSLType::Buffer(t, _) => {
                 access_funcs.insert(
                     param.name,
-                    buffer::generate_buffer_accessor(&ctx, &module, *t),
+                    DSLBuffer::generate_buffer_accessor(&ctx, &module, *t),
                 );
                 writer_funcs.insert(
                     param.name,
-                    buffer::generate_buffer_writer(&ctx, &module, *t),
+                    DSLBuffer::generate_buffer_writer(&ctx, &module, *t),
                 );
             }
             DSLType::TwoDArray(..) => {
@@ -248,14 +278,8 @@ pub fn compile_inner<'ctx, 'args>(
 
         match &param.ty {
             DSLType::Scalar(t) | DSLType::Array(t, ..) => {
-                let ih = datum_to_iter(
-                    arg.as_datum()
-                        .ok_or_else(|| ArrowKernelError::NonIterableType(param.ty.clone()))?,
-                )?;
-
-                let ptr = ih.localize_struct(&ctx, &b, st[&param.name].into_pointer_value());
-                st.insert(param.name, ptr.as_basic_value_enum());
-                let detected_dtype = DSLType::of_iterator_holder(&ih).iter_type().unwrap();
+                let ih = &ihs[&idx];
+                let detected_dtype = DSLType::of_iterator_holder(ih).iter_type().unwrap();
                 if &detected_dtype != t.as_ref() {
                     return Err(ArrowKernelError::DSLTypeMismatch(
                         "iterated parameters",
@@ -269,20 +293,14 @@ pub fn compile_inner<'ctx, 'args>(
                     &module,
                     &format!("next_{}", param.name),
                     &arg.data_type(),
-                    &ih,
+                    ih,
                 )
                 .unwrap();
                 next_funcs.insert(param.name, next_func);
                 iterator_holders.insert(param.name, ih);
             }
             DSLType::SetBits(_) => {
-                let ih = array_to_setbit_iter(&BooleanArray::new_null(0))?;
-                let ptr = ih.localize_struct(&ctx, &b, st[&param.name].into_pointer_value());
-                st.insert(param.name, ptr.as_basic_value_enum());
-
-                if arg.data_type() != DataType::Boolean {
-                    return Err(ArrowKernelError::InvalidSetBitType(arg.data_type()));
-                }
+                let ih = &ihs[&idx];
 
                 let next_func = generate_next(
                     &ctx,
@@ -296,6 +314,17 @@ pub fn compile_inner<'ctx, 'args>(
             }
             _ => return Err(ArrowKernelError::NonIterableType(param.ty.clone())),
         };
+    }
+
+    // compute all lengths
+    for param in f.params.iter() {
+        if let Some(ih) = ihs.get(&param.name) {
+            let length = get_iterator_length(&ctx, &b, ih, st[&param.name].into_pointer_value());
+            lengths.insert(param.name, length);
+        } else if param.ty.is_buffer() {
+            let len = DSLBuffer::buffer_len(ctx, &b, st[&param.name].into_pointer_value());
+            lengths.insert(param.name, Some(len));
+        }
     }
 
     // figure out which iterated values have related lengths
@@ -312,18 +341,7 @@ pub fn compile_inner<'ctx, 'args>(
             continue;
         }
 
-        let lengths = group
-            .iter()
-            .filter_map(|idx| {
-                get_iterator_length(
-                    &ctx,
-                    &b,
-                    &iterator_holders[idx],
-                    st[idx].into_pointer_value(),
-                )
-            })
-            .collect_vec();
-
+        let lengths = group.iter().filter_map(|idx| lengths[idx]).collect_vec();
         if lengths.len() <= 1 {
             continue;
         }
@@ -367,6 +385,7 @@ pub fn compile_inner<'ctx, 'args>(
         next_funcs,
         writer_funcs,
         output_specs,
+        lengths,
         outputs: writers,
     };
 
@@ -412,7 +431,7 @@ pub fn compile_inner<'ctx, 'args>(
         .unwrap_basic();
     b.build_return(Some(&result)).unwrap();
 
-    //module.print_to_stderr();
+    module.print_to_stderr();
     module.verify().unwrap();
     optimize_module(&module)?;
     let ee = module
@@ -485,19 +504,28 @@ fn compile_stmt<'ctx, 'a>(
                 .unwrap();
             ctx.b.position_at_end(emit_worked);
         }
-        DSLStmt::Set {
-            buf_idx,
-            index,
-            value,
-        } => {
+        DSLStmt::Set { buf, index, value } => {
+            if value.get_type().as_primitive().is_none() {
+                return Err(ArrowKernelError::DSLInvalidType(
+                    "values in set statements must be primitive",
+                    value.get_type(),
+                ));
+            }
+            if !buf.ty.is_buffer() {
+                return Err(ArrowKernelError::DSLTypeMismatch(
+                    "set must be on a buffer",
+                    DSLType::Buffer(value.get_type().as_primitive().unwrap(), "".into()),
+                    buf.ty.clone(),
+                ));
+            }
             let index = compile_expr(ctx, index)?;
             let value = compile_expr(ctx, value)?;
-            let func = ctx.writer_funcs[buf_idx];
+            let func = ctx.writer_funcs[&buf.name];
 
             ctx.b
                 .build_call(
                     func,
-                    &[ctx.st[buf_idx].into(), index.into(), value.into()],
+                    &[ctx.st[&buf.name].into(), index.into(), value.into()],
                     "set",
                 )
                 .unwrap();
@@ -519,7 +547,7 @@ fn compile_stmt<'ctx, 'a>(
 
             ctx.b.position_at_end(after_if);
         }
-        DSLStmt::For(floop) => {
+        DSLStmt::ForEach(floop) => {
             let loop_header = ctx.ctx.append_basic_block(*ctx.func, "loop_header");
             let loop_body = ctx.ctx.append_basic_block(*ctx.func, "loop_body");
             let loop_end = ctx.ctx.append_basic_block(*ctx.func, "loop_end");
@@ -598,6 +626,62 @@ fn compile_stmt<'ctx, 'a>(
             } else {
                 ctx.b.build_unconditional_branch(loop_header).unwrap();
             }
+
+            ctx.b.position_at_end(loop_end);
+        }
+        DSLStmt::ForRange(dslfor) => {
+            let start_at = compile_expr(ctx, &dslfor.start)?;
+            let end_at = compile_expr(ctx, &dslfor.end)?.into_int_value();
+
+            let counter_ptr = ctx
+                .b
+                .build_alloca(ctx.ctx.i64_type(), "loop_counter")
+                .unwrap();
+            ctx.b.build_store(counter_ptr, start_at).unwrap();
+
+            let loop_header = ctx.ctx.append_basic_block(*ctx.func, "loop_header");
+            let loop_body = ctx.ctx.append_basic_block(*ctx.func, "loop_body");
+            let loop_end = ctx.ctx.append_basic_block(*ctx.func, "loop_end");
+
+            ctx.b.build_unconditional_branch(loop_header).unwrap();
+            ctx.b.position_at_end(loop_header);
+            let curr_counter = ctx
+                .b
+                .build_load(ctx.ctx.i64_type(), counter_ptr, "curr_counter")
+                .unwrap()
+                .into_int_value();
+            let cond = ctx
+                .b
+                .build_int_compare(IntPredicate::ULT, curr_counter, end_at, "loop_cond")
+                .unwrap();
+
+            ctx.b
+                .build_conditional_branch(cond, loop_body, loop_end)
+                .unwrap();
+
+            ctx.b.position_at_end(loop_body);
+            let curr_counter = ctx
+                .b
+                .build_load(ctx.ctx.i64_type(), counter_ptr, "curr_counter")
+                .unwrap()
+                .into_int_value();
+            ctx.st
+                .insert(dslfor.loop_var.name, curr_counter.as_basic_value_enum());
+
+            for stmt in dslfor.body.iter() {
+                compile_stmt(ctx, &stmt)?;
+            }
+
+            let next_counter = ctx
+                .b
+                .build_int_add(
+                    curr_counter,
+                    ctx.ctx.i64_type().const_int(1, false),
+                    "new_counter",
+                )
+                .unwrap();
+            ctx.b.build_store(counter_ptr, next_counter).unwrap();
+            ctx.b.build_unconditional_branch(loop_header).unwrap();
 
             ctx.b.position_at_end(loop_end);
         }
@@ -856,6 +940,17 @@ fn compile_expr<'ctx, 'a>(
                         )),
                     }
                 }
+                DSLType::ConstScalar(ref s) => {
+                    let res = scalar_to_llvm(ctx, s.as_ref())?;
+                    if res.get_type() != tar_llvm_type {
+                        return Err(ArrowKernelError::DSLTypeMismatch(
+                            "const scalar type mismatch",
+                            orig_type,
+                            tar_type,
+                        ));
+                    }
+                    Ok(res)
+                }
                 _ => unimplemented!("invalid cast"),
             }
         }
@@ -985,6 +1080,14 @@ fn compile_expr<'ctx, 'a>(
                 ));
             })
         }
+        DSLExpr::Len(v) => ctx.lengths[&v.name]
+            .ok_or_else(|| {
+                ArrowKernelError::DSLInvalidType(
+                    "length is not available for input of this type",
+                    v.ty.clone(),
+                )
+            })
+            .map(|x| x.as_basic_value_enum()),
     }
 }
 
@@ -1093,4 +1196,85 @@ fn cast_numeric_vec<'ctx, 'a>(
         // float to float
         (false, false) => ctx.b.build_float_cast(val, tar_type, "cast").unwrap(),
     })
+}
+
+fn scalar_to_llvm<'ctx, 'a>(
+    ctx: &DSLCompilationContext<'ctx, 'a>,
+    val: &dyn Datum,
+) -> Result<BasicValueEnum<'a>, ArrowKernelError> {
+    let (arr, is_scalar) = val.get();
+    assert!(is_scalar, "scalar_to_llvm called with non-scalar value");
+
+    let res = match PrimitiveType::for_arrow_type(arr.data_type()) {
+        PrimitiveType::I8 => arr.as_primitive_opt::<Int8Type>().map(|x| {
+            ctx.ctx
+                .i8_type()
+                .const_int(x.value(0) as u64, true)
+                .as_basic_value_enum()
+        }),
+        PrimitiveType::I16 => arr.as_primitive_opt::<Int16Type>().map(|x| {
+            ctx.ctx
+                .i16_type()
+                .const_int(x.value(0) as u64, true)
+                .as_basic_value_enum()
+        }),
+        PrimitiveType::I32 => arr.as_primitive_opt::<Int32Type>().map(|x| {
+            ctx.ctx
+                .i32_type()
+                .const_int(x.value(0) as u64, true)
+                .as_basic_value_enum()
+        }),
+        PrimitiveType::I64 => arr.as_primitive_opt::<Int64Type>().map(|x| {
+            ctx.ctx
+                .i64_type()
+                .const_int(x.value(0) as u64, true)
+                .as_basic_value_enum()
+        }),
+        PrimitiveType::U8 => arr.as_primitive_opt::<UInt8Type>().map(|x| {
+            ctx.ctx
+                .i8_type()
+                .const_int(x.value(0) as u64, false)
+                .as_basic_value_enum()
+        }),
+        PrimitiveType::U16 => arr.as_primitive_opt::<UInt16Type>().map(|x| {
+            ctx.ctx
+                .i16_type()
+                .const_int(x.value(0) as u64, false)
+                .as_basic_value_enum()
+        }),
+        PrimitiveType::U32 => arr.as_primitive_opt::<UInt32Type>().map(|x| {
+            ctx.ctx
+                .i32_type()
+                .const_int(x.value(0) as u64, false)
+                .as_basic_value_enum()
+        }),
+        PrimitiveType::U64 => arr.as_primitive_opt::<UInt64Type>().map(|x| {
+            ctx.ctx
+                .i64_type()
+                .const_int(x.value(0) as u64, false)
+                .as_basic_value_enum()
+        }),
+        PrimitiveType::F16 => arr.as_primitive_opt::<Float16Type>().map(|x| {
+            ctx.ctx
+                .f16_type()
+                .const_float(x.value(0).to_f64())
+                .as_basic_value_enum()
+        }),
+        PrimitiveType::F32 => arr.as_primitive_opt::<Float32Type>().map(|x| {
+            ctx.ctx
+                .f32_type()
+                .const_float(x.value(0) as f64)
+                .as_basic_value_enum()
+        }),
+        PrimitiveType::F64 => arr.as_primitive_opt::<Float64Type>().map(|x| {
+            ctx.ctx
+                .f32_type()
+                .const_float(x.value(0))
+                .as_basic_value_enum()
+        }),
+        PrimitiveType::P64x2 => todo!(),
+        PrimitiveType::List(_, _) => todo!(),
+    };
+
+    Ok(res.expect("non-primitive const scalar in compilation"))
 }

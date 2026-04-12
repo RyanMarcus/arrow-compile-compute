@@ -3,7 +3,7 @@ use std::{ffi::c_void, sync::Arc};
 use arrow_array::{
     cast::AsArray,
     types::{Int16Type, Int32Type, Int64Type, RunEndIndexType},
-    Array, ArrayRef, BinaryArray, RunArray,
+    Array, ArrayRef, RunArray,
 };
 use arrow_buffer::NullBuffer;
 use arrow_data::ArrayDataBuilder;
@@ -422,7 +422,7 @@ impl<'a> REEWriter<'a> {
 mod tests {
     use std::ffi::c_void;
 
-    use arrow_array::{cast::AsArray, types::Int32Type, BinaryArray, Int32Array, RunArray};
+    use arrow_array::{types::Int32Type, BinaryArray, Int32Array, RunArray};
     use inkwell::{context::Context, AddressSpace, OptimizationLevel};
     use itertools::Itertools;
 

@@ -39,7 +39,7 @@ use inkwell::execution_engine::ExecutionEngine;
 use itertools::Itertools;
 use llvm_utils::str_writer_append_bytes;
 pub use null_utils::intersect_and_copy_nulls;
-pub use partition::PartitionKernel;
+pub use partition::partition;
 pub use range::RangeKernel;
 pub use rust_iter::{ArrowIter, ArrowNullableIter, IterFuncHolder};
 pub use sort::{LowerBoundKernel, SortKernel, SortOptions, TopKKernel};

@@ -126,6 +126,13 @@ impl ViewIterator {
         builder.build_store(pos_ptr, new_pos).unwrap();
     }
 
+    pub fn llvm_reset<'a>(&self, ctx: &'a Context, builder: &'a Builder, ptr: PointerValue<'a>) {
+        let pos_ptr = increment_pointer!(ctx, builder, ptr, ViewIterator::OFFSET_POS);
+        builder
+            .build_store(pos_ptr, ctx.i64_type().const_zero())
+            .unwrap();
+    }
+
     pub fn llvm_buffer_ptr<'a>(
         &self,
         ctx: &'a Context,

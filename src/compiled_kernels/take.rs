@@ -3,9 +3,8 @@ use arrow_array::{Array, ArrayRef, BooleanArray, UInt64Array};
 use arrow_buffer::NullBuffer;
 use arrow_schema::DataType;
 
-use crate::compiled_iter::datum_to_iter;
 use crate::compiled_kernels::cast::coalesce_type;
-use crate::compiled_kernels::dsl::{base_type, DSLKernel, KernelOutputType};
+use crate::compiled_kernels::dsl::base_type;
 use crate::compiled_kernels::dsl2::{
     self, dsl_args, DSLContext, DSLFunction, DSLStmt, DSLType, WriterSpec,
 };

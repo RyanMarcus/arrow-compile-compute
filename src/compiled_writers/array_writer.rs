@@ -221,12 +221,6 @@ impl<'a> LeafWriter<'a> for PrimitiveArrayWriter<'a> {
     }
 }
 
-impl<'a> PrimitiveArrayWriter<'a> {
-    pub fn primitive_type(&self) -> PrimitiveType {
-        self.pt
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::PrimitiveArrayWriter;

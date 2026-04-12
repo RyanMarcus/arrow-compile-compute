@@ -165,8 +165,8 @@ impl RunnableDSLFunction {
                         .ptrs
                         .push(prepared.twods.last().unwrap().get_ptr() as *mut c_void);
                 }
-                DSLArgument::Buffer(buf, _pt) => {
-                    prepared.ptrs.push(buf.as_ptr() as *mut c_void);
+                DSLArgument::Buffer { ptr, .. } => {
+                    prepared.ptrs.push(*ptr);
                 }
             }
         }

@@ -3,15 +3,14 @@ use std::sync::Arc;
 use super::{ArrowKernelError, Kernel};
 use crate::{
     compiled_kernels::{
-        dsl::{base_type, DSLKernel, KernelOutputType},
+        dsl::base_type,
         dsl2::{
             compile, dsl_args, DSLArgument, DSLContext, DSLFunction, DSLStmt, DSLType,
             RunnableDSLFunction,
         },
-        null_utils::replace_nulls,
     },
     compiled_writers::WriterSpec,
-    intersect_and_copy_nulls, logical_nulls, PrimitiveType,
+    intersect_and_copy_nulls, PrimitiveType,
 };
 use arrow_array::{
     cast::AsArray,
@@ -181,7 +180,7 @@ mod tests {
         Array, ArrayRef, DictionaryArray, Int16Array, Int32Array, Int64Array, RunArray,
         StringArray, UInt8Array,
     };
-    use arrow_schema::{DataType, Field, FieldRef};
+    use arrow_schema::{DataType, Field};
     use itertools::Itertools;
 
     use crate::{

@@ -3,6 +3,7 @@ use std::fmt::Debug;
 #[cfg(test)]
 use std::ops::{BitAnd, BitOr, BitXor};
 use std::sync::Arc;
+use std::{ffi::c_void, marker::PhantomData};
 
 use arrow_array::cast::AsArray;
 use arrow_array::types::UInt32Type;
@@ -11,7 +12,6 @@ use arrow_array::{ArrowPrimitiveType, PrimitiveArray};
 
 use arrow_array::ArrayRef;
 use arrow_array::{Datum, UInt32Array, UInt64Array};
-use arrow_buffer::MutableBuffer;
 use arrow_schema::DataType;
 use inkwell::context::Context;
 use inkwell::types::{BasicType, BasicTypeEnum};
@@ -31,6 +31,7 @@ mod two_d;
 mod writers;
 
 pub use self::writers::OutputSpec;
+pub use buffer::DSLBuffer;
 pub use compiler::compile;
 pub use runtime::RunnableDSLFunction;
 pub use writers::{OutputSlot, WriterSpec};
@@ -100,11 +101,11 @@ impl DSLArgumentType {
                 }
                 Ok(())
             }
-            (DSLArgumentType::Buffer(pt1), DSLArgument::Buffer(_buf, pt2)) => {
-                if pt1 != pt2 {
+            (DSLArgumentType::Buffer(pt1), DSLArgument::Buffer { primitive_type, .. }) => {
+                if pt1 != primitive_type {
                     return Err(format!(
                         "buffer type mismatch, expected {}, got {}",
-                        pt1, pt2
+                        pt1, primitive_type
                     ));
                 }
                 Ok(())
@@ -136,7 +137,11 @@ impl DSLArgumentType {
 pub enum DSLArgument<'a> {
     Datum(&'a dyn Datum),
     TwoDArray(Vec<&'a dyn Datum>),
-    Buffer(&'a mut MutableBuffer, PrimitiveType),
+    Buffer {
+        ptr: *mut c_void,
+        primitive_type: PrimitiveType,
+        _borrow: PhantomData<&'a mut buffer::DSLBuffer>,
+    },
 }
 
 impl<'a> DSLArgument<'a> {
@@ -151,8 +156,12 @@ impl<'a> DSLArgument<'a> {
         DSLArgument::TwoDArray(values.into_iter().collect())
     }
 
-    pub fn buffer(value: &'a mut MutableBuffer, pt: PrimitiveType) -> Self {
-        DSLArgument::Buffer(value, pt)
+    pub fn buffer(value: &'a mut buffer::DSLBuffer) -> Self {
+        DSLArgument::Buffer {
+            ptr: value.as_ptr(),
+            primitive_type: value.ty,
+            _borrow: PhantomData,
+        }
     }
 
     pub fn get_type(&self, dsl_ty: &DSLType) -> DSLArgumentType {
@@ -180,7 +189,7 @@ impl<'a> DSLArgument<'a> {
                     .map(|x| x.get().0.data_type().clone())
                     .collect_vec(),
             ),
-            DSLArgument::Buffer(_buf, primitive_type) => DSLArgumentType::Buffer(*primitive_type),
+            DSLArgument::Buffer { primitive_type, .. } => DSLArgumentType::Buffer(*primitive_type),
         }
     }
 
@@ -188,7 +197,7 @@ impl<'a> DSLArgument<'a> {
         match self {
             DSLArgument::Datum(d) => Some(*d),
             DSLArgument::TwoDArray(_) => None,
-            DSLArgument::Buffer(_, _) => todo!(),
+            DSLArgument::Buffer { .. } => todo!(),
         }
     }
 
@@ -203,7 +212,7 @@ impl<'a> DSLArgument<'a> {
         match self {
             DSLArgument::Datum(d) => d.get().0.data_type().clone(),
             DSLArgument::TwoDArray(a) => a[0].get().0.data_type().clone(),
-            DSLArgument::Buffer(_, pt) => pt.as_arrow_type(),
+            DSLArgument::Buffer { primitive_type, .. } => primitive_type.as_arrow_type(),
         }
     }
 
@@ -219,7 +228,7 @@ impl<'a> DSLArgument<'a> {
             (DSLArgument::Datum(..), DSLType::Scalar(..)) => true,
             (DSLArgument::Datum(..), DSLType::Array(..)) => true,
             (DSLArgument::TwoDArray(..), DSLType::TwoDArray(..)) => true,
-            (DSLArgument::Buffer(.., _), DSLType::Buffer(..)) => true,
+            (DSLArgument::Buffer { .. }, DSLType::Buffer(..)) => true,
             _ => false,
         }
     }
@@ -243,12 +252,11 @@ macro_rules! dsl_args {
         $(args.extend(dsl_args![$($rest)*]);)?
         args
     }};
-    (($buffer:expr, $primitive_type:expr)) => {
-        vec![$crate::compiled_kernels::dsl2::DSLArgument::buffer(&mut $buffer, $primitive_type)]
+    (&mut $buffer:expr) => {
+        vec![$crate::compiled_kernels::dsl2::DSLArgument::buffer(&mut $buffer)]
     };
-    (($buffer:expr, $primitive_type:expr) $(, $($rest:tt)*)?) => {{
-        let mut args =
-            vec![$crate::compiled_kernels::dsl2::DSLArgument::buffer(&mut $buffer, $primitive_type)];
+    (&mut $buffer:expr $(, $($rest:tt)*)?) => {{
+        let mut args = vec![$crate::compiled_kernels::dsl2::DSLArgument::buffer(&mut $buffer)];
         $(args.extend(dsl_args![$($rest)*]);)?
         args
     }};
@@ -271,7 +279,15 @@ impl Debug for DSLArgument<'_> {
                 .field(arg0.get().0.data_type())
                 .finish(),
             Self::TwoDArray(_) => f.debug_tuple("TwoDArray").finish(),
-            Self::Buffer(arg0, arg1) => f.debug_tuple("Buffer").field(arg0).field(arg1).finish(),
+            Self::Buffer {
+                ptr,
+                primitive_type,
+                ..
+            } => f
+                .debug_struct("Buffer")
+                .field("ptr", ptr)
+                .field("primitive_type", primitive_type)
+                .finish(),
         }
     }
 }
@@ -285,7 +301,7 @@ pub enum DSLType {
     Array(Box<DSLType>, String),
     SetBits(String),
     TwoDArray(Box<DSLType>),
-    Buffer(PrimitiveType),
+    Buffer(PrimitiveType, String),
 }
 
 impl PartialEq for DSLType {
@@ -300,7 +316,7 @@ impl PartialEq for DSLType {
             (DSLType::Array(a, a_len), DSLType::Array(b, b_len)) => a == b && a_len == b_len,
             (DSLType::SetBits(a_len), DSLType::SetBits(b_len)) => a_len == b_len,
             (DSLType::TwoDArray(a), DSLType::TwoDArray(b)) => a == b,
-            (DSLType::Buffer(a), DSLType::Buffer(b)) => a == b,
+            (DSLType::Buffer(a, a_len), DSLType::Buffer(b, b_len)) => a == b && a_len == b_len,
             _ => false,
         }
     }
@@ -318,7 +334,7 @@ impl Debug for DSLType {
                 f.debug_tuple("Array").field(ty).field(len_expr).finish()
             }
             DSLType::TwoDArray(ty) => f.debug_tuple("TwoDArray").field(ty).finish(),
-            DSLType::Buffer(ty) => f.debug_tuple("Buffer").field(ty).finish(),
+            DSLType::Buffer(ty, len) => f.debug_tuple("Buffer").field(ty).field(len).finish(),
         }
     }
 }
@@ -329,7 +345,7 @@ impl DSLType {
             DSLType::Array(ty, ..) => Some(*ty.clone()),
             DSLType::SetBits(..) => Some(DSLType::Primitive(PrimitiveType::U64)),
             DSLType::TwoDArray(ty, ..) => Some(*ty.clone()),
-            DSLType::Buffer(ty) => Some(DSLType::Primitive(*ty)),
+            DSLType::Buffer(ty, ..) => Some(DSLType::Primitive(*ty)),
             DSLType::Scalar(ty) => Some(*ty.clone()),
             DSLType::ConstScalar(_) => Some(self.clone()),
             _ => None,
@@ -369,7 +385,7 @@ impl DSLType {
             DSLType::Scalar(t) => t.is_signed(),
             DSLType::Array(t, ..) => t.is_signed(),
             DSLType::TwoDArray(t, ..) => t.is_signed(),
-            DSLType::Buffer(t) => Some(t.is_signed()),
+            DSLType::Buffer(t, ..) => Some(t.is_signed()),
         }
     }
 
@@ -379,6 +395,10 @@ impl DSLType {
             DSLType::ConstScalar(..) | DSLType::Scalar(..) => true,
             _ => false,
         }
+    }
+
+    pub fn is_buffer(&self) -> bool {
+        matches!(self, DSLType::Buffer(..))
     }
 
     pub fn llvm_type<'a>(&self, ctx: &'a Context) -> Option<BasicTypeEnum<'a>> {
@@ -406,8 +426,9 @@ impl DSLType {
 
     pub fn size_tag(&self) -> Option<&str> {
         match self {
-            DSLType::Array(_, name) => Some(name),
-            DSLType::SetBits(name) => Some(name),
+            DSLType::Array(_, name) | DSLType::SetBits(name) | DSLType::Buffer(_, name) => {
+                Some(name)
+            }
             _ => None,
         }
     }
@@ -450,8 +471,8 @@ impl DSLType {
         DSLType::Scalar(Box::new(DSLType::Primitive(pt)))
     }
 
-    pub fn buffer_of(pt: PrimitiveType) -> Self {
-        DSLType::Buffer(pt)
+    pub fn buffer_of<S: Into<String>>(pt: PrimitiveType, len_expr: S) -> Self {
+        DSLType::Buffer(pt, len_expr.into())
     }
 }
 
@@ -677,7 +698,7 @@ pub enum DSLStmt {
         value: DSLExpr,
     },
     Set {
-        buf_idx: usize,
+        buf: DSLValue,
         index: DSLExpr,
         value: DSLExpr,
     },
@@ -685,7 +706,8 @@ pub enum DSLStmt {
         cond: DSLExpr,
         then: Vec<DSLStmt>,
     },
-    For(DSLFor),
+    ForEach(DSLForEach),
+    ForRange(DSLForRange),
 }
 
 impl Into<Vec<DSLStmt>> for DSLStmt {
@@ -715,9 +737,26 @@ impl DSLStmt {
 
         let body = f(&loop_vars)?;
 
-        Ok(DSLStmt::For(DSLFor {
+        Ok(DSLStmt::ForEach(DSLForEach {
             loop_vars,
             iterators: to_iter.iter().cloned().collect_vec(),
+            body: body.into(),
+        }))
+    }
+
+    pub fn for_range<S: Into<Vec<DSLStmt>>, F: FnOnce(&DSLValue) -> Result<S, ArrowKernelError>>(
+        ctx: &mut DSLContext,
+        start: DSLExpr,
+        end: DSLExpr,
+        f: F,
+    ) -> Result<DSLStmt, ArrowKernelError> {
+        let loop_var = DSLValue::new(ctx, DSLType::Primitive(PrimitiveType::U64));
+        let body = f(&loop_var)?;
+
+        Ok(DSLStmt::ForRange(DSLForRange {
+            loop_var,
+            start,
+            end,
             body: body.into(),
         }))
     }
@@ -744,12 +783,12 @@ impl DSLStmt {
     }
 
     pub fn set(
-        buf_idx: usize,
+        buf: &DSLValue,
         index: &DSLExpr,
         value: &DSLExpr,
     ) -> Result<DSLStmt, ArrowKernelError> {
         Ok(DSLStmt::Set {
-            buf_idx,
+            buf: buf.clone(),
             index: index.clone(),
             value: value.clone(),
         })
@@ -763,7 +802,12 @@ impl DSLStmt {
                     stmt.accessed_parameters(params);
                 }
             }
-            DSLStmt::For(dslfor) => {
+            DSLStmt::ForEach(dslfor) => {
+                for stmt in dslfor.body.iter() {
+                    stmt.accessed_parameters(params);
+                }
+            }
+            DSLStmt::ForRange(dslfor) => {
                 for stmt in dslfor.body.iter() {
                     stmt.accessed_parameters(params);
                 }
@@ -772,12 +816,8 @@ impl DSLStmt {
                 index.accessed_parameters(params);
                 value.accessed_parameters(params);
             }
-            DSLStmt::Set {
-                index,
-                value,
-                buf_idx,
-            } => {
-                params.insert(*buf_idx);
+            DSLStmt::Set { buf, index, value } => {
+                params.insert(buf.name);
                 index.accessed_parameters(params);
                 value.accessed_parameters(params);
             }
@@ -786,7 +826,7 @@ impl DSLStmt {
 
     pub fn iterated_parameters(&self, params: &mut HashSet<usize>) {
         match self {
-            DSLStmt::For(dslfor) => {
+            DSLStmt::ForEach(dslfor) => {
                 params.extend(dslfor.iterators.iter().map(|x| x.name));
                 for stmt in dslfor.body.iter() {
                     stmt.iterated_parameters(params);
@@ -802,6 +842,24 @@ impl DSLStmt {
     }
 }
 
+pub struct DSLForEach {
+    /// variables inside the for loop
+    loop_vars: Vec<DSLValue>,
+
+    /// values to iterate over
+    iterators: Vec<DSLValue>,
+    body: Vec<DSLStmt>,
+}
+
+pub struct DSLForRange {
+    /// variable inside the for loop
+    loop_var: DSLValue,
+
+    start: DSLExpr,
+    end: DSLExpr,
+    body: Vec<DSLStmt>,
+}
+
 #[derive(Clone, Debug)]
 pub enum DSLExpr {
     Compare(DSLComparison, Box<DSLExpr>, Box<DSLExpr>),
@@ -811,6 +869,7 @@ pub enum DSLExpr {
     CastToBool(Box<DSLExpr>),
     ArithBinOp(DSLArithBinOp, Box<DSLExpr>, Box<DSLExpr>),
     BitwiseBinOp(DSLBitwiseBinOp, Box<DSLExpr>, Box<DSLExpr>),
+    Len(Box<DSLValue>),
 }
 
 impl DSLExpr {
@@ -899,6 +958,16 @@ impl DSLExpr {
         ))
     }
 
+    pub fn len(&self) -> Result<DSLExpr, ArrowKernelError> {
+        match self {
+            DSLExpr::Value(v) => Ok(DSLExpr::Len(Box::new(v.clone()))),
+            _ => Err(ArrowKernelError::DSLInvalidType(
+                "cannot get length of this type",
+                self.get_type(),
+            )),
+        }
+    }
+
     pub fn get_type(&self) -> DSLType {
         match self {
             DSLExpr::Compare(..) => DSLType::Boolean,
@@ -915,6 +984,7 @@ impl DSLExpr {
             DSLExpr::BitwiseBinOp(_, v, _) | DSLExpr::ArithBinOp(_, v, _) => v.get_type().clone(),
             DSLExpr::Cast(_, pt) => DSLType::Primitive(*pt),
             DSLExpr::CastToBool(_) => DSLType::Boolean,
+            DSLExpr::Len(_) => DSLType::Primitive(PrimitiveType::U64),
         }
     }
 
@@ -930,7 +1000,7 @@ impl DSLExpr {
                 params.insert(arr.name);
                 idx.iter().for_each(|i| i.accessed_parameters(params));
             }
-            DSLExpr::Value(_) => {}
+            DSLExpr::Value(_) | DSLExpr::Len(_) => {}
             DSLExpr::Cast(val, _) => val.accessed_parameters(params),
             DSLExpr::CastToBool(val) => val.accessed_parameters(params),
         }
@@ -957,15 +1027,6 @@ impl From<usize> for DSLExpr {
     }
 }
 
-pub struct DSLFor {
-    /// variables inside the for loop
-    loop_vars: Vec<DSLValue>,
-
-    /// values to iterate over
-    iterators: Vec<DSLValue>,
-    body: Vec<DSLStmt>,
-}
-
 #[cfg(test)]
 mod tests {
     use std::{collections::HashSet, sync::Arc};
@@ -984,8 +1045,8 @@ mod tests {
             cast::coalesce_type,
             dsl::DSLKernel,
             dsl2::{
-                compiler::compile, writers::WriterSpec, DSLArgument, DSLComparison, DSLContext,
-                DSLFor, DSLFunction, DSLStmt, DSLType, OutputSpec,
+                buffer::DSLBuffer, compiler::compile, writers::WriterSpec, DSLArgument,
+                DSLComparison, DSLContext, DSLForEach, DSLFunction, DSLStmt, DSLType, OutputSpec,
             },
         },
         PrimitiveType,
@@ -1246,11 +1307,11 @@ mod tests {
         let mut func = DSLFunction::new("max_agg");
         let arr_input = Int32Array::new_null(0);
         let tic_input = UInt32Array::new_null(0);
-        let mut buf_input = MutableBuffer::new(0);
+        let mut buf_input = DSLBuffer::new(PrimitiveType::I32, 0);
 
         let arr = func.add_arg(&mut ctx, DSLType::array_of(PrimitiveType::I32, "n"));
         let tic = func.add_arg(&mut ctx, DSLType::array_of(PrimitiveType::U32, "n"));
-        let buf = func.add_arg(&mut ctx, DSLType::buffer_of(PrimitiveType::I32));
+        let buf = func.add_arg(&mut ctx, DSLType::buffer_of(PrimitiveType::I32, "k"));
 
         func.add_body(
             DSLStmt::for_each(&mut ctx, &[arr, tic], |loop_vars| {
@@ -1259,26 +1320,21 @@ mod tests {
                 let old_val = buf.expr().at(&tic_val)?;
 
                 let cmp = new_val.cmp(&old_val, DSLComparison::Gt)?;
-                DSLStmt::cond(cmp, DSLStmt::set(2, &tic_val, &new_val)?)
+                DSLStmt::cond(cmp, DSLStmt::set(&buf, &tic_val, &new_val)?)
             })
             .unwrap(),
         );
 
-        let func = compile(
-            func,
-            dsl_args![arr_input, tic_input, (buf_input, PrimitiveType::I32),],
-        )
-        .unwrap();
+        let func = compile(func, dsl_args![arr_input, tic_input, &mut buf_input]).unwrap();
 
-        let mut buf = MutableBuffer::new(4 * 3);
-        buf.extend_zeros(4 * 3);
+        let mut buf = DSLBuffer::new(PrimitiveType::I32, 3);
         let arr = Int32Array::from(vec![10, 20, 30, 40, 50]);
         let tic = UInt32Array::from(vec![0, 1, 0, 2, 1]);
 
-        func.run(&dsl_args![arr, tic, (buf, PrimitiveType::I32)])
-            .unwrap();
-        let buf = ScalarBuffer::<i32>::from(buf);
-        let res = Int32Array::new(buf, None);
+        func.run(&dsl_args![arr, tic, &mut buf]).unwrap();
+
+        let res = buf.into_array();
+        let res = res.as_primitive::<Int32Type>().clone();
         assert_eq!(res, Int32Array::from(vec![30, 50, 40]));
     }
 

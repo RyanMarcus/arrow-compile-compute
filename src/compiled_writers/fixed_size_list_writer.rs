@@ -181,12 +181,6 @@ impl<'a> LeafWriter<'a> for FixedSizeListWriter<'a> {
     }
 }
 
-impl<'a> FixedSizeListWriter<'a> {
-    pub fn primitive_type(&self) -> PrimitiveType {
-        self.pt
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use std::ffi::c_void;

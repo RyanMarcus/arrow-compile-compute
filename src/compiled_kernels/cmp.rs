@@ -1,30 +1,21 @@
 use arrow_array::cast::AsArray;
-use arrow_array::{Array, BooleanArray, Datum};
-use arrow_buffer::NullBuffer;
+use arrow_array::{BooleanArray, Datum};
 use arrow_schema::DataType;
-use inkwell::execution_engine::JitFunction;
 use inkwell::intrinsics::Intrinsic;
 use inkwell::module::{Linkage, Module};
 
-use inkwell::values::{BasicValue, FunctionValue};
-use inkwell::{context::Context, AddressSpace};
-use inkwell::{IntPredicate, OptimizationLevel};
-use ouroboros::self_referencing;
-use std::ffi::c_void;
+use inkwell::context::Context;
+use inkwell::values::FunctionValue;
+use inkwell::IntPredicate;
 
-use crate::compiled_iter::{datum_to_iter, generate_next, generate_next_block, IteratorHolder};
-use crate::compiled_kernels::dsl::{DSLKernel, KernelOutputType};
 use crate::compiled_kernels::dsl2::{
-    compile, dsl_args, DSLArgument, DSLBitwiseBinOp, DSLComparison, DSLContext, DSLExpr,
-    DSLFunction, DSLStmt, DSLType, RunnableDSLFunction,
+    compile, DSLArgument, DSLBitwiseBinOp, DSLComparison, DSLContext, DSLFunction, DSLStmt,
+    DSLType, RunnableDSLFunction,
 };
-use crate::compiled_kernels::{
-    gen_convert_numeric_vec, link_req_helpers, optimize_module, DSLArithBinOp,
-};
-use crate::compiled_writers::{BooleanWriter, LeafWriter, LeafWriterAllocation, WriterSpec};
+use crate::compiled_writers::WriterSpec;
 use crate::{
-    declare_blocks, increment_pointer, intersect_and_copy_nulls, pointer_diff, ComparisonType,
-    Predicate, PrimitiveType,
+    declare_blocks, increment_pointer, intersect_and_copy_nulls, pointer_diff, Predicate,
+    PrimitiveType,
 };
 
 use super::{ArrowKernelError, Kernel};

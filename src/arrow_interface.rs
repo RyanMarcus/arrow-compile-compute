@@ -476,14 +476,12 @@ pub mod select {
     use arrow_array::{make_array, Array, ArrayRef, BooleanArray};
 
     use crate::{
-        compiled_kernels::{concat_all, FilterKernel, KernelCache, PartitionKernel, TakeKernel},
+        compiled_kernels::{concat_all, FilterKernel, KernelCache, TakeKernel},
         ArrowKernelError,
     };
 
     static TAKE_PROGRAM_CACHE: LazyLock<KernelCache<TakeKernel>> = LazyLock::new(KernelCache::new);
     static FILTER_PROGRAM_CACHE: LazyLock<KernelCache<FilterKernel>> =
-        LazyLock::new(KernelCache::new);
-    static PARTITION_PROGRAM_CACHE: LazyLock<KernelCache<PartitionKernel>> =
         LazyLock::new(KernelCache::new);
 
     /// Extract the elements in `data` at the indices specified in `idxes`.
@@ -561,8 +559,8 @@ pub mod select {
     /// Partitions an array into multiple arrays based on the partition indexes.
     ///
     /// The partition indexes must be non-null and castable to unsigned
-    /// integers. Null values in the input array are skipped (not placed into
-    /// any partition), and the corresponding partition index is ignored.
+    /// integers. Nulls in `data` are preserved in the output partition they
+    /// belong to.
     ///
     /// ```
     /// use arrow_array::cast::AsArray;
@@ -574,27 +572,21 @@ pub mod select {
     /// let res = arrow_compile_compute::select::partition(&data, &pidxes, Some(2)).unwrap();
     ///
     /// assert_eq!(res.len(), 2);
-    /// assert_eq!(res[0].as_primitive::<Int32Type>().values(), &[1]); // nulls are skipped
-    /// assert_eq!(res[1].as_primitive::<Int32Type>().values(), &[2, 3]);
+    /// assert_eq!(
+    ///     res[0].as_primitive::<Int32Type>().iter().collect::<Vec<_>>(),
+    ///     vec![Some(1), None]
+    /// );
+    /// assert_eq!(
+    ///     res[1].as_primitive::<Int32Type>().iter().collect::<Vec<_>>(),
+    ///     vec![Some(2), Some(3)]
+    /// );
     /// ```
     pub fn partition(
         data: &dyn Array,
         partition_indexes: &dyn Array,
         nparts: Option<usize>,
     ) -> Result<Vec<ArrayRef>, ArrowKernelError> {
-        let nparts = match nparts {
-            Some(x) => x,
-            None => crate::iter::iter_nonnull_u64(partition_indexes)?
-                .max()
-                .map(|x| x as usize)
-                .unwrap_or(0),
-        };
-
-        if nparts == 0 {
-            return Ok(vec![]);
-        }
-
-        PARTITION_PROGRAM_CACHE.get((data, partition_indexes), nparts)
+        crate::compiled_kernels::partition(data, partition_indexes, nparts)
     }
 }
 

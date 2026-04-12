@@ -139,6 +139,13 @@ impl StringIterator {
         let new_pos = builder.build_int_add(pos, amt, "new_pos").unwrap();
         builder.build_store(pos_ptr, new_pos).unwrap();
     }
+
+    pub fn llvm_reset<'a>(&self, ctx: &'a Context, builder: &'a Builder, ptr: PointerValue<'a>) {
+        let pos_ptr = increment_pointer!(ctx, builder, ptr, StringIterator::OFFSET_POS);
+        builder
+            .build_store(pos_ptr, ctx.i64_type().const_zero())
+            .unwrap();
+    }
 }
 
 /// Same as `StringIterator`, but with 64 bit offsets.
@@ -229,6 +236,13 @@ impl LargeStringIterator {
             .into_int_value();
         let new_pos = builder.build_int_add(pos, amt, "new_pos").unwrap();
         builder.build_store(pos_ptr, new_pos).unwrap();
+    }
+
+    pub fn llvm_reset<'a>(&self, ctx: &'a Context, builder: &'a Builder, ptr: PointerValue<'a>) {
+        let pos_ptr = increment_pointer!(ctx, builder, ptr, LargeStringIterator::OFFSET_POS);
+        builder
+            .build_store(pos_ptr, ctx.i64_type().const_zero())
+            .unwrap();
     }
 }
 

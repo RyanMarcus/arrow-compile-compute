@@ -420,6 +420,40 @@ impl SetBitIterator {
         }
         next
     }
+
+    pub fn llvm_reset<'a>(&self, ctx: &'a Context, build: &'a Builder, ptr: PointerValue<'a>) {
+        let zero = ctx.i64_type().const_zero();
+        build
+            .build_store(
+                increment_pointer!(ctx, build, ptr, SetBitIterator::OFFSET_HEADER_IDX),
+                zero,
+            )
+            .unwrap();
+        build
+            .build_store(
+                increment_pointer!(ctx, build, ptr, SetBitIterator::OFFSET_TAIL_IDX),
+                zero,
+            )
+            .unwrap();
+        build
+            .build_store(
+                increment_pointer!(ctx, build, ptr, SetBitIterator::OFFSET_CURRENT_U64),
+                zero,
+            )
+            .unwrap();
+        build
+            .build_store(
+                increment_pointer!(ctx, build, ptr, SetBitIterator::OFFSET_CURR_SETBIT_IDX),
+                self.llvm_head_len(ctx, build, ptr),
+            )
+            .unwrap();
+        build
+            .build_store(
+                increment_pointer!(ctx, build, ptr, SetBitIterator::OFFSET_SEGMENT_POS),
+                self.llvm_segment_start(ctx, build, ptr),
+            )
+            .unwrap();
+    }
 }
 
 #[cfg(test)]

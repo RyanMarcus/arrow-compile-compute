@@ -2,6 +2,8 @@ mod bitmap;
 mod dictionary;
 mod fixed_size_list;
 mod primitive;
+#[cfg(test)]
+mod reset_tests;
 mod runend;
 mod scalar;
 mod setbit;
@@ -349,6 +351,147 @@ impl IteratorHolder {
             IteratorHolder::Primitive(i) => i.localize_struct(ctx, b, ptr),
             IteratorHolder::FixedSizeList(i) => i.localize_struct(ctx, b, ptr),
             _ => ptr,
+        }
+    }
+}
+
+/// Adds a function to the module that resets iterator state back to its
+/// original position. The generated function's signature is:
+///
+/// fn reset(iter: ptr)
+///
+pub fn generate_reset_iterator<'a>(
+    ctx: &'a Context,
+    llvm_mod: &Module<'a>,
+    label: &str,
+    ih: &IteratorHolder,
+) -> Option<FunctionValue<'a>> {
+    let build = ctx.create_builder();
+    let ptr_type = ctx.ptr_type(AddressSpace::default());
+    let name = format!("{}_reset", label);
+
+    if let Some(existing) = llvm_mod.get_function(&name) {
+        return Some(existing);
+    }
+
+    let fn_type = ctx.void_type().fn_type(&[ptr_type.into()], false);
+    let reset = llvm_mod.add_function(
+        &name,
+        fn_type,
+        Some(
+            #[cfg(test)]
+            Linkage::External,
+            #[cfg(not(test))]
+            Linkage::Private,
+        ),
+    );
+    set_noalias_params(&reset);
+    let iter_ptr = reset.get_nth_param(0).unwrap().into_pointer_value();
+
+    match ih {
+        IteratorHolder::Primitive(iter) => {
+            declare_blocks!(ctx, reset, entry);
+            build.position_at_end(entry);
+            iter.llvm_reset(ctx, &build, iter_ptr);
+            build.build_return(None).unwrap();
+            Some(reset)
+        }
+        IteratorHolder::String(iter) => {
+            declare_blocks!(ctx, reset, entry);
+            build.position_at_end(entry);
+            iter.llvm_reset(ctx, &build, iter_ptr);
+            build.build_return(None).unwrap();
+            Some(reset)
+        }
+        IteratorHolder::LargeString(iter) => {
+            declare_blocks!(ctx, reset, entry);
+            build.position_at_end(entry);
+            iter.llvm_reset(ctx, &build, iter_ptr);
+            build.build_return(None).unwrap();
+            Some(reset)
+        }
+        IteratorHolder::View(iter) => {
+            declare_blocks!(ctx, reset, entry);
+            build.position_at_end(entry);
+            iter.llvm_reset(ctx, &build, iter_ptr);
+            build.build_return(None).unwrap();
+            Some(reset)
+        }
+        IteratorHolder::Bitmap(iter) => {
+            declare_blocks!(ctx, reset, entry);
+            build.position_at_end(entry);
+            iter.llvm_reset(ctx, &build, iter_ptr);
+            build.build_return(None).unwrap();
+            Some(reset)
+        }
+        IteratorHolder::SetBit(iter) => {
+            declare_blocks!(ctx, reset, entry);
+            build.position_at_end(entry);
+            iter.llvm_reset(ctx, &build, iter_ptr);
+            build.build_return(None).unwrap();
+            Some(reset)
+        }
+        IteratorHolder::Dictionary { arr, keys, values } => {
+            let key_reset =
+                generate_reset_iterator(ctx, llvm_mod, &format!("{}_key", label), keys).unwrap();
+            let value_reset =
+                generate_reset_iterator(ctx, llvm_mod, &format!("{}_value", label), values)
+                    .unwrap();
+
+            declare_blocks!(ctx, reset, entry);
+            build.position_at_end(entry);
+            let key_ptr = arr.llvm_key_iter_ptr(ctx, &build, iter_ptr);
+            let val_ptr = arr.llvm_val_iter_ptr(ctx, &build, iter_ptr);
+            build
+                .build_call(key_reset, &[key_ptr.into()], "reset_key_iter")
+                .unwrap();
+            build
+                .build_call(value_reset, &[val_ptr.into()], "reset_value_iter")
+                .unwrap();
+            build.build_return(None).unwrap();
+            Some(reset)
+        }
+        IteratorHolder::RunEnd {
+            arr,
+            run_ends,
+            values,
+        } => {
+            let re_reset =
+                generate_reset_iterator(ctx, llvm_mod, &format!("{}_run_ends", label), run_ends)
+                    .unwrap();
+            let value_reset =
+                generate_reset_iterator(ctx, llvm_mod, &format!("{}_values", label), values)
+                    .unwrap();
+
+            declare_blocks!(ctx, reset, entry);
+            build.position_at_end(entry);
+            let re_ptr = arr.llvm_re_iter_ptr(ctx, &build, iter_ptr);
+            let val_ptr = arr.llvm_val_iter_ptr(ctx, &build, iter_ptr);
+            build
+                .build_call(re_reset, &[re_ptr.into()], "reset_run_end_iter")
+                .unwrap();
+            build
+                .build_call(value_reset, &[val_ptr.into()], "reset_value_iter")
+                .unwrap();
+            arr.llvm_reset(ctx, &build, iter_ptr);
+            build.build_return(None).unwrap();
+            Some(reset)
+        }
+        IteratorHolder::FixedSizeList(iter) => {
+            declare_blocks!(ctx, reset, entry);
+            build.position_at_end(entry);
+            iter.llvm_reset(ctx, &build, iter_ptr);
+            build.build_return(None).unwrap();
+            Some(reset)
+        }
+        IteratorHolder::ScalarPrimitive(_)
+        | IteratorHolder::ScalarString(_)
+        | IteratorHolder::ScalarBinary(_)
+        | IteratorHolder::ScalarVec(_) => {
+            declare_blocks!(ctx, reset, entry);
+            build.position_at_end(entry);
+            build.build_return(None).unwrap();
+            Some(reset)
         }
     }
 }
