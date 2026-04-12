@@ -3,13 +3,18 @@ use arrow_array::{Array, ArrayRef, BooleanArray};
 use arrow_buffer::NullBuffer;
 use arrow_schema::DataType;
 
-use crate::compiled_kernels::dsl::{DSLKernel, KernelOutputType};
+use crate::compiled_kernels::cast::coalesce_type;
+use crate::compiled_kernels::dsl::{base_type, DSLKernel, KernelOutputType};
+use crate::compiled_kernels::dsl2::{
+    compile, dsl_args, DSLArgument, DSLContext, DSLFunction, DSLStmt, DSLType, RunnableDSLFunction,
+};
 use crate::compiled_kernels::null_utils::replace_nulls;
+use crate::compiled_writers::WriterSpec;
 use crate::{logical_nulls, ArrowKernelError, PrimitiveType};
 
 use crate::compiled_kernels::Kernel;
 
-pub struct FilterKernel(DSLKernel);
+pub struct FilterKernel(RunnableDSLFunction);
 unsafe impl Sync for FilterKernel {}
 unsafe impl Send for FilterKernel {}
 
@@ -30,7 +35,7 @@ impl Kernel for FilterKernel {
             return Err(ArrowKernelError::SizeMismatch);
         }
 
-        let mut res = self.0.call(&[&inp.0, &inp.1])?;
+        let mut res = self.0.run(&dsl_args!(inp.0, inp.1))?[0].clone();
         if let Some(nulls) = logical_nulls(inp.0)? {
             let ba = BooleanArray::new(nulls.into_inner(), None);
             let filtered_nulls = crate::arrow_interface::select::filter(&ba, inp.1)?;
@@ -38,45 +43,48 @@ impl Kernel for FilterKernel {
             let filtered_nulls = NullBuffer::new(filtered_nulls.clone().into_parts().0);
             res = replace_nulls(res, Some(filtered_nulls));
         }
+
+        let base_dt = base_type(inp.0.data_type());
+        res = coalesce_type(res, &base_dt)?;
+
         Ok(res)
     }
 
     fn compile(inp: &Self::Input<'_>, _params: Self::Params) -> Result<Self, ArrowKernelError> {
         let (arr, filt) = inp;
 
-        // TODO more robust output type selecction
-        let out_type = if PrimitiveType::for_arrow_type(arr.data_type()) == PrimitiveType::P64x2 {
-            KernelOutputType::String
-        } else if arr.data_type() == &DataType::Boolean {
-            KernelOutputType::Boolean
-        } else {
-            KernelOutputType::Array
-        };
+        let mut ctx = DSLContext::new();
+        let mut func = DSLFunction::new("filter");
+        let arr_arg = func.add_arg(&mut ctx, DSLType::array_like(arr, "n"));
 
-        if let DataType::RunEndEncoded(_, _) = inp.0.data_type() {
-            Ok(FilterKernel(
-                DSLKernel::compile(&[arr, filt], |ctx| {
-                    let arr = ctx.get_input(0)?;
-                    let filt = ctx.get_input(1)?;
-                    ctx.iter_over(vec![arr, filt])
-                        .filter(|i| i[1].eq(&0.into()).not())
-                        .map(|i| vec![i[0].clone()])
-                        .collect(out_type)
+        if matches!(arr.data_type(), DataType::RunEndEncoded(_, _)) {
+            let fil_arg = func.add_arg(&mut ctx, DSLType::array_like(filt, "n"));
+            func.add_ret(WriterSpec::for_base_type_of_datum(arr), "<= n");
+
+            func.add_body(
+                DSLStmt::for_each(&mut ctx, &[arr_arg, fil_arg], |loop_vars| {
+                    let item = loop_vars[0].expr();
+                    let filt = loop_vars[1].expr();
+                    DSLStmt::cond(filt, DSLStmt::emit(0, item)?)
                 })
-                .map_err(ArrowKernelError::DSLError)?,
-            ))
+                .unwrap(),
+            );
         } else {
-            Ok(FilterKernel(
-                DSLKernel::compile(&[arr, filt], |ctx| {
-                    let arr = ctx.get_input(0)?;
-                    let filt = ctx.get_input(1)?.into_set_bits()?;
-                    ctx.iter_over(vec![filt])
-                        .map(|i| vec![arr.at(&i[0])])
-                        .collect(out_type)
+            let fil_arg = func.add_arg(&mut ctx, DSLType::set_bits("m"));
+            func.add_ret(WriterSpec::for_base_type_of_datum(arr), "m");
+
+            func.add_body(
+                DSLStmt::for_each(&mut ctx, &[fil_arg], |loop_vars| {
+                    let idx = loop_vars[0].expr();
+                    let item = arr_arg.expr().at(&idx)?;
+                    DSLStmt::emit(0, item)
                 })
-                .map_err(ArrowKernelError::DSLError)?,
-            ))
+                .unwrap(),
+            );
         }
+
+        let func = compile(func, [DSLArgument::Datum(arr), DSLArgument::Datum(filt)])?;
+        Ok(FilterKernel(func))
     }
 
     fn get_key_for_input(
@@ -89,7 +97,7 @@ impl Kernel for FilterKernel {
 
 #[cfg(test)]
 mod tests {
-    use arrow_array::{cast::AsArray, types::Int32Type, BooleanArray, Int32Array, RunArray};
+    use arrow_array::{cast::AsArray, types::Int32Type, Array, BooleanArray, Int32Array, RunArray};
     use arrow_schema::DataType;
     use itertools::Itertools;
 
@@ -178,5 +186,30 @@ mod tests {
                 });
             }
         });
+    }
+
+    #[test]
+    fn test_filter_string() {
+        let data = arrow_array::StringArray::from(vec!["a", "b", "c", "d"]);
+        let filt = BooleanArray::from(vec![true, false, true, false]);
+
+        let k = FilterKernel::compile(&(&data, &filt), ()).unwrap();
+        let res = k.call((&data, &filt)).unwrap();
+        let res = res.as_string::<i32>();
+
+        assert_eq!(res.iter().collect_vec(), vec![Some("a"), Some("c")]);
+    }
+
+    #[test]
+    fn test_filter_string_empty() {
+        let data = arrow_array::StringArray::from(Vec::<&str>::new());
+        let filt = BooleanArray::from(Vec::<bool>::new());
+
+        let k = FilterKernel::compile(&(&data, &filt), ()).unwrap();
+        let res = k.call((&data, &filt)).unwrap();
+        let res = res.as_string::<i32>();
+
+        assert_eq!(res.len(), 0);
+        assert_eq!(res.iter().collect_vec(), Vec::<Option<&str>>::new());
     }
 }
