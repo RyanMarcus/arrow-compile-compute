@@ -25,7 +25,7 @@ use ouroboros::self_referencing;
 use crate::{
     compiled_iter::{
         array_to_setbit_iter, datum_to_iter, generate_next, generate_random_access,
-        get_iterator_length,
+        generate_reset_iterator, get_iterator_length,
     },
     compiled_kernels::{
         cmp::{add_float_to_int, add_memcmp},
@@ -95,6 +95,7 @@ pub struct DSLCompilationContext<'ctx, 'a> {
     pub access_funcs: HashMap<usize, FunctionValue<'a>>,
     pub next_funcs: HashMap<usize, FunctionValue<'a>>,
     pub writer_funcs: HashMap<usize, FunctionValue<'a>>,
+    pub reset_funcs: HashMap<usize, FunctionValue<'a>>,
     pub lengths: HashMap<usize, Option<IntValue<'a>>>,
     pub output_specs: Vec<crate::compiled_writers::WriterSpec>,
     pub outputs: Vec<Writer<'a>>,
@@ -185,6 +186,7 @@ pub fn compile_inner<'ctx, 'args>(
     let mut writer_funcs = HashMap::new();
     let mut ihs = HashMap::new();
     let mut lengths = HashMap::new();
+    let mut reset_funcs = HashMap::new();
 
     // load LLVM function parameters into the symbol table
     for (idx, param) in f.params.iter().enumerate() {
@@ -271,7 +273,6 @@ pub fn compile_inner<'ctx, 'args>(
     }
 
     // setup iterators
-    let mut iterator_holders = HashMap::new();
     for idx in f.iterated_parameters() {
         let param = names_to_params[&idx];
         let arg = &names_to_args[&idx];
@@ -297,7 +298,10 @@ pub fn compile_inner<'ctx, 'args>(
                 )
                 .unwrap();
                 next_funcs.insert(param.name, next_func);
-                iterator_holders.insert(param.name, ih);
+
+                let reset_func =
+                    generate_reset_iterator(&ctx, &module, &format!("{}", param.name), ih).unwrap();
+                reset_funcs.insert(param.name, reset_func);
             }
             DSLType::SetBits(_) => {
                 let ih = &ihs[&idx];
@@ -311,6 +315,10 @@ pub fn compile_inner<'ctx, 'args>(
                 )
                 .unwrap();
                 next_funcs.insert(param.name, next_func);
+
+                let reset_func =
+                    generate_reset_iterator(&ctx, &module, &format!("{}", param.name), ih).unwrap();
+                reset_funcs.insert(param.name, reset_func);
             }
             _ => return Err(ArrowKernelError::NonIterableType(param.ty.clone())),
         };
@@ -384,6 +392,7 @@ pub fn compile_inner<'ctx, 'args>(
         access_funcs,
         next_funcs,
         writer_funcs,
+        reset_funcs,
         output_specs,
         lengths,
         outputs: writers,
@@ -431,7 +440,6 @@ pub fn compile_inner<'ctx, 'args>(
         .unwrap_basic();
     b.build_return(Some(&result)).unwrap();
 
-    module.print_to_stderr();
     module.verify().unwrap();
     optimize_module(&module)?;
     let ee = module
@@ -505,12 +513,13 @@ fn compile_stmt<'ctx, 'a>(
             ctx.b.position_at_end(emit_worked);
         }
         DSLStmt::Set { buf, index, value } => {
-            if value.get_type().as_primitive().is_none() {
+            if !matches!(value.get_type(), DSLType::Primitive(_) | DSLType::Boolean) {
                 return Err(ArrowKernelError::DSLInvalidType(
-                    "values in set statements must be primitive",
+                    "values in set statements must be primitive or boolean",
                     value.get_type(),
                 ));
             }
+
             if !buf.ty.is_buffer() {
                 return Err(ArrowKernelError::DSLTypeMismatch(
                     "set must be on a buffer",
@@ -519,7 +528,15 @@ fn compile_stmt<'ctx, 'a>(
                 ));
             }
             let index = compile_expr(ctx, index)?;
-            let value = compile_expr(ctx, value)?;
+            let mut value = compile_expr(ctx, value)?;
+            // upcast boolean values to i8
+            if value.get_type() == ctx.ctx.bool_type().as_basic_type_enum() {
+                value = ctx
+                    .b
+                    .build_int_z_extend(value.into_int_value(), ctx.ctx.i8_type(), "ext_bool")
+                    .unwrap()
+                    .as_basic_value_enum();
+            }
             let func = ctx.writer_funcs[&buf.name];
 
             ctx.b
@@ -552,6 +569,15 @@ fn compile_stmt<'ctx, 'a>(
             let loop_body = ctx.ctx.append_basic_block(*ctx.func, "loop_body");
             let loop_end = ctx.ctx.append_basic_block(*ctx.func, "loop_end");
 
+            floop.iterators.iter().for_each(|itr| {
+                ctx.b
+                    .build_call(
+                        ctx.reset_funcs[&itr.name],
+                        &[ctx.st[&itr.name].into()],
+                        "reset",
+                    )
+                    .unwrap();
+            });
             ctx.b.build_unconditional_branch(loop_header).unwrap();
             // in the loop header, call next on all iterators and `and` together
             // the results
@@ -995,6 +1021,26 @@ fn compile_expr<'ctx, 'a>(
                 )),
             }
         }
+        DSLExpr::BitCast(v, tar_pt) => {
+            let v = compile_expr(ctx, v)?;
+            Ok(ctx
+                .b
+                .build_bit_cast(v, tar_pt.llvm_type(ctx.ctx), "bitcast")
+                .unwrap())
+        }
+        DSLExpr::FloatToTotalOrderSInt(v) => {
+            let pt = v.get_type().as_primitive().unwrap();
+            let v = compile_expr(ctx, v)?;
+            let cvt_f = add_float_to_int(ctx.ctx, ctx.module, pt);
+            let res = ctx
+                .b
+                .build_call(cvt_f, &[v.into()], "float_to_total_order_sint")
+                .unwrap()
+                .try_as_basic_value()
+                .unwrap_basic();
+            Ok(res)
+        }
+
         DSLExpr::ArithBinOp(op, lhs, rhs) => {
             let lhs_v = compile_expr(ctx, lhs)?;
             let rhs_v = compile_expr(ctx, rhs)?;
@@ -1088,6 +1134,59 @@ fn compile_expr<'ctx, 'a>(
                 )
             })
             .map(|x| x.as_basic_value_enum()),
+        DSLExpr::Bswap(v) => {
+            let v = compile_expr(ctx, v)?.into_int_value();
+
+            if v.get_type().get_bit_width() == 8 {
+                return Ok(v.as_basic_value_enum());
+            }
+
+            let bswap_in = Intrinsic::find("llvm.bswap").unwrap();
+            let func = bswap_in
+                .get_declaration(&ctx.module, &[v.get_type().into()])
+                .unwrap();
+            let res = ctx
+                .b
+                .build_call(func, &[v.into()], "bswap")
+                .unwrap()
+                .try_as_basic_value()
+                .unwrap_basic();
+            Ok(res)
+        }
+        DSLExpr::BitNot(v) => {
+            let value = compile_expr(ctx, v)?;
+            match v.get_type() {
+                DSLType::Boolean => Ok(ctx
+                    .b
+                    .build_not(value.into_int_value(), "bit_not")
+                    .unwrap()
+                    .as_basic_value_enum()),
+                DSLType::Primitive(pt) if pt.is_int() => Ok(ctx
+                    .b
+                    .build_not(value.into_int_value(), "bit_not")
+                    .unwrap()
+                    .as_basic_value_enum()),
+                DSLType::Primitive(pt) if pt.is_float() => {
+                    let int_type = PrimitiveType::int_with_width(pt.width())
+                        .llvm_type(ctx.ctx)
+                        .into_int_type();
+                    let value_bits = ctx
+                        .b
+                        .build_bit_cast(value, int_type, "bit_not_bits")
+                        .unwrap()
+                        .into_int_value();
+                    let inverted_bits = ctx.b.build_not(value_bits, "bit_not").unwrap();
+                    Ok(ctx
+                        .b
+                        .build_bit_cast(inverted_bits, pt.llvm_type(ctx.ctx), "bit_not_float")
+                        .unwrap())
+                }
+                _ => Err(ArrowKernelError::DSLInvalidType(
+                    "can only bit_not numeric primitive types or booleans",
+                    v.get_type(),
+                )),
+            }
+        }
     }
 }
 

@@ -485,6 +485,13 @@ impl PrimitiveType {
         )
     }
 
+    pub fn is_float(&self) -> bool {
+        matches!(
+            self,
+            PrimitiveType::F16 | PrimitiveType::F32 | PrimitiveType::F64
+        )
+    }
+
     /// Returns the "best" common value to cast both types to in order to
     /// perform a comparison. Returns `None` if there is no compatible type.
     fn dominant(lhs_prim: PrimitiveType, rhs_prim: PrimitiveType) -> Option<PrimitiveType> {

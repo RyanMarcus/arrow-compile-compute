@@ -476,12 +476,14 @@ pub mod select {
     use arrow_array::{make_array, Array, ArrayRef, BooleanArray};
 
     use crate::{
-        compiled_kernels::{concat_all, FilterKernel, KernelCache, TakeKernel},
+        compiled_kernels::{concat_all, FilterKernel, KernelCache, PartitionKernel, TakeKernel},
         ArrowKernelError,
     };
 
     static TAKE_PROGRAM_CACHE: LazyLock<KernelCache<TakeKernel>> = LazyLock::new(KernelCache::new);
     static FILTER_PROGRAM_CACHE: LazyLock<KernelCache<FilterKernel>> =
+        LazyLock::new(KernelCache::new);
+    static PARTITION_PROGRAM_CACHE: LazyLock<KernelCache<PartitionKernel>> =
         LazyLock::new(KernelCache::new);
 
     /// Extract the elements in `data` at the indices specified in `idxes`.
@@ -569,7 +571,7 @@ pub mod select {
     ///
     /// let data = Int32Array::from(vec![Some(1), Some(2), None, Some(3)]);
     /// let pidxes = Int32Array::from(vec![0, 1, 0, 1]);
-    /// let res = arrow_compile_compute::select::partition(&data, &pidxes, Some(2)).unwrap();
+    /// let res = arrow_compile_compute::select::partition(&data, &pidxes).unwrap();
     ///
     /// assert_eq!(res.len(), 2);
     /// assert_eq!(
@@ -584,9 +586,8 @@ pub mod select {
     pub fn partition(
         data: &dyn Array,
         partition_indexes: &dyn Array,
-        nparts: Option<usize>,
     ) -> Result<Vec<ArrayRef>, ArrowKernelError> {
-        crate::compiled_kernels::partition(data, partition_indexes, nparts)
+        PARTITION_PROGRAM_CACHE.get((data, partition_indexes), ())
     }
 }
 
@@ -597,13 +598,11 @@ pub mod compute {
     use arrow_array::{Array, Datum, UInt64Array};
 
     use crate::{
-        compiled_kernels::{HashFunction, HashKernel, KernelCache, RangeKernel},
+        compiled_kernels::{HashFunction, HashKernel, KernelCache},
         ArrowKernelError,
     };
 
     static HASH_PROGRAM_CACHE: LazyLock<KernelCache<HashKernel>> = LazyLock::new(KernelCache::new);
-    static RANGE_PROGRAM_CACHE: LazyLock<KernelCache<RangeKernel>> =
-        LazyLock::new(KernelCache::new);
 
     /// Compute a 64-bit modified murmurhash for each element in `data`.
     ///
@@ -658,27 +657,6 @@ pub mod compute {
     /// ```
     pub fn hash_unchained(data: &dyn Datum) -> Result<UInt64Array, ArrowKernelError> {
         HASH_PROGRAM_CACHE.get(data, HashFunction::Unchained)
-    }
-
-    /// Compute the range and minimum value of a primitive integer array.
-    ///
-    /// The returned tuple is `(range, min)`, where `range` is the difference
-    /// between the maximum and minimum values in the array. The input array
-    /// must be non-null.
-    ///
-    /// # Example
-    ///
-    /// ```
-    /// use arrow_array::Int32Array;
-    /// use arrow_compile_compute::compute::range;
-    ///
-    /// let data = Int32Array::from(vec![1, -4, 12]);
-    /// let (range, min) = range(&data).unwrap();
-    /// assert_eq!(range, 16);
-    /// assert_eq!(min, -4);
-    /// ```
-    pub fn range(data: &dyn Array) -> Result<(u128, i128), ArrowKernelError> {
-        RANGE_PROGRAM_CACHE.get(data, ())
     }
 
     /// Compute an approximation of the maximum run length inside of an array.

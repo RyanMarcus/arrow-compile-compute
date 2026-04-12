@@ -1,8 +1,9 @@
 use std::{ffi::c_void, sync::Arc};
 
 use arrow_array::{
-    ArrayRef, FixedSizeListArray, Float16Array, Float32Array, Float64Array, Int16Array, Int32Array,
-    Int64Array, Int8Array, UInt16Array, UInt32Array, UInt64Array, UInt8Array,
+    builder::BinaryBuilder, ArrayRef, FixedSizeListArray, Float16Array, Float32Array, Float64Array,
+    Int16Array, Int32Array, Int64Array, Int8Array, UInt16Array, UInt32Array, UInt64Array,
+    UInt8Array,
 };
 use arrow_buffer::MutableBuffer;
 use arrow_schema::Field;
@@ -55,7 +56,24 @@ impl DSLBuffer {
             PrimitiveType::F16 => Arc::new(Float16Array::new(self.buf.into(), None)),
             PrimitiveType::F32 => Arc::new(Float32Array::new(self.buf.into(), None)),
             PrimitiveType::F64 => Arc::new(Float64Array::new(self.buf.into(), None)),
-            PrimitiveType::P64x2 => todo!(),
+            PrimitiveType::P64x2 => {
+                let mut b = BinaryBuilder::new();
+                let slice = bytemuck::cast_slice::<u8, u128>(self.buf.as_slice());
+
+                for &v in slice {
+                    let start_ptr = (v as u64) as *const u8;
+                    let end_ptr = ((v >> 64) as u64) as *const u8;
+                    assert!(end_ptr >= start_ptr);
+
+                    let value = unsafe {
+                        let len = end_ptr.offset_from_unsigned(start_ptr) as usize;
+                        std::slice::from_raw_parts(start_ptr, len)
+                    };
+                    b.append_value(value);
+                }
+
+                Arc::new(b.finish())
+            }
             PrimitiveType::List(ty, size) => {
                 let values: ArrayRef = match ty {
                     ListItemType::I8 => Arc::new(Int8Array::new(self.buf.into(), None)),

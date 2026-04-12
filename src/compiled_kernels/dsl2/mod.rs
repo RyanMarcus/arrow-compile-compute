@@ -10,7 +10,7 @@ use arrow_array::types::UInt32Type;
 #[cfg(test)]
 use arrow_array::{ArrowPrimitiveType, PrimitiveArray};
 
-use arrow_array::ArrayRef;
+use arrow_array::{ArrayRef, UInt16Array, UInt8Array};
 use arrow_array::{Datum, UInt32Array, UInt64Array};
 use arrow_schema::DataType;
 use inkwell::context::Context;
@@ -638,6 +638,20 @@ impl DSLValue {
             ty: DSLType::ConstScalar(Arc::new(UInt32Array::new_scalar(value))),
         }
     }
+
+    pub fn u16(value: u16) -> Self {
+        Self {
+            name: 0,
+            ty: DSLType::ConstScalar(Arc::new(UInt16Array::new_scalar(value))),
+        }
+    }
+
+    pub fn u8(value: u8) -> Self {
+        Self {
+            name: 0,
+            ty: DSLType::ConstScalar(Arc::new(UInt8Array::new_scalar(value))),
+        }
+    }
 }
 
 pub struct DSLFunction {
@@ -867,8 +881,12 @@ pub enum DSLExpr {
     Value(DSLValue),
     Cast(Box<DSLExpr>, PrimitiveType),
     CastToBool(Box<DSLExpr>),
+    BitCast(Box<DSLExpr>, PrimitiveType),
+    FloatToTotalOrderSInt(Box<DSLExpr>),
     ArithBinOp(DSLArithBinOp, Box<DSLExpr>, Box<DSLExpr>),
     BitwiseBinOp(DSLBitwiseBinOp, Box<DSLExpr>, Box<DSLExpr>),
+    Bswap(Box<DSLExpr>),
+    BitNot(Box<DSLExpr>),
     Len(Box<DSLValue>),
 }
 
@@ -926,6 +944,37 @@ impl DSLExpr {
         }
     }
 
+    pub fn bit_cast(&self, tar_pt: PrimitiveType) -> Result<DSLExpr, ArrowKernelError> {
+        let cur_pt = self.get_type().as_primitive().ok_or_else(|| {
+            ArrowKernelError::DSLInvalidType("can only bitcast primitive types", self.get_type())
+        })?;
+        if cur_pt.width() != tar_pt.width() {
+            return Err(ArrowKernelError::DSLInvalidType(
+                "bitcast width mismatch",
+                self.get_type(),
+            ));
+        }
+        Ok(DSLExpr::BitCast(Box::new(self.clone()), tar_pt))
+    }
+
+    pub fn float_to_total_order_sint(&self) -> Result<DSLExpr, ArrowKernelError> {
+        let pt = self.get_type().as_primitive().ok_or_else(|| {
+            ArrowKernelError::DSLInvalidType(
+                "can only convert float primitive types to total order sint",
+                self.get_type(),
+            )
+        })?;
+
+        if !pt.is_float() {
+            return Err(ArrowKernelError::DSLInvalidType(
+                "can only convert float types to total order sint",
+                self.get_type(),
+            ));
+        }
+
+        Ok(DSLExpr::FloatToTotalOrderSInt(Box::new(self.clone())))
+    }
+
     pub fn arith(&self, op: DSLArithBinOp, rhs: DSLExpr) -> Result<DSLExpr, ArrowKernelError> {
         if self.get_type() != rhs.get_type() {
             return Err(ArrowKernelError::DSLTypeMismatch(
@@ -968,6 +1017,37 @@ impl DSLExpr {
         }
     }
 
+    pub fn bswap(&self) -> Result<DSLExpr, ArrowKernelError> {
+        let pt = self.get_type().as_primitive().ok_or_else(|| {
+            ArrowKernelError::DSLInvalidType(
+                "can only bswap primitive integer types",
+                self.get_type(),
+            )
+        })?;
+
+        if pt.is_int() {
+            Ok(DSLExpr::Bswap(Box::new(self.clone())))
+        } else {
+            Err(ArrowKernelError::DSLInvalidType(
+                "can only bswap integer types",
+                self.get_type(),
+            ))
+        }
+    }
+
+    pub fn bit_not(&self) -> Result<DSLExpr, ArrowKernelError> {
+        match self.get_type() {
+            DSLType::Boolean => Ok(DSLExpr::BitNot(Box::new(self.clone()))),
+            DSLType::Primitive(pt) if pt.as_numeric_primitive_type().is_some() => {
+                Ok(DSLExpr::BitNot(Box::new(self.clone())))
+            }
+            _ => Err(ArrowKernelError::DSLInvalidType(
+                "can only bit_not numeric primitive types or booleans",
+                self.get_type(),
+            )),
+        }
+    }
+
     pub fn get_type(&self) -> DSLType {
         match self {
             DSLExpr::Compare(..) => DSLType::Boolean,
@@ -982,8 +1062,13 @@ impl DSLExpr {
             }
             DSLExpr::Value(v) => v.ty.clone(),
             DSLExpr::BitwiseBinOp(_, v, _) | DSLExpr::ArithBinOp(_, v, _) => v.get_type().clone(),
-            DSLExpr::Cast(_, pt) => DSLType::Primitive(*pt),
+            DSLExpr::FloatToTotalOrderSInt(v) => DSLType::Primitive(PrimitiveType::int_with_width(
+                v.get_type().as_primitive().unwrap().width(),
+            )),
+            DSLExpr::Bswap(v) | DSLExpr::BitNot(v) => v.get_type(),
+            DSLExpr::Cast(_, pt) | DSLExpr::BitCast(_, pt) => DSLType::Primitive(*pt),
             DSLExpr::CastToBool(_) => DSLType::Boolean,
+
             DSLExpr::Len(_) => DSLType::Primitive(PrimitiveType::U64),
         }
     }
@@ -1001,8 +1086,12 @@ impl DSLExpr {
                 idx.iter().for_each(|i| i.accessed_parameters(params));
             }
             DSLExpr::Value(_) | DSLExpr::Len(_) => {}
-            DSLExpr::Cast(val, _) => val.accessed_parameters(params),
-            DSLExpr::CastToBool(val) => val.accessed_parameters(params),
+            DSLExpr::Cast(val, _)
+            | DSLExpr::BitCast(val, _)
+            | DSLExpr::CastToBool(val)
+            | DSLExpr::Bswap(val)
+            | DSLExpr::BitNot(val)
+            | DSLExpr::FloatToTotalOrderSInt(val) => val.accessed_parameters(params),
         }
     }
 
@@ -1033,8 +1122,8 @@ mod tests {
 
     use arrow_array::{
         cast::AsArray,
-        types::{Int32Type, UInt64Type},
-        ArrayRef, BooleanArray, Datum, Int32Array, StringArray, UInt32Array,
+        types::{Int32Type, UInt32Type, UInt64Type},
+        ArrayRef, BooleanArray, Datum, Float32Array, Int32Array, StringArray, UInt32Array,
     };
     use arrow_buffer::{Buffer, MutableBuffer, ScalarBuffer};
     use arrow_schema::DataType;
@@ -1046,7 +1135,8 @@ mod tests {
             dsl::DSLKernel,
             dsl2::{
                 buffer::DSLBuffer, compiler::compile, writers::WriterSpec, DSLArgument,
-                DSLComparison, DSLContext, DSLForEach, DSLFunction, DSLStmt, DSLType, OutputSpec,
+                DSLComparison, DSLContext, DSLForEach, DSLFunction, DSLStmt, DSLType, DSLValue,
+                OutputSpec,
             },
         },
         PrimitiveType,
@@ -1210,6 +1300,103 @@ mod tests {
             out.into_iter().map(|x| x.unwrap()).collect_vec(),
             vec![10, 40]
         );
+    }
+
+    #[test]
+    fn test_dsl2_bit_not_bool() {
+        let mut ctx = DSLContext::new();
+        let mut func = DSLFunction::new("bit_not_bool");
+        let arr_input = BooleanArray::new_null(0);
+
+        let arr = func.add_arg(&mut ctx, DSLType::array_like(&arr_input, "n"));
+        func.add_body(
+            DSLStmt::for_each(&mut ctx, &[arr], |loop_vars| {
+                DSLStmt::emit(0, loop_vars[0].expr().bit_not()?)
+            })
+            .unwrap(),
+        );
+        func.add_ret(WriterSpec::Boolean, "n");
+
+        let func = compile(func, dsl_args![arr_input]).unwrap();
+
+        let arr = BooleanArray::from(vec![true, false, true, false]);
+        let result = func.run(&dsl_args![arr]).unwrap();
+        let out = result.into_iter().next().unwrap();
+        let out = out.as_boolean();
+        assert_eq!(
+            out.into_iter().map(|x| x.unwrap()).collect_vec(),
+            vec![false, true, false, true]
+        );
+    }
+
+    #[test]
+    fn test_dsl2_bit_not_i32() {
+        let mut ctx = DSLContext::new();
+        let mut func = DSLFunction::new("bit_not_i32");
+        let arr_input = Int32Array::new_null(0);
+
+        let arr = func.add_arg(&mut ctx, DSLType::array_of(PrimitiveType::I32, "n"));
+        func.add_body(
+            DSLStmt::for_each(&mut ctx, &[arr], |loop_vars| {
+                DSLStmt::emit(0, loop_vars[0].expr().bit_not()?)
+            })
+            .unwrap(),
+        );
+        func.add_ret(WriterSpec::Primitive(PrimitiveType::I32), "n");
+
+        let func = compile(func, dsl_args![arr_input]).unwrap();
+
+        let arr = Int32Array::from(vec![-2, 0, 5]);
+        let result = func.run(&dsl_args![arr]).unwrap();
+        let out = result.into_iter().next().unwrap();
+        let out = out.as_primitive::<Int32Type>();
+        assert_eq!(
+            out.into_iter().map(|x| x.unwrap()).collect_vec(),
+            vec![1, -1, -6]
+        );
+    }
+
+    #[test]
+    fn test_dsl2_bit_not_f32() {
+        let mut ctx = DSLContext::new();
+        let mut func = DSLFunction::new("bit_not_f32");
+        let arr_input = Float32Array::new_null(0);
+
+        let arr = func.add_arg(&mut ctx, DSLType::array_of(PrimitiveType::F32, "n"));
+        func.add_body(
+            DSLStmt::for_each(&mut ctx, &[arr], |loop_vars| {
+                let value = loop_vars[0]
+                    .expr()
+                    .bit_not()?
+                    .bit_cast(PrimitiveType::U32)?;
+                DSLStmt::emit(0, value)
+            })
+            .unwrap(),
+        );
+        func.add_ret(WriterSpec::Primitive(PrimitiveType::U32), "n");
+
+        let func = compile(func, dsl_args![arr_input]).unwrap();
+
+        let arr = Float32Array::from(vec![1.0, -0.0, 42.25]);
+        let result = func.run(&dsl_args![arr]).unwrap();
+        let out = result.into_iter().next().unwrap();
+        let out = out.as_primitive::<UInt32Type>();
+        assert_eq!(
+            out.into_iter().map(|x| x.unwrap()).collect_vec(),
+            vec![!1.0f32.to_bits(), !(-0.0f32).to_bits(), !42.25f32.to_bits()]
+        );
+    }
+
+    #[test]
+    fn test_dsl2_bit_not_rejects_non_numeric_types() {
+        let mut ctx = DSLContext::new();
+        let value = DSLValue::new(&mut ctx, DSLType::Primitive(PrimitiveType::P64x2));
+        let err = value.expr().bit_not().unwrap_err();
+
+        assert!(matches!(
+            err,
+            crate::ArrowKernelError::DSLInvalidType(_, DSLType::Primitive(PrimitiveType::P64x2))
+        ));
     }
 
     #[test]

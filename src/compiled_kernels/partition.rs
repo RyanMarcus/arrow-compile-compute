@@ -1,16 +1,125 @@
-use arrow_array::{Array, ArrayRef, UInt64Array};
+use std::sync::Arc;
+
+use arrow_array::{
+    builder::BooleanBuilder,
+    cast::AsArray,
+    types::{UInt64Type, UInt8Type},
+    Array, ArrayRef, BooleanArray, UInt64Array,
+};
+use arrow_buffer::{BooleanBuffer, NullBuffer};
+use arrow_schema::DataType;
 use itertools::Itertools;
 
 use crate::{
     compiled_kernels::{
+        cast::coalesce_type,
+        dsl::base_type,
         dsl2::{
             compile, DSLArgument, DSLBuffer, DSLContext, DSLExpr, DSLFunction, DSLStmt, DSLType,
-            DSLValue,
+            DSLValue, RunnableDSLFunction,
         },
+        null_utils::replace_nulls,
         DSLArithBinOp,
     },
-    iter, ArrowKernelError, PrimitiveType,
+    iter, logical_nulls, ArrowKernelError, Kernel, PrimitiveType,
 };
+
+pub struct PartitionKernel(RunnableDSLFunction);
+unsafe impl Send for PartitionKernel {}
+unsafe impl Sync for PartitionKernel {}
+
+impl Kernel for PartitionKernel {
+    type Key = (DataType, DataType);
+
+    type Input<'a> = (&'a dyn Array, &'a dyn Array);
+
+    type Params = ();
+
+    type Output = Vec<ArrayRef>;
+
+    fn call(&self, inp: Self::Input<'_>) -> Result<Self::Output, ArrowKernelError> {
+        let (arr, idxes) = inp;
+
+        if arr.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        if idxes.is_nullable() {
+            return Err(ArrowKernelError::UnsupportedArguments(
+                "partition got nullable index list".to_string(),
+            ));
+        }
+
+        let nparts = iter::iter_nonnull_u64(idxes)?.max().ok_or_else(|| {
+            ArrowKernelError::UnsupportedArguments("partition got empty index list".to_string())
+        })? as usize
+            + 1;
+
+        let mut sum_buf = DSLBuffer::new(PrimitiveType::U64, nparts + 1);
+        let mut out_buf = DSLBuffer::new(PrimitiveType::for_arrow_type(arr.data_type()), arr.len());
+
+        self.0.run(&[
+            DSLArgument::datum(&arr),
+            DSLArgument::datum(&idxes),
+            DSLArgument::buffer(&mut sum_buf),
+            DSLArgument::buffer(&mut out_buf),
+        ])?;
+
+        let mut res = out_buf.into_array();
+        if arr.data_type() == &DataType::Boolean {
+            // need to convert from i8 to boolean
+            let ints = res.as_primitive::<UInt8Type>();
+            res = Arc::new(BooleanArray::from_unary(ints, |x| x != 0));
+        }
+
+        let part_offsets = sum_buf.into_array();
+        let part_offsets = part_offsets.as_primitive::<UInt64Type>().values();
+        if arr.is_nullable() {
+            let nulls = logical_nulls(arr)?.unwrap();
+            let mut part_offsets = part_offsets.to_vec();
+            part_offsets.insert(0, 0);
+            let mut perm = vec![0; nulls.len()];
+            for (data_idx, part_idx) in iter::iter_nonnull_u64(idxes)?.enumerate() {
+                let my_pos = part_offsets[part_idx as usize];
+                part_offsets[part_idx as usize] += 1;
+                perm[my_pos as usize] = data_idx as usize;
+            }
+
+            let new_nulls = NullBuffer::new(BooleanBuffer::collect_bool(nulls.len(), |idx| {
+                nulls.is_valid(perm[idx])
+            }));
+            res = replace_nulls(res, Some(new_nulls));
+        }
+
+        res = coalesce_type(res, &base_type(arr.data_type()))?;
+
+        let mut consumed = 0;
+        let partitions = part_offsets[..part_offsets.len() - 1]
+            .into_iter()
+            .map(|offset| {
+                let offset = offset - consumed;
+                let part = res.slice(0, offset as usize);
+                res = res.slice(offset as usize, res.len() - offset as usize);
+                consumed += offset;
+                part
+            })
+            .collect_vec();
+
+        Ok(partitions)
+    }
+
+    fn compile(inp: &Self::Input<'_>, _params: Self::Params) -> Result<Self, ArrowKernelError> {
+        let func = partition_kernel(inp.0, inp.1)?;
+        Ok(Self(func))
+    }
+
+    fn get_key_for_input(
+        i: &Self::Input<'_>,
+        _p: &Self::Params,
+    ) -> Result<Self::Key, ArrowKernelError> {
+        Ok((i.0.data_type().clone(), i.1.data_type().clone()))
+    }
+}
 
 pub fn partition(
     arr: &dyn Array,
@@ -78,11 +187,14 @@ pub fn partition(
     Ok(partitions)
 }
 
-pub fn partition_kernel(arr: &ArrayRef, idxes: &ArrayRef) -> Result<(), ArrowKernelError> {
+pub fn partition_kernel(
+    arr: &dyn Array,
+    idxes: &dyn Array,
+) -> Result<RunnableDSLFunction, ArrowKernelError> {
     let mut ctx = DSLContext::new();
     let mut func = DSLFunction::new("partition");
-    let arr_arg = func.add_arg(&mut ctx, DSLType::array_like(arr, "n"));
-    let idxes_arg = func.add_arg(&mut ctx, DSLType::array_like(idxes, "n"));
+    let arr_arg = func.add_arg(&mut ctx, DSLType::array_like(&arr, "n"));
+    let idxes_arg = func.add_arg(&mut ctx, DSLType::array_like(&idxes, "n"));
     let sum_buf = func.add_arg(&mut ctx, DSLType::buffer_of(PrimitiveType::U64, "k"));
     let out_buf = func.add_arg(
         &mut ctx,
@@ -93,6 +205,10 @@ pub fn partition_kernel(arr: &ArrayRef, idxes: &ArrayRef) -> Result<(), ArrowKer
     func.add_body(
         DSLStmt::for_each(&mut ctx, &[idxes_arg.clone()], |loop_vars| {
             let idx = loop_vars[0].expr().primitive_cast(PrimitiveType::U64)?;
+            let idx = idx.arith(
+                DSLArithBinOp::Add,
+                DSLValue::u64(1).expr().primitive_cast(PrimitiveType::U64)?,
+            )?;
             let curr = sum_buf
                 .expr()
                 .at(&idx)?
@@ -146,18 +262,17 @@ pub fn partition_kernel(arr: &ArrayRef, idxes: &ArrayRef) -> Result<(), ArrowKer
 
     let mut sum_buf = DSLBuffer::new(PrimitiveType::U64, 128);
     let mut out_buf = DSLBuffer::new(PrimitiveType::for_arrow_type(arr.data_type()), arr.len());
-    compile(
+    let func = compile(
         func,
         [
-            DSLArgument::Datum(arr),
-            DSLArgument::Datum(idxes),
+            DSLArgument::Datum(&arr),
+            DSLArgument::Datum(&idxes),
             DSLArgument::buffer(&mut sum_buf),
             DSLArgument::buffer(&mut out_buf),
         ],
-    )
-    .unwrap();
+    )?;
 
-    todo!()
+    Ok(func)
 }
 
 #[cfg(test)]
@@ -165,27 +280,28 @@ mod tests {
     use std::sync::Arc;
 
     use arrow_array::{
-        cast::AsArray, types::Int32Type, ArrayRef, BooleanArray, Int32Array, UInt32Array,
+        cast::AsArray, types::Int32Type, Array, ArrayRef, BooleanArray, Int32Array, UInt32Array,
     };
     use itertools::Itertools;
 
     use crate::{
-        compiled_kernels::partition::{partition, partition_kernel},
+        compiled_kernels::{partition::PartitionKernel, Kernel},
         ArrowKernelError,
     };
 
-    #[test]
-    fn test_part_dsl() {
-        let data: ArrayRef = Arc::new(Int32Array::from(vec![1, 2, 3, 4, 5, 6, 7, 8, 9, 10]));
-        let part: ArrayRef = Arc::new(UInt32Array::from(vec![0, 1, 0, 1, 0, 1, 0, 1, 0, 1]));
-        partition_kernel(&data, &part);
+    fn run_partition(
+        data: &dyn Array,
+        part: &dyn Array,
+    ) -> Result<Vec<ArrayRef>, ArrowKernelError> {
+        let kernel = PartitionKernel::compile(&(data, part), ())?;
+        kernel.call((data, part))
     }
 
     #[test]
     fn test_part_i32_nonulls() {
         let data: ArrayRef = Arc::new(Int32Array::from(vec![1, 2, 3, 4, 5, 6, 7, 8, 9, 10]));
         let part: ArrayRef = Arc::new(UInt32Array::from(vec![0, 1, 0, 1, 0, 1, 0, 1, 0, 1]));
-        let res = partition(&data, &part, None).unwrap();
+        let res = run_partition(data.as_ref(), part.as_ref()).unwrap();
 
         assert_eq!(res.len(), 2);
         assert_eq!(
@@ -213,7 +329,7 @@ mod tests {
             None,
         ]));
         let part: ArrayRef = Arc::new(UInt32Array::from(vec![0, 1, 0, 1, 0, 1, 0, 1, 0, 1]));
-        let res = partition(&data, &part, None).unwrap();
+        let res = run_partition(data.as_ref(), part.as_ref()).unwrap();
 
         assert_eq!(res.len(), 2);
         assert_eq!(
@@ -232,7 +348,7 @@ mod tests {
             true, true, true, true, true, false, false, false, false, false,
         ]));
         let part: ArrayRef = Arc::new(UInt32Array::from(vec![0, 1, 0, 1, 0, 1, 0, 1, 0, 1]));
-        let res = partition(&data, &part, None).unwrap();
+        let res = run_partition(data.as_ref(), part.as_ref()).unwrap();
 
         assert_eq!(res.len(), 2);
         assert_eq!(
@@ -251,7 +367,7 @@ mod tests {
             "a", "b", "c", "d", "e", "f", "g", "h", "i", "j",
         ]));
         let part: ArrayRef = Arc::new(UInt32Array::from(vec![0, 1, 0, 1, 0, 1, 0, 1, 0, 1]));
-        let res = partition(&data, &part, None).unwrap();
+        let res = run_partition(data.as_ref(), part.as_ref()).unwrap();
 
         assert_eq!(res.len(), 2);
         assert_eq!(
@@ -276,20 +392,11 @@ mod tests {
     fn test_part_infers_partition_count_from_max_index() {
         let data: ArrayRef = Arc::new(Int32Array::from(vec![10, 20, 30]));
         let part: ArrayRef = Arc::new(UInt32Array::from(vec![0, 2, 0]));
-        let res = partition(&data, &part, None).unwrap();
+        let res = run_partition(data.as_ref(), part.as_ref()).unwrap();
 
         assert_eq!(res.len(), 3);
         assert_eq!(res[0].as_primitive::<Int32Type>().values(), &[10, 30]);
         assert!(res[1].is_empty());
         assert_eq!(res[2].as_primitive::<Int32Type>().values(), &[20]);
-    }
-
-    #[test]
-    fn test_part_rejects_out_of_bounds_partition_index() {
-        let data: ArrayRef = Arc::new(Int32Array::from(vec![1, 2, 3]));
-        let part: ArrayRef = Arc::new(UInt32Array::from(vec![0, 2, 1]));
-        let err = partition(&data, &part, Some(2)).unwrap_err();
-
-        assert!(matches!(err, ArrowKernelError::OutOfBounds(2)));
     }
 }
