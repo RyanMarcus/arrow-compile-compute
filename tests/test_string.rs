@@ -25,8 +25,8 @@ proptest! {
 
         let expected_bools = haystack
             .iter()
-            .map(|maybe_value| maybe_value.as_ref().map(|value| value.starts_with(needle.as_str())).unwrap_or(false))
-            .collect::<Vec<bool>>();
+            .map(|maybe_value| maybe_value.as_ref().map(|value| value.starts_with(needle.as_str())))
+            .collect::<Vec<Option<bool>>>();
         let expected = BooleanArray::from(expected_bools);
 
         assert_eq!(result, expected);
@@ -41,8 +41,8 @@ proptest! {
 
         let expected_bools = haystack
             .iter()
-            .map(|maybe_value| maybe_value.as_ref().map(|value| value.ends_with(needle.as_str())).unwrap_or(false))
-            .collect::<Vec<bool>>();
+            .map(|maybe_value| maybe_value.as_ref().map(|value| value.ends_with(needle.as_str())))
+            .collect::<Vec<Option<bool>>>();
         let expected = BooleanArray::from(expected_bools);
 
         assert_eq!(result, expected);
@@ -67,9 +67,8 @@ proptest! {
                             haystack_bytes.windows(needle.len()).any(|window| window == needle.as_slice())
                         }
                     })
-                    .unwrap_or(false)
             })
-            .collect::<Vec<bool>>();
+            .collect::<Vec<Option<bool>>>();
         let expected = BooleanArray::from(expected_bools);
 
         assert_eq!(result, expected);

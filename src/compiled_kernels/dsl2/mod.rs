@@ -609,6 +609,21 @@ impl From<Predicate> for DSLComparison {
     }
 }
 
+#[derive(Debug, Clone, Copy, Hash, PartialEq, Eq)]
+pub enum DSLStringPredicate {
+    StartsWith,
+    EndsWith,
+}
+
+impl DSLStringPredicate {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            DSLStringPredicate::StartsWith => "starts_with",
+            DSLStringPredicate::EndsWith => "ends_with",
+        }
+    }
+}
+
 #[derive(Clone, Debug)]
 pub struct DSLValue {
     name: usize,
@@ -916,6 +931,7 @@ pub struct DSLForRange {
 #[derive(Clone, Debug)]
 pub enum DSLExpr {
     Compare(DSLComparison, Box<DSLExpr>, Box<DSLExpr>),
+    StringPredicate(DSLStringPredicate, Box<DSLExpr>, Box<DSLExpr>),
     At(Box<DSLValue>, Vec<Box<DSLExpr>>),
     Value(DSLValue),
     Cast(Box<DSLExpr>, PrimitiveType),
@@ -937,6 +953,43 @@ impl DSLExpr {
             Box::new(self.clone()),
             Box::new(other.clone()),
         ))
+    }
+
+    fn string_predicate(
+        &self,
+        other: &DSLExpr,
+        pred: DSLStringPredicate,
+    ) -> Result<DSLExpr, ArrowKernelError> {
+        let lhs_type = self.get_type();
+        let rhs_type = other.get_type();
+        if lhs_type != rhs_type {
+            return Err(ArrowKernelError::DSLTypeMismatch(
+                "string predicate",
+                lhs_type,
+                rhs_type,
+            ));
+        }
+
+        if lhs_type != DSLType::Primitive(PrimitiveType::P64x2) {
+            return Err(ArrowKernelError::DSLInvalidType(
+                "string predicates require primitive P64x2 values",
+                lhs_type,
+            ));
+        }
+
+        Ok(DSLExpr::StringPredicate(
+            pred,
+            Box::new(self.clone()),
+            Box::new(other.clone()),
+        ))
+    }
+
+    pub fn starts_with(&self, other: &DSLExpr) -> Result<DSLExpr, ArrowKernelError> {
+        self.string_predicate(other, DSLStringPredicate::StartsWith)
+    }
+
+    pub fn ends_with(&self, other: &DSLExpr) -> Result<DSLExpr, ArrowKernelError> {
+        self.string_predicate(other, DSLStringPredicate::EndsWith)
     }
 
     pub fn at(&self, index: &DSLExpr) -> Result<DSLExpr, ArrowKernelError> {
@@ -1114,7 +1167,7 @@ impl DSLExpr {
 
     pub fn get_type(&self) -> DSLType {
         match self {
-            DSLExpr::Compare(..) => DSLType::Boolean,
+            DSLExpr::Compare(..) | DSLExpr::StringPredicate(..) => DSLType::Boolean,
             DSLExpr::At(val, idxes) => {
                 let mut t = val.ty.clone();
                 for _ in idxes {
@@ -1140,6 +1193,7 @@ impl DSLExpr {
     fn accessed_parameters(&self, params: &mut HashSet<usize>) {
         match self {
             DSLExpr::Compare(_, l, r)
+            | DSLExpr::StringPredicate(_, l, r)
             | DSLExpr::ArithBinOp(_, l, r)
             | DSLExpr::BitwiseBinOp(_, l, r) => {
                 l.accessed_parameters(params);
@@ -1630,6 +1684,48 @@ mod tests {
         let result = result.as_primitive::<UInt64Type>();
         let result = result.iter().map(|x| x.unwrap()).collect_vec();
         assert_eq!(result, vec![0]);
+    }
+
+    #[test]
+    fn test_dsl2_string_predicates() {
+        let mut ctx = DSLContext::new();
+        let mut func = DSLFunction::new("string_predicates");
+        let arr_input = StringArray::new_null(0);
+        let prefix_input = StringArray::new_scalar("he");
+        let suffix_input = StringArray::new_scalar("lo");
+
+        let arr = func.add_arg(&mut ctx, DSLType::array_of(PrimitiveType::P64x2, "n"));
+        let prefix = func.add_arg(&mut ctx, DSLType::scalar_of(PrimitiveType::P64x2));
+        let suffix = func.add_arg(&mut ctx, DSLType::scalar_of(PrimitiveType::P64x2));
+
+        func.add_body(
+            DSLStmt::for_each(&mut ctx, &[arr, prefix, suffix], |loop_vars| {
+                let starts = loop_vars[0].expr().starts_with(&loop_vars[1].expr())?;
+                let ends = loop_vars[0].expr().ends_with(&loop_vars[2].expr())?;
+                Ok(vec![DSLStmt::emit(0, starts)?, DSLStmt::emit(1, ends)?])
+            })
+            .unwrap(),
+        );
+        func.add_ret(WriterSpec::Boolean, "n");
+        func.add_ret(WriterSpec::Boolean, "n");
+
+        let func = compile(func, dsl_args![arr_input, prefix_input, suffix_input]).unwrap();
+
+        let arr = StringArray::from(vec!["hello", "helium", "world"]);
+        let prefix = StringArray::new_scalar("he");
+        let suffix = StringArray::new_scalar("lo");
+        let result = func.run(&dsl_args![arr, prefix, suffix]).unwrap();
+
+        let starts = result[0].as_boolean();
+        let ends = result[1].as_boolean();
+        assert_eq!(
+            starts.iter().map(|x| x.unwrap()).collect_vec(),
+            vec![true, true, false]
+        );
+        assert_eq!(
+            ends.iter().map(|x| x.unwrap()).collect_vec(),
+            vec![true, false, false]
+        );
     }
 
     #[test]

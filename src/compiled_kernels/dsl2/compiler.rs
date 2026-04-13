@@ -29,10 +29,11 @@ use crate::{
     },
     compiled_kernels::{
         cmp::{add_float_to_int, add_memcmp},
+        dsl::string_funcs::{add_str_endswith, add_str_startswith},
         dsl2::{
             buffer::DSLBuffer, runtime::RunnableDSLFunction, two_d, writers::accepted_type,
             DSLArgument, DSLArgumentType, DSLArithBinOp, DSLBitwiseBinOp, DSLExpr, DSLFunction,
-            DSLStmt, DSLType, DSLValue,
+            DSLStmt, DSLStringPredicate, DSLType, DSLValue,
         },
         link_req_helpers, optimize_module,
     },
@@ -726,6 +727,21 @@ fn compile_expr<'ctx, 'a>(
     expr: &DSLExpr,
 ) -> Result<BasicValueEnum<'a>, ArrowKernelError> {
     match expr {
+        DSLExpr::StringPredicate(pred, lhs, rhs) => {
+            let lhs = compile_expr(ctx, lhs)?;
+            let rhs = compile_expr(ctx, rhs)?;
+            let predicate = match pred {
+                DSLStringPredicate::StartsWith => add_str_startswith(ctx.ctx, ctx.module),
+                DSLStringPredicate::EndsWith => add_str_endswith(ctx.ctx, ctx.module),
+            };
+
+            Ok(ctx
+                .b
+                .build_call(predicate, &[lhs.into(), rhs.into()], pred.as_str())
+                .unwrap()
+                .try_as_basic_value()
+                .unwrap_basic())
+        }
         DSLExpr::Compare(op, lhs, rhs) => {
             let lhs_type = lhs.get_type();
             let rhs_type = rhs.get_type();

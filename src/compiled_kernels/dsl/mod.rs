@@ -2,7 +2,7 @@ mod context;
 mod errors;
 mod expressions;
 mod kernels;
-mod string_funcs;
+pub(crate) mod string_funcs;
 #[cfg(test)]
 mod tests;
 mod types;

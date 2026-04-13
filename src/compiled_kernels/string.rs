@@ -1,12 +1,15 @@
-use arrow_array::{cast::AsArray, Array, BinaryArray, BooleanArray, Datum};
+use arrow_array::{cast::AsArray, Array, BooleanArray, Datum};
 use arrow_buffer::BooleanBufferBuilder;
 use arrow_schema::DataType;
 use itertools::Itertools;
 use memchr::memmem::Finder;
 
 use crate::{
-    compiled_kernels::dsl::{DSLKernel, KernelOutputType},
-    logical_nulls, ArrowKernelError, Kernel,
+    compiled_kernels::dsl2::{
+        compile, DSLArgument, DSLContext, DSLFunction, DSLStmt, DSLType, RunnableDSLFunction,
+    },
+    compiled_writers::WriterSpec,
+    intersect_and_copy_nulls, logical_nulls, ArrowKernelError, Kernel,
 };
 
 #[derive(Clone, Copy, Debug)]
@@ -35,8 +38,20 @@ impl LikeSeq {
 }
 
 fn masked_compare(str: &[u8], pattern: &[u8], mask: &[u32]) -> bool {
-    for idx in mask {
-        if str[*idx as usize] != pattern[*idx as usize] {
+    if str.len() != pattern.len() {
+        return false;
+    }
+
+    let mut next_mask = mask.iter().copied();
+    let mut mask_idx = next_mask.next();
+
+    for idx in 0..pattern.len() {
+        if mask_idx == Some(idx as u32) {
+            mask_idx = next_mask.next();
+            continue;
+        }
+
+        if str[idx] != pattern[idx] {
             return false;
         }
     }
@@ -109,8 +124,9 @@ fn filter_bytes<F: Fn(&[u8]) -> bool>(
     arr: &dyn Array,
     f: F,
 ) -> Result<BooleanArray, ArrowKernelError> {
+    let nulls = logical_nulls(arr)?;
     let mut builder = BooleanBufferBuilder::new(arr.len());
-    if arr.is_nullable() {
+    if nulls.is_some() {
         let mut last_idx = 0;
         for (idx, bytes) in crate::arrow_interface::iter::iter_nonnull_bytes(arr)?.indexed() {
             builder.append_n(idx - last_idx, false);
@@ -125,7 +141,7 @@ fn filter_bytes<F: Fn(&[u8]) -> bool>(
             builder.append(f(bytes));
         }
     }
-    Ok(BooleanArray::new(builder.finish(), None))
+    Ok(BooleanArray::new(builder.finish(), nulls))
 }
 
 type StringLikePredicate = dyn Fn(&dyn Array) -> Result<BooleanArray, ArrowKernelError>;
@@ -161,7 +177,10 @@ pub fn compile_string_like(
                 }
                 i += 1;
             }
-            b'_' => seq.push(LikeSeq::AnyChar),
+            b'_' => {
+                seq.push(LikeSeq::AnyChar);
+                i += 1;
+            }
             x if x == escape => {
                 if i + 1 < like_pattern.len() {
                     seq.push(LikeSeq::Literal(like_pattern[i + 1]));
@@ -186,8 +205,7 @@ pub fn compile_string_like(
         (0, false) => {
             // exact match
             let pattern = seq.into_iter().map(|seq| seq.into_literal()).collect_vec();
-            let pattern = BinaryArray::new_scalar(pattern);
-            Box::new(move |arr| crate::arrow_interface::cmp::eq(&arr, &pattern))
+            Box::new(move |arr| filter_bytes(arr, |bytes| bytes == pattern.as_slice()))
         }
         (0, true) => {
             // masked match
@@ -216,9 +234,7 @@ pub fn compile_string_like(
                     .skip(1)
                     .map(|i| i.into_literal())
                     .collect_vec();
-                let pattern = BinaryArray::new_scalar(pattern);
-                println!("pattern: {:?}", pattern);
-                Box::new(move |arr| crate::arrow_interface::cmp::ends_with(arr, &pattern))
+                Box::new(move |arr| filter_bytes(arr, |bytes| bytes.ends_with(&pattern)))
             } else if seq.last().unwrap().is_wildcard() {
                 // prefix
                 let seq_len = seq.len();
@@ -227,9 +243,7 @@ pub fn compile_string_like(
                     .take(seq_len - 1)
                     .map(|i| i.into_literal())
                     .collect_vec();
-
-                let pattern = BinaryArray::new_scalar(pattern);
-                Box::new(move |arr| crate::arrow_interface::cmp::starts_with(arr, &pattern))
+                Box::new(move |arr| filter_bytes(arr, |bytes| bytes.starts_with(&pattern)))
             } else {
                 // prefix and suffix
                 let wildcard_idx = seq.iter().position(|c| c.is_wildcard()).unwrap();
@@ -274,7 +288,7 @@ pub fn compile_string_like(
 
                 Box::new(move |arr| {
                     filter_bytes(arr, |b| {
-                        b.len() > l && masked_compare(&b[b.len() - l..], &pattern, &mask)
+                        b.len() >= l && masked_compare(&b[b.len() - l..], &pattern, &mask)
                     })
                 })
             } else if seq.last().unwrap().is_wildcard() {
@@ -297,7 +311,7 @@ pub fn compile_string_like(
 
                 Box::new(move |arr| {
                     filter_bytes(arr, |b| {
-                        b.len() > l && masked_compare(&b[..l], &pattern, &mask)
+                        b.len() >= l && masked_compare(&b[..l], &pattern, &mask)
                     })
                 })
             } else {
@@ -389,7 +403,7 @@ pub enum StringKernelType {
     EndsWith,
 }
 
-pub struct StringStartEndKernel(DSLKernel);
+pub struct StringStartEndKernel(RunnableDSLFunction);
 unsafe impl Sync for StringStartEndKernel {}
 unsafe impl Send for StringStartEndKernel {}
 
@@ -406,36 +420,44 @@ impl Kernel for StringStartEndKernel {
     type Output = BooleanArray;
 
     fn call(&self, inp: Self::Input<'_>) -> Result<Self::Output, ArrowKernelError> {
-        let (needle, is_scalar) = inp.1.get();
-        if is_scalar && needle.is_null(0) {
-            return Ok(BooleanArray::from(vec![false; inp.0.len()]));
-        }
-
-        let mut res = self.0.call(&[&inp.0, inp.1])?.as_boolean().clone();
-        if let Some(nulls) = logical_nulls(inp.0)? {
-            let b1 = nulls.inner();
-            let b2 = res.values();
-            res = BooleanArray::from(b1 & b2);
-        }
-        Ok(res)
+        let haystack = &inp.0 as &dyn Datum;
+        let res = self
+            .0
+            .run(&[DSLArgument::Datum(haystack), DSLArgument::Datum(inp.1)])?[0]
+            .clone();
+        intersect_and_copy_nulls(&[haystack, inp.1], res).map(|x| x.as_boolean().clone())
     }
 
     fn compile(inp: &Self::Input<'_>, params: Self::Params) -> Result<Self, ArrowKernelError> {
         let (arr, needle) = inp;
+        let haystack = &*arr as &dyn Datum;
 
-        Ok(StringStartEndKernel(
-            DSLKernel::compile(&[arr, *needle], |ctx| {
-                let arr = ctx.get_input(0)?;
-                let needle = ctx.get_input(1)?;
-                ctx.iter_over(vec![arr, needle])
-                    .map(|i| match params {
-                        StringKernelType::StartsWith => vec![i[0].starts_with(&i[1])],
-                        StringKernelType::EndsWith => vec![i[0].ends_with(&i[1])],
-                    })
-                    .collect(KernelOutputType::Boolean)
-            })
-            .map_err(ArrowKernelError::DSLError)?,
-        ))
+        let mut ctx = DSLContext::new();
+        let mut func = DSLFunction::new("str_start_end");
+        let haystack_arg = func.add_arg(&mut ctx, DSLType::array_like(haystack, "n"));
+        let needle_arg = func.add_arg(&mut ctx, DSLType::array_like(*needle, "n"));
+        func.add_ret(WriterSpec::Boolean, "n");
+        func.add_body(DSLStmt::for_each(
+            &mut ctx,
+            &[haystack_arg, needle_arg],
+            |loop_vars| {
+                let pred = match params {
+                    StringKernelType::StartsWith => {
+                        loop_vars[0].expr().starts_with(&loop_vars[1].expr())?
+                    }
+                    StringKernelType::EndsWith => {
+                        loop_vars[0].expr().ends_with(&loop_vars[1].expr())?
+                    }
+                };
+                DSLStmt::emit(0, pred)
+            },
+        )?);
+        let func = compile(
+            func,
+            [DSLArgument::Datum(haystack), DSLArgument::Datum(*needle)],
+        )?;
+
+        Ok(StringStartEndKernel(func))
     }
 
     fn get_key_for_input(
@@ -499,7 +521,23 @@ mod tests {
                 .unwrap();
         let result = kernel.call((&source, &needle)).unwrap();
 
-        assert_eq!(result, BooleanArray::from(vec![true, false, false, true]));
+        assert_eq!(
+            result,
+            BooleanArray::from(vec![Some(true), None, Some(false), Some(true)])
+        );
+    }
+
+    #[test]
+    fn test_string_starts_with_kernel_null_scalar_needle() {
+        let source = StringArray::from(vec!["prefix-value", "other", "prefix"]);
+        let needle = Scalar::new(StringArray::from(vec![None::<&str>]));
+
+        let kernel =
+            StringStartEndKernel::compile(&(&source, &needle), StringKernelType::StartsWith)
+                .unwrap();
+        let result = kernel.call((&source, &needle)).unwrap();
+
+        assert_eq!(result, BooleanArray::from(vec![None, None, None]));
     }
 
     #[test]
@@ -515,6 +553,19 @@ mod tests {
     }
 
     #[test]
+    fn test_string_starts_with_kernel_array_needles_with_nulls() {
+        let source = StringArray::from(vec![Some("prefix-value"), Some("other"), None]);
+        let needle = StringArray::from(vec![Some("prefix"), None, Some("x")]);
+
+        let kernel =
+            StringStartEndKernel::compile(&(&source, &needle), StringKernelType::StartsWith)
+                .unwrap();
+        let result = kernel.call((&source, &needle)).unwrap();
+
+        assert_eq!(result, BooleanArray::from(vec![Some(true), None, None]));
+    }
+
+    #[test]
     fn test_string_contains() {
         let data = StringArray::from(vec!["hello", "world", "hello world"]);
         let pattern = b"llo";
@@ -522,6 +573,19 @@ mod tests {
         let result = string_contains(&data, pattern).unwrap();
 
         assert_eq!(result, BooleanArray::from(vec![true, false, true]));
+    }
+
+    #[test]
+    fn test_string_contains_nulls() {
+        let data = StringArray::from(vec![Some("hello"), None, Some("world")]);
+        let pattern = b"llo";
+
+        let result = string_contains(&data, pattern).unwrap();
+
+        assert_eq!(
+            result,
+            BooleanArray::from(vec![Some(true), None, Some(false)])
+        );
     }
 
     #[test]
@@ -563,5 +627,13 @@ mod tests {
         let arb = compile_string_like(b"h%o%o%", b'\\').unwrap();
         let result = arb(&data).unwrap().iter().map(|x| x.unwrap()).collect_vec();
         assert_eq!(result, vec![false, false, true]);
+
+        let data = StringArray::from(vec![Some("hello"), None, Some("hallo")]);
+        let masked = compile_string_like(b"h_llo", b'\\').unwrap();
+        let result = masked(&data).unwrap();
+        assert_eq!(
+            result,
+            BooleanArray::from(vec![Some(true), None, Some(true)])
+        );
     }
 }

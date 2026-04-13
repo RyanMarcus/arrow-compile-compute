@@ -1,6 +1,8 @@
 use std::collections::HashSet;
 
-use arrow_array::{Array, Float16Array, Float32Array, Float64Array, Int32Array, Int64Array, StringArray};
+use arrow_array::{
+    Array, Float16Array, Float32Array, Float64Array, Int32Array, Int64Array, StringArray,
+};
 use arrow_compile_compute::SortOptions;
 use itertools::Itertools;
 use proptest::{prelude::any, proptest};
@@ -206,10 +208,13 @@ fn test_lower_bound_descending() {
 
     let sorted = Int32Array::from(sorted_values.clone());
     let keys = Int32Array::from(key_values.clone());
-    let key_input = (&keys as &dyn arrow_array::Datum, SortOptions {
-        descending: true,
-        nulls_first: false,
-    });
+    let key_input = (
+        &keys as &dyn arrow_array::Datum,
+        SortOptions {
+            descending: true,
+            nulls_first: false,
+        },
+    );
 
     let res = arrow_compile_compute::sort::lower_bound(key_input, &sorted).unwrap();
     let indices = res.into_iter().map(|x| x.unwrap()).collect_vec();
@@ -245,10 +250,13 @@ fn test_lower_bound_nulls_first() {
     let sorted = Int32Array::from(vec![None, Some(1), Some(3)]);
     let keys = Int32Array::from(vec![Some(0), None, Some(2)]);
 
-    let key_input = (&keys as &dyn arrow_array::Datum, SortOptions {
-        descending: false,
-        nulls_first: true,
-    });
+    let key_input = (
+        &keys as &dyn arrow_array::Datum,
+        SortOptions {
+            descending: false,
+            nulls_first: true,
+        },
+    );
 
     let res = arrow_compile_compute::sort::lower_bound(key_input, &sorted).unwrap();
     let indices = res.into_iter().map(|x| x.unwrap()).collect_vec();
