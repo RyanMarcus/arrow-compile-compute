@@ -207,19 +207,15 @@ pub mod cast {
 
 /// Order arrays and groups of arrays
 pub mod sort {
-    use std::sync::LazyLock;
+    use arrow_array::{Array, BinaryArray, Datum, UInt32Array};
 
-    use arrow_array::{Array, UInt32Array};
+    use crate::{compiled_kernels, ArrowKernelError, SortOptions};
 
-    use crate::{
-        compiled_kernels::{KernelCache, LowerBoundKernel, SortKernel, TopKKernel},
-        ArrowKernelError, SortOptions,
-    };
-
-    static SORT_PROGRAM_CACHE: LazyLock<KernelCache<SortKernel>> = LazyLock::new(KernelCache::new);
-    static TOPK_PROGRAM_CACHE: LazyLock<KernelCache<TopKKernel>> = LazyLock::new(KernelCache::new);
-    static LOWER_BOUND_CACHE: LazyLock<KernelCache<LowerBoundKernel>> =
-        LazyLock::new(KernelCache::new);
+    pub fn normalize_columns(
+        arr: &[(&dyn Datum, SortOptions)],
+    ) -> Result<BinaryArray, ArrowKernelError> {
+        compiled_kernels::normalize_columns(arr)
+    }
 
     /// Returns an array of indices that would sort the input array. Combine
     /// this kernel with `take` to physically sort the array.
@@ -227,7 +223,7 @@ pub mod sort {
         arr: &dyn Array,
         options: SortOptions,
     ) -> Result<UInt32Array, ArrowKernelError> {
-        SORT_PROGRAM_CACHE.get(vec![arr], vec![options])
+        compiled_kernels::sort_col(&arr, options)
     }
 
     /// Returns an array of indices that would sort the input arrays. Combine
@@ -236,7 +232,23 @@ pub mod sort {
         arr: &[&dyn Array],
         options: &[SortOptions],
     ) -> Result<UInt32Array, ArrowKernelError> {
-        SORT_PROGRAM_CACHE.get(arr.to_vec(), options.to_vec())
+        if arr.len() != options.len() {
+            return Err(ArrowKernelError::ArgumentMismatch(format!(
+                "expected the same number of columns and sort options, got {} columns and {} options",
+                arr.len(),
+                options.len()
+            )));
+        }
+
+        let inputs: Vec<(&dyn Datum, SortOptions)> = arr
+            .iter()
+            .zip(options.iter().copied())
+            .map(|(arr, opts)| {
+                let datum: &dyn Datum = arr;
+                (datum, opts)
+            })
+            .collect();
+        compiled_kernels::sort_multi_col(&inputs)
     }
 
     /// Returns an array of indices that to the top K elements of the input
@@ -246,32 +258,32 @@ pub mod sort {
         options: &[SortOptions],
         k: usize,
     ) -> Result<UInt32Array, ArrowKernelError> {
-        TOPK_PROGRAM_CACHE.get((arr.to_vec(), k), options.to_vec())
+        if arr.len() != options.len() {
+            return Err(ArrowKernelError::ArgumentMismatch(format!(
+                "expected the same number of columns and sort options, got {} columns and {} options",
+                arr.len(),
+                options.len()
+            )));
+        }
+
+        let inputs: Vec<(&dyn Datum, SortOptions)> = arr
+            .iter()
+            .zip(options.iter().copied())
+            .map(|(arr, opts)| {
+                let datum: &dyn Datum = arr;
+                (datum, opts)
+            })
+            .collect();
+        compiled_kernels::top_k(&inputs, k)
     }
 
     /// For each row of `keys`, returns the insertion point in `sorted`
     /// preserving sort order (lower bound).
     pub fn lower_bound(
-        keys: &[&dyn Array],
-        sorted: &[&dyn Array],
-        options: &[SortOptions],
+        keys: (&dyn Datum, SortOptions),
+        sorted: &dyn Array,
     ) -> Result<UInt32Array, ArrowKernelError> {
-        if keys.len() != sorted.len() || keys.len() != options.len() {
-            return Err(ArrowKernelError::ArgumentMismatch(format!(
-                "expected the same number of key, sorted, and option columns, got {} keys, {} sorted, {} options",
-                keys.len(),
-                sorted.len(),
-                options.len()
-            )));
-        }
-
-        if keys.is_empty() {
-            return Err(ArrowKernelError::ArgumentMismatch(
-                "lower_bound requires at least one column".to_string(),
-            ));
-        }
-
-        LOWER_BOUND_CACHE.get((keys.to_vec(), sorted.to_vec()), options.to_vec())
+        compiled_kernels::lower_bound(keys, sorted)
     }
 }
 

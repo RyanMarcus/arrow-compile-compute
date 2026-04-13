@@ -4,22 +4,20 @@ use arrow_array::{
     builder::BinaryBuilder,
     cast::AsArray,
     types::{UInt16Type, UInt32Type, UInt64Type, UInt8Type},
-    ArrayRef, BinaryArray, Datum, PrimitiveArray, UInt16Array, UInt32Array, UInt64Array,
-    UInt8Array,
+    ArrayRef, BinaryArray, BooleanArray, Datum, UInt16Array, UInt32Array, UInt64Array, UInt8Array,
 };
-use arrow_buffer::{NullBuffer, ToByteSlice};
+use arrow_buffer::NullBuffer;
 use arrow_schema::DataType;
-use itertools::Itertools;
 
 use crate::{
     compiled_kernels::{
         dsl2::{
-            compile, DSLArgument, DSLBitwiseBinOp, DSLContext, DSLFunction, DSLStmt, DSLType,
-            DSLValue, RunnableDSLFunction,
+            compile, DSLArgument, DSLBitwiseBinOp, DSLContext, DSLExpr, DSLFunction, DSLStmt,
+            DSLType, DSLValue, RunnableDSLFunction,
         },
         KernelCache,
     },
-    compiled_writers::WriterSpec,
+    compiled_writers::{BooleanAllocation, WriterSpec},
     iter, ArrowKernelError, Kernel, PrimitiveType, SortOptions,
 };
 
@@ -87,7 +85,8 @@ pub fn normalize_columns(
         }
 
         if pt.is_int() || pt.is_float() {
-            normed.push(NORM_NUMERIC_CACHE.get(&arr, opts.descending)?);
+            let normalized = NORM_NUMERIC_CACHE.get(&arr, opts.descending)?;
+            normed.push(normalized);
         } else if matches!(pt, PrimitiveType::P64x2) {
             normed.push(normalize_bytes(&arr, opts.descending)?);
         } else {
@@ -123,7 +122,7 @@ unsafe impl Send for NormalizeNumeric {}
 unsafe impl Sync for NormalizeNumeric {}
 
 impl Kernel for NormalizeNumeric {
-    type Key = (DataType, bool);
+    type Key = (DataType, bool, bool);
 
     type Input<'a> = &'a dyn Datum;
 
@@ -132,7 +131,16 @@ impl Kernel for NormalizeNumeric {
     type Output = ArrayRef;
 
     fn call(&self, inp: Self::Input<'_>) -> Result<Self::Output, ArrowKernelError> {
-        let res = self.0.run(&[DSLArgument::Datum(inp)])?;
+        let nulls = if let Some(nb) = inp.get().0.nulls() {
+            let ba = BooleanArray::from(nb.inner().clone());
+            Arc::new(ba) as Arc<dyn Datum>
+        } else {
+            Arc::new(BooleanArray::new_scalar(true))
+        };
+
+        let res = self
+            .0
+            .run(&[DSLArgument::Datum(inp), DSLArgument::Datum(nulls.as_ref())])?;
         let res = res[0].clone();
         Ok(res)
     }
@@ -152,7 +160,11 @@ impl Kernel for NormalizeNumeric {
         i: &Self::Input<'_>,
         p: &Self::Params,
     ) -> Result<Self::Key, ArrowKernelError> {
-        Ok((i.get().0.data_type().clone(), *p))
+        Ok((
+            i.get().0.data_type().clone(),
+            i.get().0.nulls().is_some(),
+            *p,
+        ))
     }
 }
 
@@ -164,6 +176,14 @@ fn normalize_numeric(
     let mut ctx = DSLContext::new();
     let mut func = DSLFunction::new("norm_sint");
     let arr_arg = func.add_arg(&mut ctx, DSLType::array_like(arr, "n"));
+
+    let nul: Arc<dyn Datum> = if let Some(nb) = arr.get().0.nulls() {
+        Arc::new(BooleanArray::from(nb.inner().clone()))
+    } else {
+        Arc::new(BooleanArray::new_scalar(true))
+    };
+    let nul_arg = func.add_arg(&mut ctx, DSLType::array_like(&*nul, "n"));
+
     let out_type = match inp_pt {
         PrimitiveType::I8 => PrimitiveType::U8,
         PrimitiveType::I16 => PrimitiveType::U16,
@@ -177,8 +197,9 @@ fn normalize_numeric(
     func.add_ret(WriterSpec::Primitive(out_type), "n");
 
     func.add_body(
-        DSLStmt::for_each(&mut ctx, &[arr_arg], |loop_vars| {
+        DSLStmt::for_each(&mut ctx, &[arr_arg, nul_arg], |loop_vars| {
             let mut itm = loop_vars[0].expr();
+            let is_valid = loop_vars[1].expr();
 
             if inp_pt.is_float() {
                 itm = itm.float_to_total_order_sint()?;
@@ -207,26 +228,35 @@ fn normalize_numeric(
                 itm = itm.bit_not()?;
             }
 
+            let zero = DSLValue::zero_like(&itm).as_primitive_expr()?;
+            itm = is_valid.select(itm, zero)?;
             DSLStmt::emit(0, itm)
         })
         .unwrap(),
     );
 
-    let func = compile(func, [DSLArgument::Datum(arr)])?;
+    let func = compile(
+        func,
+        [DSLArgument::Datum(arr), DSLArgument::Datum(nul.as_ref())],
+    )?;
     Ok(func)
 }
 
 fn normalize_bytes(arr: &dyn Datum, invert: bool) -> Result<ArrayRef, ArrowKernelError> {
     let mut bb = BinaryBuilder::new();
     let mut row_buf = Vec::new();
-    for s in iter::iter_nonnull_bytes(arr.get().0)? {
+    for s in iter::iter_bytes(arr.get().0)? {
         row_buf.clear();
-        for &b in s {
-            row_buf.push(if invert { !b } else { b });
-            if b == 0 {
-                row_buf.push(if invert { 0 } else { 255 });
+        if let Some(s) = s {
+            for &b in s {
+                let encoded = if invert { !b } else { b };
+                row_buf.push(encoded);
+                if (!invert && encoded == 0) || (invert && encoded == 255) {
+                    row_buf.push(if invert { 0 } else { 255 });
+                }
             }
         }
+        row_buf.extend_from_slice(if invert { &[255, 255] } else { &[0, 0] });
         bb.append_value(&row_buf);
     }
 
@@ -255,15 +285,55 @@ fn normalize_nulls(nb: &NullBuffer, nulls_first: bool) -> UInt8Array {
 
 #[cfg(test)]
 mod tests {
-    use arrow_array::{cast::AsArray, types::UInt32Type, Float32Array, Int32Array, UInt32Array};
+    use std::sync::Arc;
 
-    use crate::compiled_kernels::{dsl2::DSLArgument, sort_norm::normalize_numeric};
+    use arrow_array::{
+        cast::AsArray, types::UInt32Type, Array, ArrayRef, BinaryArray, BooleanArray, Datum,
+        Float32Array, Int32Array, UInt32Array,
+    };
+    use arrow_buffer::NullBuffer;
+    use itertools::Itertools;
+
+    use super::{normalize_columns, normalize_numeric};
+    use crate::{compiled_kernels::dsl2::DSLArgument, sort, SortOptions};
+
+    fn lexicographic_sort_indices(arr: &BinaryArray) -> Vec<u32> {
+        let mut idxes = (0..arr.len() as u32).collect_vec();
+        idxes.sort_by(|lhs, rhs| {
+            arr.value(*lhs as usize)
+                .cmp(arr.value(*rhs as usize))
+                .then(lhs.cmp(rhs))
+        });
+        idxes
+    }
+
+    fn assert_normalized_sort_matches(arrs: &[ArrayRef], options: &[SortOptions]) {
+        let sort_inputs = arrs
+            .iter()
+            .map(|arr| arr.as_ref() as &dyn Array)
+            .collect_vec();
+        let datum_inputs = sort_inputs
+            .iter()
+            .zip(options.iter().copied())
+            .map(|(arr, opts)| (arr as &dyn Datum, opts))
+            .collect_vec();
+
+        let normalized = normalize_columns(&datum_inputs).unwrap();
+        let expected = sort::multicol_sort_to_indices(&sort_inputs, options).unwrap();
+        let expected = expected.values().iter().copied().collect_vec();
+
+        assert_eq!(normalized.len(), arrs[0].len());
+        assert_eq!(lexicographic_sort_indices(&normalized), expected);
+    }
 
     #[test]
     fn test_signed_int_normalization() {
         let data = Int32Array::from(vec![1, -5, 100, -1000]);
         let func = normalize_numeric(&data, false).unwrap();
-        let out = func.run(&[DSLArgument::datum(&data)]).unwrap();
+        let valid = BooleanArray::new_scalar(true);
+        let out = func
+            .run(&[DSLArgument::datum(&data), DSLArgument::datum(&valid)])
+            .unwrap();
         assert_eq!(out.len(), 1);
         assert_eq!(
             out[0].as_primitive::<UInt32Type>().values(),
@@ -275,7 +345,10 @@ mod tests {
     fn test_unsigned_int_normalization() {
         let data = UInt32Array::from(vec![1, 5, 100, 1000]);
         let func = normalize_numeric(&data, false).unwrap();
-        let out = func.run(&[DSLArgument::datum(&data)]).unwrap();
+        let valid = BooleanArray::new_scalar(true);
+        let out = func
+            .run(&[DSLArgument::datum(&data), DSLArgument::datum(&valid)])
+            .unwrap();
         assert_eq!(out.len(), 1);
         assert_eq!(
             out[0].as_primitive::<UInt32Type>().values(),
@@ -287,7 +360,10 @@ mod tests {
     fn test_unsigned_f32_normalization() {
         let data = Float32Array::from(vec![1.0, 5.5, 100.0, -1000.0]);
         let func = normalize_numeric(&data, false).unwrap();
-        let out = func.run(&[DSLArgument::datum(&data)]).unwrap();
+        let valid = BooleanArray::new_scalar(true);
+        let out = func
+            .run(&[DSLArgument::datum(&data), DSLArgument::datum(&valid)])
+            .unwrap();
         assert_eq!(out.len(), 1);
         assert_eq!(
             out[0].as_primitive::<UInt32Type>().values(),
@@ -298,5 +374,76 @@ mod tests {
                 0xFFFF853B  // -1000.0
             ]
         )
+    }
+
+    #[test]
+    fn test_normalize_columns_lexicographic_sort_matches_multicol_sort() {
+        let bytes = Arc::new(BinaryArray::from(vec![
+            Some(&b"a"[..]),
+            Some(&b"a\0"[..]),
+            Some(&b"a"[..]),
+            Some(&b"a\0z"[..]),
+            Some(&b"a\0"[..]),
+            Some(&b""[..]),
+        ])) as ArrayRef;
+        let ints = Arc::new(UInt32Array::from(vec![1, 0, 0, 2, 1, 3])) as ArrayRef;
+
+        assert_normalized_sort_matches(
+            &[bytes, ints],
+            &[SortOptions::default(), SortOptions::default()],
+        );
+    }
+
+    #[test]
+    fn test_normalize_columns_lexicographic_sort_matches_multicol_sort_descending() {
+        let floats = Arc::new(Float32Array::from(vec![
+            1.0,
+            -0.0,
+            2.5,
+            f32::NEG_INFINITY,
+            2.5,
+            1.0,
+        ])) as ArrayRef;
+        let bytes = Arc::new(BinaryArray::from(vec![
+            Some(&b"b"[..]),
+            Some(&b"a\0"[..]),
+            Some(&b"a"[..]),
+            Some(&b"zz"[..]),
+            Some(&b"a\0z"[..]),
+            Some(&b"b"[..]),
+        ])) as ArrayRef;
+
+        let descending = SortOptions {
+            descending: true,
+            nulls_first: false,
+        };
+        assert_normalized_sort_matches(&[floats, bytes], &[descending, descending]);
+    }
+
+    #[test]
+    fn test_normalize_columns_lexicographic_sort_matches_multicol_sort_nulls_first() {
+        let ints = Arc::new(Int32Array::new(
+            vec![50, 777, 10, -999, 10, 0].into(),
+            Some(NullBuffer::from(vec![true, false, true, false, true, true])),
+        )) as ArrayRef;
+        let bytes = Arc::new(BinaryArray::from(vec![
+            Some(&b"bb"[..]),
+            Some(&b"zz"[..]),
+            Some(&b"aa"[..]),
+            None,
+            Some(&b"aa\0"[..]),
+            Some(&b""[..]),
+        ])) as ArrayRef;
+
+        assert_normalized_sort_matches(
+            &[ints, bytes],
+            &[
+                SortOptions {
+                    descending: false,
+                    nulls_first: true,
+                },
+                SortOptions::default(),
+            ],
+        );
     }
 }

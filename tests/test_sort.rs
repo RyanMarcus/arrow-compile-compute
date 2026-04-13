@@ -1,6 +1,6 @@
 use std::collections::HashSet;
 
-use arrow_array::{Array, Float16Array, Float32Array, Float64Array, Int32Array, StringArray};
+use arrow_array::{Array, Float16Array, Float32Array, Float64Array, Int32Array, Int64Array, StringArray};
 use arrow_compile_compute::SortOptions;
 use itertools::Itertools;
 use proptest::{prelude::any, proptest};
@@ -154,11 +154,9 @@ proptest! {
 
         let sorted_array = Int32Array::from(sorted.clone());
         let key_array = Int32Array::from(keys.clone());
-        let key_refs: [&dyn Array; 1] = [&key_array];
-        let sorted_refs: [&dyn Array; 1] = [&sorted_array];
-        let options = [SortOptions::default()];
+        let key_input = (&key_array as &dyn arrow_array::Datum, SortOptions::default());
 
-        let result = arrow_compile_compute::sort::lower_bound(&key_refs, &sorted_refs, &options)
+        let result = arrow_compile_compute::sort::lower_bound(key_input, &sorted_array)
             .unwrap();
         let indices = result.into_iter().map(|x| x.unwrap()).collect_vec();
         assert_eq!(indices, expected);
@@ -170,29 +168,23 @@ fn test_lower_bound_single_column() {
     let sorted = Int32Array::from(vec![1, 3, 5, 5, 7]);
     let keys = Int32Array::from(vec![0, 2, 5, 6, 8]);
 
-    let key_refs: [&dyn Array; 1] = [&keys];
-    let sorted_refs: [&dyn Array; 1] = [&sorted];
-    let options = [SortOptions::default()];
+    let key_input = (&keys as &dyn arrow_array::Datum, SortOptions::default());
 
-    let res = arrow_compile_compute::sort::lower_bound(&key_refs, &sorted_refs, &options).unwrap();
+    let res = arrow_compile_compute::sort::lower_bound(key_input, &sorted).unwrap();
     let indices = res.into_iter().map(|x| x.unwrap()).collect_vec();
     assert_eq!(indices, vec![0, 1, 2, 4, 5]);
 }
 
 #[test]
-fn test_lower_bound_multi_column() {
-    let sorted_a = Int32Array::from(vec![1, 1, 2, 2, 3]);
-    let sorted_b = Int32Array::from(vec![10, 20, 5, 15, 0]);
-    let key_a = Int32Array::from(vec![0, 2, 2, 4]);
-    let key_b = Int32Array::from(vec![0, 5, 12, 0]);
+fn test_lower_bound_string() {
+    let sorted = StringArray::from(vec!["a", "b", "b", "d"]);
+    let keys = StringArray::from(vec!["", "b", "c", "z"]);
 
-    let key_refs: [&dyn Array; 2] = [&key_a, &key_b];
-    let sorted_refs: [&dyn Array; 2] = [&sorted_a, &sorted_b];
-    let options = [SortOptions::default(), SortOptions::default()];
+    let key_input = (&keys as &dyn arrow_array::Datum, SortOptions::default());
 
-    let res = arrow_compile_compute::sort::lower_bound(&key_refs, &sorted_refs, &options).unwrap();
+    let res = arrow_compile_compute::sort::lower_bound(key_input, &sorted).unwrap();
     let indices = res.into_iter().map(|x| x.unwrap()).collect_vec();
-    assert_eq!(indices, vec![0, 2, 3, 5]);
+    assert_eq!(indices, vec![0, 1, 3, 4]);
 }
 
 #[test]
@@ -200,11 +192,9 @@ fn test_lower_bound_with_nulls() {
     let sorted = Int32Array::from(vec![Some(1), Some(3), None]);
     let keys = Int32Array::from(vec![Some(0), Some(3), None]);
 
-    let key_refs: [&dyn Array; 1] = [&keys];
-    let sorted_refs: [&dyn Array; 1] = [&sorted];
-    let options = [SortOptions::default()];
+    let key_input = (&keys as &dyn arrow_array::Datum, SortOptions::default());
 
-    let res = arrow_compile_compute::sort::lower_bound(&key_refs, &sorted_refs, &options).unwrap();
+    let res = arrow_compile_compute::sort::lower_bound(key_input, &sorted).unwrap();
     let indices = res.into_iter().map(|x| x.unwrap()).collect_vec();
     assert_eq!(indices, vec![0, 1, 2]);
 }
@@ -216,14 +206,12 @@ fn test_lower_bound_descending() {
 
     let sorted = Int32Array::from(sorted_values.clone());
     let keys = Int32Array::from(key_values.clone());
-    let key_refs: [&dyn Array; 1] = [&keys];
-    let sorted_refs: [&dyn Array; 1] = [&sorted];
-    let options = [SortOptions {
+    let key_input = (&keys as &dyn arrow_array::Datum, SortOptions {
         descending: true,
         nulls_first: false,
-    }];
+    });
 
-    let res = arrow_compile_compute::sort::lower_bound(&key_refs, &sorted_refs, &options).unwrap();
+    let res = arrow_compile_compute::sort::lower_bound(key_input, &sorted).unwrap();
     let indices = res.into_iter().map(|x| x.unwrap()).collect_vec();
 
     let expected: Vec<u32> = key_values
@@ -240,19 +228,45 @@ fn test_lower_bound_descending() {
 }
 
 #[test]
+fn test_lower_bound_mixed_numeric_types() {
+    let sorted = Int64Array::from(vec![1_i64, 3, 5, 7]);
+    let keys = Int32Array::from(vec![0_i32, 3, 4, 8]);
+
+    let key_input = (&keys as &dyn arrow_array::Datum, SortOptions::default());
+
+    let res = arrow_compile_compute::sort::lower_bound(key_input, &sorted).unwrap();
+    let indices = res.into_iter().map(|x| x.unwrap()).collect_vec();
+
+    assert_eq!(indices, vec![0, 1, 2, 4]);
+}
+
+#[test]
 fn test_lower_bound_nulls_first() {
     let sorted = Int32Array::from(vec![None, Some(1), Some(3)]);
     let keys = Int32Array::from(vec![Some(0), None, Some(2)]);
 
-    let key_refs: [&dyn Array; 1] = [&keys];
-    let sorted_refs: [&dyn Array; 1] = [&sorted];
-    let options = [SortOptions {
+    let key_input = (&keys as &dyn arrow_array::Datum, SortOptions {
         descending: false,
         nulls_first: true,
-    }];
+    });
 
-    let res = arrow_compile_compute::sort::lower_bound(&key_refs, &sorted_refs, &options).unwrap();
+    let res = arrow_compile_compute::sort::lower_bound(key_input, &sorted).unwrap();
     let indices = res.into_iter().map(|x| x.unwrap()).collect_vec();
 
     assert_eq!(indices, vec![1, 0, 2]);
+}
+
+#[test]
+fn test_topk_indices_full_len() {
+    let array = Int32Array::from(vec![5, 1, 4, 2]);
+    let arr_refs: [&dyn Array; 1] = [&array];
+    let options = [SortOptions::default()];
+
+    let result = arrow_compile_compute::sort::topk_indices(&arr_refs, &options, array.len())
+        .unwrap()
+        .into_iter()
+        .map(|x| x.unwrap())
+        .collect_vec();
+
+    assert_eq!(result, vec![1, 3, 2, 0]);
 }

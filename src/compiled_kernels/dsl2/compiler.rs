@@ -143,7 +143,13 @@ pub fn compile_inner<'ctx, 'args>(
     let args: Vec<_> = args.into_iter().collect();
 
     // validate parameters
-    assert_eq!(args.len(), f.params.len());
+    assert_eq!(
+        args.len(),
+        f.params.len(),
+        "number of arguments ({}) does not match number of parameters ({})",
+        args.len(),
+        f.params.len(),
+    );
     for (i, (arg, param)) in args.iter().zip(f.params.iter()).enumerate() {
         if !arg.is_compatible_with(&param.ty) {
             return Err(ArrowKernelError::ArgumentTypeMismatch(
@@ -881,6 +887,16 @@ fn compile_expr<'ctx, 'a>(
                         .i32_type()
                         .const_int(v.as_primitive::<UInt32Type>().value(0) as u64, false)
                         .as_basic_value_enum()),
+                    DataType::UInt16 => Ok(ctx
+                        .ctx
+                        .i16_type()
+                        .const_int(v.as_primitive::<UInt16Type>().value(0) as u64, false)
+                        .as_basic_value_enum()),
+                    DataType::UInt8 => Ok(ctx
+                        .ctx
+                        .i8_type()
+                        .const_int(v.as_primitive::<UInt8Type>().value(0) as u64, false)
+                        .as_basic_value_enum()),
                     _ => todo!(),
                 }
             }
@@ -1040,7 +1056,6 @@ fn compile_expr<'ctx, 'a>(
                 .unwrap_basic();
             Ok(res)
         }
-
         DSLExpr::ArithBinOp(op, lhs, rhs) => {
             let lhs_v = compile_expr(ctx, lhs)?;
             let rhs_v = compile_expr(ctx, rhs)?;
@@ -1186,6 +1201,16 @@ fn compile_expr<'ctx, 'a>(
                     v.get_type(),
                 )),
             }
+        }
+        DSLExpr::Select(cond, v1, v2) => {
+            let cond_v = compile_expr(ctx, cond)?.into_int_value();
+            let v1_v = compile_expr(ctx, v1)?;
+            let v2_v = compile_expr(ctx, v2)?;
+            Ok(ctx
+                .b
+                .build_select(cond_v, v1_v, v2_v, "select")
+                .unwrap()
+                .as_basic_value_enum())
         }
     }
 }

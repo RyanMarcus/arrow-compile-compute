@@ -2,6 +2,7 @@ use std::collections::HashSet;
 use std::fmt::Debug;
 #[cfg(test)]
 use std::ops::{BitAnd, BitOr, BitXor};
+use std::process::CommandEnvs;
 use std::sync::Arc;
 use std::{ffi::c_void, marker::PhantomData};
 
@@ -10,7 +11,7 @@ use arrow_array::types::UInt32Type;
 #[cfg(test)]
 use arrow_array::{ArrowPrimitiveType, PrimitiveArray};
 
-use arrow_array::{ArrayRef, UInt16Array, UInt8Array};
+use arrow_array::{ArrayRef, BooleanArray, UInt16Array, UInt8Array};
 use arrow_array::{Datum, UInt32Array, UInt64Array};
 use arrow_schema::DataType;
 use inkwell::context::Context;
@@ -368,6 +369,7 @@ impl DSLType {
             IteratorHolder::RunEnd { values, .. } => Self::of_iterator_holder(values),
             IteratorHolder::FixedSizeList(it) => Self::array_of(it.ptype(), ""),
             IteratorHolder::ScalarPrimitive(it) => DSLType::scalar_of(it.ptype),
+            IteratorHolder::ScalarBoolean(..) => DSLType::Scalar(Box::new(DSLType::Boolean)),
             IteratorHolder::ScalarString(..) => DSLType::scalar_of(PrimitiveType::P64x2),
             IteratorHolder::ScalarBinary(..) => DSLType::scalar_of(PrimitiveType::P64x2),
             IteratorHolder::ScalarVec(it) => DSLType::scalar_of(it.ptype()),
@@ -652,6 +654,43 @@ impl DSLValue {
             ty: DSLType::ConstScalar(Arc::new(UInt8Array::new_scalar(value))),
         }
     }
+
+    pub fn u1(value: bool) -> Self {
+        Self {
+            name: 0,
+            ty: DSLType::ConstScalar(Arc::new(BooleanArray::new_scalar(value))),
+        }
+    }
+
+    pub fn zero_like(expr: &DSLExpr) -> Self {
+        match expr.get_type() {
+            DSLType::Boolean => DSLValue::u1(false),
+            DSLType::Primitive(pt) => match pt.width() {
+                1 => DSLValue::u8(0),
+                2 => DSLValue::u16(0),
+                4 => DSLValue::u32(0),
+                8 => DSLValue::u64(0),
+                _ => panic!("cannot make zero-like value for {:?}", expr),
+            },
+            _ => panic!("cannot make zero-like value for {:?}", expr),
+        }
+    }
+
+    pub fn as_primitive_expr(&self) -> Result<DSLExpr, ArrowKernelError> {
+        match &self.ty {
+            DSLType::ConstScalar(datum) => {
+                let v = datum.get().0;
+                match v.data_type() {
+                    DataType::Boolean => self.expr().cast_to_bool(),
+                    DataType::Binary => todo!(),
+                    _ => self
+                        .expr()
+                        .primitive_cast(PrimitiveType::for_arrow_type(v.data_type())),
+                }
+            }
+            _ => panic!("cannot cast non-const value to primitive expr"),
+        }
+    }
 }
 
 pub struct DSLFunction {
@@ -888,6 +927,7 @@ pub enum DSLExpr {
     Bswap(Box<DSLExpr>),
     BitNot(Box<DSLExpr>),
     Len(Box<DSLValue>),
+    Select(Box<DSLExpr>, Box<DSLExpr>, Box<DSLExpr>),
 }
 
 impl DSLExpr {
@@ -1048,6 +1088,30 @@ impl DSLExpr {
         }
     }
 
+    pub fn select(&self, v1: DSLExpr, v2: DSLExpr) -> Result<DSLExpr, ArrowKernelError> {
+        if self.get_type() != DSLType::Boolean {
+            return Err(ArrowKernelError::DSLTypeMismatch(
+                "select condition must be a boolean",
+                DSLType::Boolean,
+                self.get_type(),
+            ));
+        }
+
+        if v1.get_type() != v2.get_type() {
+            return Err(ArrowKernelError::DSLTypeMismatch(
+                "select v1 and v2 must have the same type",
+                v1.get_type(),
+                v2.get_type(),
+            ));
+        }
+
+        Ok(DSLExpr::Select(
+            Box::new(self.clone()),
+            Box::new(v1),
+            Box::new(v2),
+        ))
+    }
+
     pub fn get_type(&self) -> DSLType {
         match self {
             DSLExpr::Compare(..) => DSLType::Boolean,
@@ -1068,8 +1132,8 @@ impl DSLExpr {
             DSLExpr::Bswap(v) | DSLExpr::BitNot(v) => v.get_type(),
             DSLExpr::Cast(_, pt) | DSLExpr::BitCast(_, pt) => DSLType::Primitive(*pt),
             DSLExpr::CastToBool(_) => DSLType::Boolean,
-
             DSLExpr::Len(_) => DSLType::Primitive(PrimitiveType::U64),
+            DSLExpr::Select(_, v1, _v2) => v1.get_type().clone(),
         }
     }
 
@@ -1080,6 +1144,11 @@ impl DSLExpr {
             | DSLExpr::BitwiseBinOp(_, l, r) => {
                 l.accessed_parameters(params);
                 r.accessed_parameters(params);
+            }
+            DSLExpr::Select(cond, v1, v2) => {
+                cond.accessed_parameters(params);
+                v1.accessed_parameters(params);
+                v2.accessed_parameters(params);
             }
             DSLExpr::At(arr, idx) => {
                 params.insert(arr.name);

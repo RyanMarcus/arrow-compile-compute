@@ -128,6 +128,15 @@ impl RunnableDSLFunction {
         &self,
         inputs: &[DSLArgument<'args>],
     ) -> Result<PreparedInputs, ArrowKernelError> {
+        let expected_inputs = self.compiled.borrow_arg_types().len();
+        if inputs.len() != expected_inputs {
+            return Err(ArrowKernelError::ArgumentMismatch(format!(
+                "expected {} inputs, got {}",
+                expected_inputs,
+                inputs.len()
+            )));
+        }
+
         let mut prepared = PreparedInputs {
             ptrs: Vec::new(),
             ihs: Vec::new(),
