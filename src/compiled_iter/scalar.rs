@@ -154,6 +154,34 @@ impl From<f64> for IteratorHolder {
 #[repr(C)]
 #[derive(ReprOffset, Debug)]
 #[roff(usize_offsets)]
+pub struct ScalarBooleanIterator {
+    val: u8,
+}
+
+impl ScalarBooleanIterator {
+    pub fn new(val: bool) -> Self {
+        Self { val: val as u8 }
+    }
+
+    pub fn llvm_val_ptr<'a>(
+        &self,
+        ctx: &'a Context,
+        builder: &'a Builder,
+        ptr: PointerValue<'a>,
+    ) -> PointerValue<'a> {
+        increment_pointer!(ctx, builder, ptr, ScalarPrimitiveIterator::OFFSET_VAL)
+    }
+}
+
+impl From<bool> for IteratorHolder {
+    fn from(val: bool) -> Self {
+        IteratorHolder::ScalarBoolean(Box::new(ScalarBooleanIterator::new(val)))
+    }
+}
+
+#[repr(C)]
+#[derive(ReprOffset, Debug)]
+#[roff(usize_offsets)]
 pub struct ScalarStringIterator {
     ptr1: *const u8,
     ptr2: *const u8,
@@ -278,7 +306,7 @@ impl ScalarVectorIterator {
 mod tests {
     use std::ffi::c_void;
 
-    use arrow_array::{Float32Array, Int32Array, Scalar};
+    use arrow_array::{BooleanArray, Float32Array, Int32Array, Scalar};
     use arrow_schema::DataType;
     use inkwell::{context::Context, OptimizationLevel};
 
@@ -397,6 +425,37 @@ mod tests {
                 true
             );
             assert_eq!(buf.0, [f, f, f, f]);
+        };
+    }
+
+    #[test]
+    fn test_scalar_bool() {
+        let s = BooleanArray::new_scalar(true);
+        let mut iter = datum_to_iter(&s).unwrap();
+
+        let ctx = Context::create();
+        let module = ctx.create_module("test_scalar_bool");
+        let func_next =
+            generate_next(&ctx, &module, "iter_prim_test", &DataType::Boolean, &iter).unwrap();
+
+        let fname_next = func_next.get_name().to_str().unwrap();
+
+        module.verify().unwrap();
+        let ee = module
+            .create_jit_execution_engine(OptimizationLevel::None)
+            .unwrap();
+
+        let next_func = unsafe {
+            ee.get_function::<unsafe extern "C" fn(*mut c_void, *mut u8) -> bool>(fname_next)
+                .unwrap()
+        };
+
+        let mut buf = [0_u8; 1];
+        unsafe {
+            assert_eq!(next_func.call(iter.get_mut_ptr(), buf.as_mut_ptr()), true);
+            assert_eq!(buf, [1]);
+            assert_eq!(next_func.call(iter.get_mut_ptr(), buf.as_mut_ptr()), true);
+            assert_eq!(buf, [1]);
         };
     }
 }

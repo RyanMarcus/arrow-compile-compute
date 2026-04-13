@@ -44,10 +44,11 @@ use string::{LargeStringIterator, StringIterator};
 use crate::{
     compiled_iter::{
         fixed_size_list::FixedSizeListIterator,
-        scalar::{ScalarBinaryIterator, ScalarVectorIterator},
+        scalar::{ScalarBinaryIterator, ScalarBooleanIterator, ScalarVectorIterator},
         view::ViewIterator,
     },
-    declare_blocks, increment_pointer, set_noalias_params, ArrowKernelError, PrimitiveType,
+    declare_blocks, increment_pointer, mark_load_invariant, set_noalias_params, ArrowKernelError,
+    PrimitiveType,
 };
 
 pub fn array_to_setbit_iter(arr: &BooleanArray) -> Result<IteratorHolder, ArrowKernelError> {
@@ -161,6 +162,7 @@ pub fn datum_to_iter(val: &dyn Datum) -> Result<IteratorHolder, ArrowKernelError
         Ok(array_to_iter(d))
     } else {
         match d.data_type() {
+            DataType::Boolean => Ok(d.as_boolean().value(0).into()),
             DataType::Int8 => Ok(d.as_primitive::<Int8Type>().value(0).into()),
             DataType::Int16 => Ok(d.as_primitive::<Int16Type>().value(0).into()),
             DataType::Int32 => Ok(d.as_primitive::<Int32Type>().value(0).into()),
@@ -286,6 +288,7 @@ pub enum IteratorHolder {
     },
     FixedSizeList(Box<FixedSizeListIterator>),
     ScalarPrimitive(Box<ScalarPrimitiveIterator>),
+    ScalarBoolean(Box<ScalarBooleanIterator>),
     ScalarString(Box<ScalarStringIterator>),
     ScalarBinary(Box<ScalarBinaryIterator>),
     ScalarVec(Box<ScalarVectorIterator>),
@@ -306,6 +309,7 @@ impl IteratorHolder {
             IteratorHolder::RunEnd { arr: iter, .. } => &mut **iter as *mut _ as *mut c_void,
             IteratorHolder::FixedSizeList(iter) => &mut **iter as *mut _ as *mut c_void,
             IteratorHolder::ScalarPrimitive(iter) => &mut **iter as *mut _ as *mut c_void,
+            IteratorHolder::ScalarBoolean(iter) => &mut **iter as *mut _ as *mut c_void,
             IteratorHolder::ScalarString(iter) => &mut **iter as *mut _ as *mut c_void,
             IteratorHolder::ScalarBinary(iter) => &mut **iter as *mut _ as *mut c_void,
             IteratorHolder::ScalarVec(iter) => &mut **iter as *mut _ as *mut c_void,
@@ -333,6 +337,7 @@ impl IteratorHolder {
             IteratorHolder::RunEnd { arr: iter, .. } => &**iter as *const _ as *const c_void,
             IteratorHolder::FixedSizeList(iter) => &**iter as *const _ as *const c_void,
             IteratorHolder::ScalarPrimitive(iter) => &**iter as *const _ as *const c_void,
+            IteratorHolder::ScalarBoolean(iter) => &**iter as *const _ as *const c_void,
             IteratorHolder::ScalarString(iter) => &**iter as *const _ as *const c_void,
             IteratorHolder::ScalarBinary(iter) => &**iter as *const _ as *const c_void,
             IteratorHolder::ScalarVec(iter) => &**iter as *const _ as *const c_void,
@@ -485,6 +490,7 @@ pub fn generate_reset_iterator<'a>(
             Some(reset)
         }
         IteratorHolder::ScalarPrimitive(_)
+        | IteratorHolder::ScalarBoolean(_)
         | IteratorHolder::ScalarString(_)
         | IteratorHolder::ScalarBinary(_)
         | IteratorHolder::ScalarVec(_) => {
@@ -959,6 +965,7 @@ pub fn generate_next_block<'a, const N: u32>(
                 .unwrap();
             Some(next)
         }
+        IteratorHolder::ScalarBoolean(_) => None,
         IteratorHolder::ScalarString(_) => None,
         IteratorHolder::ScalarBinary(_) => None,
         IteratorHolder::ScalarVec(_) => None,
@@ -1652,6 +1659,24 @@ pub fn generate_next<'a>(
                 }
                 _ => unreachable!(),
             };
+            build.build_store(out_ptr, constant).unwrap();
+            build
+                .build_return(Some(&bool_type.const_int(1, false)))
+                .unwrap();
+            Some(next)
+        }
+        IteratorHolder::ScalarBoolean(s) => {
+            declare_blocks!(ctx, next, entry);
+            build.position_at_end(entry);
+            let ptr = s.llvm_val_ptr(ctx, &build, iter_ptr);
+            let constant = build
+                .build_load(ctx.i8_type(), ptr, "const_bool_u8")
+                .unwrap()
+                .into_int_value();
+            mark_load_invariant!(ctx, constant);
+            let constant = build
+                .build_int_truncate(constant, ctx.bool_type(), "trunc_const")
+                .unwrap();
             build.build_store(out_ptr, constant).unwrap();
             build
                 .build_return(Some(&bool_type.const_int(1, false)))
@@ -2406,6 +2431,7 @@ pub fn generate_random_access<'a>(
             _ => unreachable!("run-end iterator but non-iterator data type ({:?})", dt),
         },
         IteratorHolder::ScalarPrimitive(_) => None,
+        IteratorHolder::ScalarBoolean(_) => None,
         IteratorHolder::ScalarString(_) => None,
         IteratorHolder::ScalarBinary(_) => None,
         IteratorHolder::ScalarVec(iter) => {
@@ -2438,6 +2464,7 @@ pub fn get_iterator_length<'a>(
         IteratorHolder::RunEnd { .. } => None,
         IteratorHolder::FixedSizeList(iter) => Some(iter.llvm_len(ctx, builder, iter_ptr)),
         IteratorHolder::ScalarPrimitive(..) => None,
+        IteratorHolder::ScalarBoolean(..) => None,
         IteratorHolder::ScalarString(..) => None,
         IteratorHolder::ScalarBinary(..) => None,
         IteratorHolder::ScalarVec(..) => None,
