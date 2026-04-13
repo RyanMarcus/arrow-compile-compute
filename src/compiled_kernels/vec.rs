@@ -5,13 +5,16 @@ use arrow_schema::DataType;
 
 use crate::{
     compiled_kernels::{
-        dsl::{DSLKernel, KernelOutputType},
+        dsl2::{
+            compile, DSLArgument, DSLArithBinOp, DSLContext, DSLFunction, DSLStmt, DSLType,
+            RunnableDSLFunction, WriterSpec,
+        },
         null_utils::replace_nulls,
     },
-    logical_nulls, ArrayDatum, ArrowKernelError, Kernel,
+    logical_nulls, ArrayDatum, ArrowKernelError, Kernel, PrimitiveType,
 };
 
-pub struct DotKernel(DSLKernel);
+pub struct DotKernel(RunnableDSLFunction);
 unsafe impl Sync for DotKernel {}
 unsafe impl Send for DotKernel {}
 
@@ -29,7 +32,10 @@ impl Kernel for DotKernel {
 
     fn call(&self, inp: Self::Input<'_>) -> Result<Self::Output, ArrowKernelError> {
         let (q, vecs) = inp;
-        let mut res = self.0.call(&[&vecs, q])?;
+        let mut res = self
+            .0
+            .run(&[DSLArgument::datum(&vecs), DSLArgument::Datum(q)])?[0]
+            .clone();
         if let Some(nulls) = logical_nulls(vecs)? {
             res = replace_nulls(res, Some(nulls));
         }
@@ -80,16 +86,35 @@ impl Kernel for DotKernel {
             )));
         }
 
-        Ok(DotKernel(
-            DSLKernel::compile(&[vecs, *q], |ctx| {
-                let vecs = ctx.get_input(0)?;
-                let q = ctx.get_input(1)?;
-                ctx.iter_over(vec![vecs, q])
-                    .map(|i| vec![i[0].mul(&i[1]).vec_sum()])
-                    .collect(KernelOutputType::Array)
-            })
-            .map_err(ArrowKernelError::DSLError)?,
-        ))
+        if vecs.value_length() != q_val.value_length() {
+            return Err(ArrowKernelError::UnsupportedArguments(format!(
+                "vector and query must have the same length (got {} and {})",
+                vecs.value_length(),
+                q_val.value_length()
+            )));
+        }
+
+        let mut ctx = DSLContext::new();
+        let mut func = DSLFunction::new("dot_vec");
+        let vecs_arg = func.add_arg(&mut ctx, DSLType::array_like(vecs, "n"));
+        let q_arg = func.add_arg(&mut ctx, DSLType::array_like(*q, "n"));
+        func.add_ret(
+            WriterSpec::Primitive(PrimitiveType::for_arrow_type(vecs.values().data_type())),
+            "n",
+        );
+        func.add_body(
+            DSLStmt::for_each(&mut ctx, &[vecs_arg, q_arg], |loop_vars| {
+                let lhs = loop_vars[0].expr();
+                let rhs = loop_vars[1].expr();
+                let dot = lhs.arith(DSLArithBinOp::Mul, rhs)?.vec_sum()?;
+                DSLStmt::emit(0, dot)
+            })?,
+        );
+
+        Ok(DotKernel(compile(
+            func,
+            [DSLArgument::datum(&vecs), DSLArgument::Datum(*q)],
+        )?))
     }
 
     fn get_key_for_input(
@@ -100,7 +125,7 @@ impl Kernel for DotKernel {
     }
 }
 
-pub struct NormVecKernel(DSLKernel);
+pub struct NormVecKernel(RunnableDSLFunction);
 unsafe impl Sync for NormVecKernel {}
 unsafe impl Send for NormVecKernel {}
 
@@ -118,7 +143,7 @@ impl Kernel for NormVecKernel {
 
     fn call(&self, inp: Self::Input<'_>) -> Result<Self::Output, ArrowKernelError> {
         let (data, is_scalar) = inp.get();
-        let mut res = self.0.call(&[&data])?;
+        let mut res = self.0.run(&[DSLArgument::Datum(inp)])?[0].clone();
         if let Some(nulls) = logical_nulls(data)? {
             res = replace_nulls(res, Some(nulls));
         }
@@ -146,16 +171,31 @@ impl Kernel for NormVecKernel {
             ));
         }
 
-        Ok(NormVecKernel(
-            DSLKernel::compile(&[arr], |ctx| {
-                let vecs = ctx.get_input(0)?;
-                ctx.iter_over(vec![vecs])
-                    .map(|i| vec![i[0].powi(2).vec_sum().sqrt(), i[0].clone()])
-                    .map(|i| vec![i[1].div(&i[0].splat(arr.value_length() as usize))])
-                    .collect(KernelOutputType::FixedSizeList(arr.value_length() as usize))
-            })
-            .map_err(ArrowKernelError::DSLError)?,
-        ))
+        let value_length = arr.value_length() as usize;
+        let item_type = PrimitiveType::for_arrow_type(arr.values().data_type());
+        if !item_type.is_float() {
+            return Err(ArrowKernelError::UnsupportedArguments(format!(
+                "vector normalization requires float values, got {}",
+                arr.values().data_type()
+            )));
+        }
+
+        let mut ctx = DSLContext::new();
+        let mut func = DSLFunction::new("norm_vec");
+        let vecs_arg = func.add_arg(&mut ctx, DSLType::array_like(*inp, "n"));
+        func.add_ret(WriterSpec::for_base_type_of_datum(*inp), "n");
+        func.add_body(
+            DSLStmt::for_each(&mut ctx, &[vecs_arg], |loop_vars| {
+                let vec = loop_vars[0].expr();
+                let squared = vec.arith(DSLArithBinOp::Mul, vec.clone())?;
+                let norm = squared.vec_sum()?.sqrt()?;
+                let norm_vec = norm.splat(value_length)?;
+                let normalized = vec.arith(DSLArithBinOp::Div, norm_vec)?;
+                DSLStmt::emit(0, normalized)
+            })?,
+        );
+
+        Ok(NormVecKernel(compile(func, [DSLArgument::Datum(*inp)])?))
     }
 
     fn get_key_for_input(

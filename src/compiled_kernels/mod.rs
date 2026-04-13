@@ -16,18 +16,12 @@ mod sort_norm;
 mod string;
 mod take;
 mod vec;
-use std::hash::Hash;
-use std::sync::Arc;
 use std::{collections::HashMap, sync::RwLock};
 
 pub use aggregate::{
     CountAggregator, MaxAggregator, MinAggregator, MostRecentAggregator, SumAggregator,
 };
 pub use arith::BinOpKernel;
-use arrow_array::make_array;
-use arrow_array::Array;
-use arrow_array::ArrayRef;
-use arrow_buffer::NullBuffer;
 use arrow_schema::DataType;
 pub use cast::CastKernel;
 pub use cmp::ComparisonKernel;
@@ -36,10 +30,8 @@ pub use dsl2::DSLArithBinOp;
 pub use filter::FilterKernel;
 pub use ht::{HashFunction, HashKernel};
 use inkwell::execution_engine::ExecutionEngine;
-use itertools::Itertools;
 use llvm_utils::str_writer_append_bytes;
 pub use null_utils::intersect_and_copy_nulls;
-pub use partition::partition;
 pub use partition::PartitionKernel;
 pub use rust_iter::{ArrowIter, ArrowNullableIter, IterFuncHolder};
 pub use sort::{lower_bound, sort_col, sort_multi_col, top_k, SortOptions};
@@ -63,7 +55,6 @@ use inkwell::{
 };
 use thiserror::Error;
 
-use crate::compiled_kernels::dsl2::{DSLContext, DSLFunction};
 use crate::compiled_kernels::llvm_utils::save_to_string_saver;
 use crate::compiled_kernels::llvm_utils::str_view_writer_append_bytes;
 use crate::llvm_debug::debug_i64;
@@ -335,17 +326,9 @@ fn gen_convert_numeric_vec<'ctx>(
 
 #[cfg(test)]
 mod tests {
-    use std::sync::Arc;
-
-    use arrow_array::{
-        cast::AsArray, types::Int32Type, BooleanArray, DictionaryArray, Int32Array, Scalar,
-    };
-    use arrow_buffer::NullBuffer;
-    use itertools::Itertools;
-
-    use crate::{compiled_kernels::null_utils::replace_nulls, Predicate};
-
     use super::{ComparisonKernel, KernelCache};
+    use crate::Predicate;
+    use arrow_array::{BooleanArray, Int32Array, Scalar};
 
     #[test]
     fn test_kernel_cache_cmp() {

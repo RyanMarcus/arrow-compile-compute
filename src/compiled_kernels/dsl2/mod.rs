@@ -942,6 +942,9 @@ pub enum DSLExpr {
     BitwiseBinOp(DSLBitwiseBinOp, Box<DSLExpr>, Box<DSLExpr>),
     Bswap(Box<DSLExpr>),
     BitNot(Box<DSLExpr>),
+    Sqrt(Box<DSLExpr>),
+    VecSum(Box<DSLExpr>),
+    Splat(Box<DSLExpr>, usize),
     Len(Box<DSLValue>),
     Select(Box<DSLExpr>, Box<DSLExpr>, Box<DSLExpr>),
 }
@@ -1141,6 +1144,49 @@ impl DSLExpr {
         }
     }
 
+    pub fn sqrt(&self) -> Result<DSLExpr, ArrowKernelError> {
+        match self.get_type() {
+            DSLType::Primitive(pt) if pt.is_float() => Ok(DSLExpr::Sqrt(Box::new(self.clone()))),
+            DSLType::Primitive(PrimitiveType::List(item, _))
+                if PrimitiveType::from(item).is_float() =>
+            {
+                Ok(DSLExpr::Sqrt(Box::new(self.clone())))
+            }
+            _ => Err(ArrowKernelError::DSLInvalidType(
+                "sqrt requires scalar or vector float inputs",
+                self.get_type(),
+            )),
+        }
+    }
+
+    pub fn vec_sum(&self) -> Result<DSLExpr, ArrowKernelError> {
+        match self.get_type() {
+            DSLType::Primitive(PrimitiveType::List(item, _))
+                if PrimitiveType::from(item).as_numeric_primitive_type().is_some() =>
+            {
+                Ok(DSLExpr::VecSum(Box::new(self.clone())))
+            }
+            _ => Err(ArrowKernelError::DSLInvalidType(
+                "vec_sum requires a numeric fixed-size-list value",
+                self.get_type(),
+            )),
+        }
+    }
+
+    pub fn splat(&self, size: usize) -> Result<DSLExpr, ArrowKernelError> {
+        match self.get_type() {
+            DSLType::Primitive(pt)
+                if !matches!(pt, PrimitiveType::P64x2 | PrimitiveType::List(_, _)) =>
+            {
+                Ok(DSLExpr::Splat(Box::new(self.clone()), size))
+            }
+            _ => Err(ArrowKernelError::DSLInvalidType(
+                "splat requires a scalar primitive value",
+                self.get_type(),
+            )),
+        }
+    }
+
     pub fn select(&self, v1: DSLExpr, v2: DSLExpr) -> Result<DSLExpr, ArrowKernelError> {
         if self.get_type() != DSLType::Boolean {
             return Err(ArrowKernelError::DSLTypeMismatch(
@@ -1182,7 +1228,12 @@ impl DSLExpr {
             DSLExpr::FloatToTotalOrderSInt(v) => DSLType::Primitive(PrimitiveType::int_with_width(
                 v.get_type().as_primitive().unwrap().width(),
             )),
-            DSLExpr::Bswap(v) | DSLExpr::BitNot(v) => v.get_type(),
+            DSLExpr::Bswap(v) | DSLExpr::BitNot(v) | DSLExpr::Sqrt(v) => v.get_type(),
+            DSLExpr::VecSum(v) => DSLType::Primitive(v.get_type().as_primitive().unwrap().list_type_into_inner()),
+            DSLExpr::Splat(v, size) => DSLType::Primitive(PrimitiveType::List(
+                v.get_type().as_primitive().unwrap().try_into().unwrap(),
+                *size,
+            )),
             DSLExpr::Cast(_, pt) | DSLExpr::BitCast(_, pt) => DSLType::Primitive(*pt),
             DSLExpr::CastToBool(_) => DSLType::Boolean,
             DSLExpr::Len(_) => DSLType::Primitive(PrimitiveType::U64),
@@ -1214,7 +1265,10 @@ impl DSLExpr {
             | DSLExpr::CastToBool(val)
             | DSLExpr::Bswap(val)
             | DSLExpr::BitNot(val)
-            | DSLExpr::FloatToTotalOrderSInt(val) => val.accessed_parameters(params),
+            | DSLExpr::FloatToTotalOrderSInt(val)
+            | DSLExpr::Sqrt(val)
+            | DSLExpr::VecSum(val)
+            | DSLExpr::Splat(val, _) => val.accessed_parameters(params),
         }
     }
 
@@ -1244,8 +1298,9 @@ mod tests {
     use std::{collections::HashSet, sync::Arc};
 
     use arrow_array::{
+        builder::{FixedSizeListBuilder, Float32Builder, Int32Builder},
         cast::AsArray,
-        types::{Int32Type, UInt32Type, UInt64Type},
+        types::{Float32Type, Int32Type, UInt32Type, UInt64Type},
         ArrayRef, BooleanArray, Datum, Float32Array, Int32Array, StringArray, UInt32Array,
     };
     use arrow_buffer::{Buffer, MutableBuffer, ScalarBuffer};
@@ -1262,7 +1317,7 @@ mod tests {
                 OutputSpec,
             },
         },
-        PrimitiveType,
+        ListItemType, PrimitiveType,
     };
 
     #[test]
@@ -1761,5 +1816,56 @@ mod tests {
         let result = result.as_string::<i32>();
         let result = result.iter().map(|x| x.unwrap()).collect_vec();
         assert_eq!(result, vec!["one", "two", "three", "one", "two", "three"]);
+    }
+
+    #[test]
+    fn test_dsl2_vec_sum() {
+        let mut input = FixedSizeListBuilder::new(Int32Builder::new(), 3);
+        input.values().append_slice(&[1, 2, 3]);
+        input.append(true);
+        input.values().append_slice(&[-1, 0, 2]);
+        input.append(true);
+        let input = input.finish();
+
+        let mut ctx = DSLContext::new();
+        let mut func = DSLFunction::new("vec_sum");
+        let vecs = func.add_arg(&mut ctx, DSLType::array_like(&input, "n"));
+        func.add_body(
+            DSLStmt::for_each(&mut ctx, &[vecs], |loop_vars| {
+                DSLStmt::emit(0, loop_vars[0].expr().vec_sum()?)
+            })
+            .unwrap(),
+        );
+        func.add_ret(WriterSpec::Primitive(PrimitiveType::I32), "n");
+
+        let func = compile(func, dsl_args![input]).unwrap();
+        let result = func.run(&dsl_args![input]).unwrap();
+        let result = result[0].as_primitive::<Int32Type>();
+        assert_eq!(result.values(), &[6, 1]);
+    }
+
+    #[test]
+    fn test_dsl2_splat() {
+        let input = Float32Array::from(vec![1.0, -2.5]);
+
+        let mut ctx = DSLContext::new();
+        let mut func = DSLFunction::new("splat");
+        let arr = func.add_arg(&mut ctx, DSLType::array_of(PrimitiveType::F32, "n"));
+        func.add_body(
+            DSLStmt::for_each(&mut ctx, &[arr], |loop_vars| {
+                DSLStmt::emit(0, loop_vars[0].expr().splat(2)?)
+            })
+            .unwrap(),
+        );
+        func.add_ret(WriterSpec::FixedSizeList(ListItemType::F32, 2), "n");
+
+        let func = compile(func, dsl_args![input]).unwrap();
+        let result = func.run(&dsl_args![input]).unwrap();
+        let result = result[0].as_fixed_size_list();
+        assert_eq!(result.value(0).as_primitive::<Float32Type>().values(), &[1.0, 1.0]);
+        assert_eq!(
+            result.value(1).as_primitive::<Float32Type>().values(),
+            &[-2.5, -2.5]
+        );
     }
 }

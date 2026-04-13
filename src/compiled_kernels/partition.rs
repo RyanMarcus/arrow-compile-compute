@@ -1,10 +1,9 @@
 use std::sync::Arc;
 
 use arrow_array::{
-    builder::BooleanBuilder,
     cast::AsArray,
     types::{UInt64Type, UInt8Type},
-    Array, ArrayRef, BooleanArray, UInt64Array,
+    Array, ArrayRef, BooleanArray,
 };
 use arrow_buffer::{BooleanBuffer, NullBuffer};
 use arrow_schema::DataType;
@@ -15,8 +14,8 @@ use crate::{
         cast::coalesce_type,
         dsl::base_type,
         dsl2::{
-            compile, DSLArgument, DSLBuffer, DSLContext, DSLExpr, DSLFunction, DSLStmt, DSLType,
-            DSLValue, RunnableDSLFunction,
+            compile, DSLArgument, DSLBuffer, DSLContext, DSLFunction, DSLStmt, DSLType, DSLValue,
+            RunnableDSLFunction,
         },
         null_utils::replace_nulls,
         DSLArithBinOp,
@@ -119,72 +118,6 @@ impl Kernel for PartitionKernel {
     ) -> Result<Self::Key, ArrowKernelError> {
         Ok((i.0.data_type().clone(), i.1.data_type().clone()))
     }
-}
-
-pub fn partition(
-    arr: &dyn Array,
-    part_idxes: &dyn Array,
-    nparts: Option<usize>,
-) -> Result<Vec<ArrayRef>, ArrowKernelError> {
-    if arr.len() != part_idxes.len() {
-        return Err(ArrowKernelError::SizeMismatch);
-    }
-
-    if part_idxes.is_nullable() {
-        return Err(ArrowKernelError::UnsupportedArguments(
-            "partition indexes cannot be nullable".to_string(),
-        ));
-    };
-
-    let nparts = match nparts {
-        Some(x) => x,
-        None => iter::iter_nonnull_u64(part_idxes)?
-            .max()
-            .map(|x| x as usize + 1)
-            .unwrap_or(0),
-    };
-
-    if nparts == 0 {
-        return Ok(vec![]);
-    }
-
-    let mut part_offsets = vec![0_u64; nparts + 1];
-    for idx in iter::iter_nonnull_u64(part_idxes)? {
-        let idx = idx as usize;
-        if idx >= nparts {
-            return Err(ArrowKernelError::OutOfBounds(nparts));
-        }
-        part_offsets[idx + 1] += 1;
-    }
-    for idx in 1..part_offsets.len() {
-        part_offsets[idx] += part_offsets[idx - 1];
-    }
-
-    let mut indexes = vec![0; arr.len()];
-    iter::iter_nonnull_u64(part_idxes)?
-        .enumerate()
-        .for_each(|(arr_idx, part_idx)| {
-            let part_idx = part_idx as usize;
-            let new_pos = part_offsets[part_idx] as usize;
-            part_offsets[part_idx] += 1;
-            indexes[new_pos] = arr_idx as u64;
-        });
-    let indexes = UInt64Array::from(indexes);
-
-    let mut res = crate::arrow_interface::select::take(arr, &indexes)?;
-    let mut consumed = 0;
-    let partitions = part_offsets[..part_offsets.len() - 1]
-        .into_iter()
-        .map(|offset| {
-            let offset = offset - consumed;
-            let part = res.slice(0, offset as usize);
-            res = res.slice(offset as usize, res.len() - offset as usize);
-            consumed += offset;
-            part
-        })
-        .collect_vec();
-
-    Ok(partitions)
 }
 
 pub fn partition_kernel(

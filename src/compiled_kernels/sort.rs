@@ -250,8 +250,8 @@ impl SortOptions {
 mod test {
     use crate::{sort, SortOptions};
     use arrow_array::{
-        cast::AsArray, types::Int32Type, Array, ArrayRef, Datum, Float32Array, Int32Array,
-        Int64Array, StringArray, UInt32Array,
+        cast::AsArray, types::Int32Type, Array, ArrayRef, Float32Array, Int32Array, Int64Array,
+        StringArray, UInt32Array,
     };
     use itertools::Itertools;
     use std::sync::Arc;

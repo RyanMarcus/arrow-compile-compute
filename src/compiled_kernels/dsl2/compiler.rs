@@ -14,6 +14,10 @@ use inkwell::{
     context::Context,
     execution_engine::JitFunction,
     intrinsics::Intrinsic,
+    llvm_sys::{
+        LLVMFastMathAllowContract, LLVMFastMathAllowReassoc, LLVMFastMathAllowReciprocal,
+        LLVMFastMathApproxFunc,
+    },
     module::{Linkage, Module},
     types::{BasicType, BasicTypeEnum},
     values::{BasicValue, BasicValueEnum, FunctionValue, IntValue, VectorValue},
@@ -1072,6 +1076,135 @@ fn compile_expr<'ctx, 'a>(
                 .unwrap_basic();
             Ok(res)
         }
+        DSLExpr::Sqrt(v) => {
+            let value = compile_expr(ctx, v)?;
+            let decl_tys = match v.get_type().as_primitive().unwrap() {
+                PrimitiveType::F16 => vec![ctx.ctx.f16_type().into()],
+                PrimitiveType::F32 => vec![ctx.ctx.f32_type().into()],
+                PrimitiveType::F64 => vec![ctx.ctx.f64_type().into()],
+                PrimitiveType::List(item, size) => {
+                    let inner = PrimitiveType::from(item);
+                    let vec_ty = inner.llvm_vec_type(ctx.ctx, size as u32).unwrap();
+                    vec![vec_ty.into()]
+                }
+                other => {
+                    return Err(ArrowKernelError::DSLInvalidType(
+                        "sqrt requires float inputs",
+                        DSLType::Primitive(other),
+                    ))
+                }
+            };
+            let sqrt = Intrinsic::find("llvm.sqrt").unwrap();
+            let sqrt = sqrt.get_declaration(ctx.module, &decl_tys).unwrap();
+            let result = ctx
+                .b
+                .build_call(sqrt, &[value.into()], "sqrt")
+                .unwrap()
+                .try_as_basic_value()
+                .unwrap_basic();
+            result
+                .as_instruction_value()
+                .unwrap()
+                .set_fast_math_flags(
+                    LLVMFastMathAllowContract
+                        | LLVMFastMathAllowReassoc
+                        | LLVMFastMathAllowReciprocal
+                        | LLVMFastMathApproxFunc,
+                );
+            Ok(result)
+        }
+        DSLExpr::VecSum(v) => {
+            let primitive = v.get_type().as_primitive().unwrap();
+            let PrimitiveType::List(item, _) = primitive else {
+                return Err(ArrowKernelError::DSLInvalidType(
+                    "vec_sum requires a fixed-size-list value",
+                    v.get_type(),
+                ));
+            };
+
+            let inner = PrimitiveType::from(item);
+            let value = compile_expr(ctx, v)?.into_vector_value();
+            match inner {
+                PrimitiveType::I8
+                | PrimitiveType::I16
+                | PrimitiveType::I32
+                | PrimitiveType::I64
+                | PrimitiveType::U8
+                | PrimitiveType::U16
+                | PrimitiveType::U32
+                | PrimitiveType::U64 => {
+                    let reducer = Intrinsic::find("llvm.vector.reduce.add").unwrap();
+                    let reducer = reducer
+                        .get_declaration(ctx.module, &[value.get_type().into()])
+                        .unwrap();
+                    Ok(ctx
+                        .b
+                        .build_call(reducer, &[value.into()], "vec_sum")
+                        .unwrap()
+                        .try_as_basic_value()
+                        .unwrap_basic())
+                }
+                PrimitiveType::F16 | PrimitiveType::F32 | PrimitiveType::F64 => {
+                    let reducer = Intrinsic::find("llvm.vector.reduce.fadd").unwrap();
+                    let reducer = reducer
+                        .get_declaration(ctx.module, &[value.get_type().into()])
+                        .unwrap();
+                    let result = ctx
+                        .b
+                        .build_call(
+                            reducer,
+                            &[inner.llvm_type(ctx.ctx).const_zero().into(), value.into()],
+                            "vec_sum",
+                        )
+                        .unwrap()
+                        .try_as_basic_value()
+                        .unwrap_basic();
+                    result
+                        .as_instruction_value()
+                        .unwrap()
+                        .set_fast_math_flags(
+                            LLVMFastMathAllowContract
+                                | LLVMFastMathAllowReassoc
+                                | LLVMFastMathAllowReciprocal
+                                | LLVMFastMathApproxFunc,
+                        );
+                    Ok(result)
+                }
+                _ => Err(ArrowKernelError::DSLInvalidType(
+                    "vec_sum requires numeric vector inputs",
+                    v.get_type(),
+                )),
+            }
+        }
+        DSLExpr::Splat(v, size) => {
+            let pt = v.get_type().as_primitive().unwrap();
+            let vec_ty = pt.llvm_vec_type(ctx.ctx, *size as u32).ok_or_else(|| {
+                ArrowKernelError::DSLInvalidType(
+                    "cannot splat this primitive type",
+                    v.get_type(),
+                )
+            })?;
+            let value = compile_expr(ctx, v)?;
+            let singleton = ctx
+                .b
+                .build_insert_element(
+                    vec_ty.const_zero(),
+                    value,
+                    ctx.ctx.i32_type().const_zero(),
+                    "splat_insert",
+                )
+                .unwrap();
+            Ok(ctx
+                .b
+                .build_shuffle_vector(
+                    singleton,
+                    vec_ty.get_poison(),
+                    vec_ty.const_zero(),
+                    "splat",
+                )
+                .unwrap()
+                .as_basic_value_enum())
+        }
         DSLExpr::ArithBinOp(op, lhs, rhs) => {
             let lhs_v = compile_expr(ctx, lhs)?;
             let rhs_v = compile_expr(ctx, rhs)?;
@@ -1084,41 +1217,107 @@ fn compile_expr<'ctx, 'a>(
                 ));
             }
 
-            Ok(if lhs_v.is_float_value() {
-                let lhs_v = lhs_v.into_float_value();
-                let rhs_v = rhs_v.into_float_value();
-                match op {
-                    DSLArithBinOp::Add => ctx.b.build_float_add(lhs_v, rhs_v, "fadd").unwrap(),
-                    DSLArithBinOp::Sub => ctx.b.build_float_sub(lhs_v, rhs_v, "fadd").unwrap(),
-                    DSLArithBinOp::Mul => ctx.b.build_float_mul(lhs_v, rhs_v, "fadd").unwrap(),
-                    DSLArithBinOp::Div => ctx.b.build_float_div(lhs_v, rhs_v, "fadd").unwrap(),
-                    DSLArithBinOp::Rem => ctx.b.build_float_rem(lhs_v, rhs_v, "fadd").unwrap(),
+            let result = match lhs.get_type().as_primitive().ok_or_else(|| {
+                ArrowKernelError::DSLInvalidType(
+                    "arith operators require primitive values",
+                    lhs.get_type(),
+                )
+            })? {
+                PrimitiveType::F16 | PrimitiveType::F32 | PrimitiveType::F64 => {
+                    let lhs_v = lhs_v.into_float_value();
+                    let rhs_v = rhs_v.into_float_value();
+                    match op {
+                        DSLArithBinOp::Add => ctx.b.build_float_add(lhs_v, rhs_v, "fadd").unwrap(),
+                        DSLArithBinOp::Sub => ctx.b.build_float_sub(lhs_v, rhs_v, "fsub").unwrap(),
+                        DSLArithBinOp::Mul => ctx.b.build_float_mul(lhs_v, rhs_v, "fmul").unwrap(),
+                        DSLArithBinOp::Div => ctx.b.build_float_div(lhs_v, rhs_v, "fdiv").unwrap(),
+                        DSLArithBinOp::Rem => ctx.b.build_float_rem(lhs_v, rhs_v, "frem").unwrap(),
+                    }
+                    .as_basic_value_enum()
                 }
-                .as_basic_value_enum()
-            } else {
-                let lhs_v = lhs_v.into_int_value();
-                let rhs_v = rhs_v.into_int_value();
-                match op {
-                    DSLArithBinOp::Add => ctx.b.build_int_add(lhs_v, rhs_v, "iadd").unwrap(),
-                    DSLArithBinOp::Sub => ctx.b.build_int_sub(lhs_v, rhs_v, "isub").unwrap(),
-                    DSLArithBinOp::Mul => ctx.b.build_int_mul(lhs_v, rhs_v, "isub").unwrap(),
-                    DSLArithBinOp::Div => {
-                        if lhs.get_type().is_signed().unwrap() {
-                            ctx.b.build_int_signed_div(lhs_v, rhs_v, "idiv").unwrap()
-                        } else {
-                            ctx.b.build_int_unsigned_div(lhs_v, rhs_v, "udiv").unwrap()
+                PrimitiveType::I8
+                | PrimitiveType::I16
+                | PrimitiveType::I32
+                | PrimitiveType::I64
+                | PrimitiveType::U8
+                | PrimitiveType::U16
+                | PrimitiveType::U32
+                | PrimitiveType::U64 => {
+                    let lhs_v = lhs_v.into_int_value();
+                    let rhs_v = rhs_v.into_int_value();
+                    match op {
+                        DSLArithBinOp::Add => ctx.b.build_int_add(lhs_v, rhs_v, "iadd").unwrap(),
+                        DSLArithBinOp::Sub => ctx.b.build_int_sub(lhs_v, rhs_v, "isub").unwrap(),
+                        DSLArithBinOp::Mul => ctx.b.build_int_mul(lhs_v, rhs_v, "imul").unwrap(),
+                        DSLArithBinOp::Div => {
+                            if lhs.get_type().is_signed().unwrap() {
+                                ctx.b.build_int_signed_div(lhs_v, rhs_v, "idiv").unwrap()
+                            } else {
+                                ctx.b.build_int_unsigned_div(lhs_v, rhs_v, "udiv").unwrap()
+                            }
+                        }
+                        DSLArithBinOp::Rem => {
+                            if lhs.get_type().is_signed().unwrap() {
+                                ctx.b.build_int_signed_rem(lhs_v, rhs_v, "irem").unwrap()
+                            } else {
+                                ctx.b.build_int_unsigned_rem(lhs_v, rhs_v, "urem").unwrap()
+                            }
                         }
                     }
-                    DSLArithBinOp::Rem => {
-                        if lhs.get_type().is_signed().unwrap() {
-                            ctx.b.build_int_signed_rem(lhs_v, rhs_v, "irem").unwrap()
-                        } else {
-                            ctx.b.build_int_unsigned_rem(lhs_v, rhs_v, "urem").unwrap()
+                    .as_basic_value_enum()
+                }
+                PrimitiveType::List(item, _) => {
+                    let inner = PrimitiveType::from(item);
+                    if inner.is_float() {
+                        let lhs_v = lhs_v.into_vector_value();
+                        let rhs_v = rhs_v.into_vector_value();
+                        match op {
+                            DSLArithBinOp::Add => ctx.b.build_float_add(lhs_v, rhs_v, "vfadd").unwrap(),
+                            DSLArithBinOp::Sub => ctx.b.build_float_sub(lhs_v, rhs_v, "vfsub").unwrap(),
+                            DSLArithBinOp::Mul => ctx.b.build_float_mul(lhs_v, rhs_v, "vfmul").unwrap(),
+                            DSLArithBinOp::Div => ctx.b.build_float_div(lhs_v, rhs_v, "vfdiv").unwrap(),
+                            DSLArithBinOp::Rem => ctx.b.build_float_rem(lhs_v, rhs_v, "vfrem").unwrap(),
                         }
+                        .as_basic_value_enum()
+                    } else if inner.is_int() {
+                        let lhs_v = lhs_v.into_vector_value();
+                        let rhs_v = rhs_v.into_vector_value();
+                        match op {
+                            DSLArithBinOp::Add => ctx.b.build_int_add(lhs_v, rhs_v, "viadd").unwrap(),
+                            DSLArithBinOp::Sub => ctx.b.build_int_sub(lhs_v, rhs_v, "visub").unwrap(),
+                            DSLArithBinOp::Mul => ctx.b.build_int_mul(lhs_v, rhs_v, "vimul").unwrap(),
+                            DSLArithBinOp::Div => {
+                                if inner.is_signed() {
+                                    ctx.b.build_int_signed_div(lhs_v, rhs_v, "vidiv").unwrap()
+                                } else {
+                                    ctx.b.build_int_unsigned_div(lhs_v, rhs_v, "vudiv").unwrap()
+                                }
+                            }
+                            DSLArithBinOp::Rem => {
+                                if inner.is_signed() {
+                                    ctx.b.build_int_signed_rem(lhs_v, rhs_v, "virem").unwrap()
+                                } else {
+                                    ctx.b.build_int_unsigned_rem(lhs_v, rhs_v, "vurem").unwrap()
+                                }
+                            }
+                        }
+                        .as_basic_value_enum()
+                    } else {
+                        return Err(ArrowKernelError::DSLInvalidType(
+                            "arith operators require numeric vector elements",
+                            lhs.get_type(),
+                        ));
                     }
                 }
-                .as_basic_value_enum()
-            })
+                PrimitiveType::P64x2 => {
+                    return Err(ArrowKernelError::DSLInvalidType(
+                        "arith operators do not support string values",
+                        lhs.get_type(),
+                    ))
+                }
+            };
+
+            Ok(result)
         }
         DSLExpr::BitwiseBinOp(op, lhs, rhs) => {
             let lhs_v = compile_expr(ctx, lhs)?;

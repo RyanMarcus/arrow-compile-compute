@@ -12,12 +12,12 @@ use arrow_schema::DataType;
 use crate::{
     compiled_kernels::{
         dsl2::{
-            compile, DSLArgument, DSLBitwiseBinOp, DSLContext, DSLExpr, DSLFunction, DSLStmt,
-            DSLType, DSLValue, RunnableDSLFunction,
+            compile, DSLArgument, DSLBitwiseBinOp, DSLContext, DSLFunction, DSLStmt, DSLType,
+            DSLValue, RunnableDSLFunction,
         },
         KernelCache,
     },
-    compiled_writers::{BooleanAllocation, WriterSpec},
+    compiled_writers::WriterSpec,
     iter, ArrowKernelError, Kernel, PrimitiveType, SortOptions,
 };
 
