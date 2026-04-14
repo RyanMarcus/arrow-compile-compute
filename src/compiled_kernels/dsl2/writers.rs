@@ -37,7 +37,6 @@ impl OutputSpec {
     pub fn allocate(&self, expected_count: usize) -> OutputSlot {
         OutputSlot {
             spec: self.spec.clone(),
-            length_tag: self.length_tag.clone(),
             alloc: self.spec.allocate(expected_count),
         }
     }
@@ -45,17 +44,12 @@ impl OutputSpec {
 
 pub struct OutputSlot {
     spec: WriterSpec,
-    length_tag: String,
     alloc: WriterAllocation,
 }
 
 impl OutputSlot {
     pub fn spec(&self) -> &WriterSpec {
         &self.spec
-    }
-
-    pub fn length_tag(&self) -> &str {
-        &self.length_tag
     }
 
     pub fn get_ptr(&mut self) -> *mut c_void {
@@ -68,6 +62,10 @@ impl OutputSlot {
 
     pub fn into_array_ref(self, nulls: Option<NullBuffer>) -> ArrayRef {
         self.alloc.into_array_ref(nulls)
+    }
+
+    pub fn len(&self) -> usize {
+        self.alloc.len()
     }
 
     pub fn llvm_init<'a>(
@@ -142,7 +140,6 @@ mod tests {
         assert_eq!(spec.spec(), &WriterSpec::Boolean);
         assert_eq!(spec.length_tag(), "n");
         assert_eq!(slot.spec(), &WriterSpec::Boolean);
-        assert_eq!(slot.length_tag(), "n");
     }
 
     #[test]

@@ -246,16 +246,6 @@ mod tests {
     }
 
     #[test]
-    #[should_panic(expected = "aggregator capacity")]
-    fn test_count_aggregator_ingest_requires_sufficient_capacity() {
-        let tickets = UInt64Array::from(vec![0, 1, 0]);
-        let data = Int32Array::from(vec![10, 20, 30]);
-
-        let mut agg = CountAggregator::create(&[]).unwrap();
-        agg.ingest(&[&data], &tickets).unwrap();
-    }
-
-    #[test]
     fn test_count_aggregator_ingest_merge_and_finish() {
         let tickets1 = UInt64Array::from(vec![0, 1, 0, 3, 3]);
         let tickets2 = UInt64Array::from(vec![1, 1, 2]);

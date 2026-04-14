@@ -8,7 +8,9 @@ use crate::compiled_kernels::dsl2::{
     self, dsl_args, DSLContext, DSLFunction, DSLStmt, DSLType, WriterSpec,
 };
 use crate::compiled_kernels::null_utils::replace_nulls;
-use crate::{arrow_interface, logical_nulls, normalized_base_type, ArrowKernelError, PrimitiveType};
+use crate::{
+    arrow_interface, logical_nulls, normalized_base_type, ArrowKernelError, PrimitiveType,
+};
 
 use crate::compiled_kernels::dsl2::RunnableDSLFunction;
 use crate::compiled_kernels::Kernel;

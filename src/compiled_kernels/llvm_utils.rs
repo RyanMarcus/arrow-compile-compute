@@ -46,49 +46,6 @@ impl StringSaver {
         let end = start.wrapping_add(last.len());
         ((start as u64) as u128) | (((end as u64) as u128) << 64)
     }
-
-    pub fn finalize(self) -> Vec<Box<[u8]>> {
-        self.data
-    }
-}
-
-pub fn llvm_add_save_to_string_saver<'ctx, 'a>(
-    ctx: &'ctx Context,
-    module: &'a Module<'ctx>,
-) -> FunctionValue<'a> {
-    module
-        .get_function("save_to_string_saver")
-        .unwrap_or_else(|| {
-            module.add_function(
-                "save_to_string_saver",
-                ctx.i128_type().fn_type(
-                    &[
-                        ctx.ptr_type(AddressSpace::default()).into(),
-                        ctx.i64_type().into(),
-                        ctx.ptr_type(AddressSpace::default()).into(),
-                        ctx.ptr_type(AddressSpace::default()).into(),
-                    ],
-                    false,
-                ),
-                None,
-            )
-        })
-}
-
-#[no_mangle]
-pub extern "C" fn save_to_string_saver(
-    str_ptr: *const u8,
-    len: u64,
-    saver: *mut c_void,
-    out_ptr: *mut u128,
-) {
-    let bytes = unsafe { std::slice::from_raw_parts(str_ptr, len as usize) };
-    let data = unsafe { &mut *(saver as *mut StringSaver) };
-    let result = data.insert(bytes);
-
-    unsafe {
-        *out_ptr = result as u128;
-    }
 }
 
 pub fn llvm_add_save_ptrs_string_saver<'ctx, 'a>(

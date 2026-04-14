@@ -1,4 +1,4 @@
-use std::collections::{BTreeMap, HashMap};
+use std::collections::BTreeMap;
 
 use itertools::Itertools;
 use lincomdb::{LinComDB, QueryError};
@@ -31,33 +31,6 @@ impl SizeTerm {
                     return Err(format!("invalid term {}", input));
                 }
                 return Ok(SizeTerm::Term(input.trim_ascii().to_string()));
-            }
-        }
-    }
-
-    pub fn resolve(&self, m: &HashMap<&str, usize>) -> Result<ResolveResult, String> {
-        match self {
-            SizeTerm::Term(n) => m
-                .get(n.as_str())
-                .map(|s| ResolveResult::Exact(*s))
-                .ok_or_else(|| format!("unbound term: {}", n)),
-            SizeTerm::Add(s1, s2) => {
-                let s1 = s1
-                    .resolve(m)?
-                    .as_exact()
-                    .ok_or_else(|| "sum was not exact".to_string())?;
-                let s2 = s2
-                    .resolve(m)?
-                    .as_exact()
-                    .ok_or_else(|| "sum was not exact".to_string())?;
-                Ok(ResolveResult::Exact(s1 + s2))
-            }
-            SizeTerm::AtLeast(size_term) => {
-                let s = size_term
-                    .resolve(m)?
-                    .as_exact()
-                    .ok_or_else(|| "sum was not exact".to_string())?;
-                Ok(ResolveResult::AtLeast(s))
             }
         }
     }
@@ -109,22 +82,12 @@ pub enum ResolveResult {
     Unknown,
 }
 
-impl ResolveResult {
-    pub fn as_exact(&self) -> Option<usize> {
-        match self {
-            ResolveResult::Exact(s) => Some(*s),
-            _ => None,
-        }
-    }
-}
-
 enum Solution {
     Known(Vec<Ratio<i128>>),
     Unknown,
 }
 
 pub struct Resolver {
-    st: BTreeMap<String, usize>,
     solutions: Vec<Solution>,
     is_input_exact: Vec<bool>,
     is_output_exact: Vec<bool>,
@@ -171,7 +134,6 @@ impl Resolver {
         let is_output_exact = outputs.iter().map(|x| x.is_exact()).collect_vec();
 
         Ok(Self {
-            st,
             solutions,
             is_input_exact,
             is_output_exact,

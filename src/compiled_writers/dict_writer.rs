@@ -113,7 +113,6 @@ impl DictAllocation {
 pub struct DictWriter<'a> {
     ht_ptr: PointerValue<'a>,
     ingest_func: FunctionValue<'a>,
-    pt: PrimitiveType,
 }
 
 impl<'a> DictWriter<'a> {
@@ -151,13 +150,6 @@ impl<'a> DictWriter<'a> {
                 Self::llvm_init_typed::<UInt64Type>(ctx, llvm_mod, build, value_spec, alloc_ptr)
             }
         }
-    }
-
-    pub fn llvm_ingest_type(
-        &self,
-        ctx: &'a inkwell::context::Context,
-    ) -> inkwell::types::BasicTypeEnum<'a> {
-        self.pt.llvm_type(ctx)
     }
 
     pub fn llvm_ingest(
@@ -291,7 +283,6 @@ impl<'a> DictWriter<'a> {
         Self {
             ht_ptr,
             ingest_func,
-            pt: value_type,
         }
     }
 }

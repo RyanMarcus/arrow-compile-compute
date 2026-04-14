@@ -60,3 +60,16 @@ fn test_concat_bools() {
     let vals = (0..res.len()).map(|i| res.value(i)).collect_vec();
     assert_eq!(vals, vec![true, false, true, false, true]);
 }
+
+#[test]
+fn test_concat_i32_long_vectorized() {
+    let d1 = Int32Array::from((0..96).collect_vec());
+    let d2 = Int32Array::from((96..181).collect_vec());
+
+    let res =
+        arrow_compile_compute::select::concat(&[&d1 as &dyn Array, &d2 as &dyn Array]).unwrap();
+    let res = res.as_primitive::<Int32Type>();
+    let vals = res.iter().map(|x| x.unwrap()).collect_vec();
+
+    assert_eq!(vals, (0..181).collect_vec());
+}

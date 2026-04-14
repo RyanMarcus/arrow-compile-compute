@@ -485,15 +485,19 @@ pub mod iter {
 pub mod select {
     use std::sync::LazyLock;
 
-    use arrow_array::{make_array, Array, ArrayRef, BooleanArray};
+    use arrow_array::{make_array, Array, ArrayRef, BooleanArray, UInt64Array};
 
     use crate::{
-        compiled_kernels::{concat_all, FilterKernel, KernelCache, PartitionKernel, TakeKernel},
+        compiled_kernels::{
+            concat_all, FilterKernel, InterleaveKernel, KernelCache, PartitionKernel, TakeKernel,
+        },
         ArrowKernelError,
     };
 
     static TAKE_PROGRAM_CACHE: LazyLock<KernelCache<TakeKernel>> = LazyLock::new(KernelCache::new);
     static FILTER_PROGRAM_CACHE: LazyLock<KernelCache<FilterKernel>> =
+        LazyLock::new(KernelCache::new);
+    static INTERLEAVE_PROGRAM_CACHE: LazyLock<KernelCache<InterleaveKernel>> =
         LazyLock::new(KernelCache::new);
     static PARTITION_PROGRAM_CACHE: LazyLock<KernelCache<PartitionKernel>> =
         LazyLock::new(KernelCache::new);
@@ -568,6 +572,50 @@ pub mod select {
             return Ok(make_array(data[0].to_data()));
         }
         concat_all(data)
+    }
+
+    /// Takes elements by index from a list of arrays, creating a new array from
+    /// those values.
+    ///
+    /// Each entry in `indices` identifies the source array and the position
+    /// within that array. No bounds checking is performed.
+    ///
+    /// ```
+    /// use arrow_array::{cast::AsArray, StringArray};
+    /// use arrow_compile_compute::select;
+    ///
+    /// let values0 = StringArray::from(vec!["A", "D"]);
+    /// let values1 = StringArray::from(vec!["B", "C", "E"]);
+    /// let result = select::interleave(
+    ///     &[&values0, &values1],
+    ///     &[(0, 0), (1, 0), (1, 1), (0, 1)],
+    /// )
+    /// .unwrap();
+    /// let result = result.as_string::<i32>();
+    ///
+    /// assert_eq!(result.value(0), "A");
+    /// assert_eq!(result.value(1), "B");
+    /// assert_eq!(result.value(2), "C");
+    /// assert_eq!(result.value(3), "D");
+    /// ```
+    pub fn interleave(
+        values: &[&dyn Array],
+        indices: &[(usize, usize)],
+    ) -> Result<ArrayRef, ArrowKernelError> {
+        let array_indices = UInt64Array::from(
+            indices
+                .iter()
+                .map(|(array_idx, _)| *array_idx as u64)
+                .collect::<Vec<_>>(),
+        );
+        let element_indices = UInt64Array::from(
+            indices
+                .iter()
+                .map(|(_, element_idx)| *element_idx as u64)
+                .collect::<Vec<_>>(),
+        );
+
+        INTERLEAVE_PROGRAM_CACHE.get((values, &array_indices, &element_indices), ())
     }
 
     /// Partitions an array into multiple arrays based on the partition indexes.

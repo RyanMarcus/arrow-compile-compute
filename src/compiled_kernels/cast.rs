@@ -2,13 +2,12 @@ use std::sync::Arc;
 
 use super::{ArrowKernelError, Kernel};
 use crate::{
-    compiled_kernels::{
-        dsl2::{
-            compile, dsl_args, DSLArgument, DSLContext, DSLFunction, DSLStmt, DSLType,
-            RunnableDSLFunction,
-        },
+    compiled_kernels::dsl2::{
+        compile, dsl_args, DSLArgument, DSLContext, DSLFunction, DSLStmt, DSLType,
+        RunnableDSLFunction,
     },
-    compiled_writers::WriterSpec, intersect_and_copy_nulls, logical_arrow_type, PrimitiveType,
+    compiled_writers::WriterSpec,
+    intersect_and_copy_nulls, logical_arrow_type, PrimitiveType,
 };
 use arrow_array::{
     cast::AsArray,
@@ -125,6 +124,9 @@ impl Kernel for CastKernel {
     type Output = ArrayRef;
 
     fn call(&self, inp: Self::Input<'_>) -> Result<Self::Output, ArrowKernelError> {
+        if inp.data_type() == &self.tar {
+            return Ok(make_array(inp.to_data()));
+        }
         let res = self.k.run(&dsl_args![inp])?[0].clone();
         assert_eq!(
             inp.len(),
@@ -191,6 +193,7 @@ mod tests {
         let data = Int32Array::from(vec![1, 2, 3, 4, 5]);
         let expected: ArrayRef = Arc::new(Int64Array::from(vec![1, 2, 3, 4, 5]));
         let k = CastKernel::compile(&(&data as &dyn Array), DataType::Int64).unwrap();
+        assert!(k.k.vectorized);
         let res = k.call(&data).unwrap();
         assert_eq!(&res, &expected);
     }
@@ -200,6 +203,7 @@ mod tests {
         let data = Int32Array::from((0..200).collect_vec());
         let expected: ArrayRef = Arc::new(Int64Array::from((0..200).collect_vec()));
         let k = CastKernel::compile(&(&data as &dyn Array), DataType::Int64).unwrap();
+        assert!(k.k.vectorized);
         let res = k.call(&data).unwrap();
         assert_eq!(&res, &expected);
     }
@@ -217,6 +221,7 @@ mod tests {
                 .collect_vec(),
         ));
         let k = CastKernel::compile(&(&data as &dyn Array), DataType::Int64).unwrap();
+        assert!(k.k.vectorized);
         let res = k.call(&data).unwrap();
         assert_eq!(&res, &expected);
     }
@@ -226,8 +231,20 @@ mod tests {
         let data = Int64Array::from((0..200).collect_vec());
         let expected: ArrayRef = Arc::new(UInt8Array::from((0..200).collect_vec()));
         let k = CastKernel::compile(&(&data as &dyn Array), DataType::UInt8).unwrap();
+        assert!(k.k.vectorized);
         let res = k.call(&data).unwrap();
         assert_eq!(&res, &expected);
+    }
+
+    #[test]
+    fn test_i32_to_i32_short_circuit() {
+        let data = Int32Array::from(vec![Some(1), None, Some(3), Some(4)]);
+        let k = CastKernel::compile(&(&data as &dyn Array), DataType::Int32).unwrap();
+
+        let res = k.call(&data).unwrap();
+        let res = res.as_primitive::<Int32Type>();
+
+        assert_eq!(res, &data);
     }
 
     #[test]
@@ -255,6 +272,7 @@ mod tests {
         let values = Int32Array::from(vec![-100, -200, -300, -400, -500, -600]);
         let da = DictionaryArray::new(keys, Arc::new(values));
         let k = CastKernel::compile(&(&da as &dyn Array), DataType::Int32).unwrap();
+        assert!(k.k.vectorized);
 
         let res = k.call(&da).unwrap();
         assert_eq!(

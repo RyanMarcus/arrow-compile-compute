@@ -19,7 +19,6 @@ use super::{LeafWriter, LeafWriterAllocation};
 pub struct PrimitiveArrayWriter<'a> {
     ingest_func: FunctionValue<'a>,
     ingest_vec_func: FunctionValue<'a>,
-    pt: PrimitiveType,
 }
 
 #[repr(C)]
@@ -181,7 +180,8 @@ impl<'a> LeafWriter<'a> for PrimitiveArrayWriter<'a> {
                 .unwrap()
                 .into_pointer_value();
 
-            b2.build_store(curr_ptr, val).unwrap();
+            let store = b2.build_store(curr_ptr, val).unwrap();
+            store.set_alignment(1).unwrap();
             let new_ptr = increment_pointer!(ctx, b2, curr_ptr, width * 64);
             b2.build_store(alloc_ptr, new_ptr).unwrap();
             b2.build_return(None).unwrap();
@@ -191,12 +191,7 @@ impl<'a> LeafWriter<'a> for PrimitiveArrayWriter<'a> {
         PrimitiveArrayWriter {
             ingest_func,
             ingest_vec_func,
-            pt: ty,
         }
-    }
-
-    fn llvm_ingest_type(&self, ctx: &'a Context) -> inkwell::types::BasicTypeEnum<'a> {
-        self.pt.llvm_type(ctx)
     }
 
     fn llvm_ingest(&self, _ctx: &'a Context, build: &Builder<'a>, val: BasicValueEnum<'a>) {

@@ -10,7 +10,9 @@ use arrow_array::types::UInt32Type;
 #[cfg(test)]
 use arrow_array::{ArrowPrimitiveType, PrimitiveArray};
 
-use arrow_array::{ArrayRef, BooleanArray, UInt16Array, UInt8Array};
+#[cfg(test)]
+use arrow_array::ArrayRef;
+use arrow_array::{BooleanArray, UInt16Array, UInt8Array};
 use arrow_array::{Datum, UInt32Array, UInt64Array};
 use arrow_schema::DataType;
 use inkwell::context::Context;
@@ -21,7 +23,7 @@ use strum_macros::EnumIter;
 
 use crate::compiled_iter::IteratorHolder;
 use crate::compiled_kernels::llvm_utils::StringSaver;
-use crate::{logical_arrow_type, ArrowKernelError, Predicate, PrimitiveType};
+use crate::{logical_arrow_type, ArrowKernelError, ListItemType, Predicate, PrimitiveType};
 
 mod buffer;
 mod compiler;
@@ -29,6 +31,7 @@ mod resolver;
 mod runtime;
 mod string_codegen;
 mod two_d;
+mod vectorize;
 mod writers;
 
 pub use self::writers::OutputSpec;
@@ -363,6 +366,16 @@ impl DSLType {
             DSLType::Buffer(ty, ..) => Some(DSLType::Primitive(*ty)),
             DSLType::Scalar(ty) => Some(*ty.clone()),
             DSLType::ConstScalar(_) => Some(self.clone()),
+            _ => None,
+        }
+    }
+
+    pub fn block_type(&self) -> Option<DSLType> {
+        match self {
+            DSLType::Primitive(pt) => Some(DSLType::Primitive(PrimitiveType::List(
+                ListItemType::try_from(*pt).ok()?,
+                64,
+            ))),
             _ => None,
         }
     }
@@ -754,10 +767,6 @@ impl DSLFunction {
         self.ret.push(OutputSpec::new(ty, length_tag));
     }
 
-    pub fn get_param(&self, n: usize) -> Option<DSLValue> {
-        self.params.get(n).cloned()
-    }
-
     pub fn accessed_parameters(&self) -> HashSet<usize> {
         let mut params = HashSet::new();
         for stmt in self.body.iter() {
@@ -775,8 +784,13 @@ impl DSLFunction {
     }
 }
 
+#[derive(Debug)]
 pub enum DSLStmt {
     Emit {
+        index: DSLExpr,
+        value: DSLExpr,
+    },
+    EmitBlock {
         index: DSLExpr,
         value: DSLExpr,
     },
@@ -792,6 +806,7 @@ pub enum DSLStmt {
         else_: Vec<DSLStmt>,
     },
     ForEach(DSLForEach),
+    ForEachBlock(DSLForEach),
     ForRange(DSLForRange),
 }
 
@@ -876,6 +891,7 @@ impl DSLStmt {
         })
     }
 
+    #[cfg(test)] // TODO might need this in the future
     pub fn emit_dynamic(index: DSLExpr, value: DSLExpr) -> Result<DSLStmt, ArrowKernelError> {
         Ok(DSLStmt::Emit { index, value })
     }
@@ -918,7 +934,7 @@ impl DSLStmt {
                     stmt.accessed_parameters(params);
                 }
             }
-            DSLStmt::ForEach(dslfor) => {
+            DSLStmt::ForEach(dslfor) | DSLStmt::ForEachBlock(dslfor) => {
                 for stmt in dslfor.body.iter() {
                     stmt.accessed_parameters(params);
                 }
@@ -928,7 +944,7 @@ impl DSLStmt {
                     stmt.accessed_parameters(params);
                 }
             }
-            DSLStmt::Emit { index, value } => {
+            DSLStmt::Emit { index, value } | DSLStmt::EmitBlock { index, value } => {
                 index.accessed_parameters(params);
                 value.accessed_parameters(params);
             }
@@ -963,6 +979,7 @@ impl DSLStmt {
     }
 }
 
+#[derive(Debug)]
 pub struct DSLForEach {
     /// variables inside the for loop
     loop_vars: Vec<DSLValue>,
@@ -972,6 +989,7 @@ pub struct DSLForEach {
     body: Vec<DSLStmt>,
 }
 
+#[derive(Debug)]
 pub struct DSLForRange {
     /// variable inside the for loop
     loop_var: DSLValue,
@@ -1556,6 +1574,39 @@ mod tests {
         assert_eq!(
             out.into_iter().map(|x| x.unwrap()).collect_vec(),
             vec![false, true, false, true]
+        );
+    }
+
+    #[test]
+    fn test_dsl2_bool_eq() {
+        let mut ctx = DSLContext::new();
+        let mut func = DSLFunction::new("bool_eq");
+        let arr_input = BooleanArray::new_null(0);
+        let sca_input = BooleanArray::new_scalar(true);
+
+        let arr = func.add_arg(&mut ctx, DSLType::array_like(&arr_input, "n"));
+        let sca = func.add_arg(&mut ctx, DSLType::array_like(&sca_input, "n"));
+        func.add_body(
+            DSLStmt::for_each(&mut ctx, &[arr, sca], |loop_vars| {
+                let cmp = loop_vars[0]
+                    .expr()
+                    .cmp(&loop_vars[1].expr(), DSLComparison::Eq)?;
+                DSLStmt::emit(0, cmp)
+            })
+            .unwrap(),
+        );
+        func.add_ret(WriterSpec::Boolean, "n");
+
+        let func = compile(func, dsl_args![arr_input, sca_input]).unwrap();
+
+        let arr = BooleanArray::from(vec![true, false, true, false]);
+        let sca = BooleanArray::new_scalar(true);
+        let result = func.run(&dsl_args![arr, sca]).unwrap();
+        let out = result.into_iter().next().unwrap();
+        let out = out.as_boolean();
+        assert_eq!(
+            out.into_iter().map(|x| x.unwrap()).collect_vec(),
+            vec![true, false, true, false]
         );
     }
 

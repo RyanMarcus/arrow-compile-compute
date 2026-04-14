@@ -125,7 +125,6 @@ impl REEAllocation {
 pub struct REEWriter<'a> {
     ingest_func: FunctionValue<'a>,
     flush_func: FunctionValue<'a>,
-    pt: PrimitiveType,
 }
 
 impl<'a> REEWriter<'a> {
@@ -148,13 +147,6 @@ impl<'a> REEWriter<'a> {
                 Self::llvm_init_typed::<Int64Type>(ctx, llvm_mod, build, value_spec, alloc_ptr)
             }
         }
-    }
-
-    pub fn llvm_ingest_type(
-        &self,
-        ctx: &'a inkwell::context::Context,
-    ) -> inkwell::types::BasicTypeEnum<'a> {
-        self.pt.llvm_type(ctx)
     }
 
     pub fn llvm_ingest(
@@ -306,7 +298,7 @@ impl<'a> REEWriter<'a> {
                     b2.build_int_compare(IntPredicate::EQ, cmp, i64_type.const_zero(), "matches")
                         .unwrap()
                 }
-                ComparisonType::List => todo!("implement list ree writer"),
+                ComparisonType::List(_) => todo!("implement list ree writer"),
             };
             b2.build_conditional_branch(matches, matches_prev, insert_next)
                 .unwrap();
@@ -413,7 +405,6 @@ impl<'a> REEWriter<'a> {
         Self {
             ingest_func,
             flush_func,
-            pt: value_type,
         }
     }
 }

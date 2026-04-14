@@ -113,54 +113,42 @@ fn sort_primitive<T: ArrowPrimitiveType>(
     }
 
     let values = values.as_primitive::<T>();
-    let mut indices = (0..values.len() as u32).collect_vec();
+    let mut valids = Vec::with_capacity(values.len());
+    let mut nulls = Vec::new();
 
-    if let Some(nulls) = values.nulls() {
-        indices.sort_by(|a, b| {
-            let a = *a as usize;
-            let b = *b as usize;
-            match (nulls.is_valid(a), nulls.is_valid(b)) {
-                (true, true) => unsafe {
-                    // safety: by construction, all values in `indices` are in bounds
-                    let cmp =
-                        T::Native::compare(values.value_unchecked(a), values.value_unchecked(b));
-                    if opts.descending {
-                        cmp.reverse()
-                    } else {
-                        cmp
-                    }
-                },
-                (true, false) => {
-                    if opts.nulls_first {
-                        Ordering::Greater
-                    } else {
-                        Ordering::Less
-                    }
-                }
-                (false, true) => {
-                    if opts.nulls_first {
-                        Ordering::Less
-                    } else {
-                        Ordering::Greater
-                    }
-                }
-                (false, false) => Ordering::Equal,
-            }
-        });
-    } else {
-        indices.sort_by(|a, b| {
-            let a = *a as usize;
-            let b = *b as usize;
-            let cmp = unsafe {
-                // safety: by construction, all values in `indices` are in bounds
-                T::Native::compare(values.value_unchecked(a), values.value_unchecked(b))
-            };
-            if opts.descending {
-                cmp.reverse()
+    if let Some(validity) = values.nulls() {
+        for index in 0..values.len() as u32 {
+            let index_usize = index as usize;
+            if validity.is_valid(index_usize) {
+                // safety: `index_usize` is in bounds by construction and marked valid above
+                let value = unsafe { values.value_unchecked(index_usize) };
+                valids.push((index, value));
             } else {
-                cmp
+                nulls.push(index);
             }
-        });
+        }
+    } else {
+        for index in 0..values.len() as u32 {
+            let index_usize = index as usize;
+            // safety: `index_usize` is in bounds by construction
+            let value = unsafe { values.value_unchecked(index_usize) };
+            valids.push((index, value));
+        }
+    }
+
+    valids.sort_unstable_by(|(lhs_idx, lhs_val), (rhs_idx, rhs_val)| {
+        let cmp = T::Native::compare(*lhs_val, *rhs_val);
+        let cmp = if opts.descending { cmp.reverse() } else { cmp };
+        cmp.then_with(|| lhs_idx.cmp(rhs_idx))
+    });
+
+    let mut indices = Vec::with_capacity(values.len());
+    if opts.nulls_first {
+        indices.extend(nulls);
+        indices.extend(valids.into_iter().map(|(index, _)| index));
+    } else {
+        indices.extend(valids.into_iter().map(|(index, _)| index));
+        indices.extend(nulls);
     }
 
     Ok(UInt32Array::from(indices))

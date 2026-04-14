@@ -204,6 +204,11 @@ mod tests {
         let arr2 = UInt32Array::new_scalar(10);
         for op in DSLArithBinOp::iter() {
             let k = BinOpKernel::compile(&(&arr1, &arr2), op).unwrap();
+            assert!(
+                !k.0.vectorized,
+                "scalar/scalar kernels should stay scalar for op {:?}",
+                op
+            );
             let res = k.call((&arr1, &arr2)).unwrap();
             let res = res.as_primitive::<UInt32Type>();
 

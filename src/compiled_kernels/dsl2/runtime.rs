@@ -24,10 +24,12 @@ struct PreparedInputs {
 pub struct RunnableDSLFunction {
     compiled: CompiledDSLFunction,
     resolver: Resolver,
+    #[allow(dead_code)] // used in tests
+    pub(crate) vectorized: bool,
 }
 
 impl RunnableDSLFunction {
-    pub fn new(compiled: CompiledDSLFunction) -> Result<Self, ArrowKernelError> {
+    pub fn new(compiled: CompiledDSLFunction, vectorized: bool) -> Result<Self, ArrowKernelError> {
         let inputs = compiled
             .borrow_f()
             .params
@@ -46,7 +48,11 @@ impl RunnableDSLFunction {
 
         let resolver = Resolver::new(inputs, outputs).map_err(ArrowKernelError::ResolveError)?;
 
-        Ok(Self { compiled, resolver })
+        Ok(Self {
+            compiled,
+            resolver,
+            vectorized,
+        })
     }
 
     pub fn run<'args>(

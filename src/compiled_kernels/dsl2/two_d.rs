@@ -13,14 +13,14 @@ use crate::{
 
 pub struct TwoDArrayRuntime {
     ptrs: Vec<*const c_void>,
-    ihs: Vec<IteratorHolder>,
+    _ihs: Vec<IteratorHolder>,
 }
 
 impl TwoDArrayRuntime {
     pub fn new(arrs: &[&dyn Datum]) -> Result<Self, ArrowKernelError> {
         let ihs: Vec<IteratorHolder> = arrs.iter().map(|arr| datum_to_iter(*arr)).try_collect()?;
         let ptrs = ihs.iter().map(|x| x.get_ptr()).collect_vec();
-        Ok(Self { ptrs, ihs })
+        Ok(Self { ptrs, _ihs: ihs })
     }
 
     pub fn get_ptr(&self) -> *const c_void {

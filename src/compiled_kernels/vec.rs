@@ -102,14 +102,16 @@ impl Kernel for DotKernel {
             WriterSpec::Primitive(PrimitiveType::for_arrow_type(vecs.values().data_type())),
             "n",
         );
-        func.add_body(
-            DSLStmt::for_each(&mut ctx, &[vecs_arg, q_arg], |loop_vars| {
+        func.add_body(DSLStmt::for_each(
+            &mut ctx,
+            &[vecs_arg, q_arg],
+            |loop_vars| {
                 let lhs = loop_vars[0].expr();
                 let rhs = loop_vars[1].expr();
                 let dot = lhs.arith(DSLArithBinOp::Mul, rhs)?.vec_sum()?;
                 DSLStmt::emit(0, dot)
-            })?,
-        );
+            },
+        )?);
 
         Ok(DotKernel(compile(
             func,
@@ -184,16 +186,14 @@ impl Kernel for NormVecKernel {
         let mut func = DSLFunction::new("norm_vec");
         let vecs_arg = func.add_arg(&mut ctx, DSLType::array_like(*inp, "n"));
         func.add_ret(WriterSpec::for_base_type_of_datum(*inp), "n");
-        func.add_body(
-            DSLStmt::for_each(&mut ctx, &[vecs_arg], |loop_vars| {
-                let vec = loop_vars[0].expr();
-                let squared = vec.arith(DSLArithBinOp::Mul, vec.clone())?;
-                let norm = squared.vec_sum()?.sqrt()?;
-                let norm_vec = norm.splat(value_length)?;
-                let normalized = vec.arith(DSLArithBinOp::Div, norm_vec)?;
-                DSLStmt::emit(0, normalized)
-            })?,
-        );
+        func.add_body(DSLStmt::for_each(&mut ctx, &[vecs_arg], |loop_vars| {
+            let vec = loop_vars[0].expr();
+            let squared = vec.arith(DSLArithBinOp::Mul, vec.clone())?;
+            let norm = squared.vec_sum()?.sqrt()?;
+            let norm_vec = norm.splat(value_length)?;
+            let normalized = vec.arith(DSLArithBinOp::Div, norm_vec)?;
+            DSLStmt::emit(0, normalized)
+        })?);
 
         Ok(NormVecKernel(compile(func, [DSLArgument::Datum(*inp)])?))
     }

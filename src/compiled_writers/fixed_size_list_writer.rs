@@ -19,7 +19,6 @@ use super::{LeafWriter, LeafWriterAllocation};
 /// Writer for fixed-size lists of primitives
 pub struct FixedSizeListWriter<'a> {
     ingest_func: FunctionValue<'a>,
-    pt: PrimitiveType,
 }
 
 #[repr(C)]
@@ -160,14 +159,7 @@ impl<'a> LeafWriter<'a> for FixedSizeListWriter<'a> {
             func
         };
 
-        FixedSizeListWriter {
-            ingest_func,
-            pt: ty,
-        }
-    }
-
-    fn llvm_ingest_type(&self, ctx: &'a Context) -> inkwell::types::BasicTypeEnum<'a> {
-        self.pt.llvm_type(ctx)
+        FixedSizeListWriter { ingest_func }
     }
 
     fn llvm_ingest(&self, _ctx: &'a Context, build: &Builder<'a>, val: BasicValueEnum<'a>) {

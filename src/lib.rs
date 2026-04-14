@@ -19,7 +19,7 @@ use inkwell::{
     context::Context,
     types::{BasicTypeEnum, VectorType},
     values::FunctionValue,
-    AddressSpace, IntPredicate,
+    AddressSpace,
 };
 
 mod arrow_interface;
@@ -325,12 +325,12 @@ pub enum PrimitiveType {
     List(ListItemType, usize),
 }
 
-#[derive(Copy, Clone, Debug)]
-enum ComparisonType {
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) enum ComparisonType {
     Int { signed: bool },
     Float,
     String,
-    List,
+    List(Box<ComparisonType>),
 }
 
 impl std::fmt::Display for PrimitiveType {
@@ -537,7 +537,7 @@ impl PrimitiveType {
         }
     }
 
-    fn comparison_type(&self) -> ComparisonType {
+    pub(crate) fn comparison_type(&self) -> ComparisonType {
         match self {
             PrimitiveType::I8 | PrimitiveType::I16 | PrimitiveType::I32 | PrimitiveType::I64 => {
                 ComparisonType::Int { signed: true }
@@ -546,7 +546,9 @@ impl PrimitiveType {
                 ComparisonType::Int { signed: false }
             }
             PrimitiveType::P64x2 => ComparisonType::String,
-            PrimitiveType::List(_, _) => ComparisonType::List,
+            PrimitiveType::List(lt, _) => {
+                ComparisonType::List(Box::new(PrimitiveType::from(*lt).comparison_type()))
+            }
             PrimitiveType::F16 | PrimitiveType::F32 | PrimitiveType::F64 => ComparisonType::Float,
         }
     }
@@ -573,6 +575,16 @@ impl PrimitiveType {
             PrimitiveType::F32 => Some(NumericPrimitiveType::F32),
             PrimitiveType::F64 => Some(NumericPrimitiveType::F64),
             _ => None,
+        }
+    }
+
+    pub fn as_list(&self, s: usize) -> Option<PrimitiveType> {
+        match self {
+            PrimitiveType::List(_, _) => None,
+            _ => Some(PrimitiveType::List(
+                ListItemType::try_from(self.clone()).ok()?,
+                s,
+            )),
         }
     }
 }
@@ -662,39 +674,6 @@ pub enum Predicate {
     Lte,
     Gt,
     Gte,
-}
-
-impl Predicate {
-    fn as_int_pred(&self, signed: bool) -> IntPredicate {
-        match (self, signed) {
-            (Predicate::Eq, _) => IntPredicate::EQ,
-            (Predicate::Ne, _) => IntPredicate::NE,
-            (Predicate::Lt, true) => IntPredicate::SLT,
-            (Predicate::Lt, false) => IntPredicate::ULT,
-            (Predicate::Lte, true) => IntPredicate::SLE,
-            (Predicate::Lte, false) => IntPredicate::ULE,
-            (Predicate::Gt, true) => IntPredicate::SGT,
-            (Predicate::Gt, false) => IntPredicate::UGT,
-            (Predicate::Gte, true) => IntPredicate::SGE,
-            (Predicate::Gte, false) => IntPredicate::UGE,
-        }
-    }
-
-    /// Returns the variant of this predicate that produces the same answer if
-    /// the operands are flipped. For example:
-    ///
-    /// `(A == B) == (B == A)`
-    /// `(A > B) == (B < A)`
-    fn flip(&self) -> Predicate {
-        match self {
-            Predicate::Eq => Predicate::Eq,
-            Predicate::Ne => Predicate::Ne,
-            Predicate::Lt => Predicate::Gt,
-            Predicate::Lte => Predicate::Gte,
-            Predicate::Gt => Predicate::Lt,
-            Predicate::Gte => Predicate::Lte,
-        }
-    }
 }
 
 struct ArrayDatum(ArrayRef);

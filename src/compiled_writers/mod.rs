@@ -8,7 +8,6 @@ use inkwell::{
     builder::Builder,
     context::Context,
     module::Module,
-    types::BasicTypeEnum,
     values::{BasicValueEnum, PointerValue, VectorValue},
 };
 
@@ -51,7 +50,6 @@ pub trait LeafWriter<'a> {
         alloc_ptr: PointerValue<'a>,
     ) -> Self;
 
-    fn llvm_ingest_type(&self, ctx: &'a Context) -> BasicTypeEnum<'a>;
     fn llvm_ingest(&self, ctx: &'a Context, build: &Builder<'a>, val: BasicValueEnum<'a>);
     fn llvm_flush(&self, ctx: &'a Context, build: &Builder<'a>);
 
@@ -461,19 +459,6 @@ pub enum Writer<'a> {
 }
 
 impl<'a> Writer<'a> {
-    pub fn llvm_ingest_type(&self, ctx: &'a Context) -> BasicTypeEnum<'a> {
-        match self {
-            Self::Primitive(writer) => writer.llvm_ingest_type(ctx),
-            Self::Boolean(writer) => writer.llvm_ingest_type(ctx),
-            Self::String(writer) => writer.llvm_ingest_type(ctx),
-            Self::LargeString(writer) => writer.llvm_ingest_type(ctx),
-            Self::StringView(writer) => writer.llvm_ingest_type(ctx),
-            Self::FixedSizeList(writer) => writer.llvm_ingest_type(ctx),
-            Self::Dictionary(writer) => writer.llvm_ingest_type(ctx),
-            Self::RunEndEncoded(writer) => writer.llvm_ingest_type(ctx),
-        }
-    }
-
     pub fn llvm_ingest(&self, ctx: &'a Context, build: &Builder<'a>, val: BasicValueEnum<'a>) {
         match self {
             Self::Primitive(writer) => writer.llvm_ingest(ctx, build, val),

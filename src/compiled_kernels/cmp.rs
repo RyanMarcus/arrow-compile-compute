@@ -476,12 +476,18 @@ mod tests {
     };
 
     #[test]
-    fn test_num_num_cmp() {
-        let a = UInt32Array::from(vec![1, 2, 3]);
-        let b = UInt32Array::from(vec![11, 0, 13]);
+    fn test_num_num_cmp_nonnull() {
+        let mut rng = fastrand::Rng::with_seed(42);
+        let a = (0..100).map(|_| rng.u32(0..100)).collect_vec();
+        let b = (0..100).map(|_| rng.u32(0..100)).collect_vec();
+        let answer = a.iter().zip(b.iter()).map(|(a, b)| a < b).collect_vec();
+
+        let a = UInt32Array::from(a);
+        let b = UInt32Array::from(b);
         let k = ComparisonKernel::compile(&(&a, &b), Predicate::Lt).unwrap();
+        assert!(k.0.vectorized);
         let r = k.call((&a, &b)).unwrap();
-        assert_eq!(r, BooleanArray::from(vec![true, false, true]));
+        assert_eq!(r, BooleanArray::from(answer));
     }
 
     #[test]
@@ -489,6 +495,7 @@ mod tests {
         let a = UInt32Array::from(vec![Some(1), Some(2), None]);
         let b = UInt32Array::from(vec![Some(11), Some(0), Some(13)]);
         let k = ComparisonKernel::compile(&(&a, &b), Predicate::Lt).unwrap();
+        assert!(k.0.vectorized);
         let r = k.call((&a, &b)).unwrap();
         assert_eq!(r, BooleanArray::from(vec![Some(true), Some(false), None]));
     }
@@ -498,6 +505,7 @@ mod tests {
         let a = UInt32Array::from((0..100).collect_vec());
         let b = UInt32Array::from((1..101).collect_vec());
         let k = ComparisonKernel::compile(&(&a, &b), Predicate::Lt).unwrap();
+        assert!(k.0.vectorized);
         let r = k.call((&a, &b)).unwrap();
         assert_eq!(r, BooleanArray::from(vec![true; 100]))
     }
@@ -541,6 +549,7 @@ mod tests {
 
         // Compare equality
         let k = ComparisonKernel::compile(&(&dict_arr, &ree), Predicate::Eq).unwrap();
+        assert!(k.0.vectorized);
         let r = k.call((&dict_arr, &ree)).unwrap();
 
         assert_eq!(r, BooleanArray::from(vec![true; n]));
@@ -551,6 +560,7 @@ mod tests {
         let a = UInt32Array::from((0..100).collect_vec());
         let b = Scalar::new(UInt32Array::from(vec![5]));
         let k = ComparisonKernel::compile(&(&a, &b), Predicate::Lt).unwrap();
+        assert!(k.0.vectorized);
         let r = k.call((&a, &b)).unwrap();
 
         let expected_result = (0..100).map(|i| i < 5).collect::<Vec<bool>>();
@@ -562,6 +572,7 @@ mod tests {
         let a = Float32Array::from((0..100).map(|i| i as f32).collect_vec());
         let b = Float32Array::from((1..101).map(|i| i as f32).collect_vec());
         let k = ComparisonKernel::compile(&(&a, &b), Predicate::Lt).unwrap();
+        assert!(k.0.vectorized);
         let r = k.call((&a, &b)).unwrap();
         assert_eq!(r, BooleanArray::from(vec![true; 100]))
     }
@@ -571,6 +582,7 @@ mod tests {
         let a = Float32Array::from((0..100).map(|i| i as f32).collect_vec());
         let b = Scalar::new(Float32Array::from(vec![5.0]));
         let k = ComparisonKernel::compile(&(&a, &b), Predicate::Lt).unwrap();
+        assert!(k.0.vectorized);
         let r = k.call((&a, &b)).unwrap();
 
         let expected_result = (0..100).map(|i| i < 5).collect::<Vec<bool>>();
@@ -582,6 +594,7 @@ mod tests {
         let a = Float32Array::from(vec![-93294.49]);
         let b = Float32Array::new_scalar(-205150180000.0);
         let k = ComparisonKernel::compile(&(&a, &b), Predicate::Lt).unwrap();
+        assert!(k.0.vectorized);
         let r = k.call((&a, &b)).unwrap();
 
         let res = (-93294.49_f32).total_cmp(&-205150180000.0) == Ordering::Less;
@@ -593,6 +606,7 @@ mod tests {
         let a = Int32Array::from(vec![1, 2, 3, 4]);
         let b = Int64Array::from(vec![4, 3, 2, 1]);
         let k = ComparisonKernel::compile(&(&a, &b), Predicate::Lt).unwrap();
+        assert!(k.0.vectorized);
         let r = k.call((&a, &b)).unwrap();
 
         let expected_result = vec![true, true, false, false];
@@ -681,6 +695,7 @@ mod tests {
         let lb = Scalar::new(Int32Array::from(vec![2]));
         let ub = Scalar::new(Int32Array::from(vec![5]));
         let k = BetweenKernel::compile(&(&a, &lb, &ub), ()).unwrap();
+        assert!(k.0.vectorized);
         let r = k.call((&a, &lb, &ub)).unwrap();
         assert_eq!(
             r,

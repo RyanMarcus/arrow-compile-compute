@@ -3,11 +3,11 @@ mod arith;
 mod cast;
 pub(crate) mod cmp;
 mod concat;
-pub(crate) mod error_types;
-pub mod dsl;
 mod dsl2;
+pub(crate) mod error_types;
 mod filter;
 pub(crate) mod ht;
+mod interleave;
 mod llvm_utils;
 mod null_utils;
 mod partition;
@@ -30,6 +30,7 @@ pub use concat::concat_all;
 pub use dsl2::DSLArithBinOp;
 pub use filter::FilterKernel;
 pub use ht::{HashFunction, HashKernel};
+pub use interleave::InterleaveKernel;
 use inkwell::execution_engine::ExecutionEngine;
 use llvm_utils::str_writer_append_bytes;
 pub use null_utils::intersect_and_copy_nulls;
@@ -42,8 +43,8 @@ pub use take::TakeKernel;
 pub use vec::{DotKernel, NormVecKernel};
 
 use self::{
-    error_types::DSLError,
     dsl2::{DSLExpr, DSLType},
+    error_types::DSLError,
 };
 use inkwell::{
     builder::Builder,
@@ -56,8 +57,8 @@ use inkwell::{
 };
 use thiserror::Error;
 
+use crate::compiled_kernels::llvm_utils::save_ptrs_to_string_saver;
 use crate::compiled_kernels::llvm_utils::str_view_writer_append_bytes;
-use crate::compiled_kernels::llvm_utils::{save_ptrs_to_string_saver, save_to_string_saver};
 use crate::llvm_debug::debug_i64;
 use crate::llvm_debug::debug_ptr;
 use crate::PrimitiveType;
@@ -209,10 +210,6 @@ pub(crate) fn link_req_helpers(
 
     if let Some(func) = module.get_function("str_view_writer_append_bytes") {
         ee.add_global_mapping(&func, str_view_writer_append_bytes as *const () as usize);
-    }
-
-    if let Some(func) = module.get_function("save_to_string_saver") {
-        ee.add_global_mapping(&func, save_to_string_saver as *const () as usize);
     }
 
     if let Some(func) = module.get_function("save_ptrs_to_string_saver") {

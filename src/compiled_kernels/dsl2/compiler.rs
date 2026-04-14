@@ -28,23 +28,23 @@ use ouroboros::self_referencing;
 
 use crate::{
     compiled_iter::{
-        array_to_setbit_iter, datum_to_iter, generate_next, generate_random_access,
-        generate_reset_iterator, get_iterator_length,
+        array_to_setbit_iter, datum_to_iter, generate_next, generate_next_block,
+        generate_random_access, generate_reset_iterator, get_iterator_length,
     },
     compiled_kernels::{
-        cmp::{add_float_to_int, add_memcmp},
+        cmp::{add_float_to_int, add_float_vec_to_int_vec, add_memcmp},
         dsl2::{
-            add_str_endswith, add_str_startswith, buffer::DSLBuffer,
-            runtime::RunnableDSLFunction, two_d, writers::accepted_type, DSLArgument,
-            DSLArgumentType, DSLArithBinOp, DSLBitwiseBinOp, DSLExpr, DSLFunction, DSLStmt,
-            DSLStringPredicate, DSLType, DSLValue,
+            add_str_endswith, add_str_startswith, buffer::DSLBuffer, runtime::RunnableDSLFunction,
+            two_d, vectorize, writers::accepted_type, DSLArgument, DSLArgumentType, DSLArithBinOp,
+            DSLBitwiseBinOp, DSLExpr, DSLFunction, DSLStmt, DSLStringPredicate, DSLType, DSLValue,
         },
         link_req_helpers,
         llvm_utils::llvm_add_save_ptrs_string_saver,
         optimize_module,
     },
     compiled_writers::Writer,
-    increment_pointer, set_noalias_params, ArrowKernelError, NumericPrimitiveType, PrimitiveType,
+    increment_pointer, set_noalias_params, ArrowKernelError, ComparisonType, NumericPrimitiveType,
+    PrimitiveType,
 };
 
 pub enum KernelReturnCode {
@@ -94,6 +94,21 @@ fn dsl_type_to_llvm_type<'a>(ctx: &'a Context, v: &DSLType) -> BasicTypeEnum<'a>
     }
 }
 
+fn build_entry_alloca<'ctx>(
+    ctx: &DSLCompilationContext<'ctx, '_>,
+    ty: BasicTypeEnum<'ctx>,
+    name: &str,
+) -> inkwell::values::PointerValue<'ctx> {
+    let builder = ctx.ctx.create_builder();
+    let entry = ctx.func.get_first_basic_block().unwrap();
+    if let Some(first_instr) = entry.get_first_instruction() {
+        builder.position_before(&first_instr);
+    } else {
+        builder.position_at_end(entry);
+    }
+    builder.build_alloca(ty, name).unwrap()
+}
+
 pub struct DSLCompilationContext<'ctx, 'a> {
     pub ctx: &'ctx Context,
     pub module: &'a Module<'ctx>,
@@ -102,11 +117,13 @@ pub struct DSLCompilationContext<'ctx, 'a> {
     pub st: HashMap<usize, BasicValueEnum<'a>>,
     pub access_funcs: HashMap<usize, FunctionValue<'a>>,
     pub next_funcs: HashMap<usize, FunctionValue<'a>>,
+    pub next_block_funcs: HashMap<usize, FunctionValue<'a>>,
     pub writer_funcs: HashMap<usize, FunctionValue<'a>>,
     pub reset_funcs: HashMap<usize, FunctionValue<'a>>,
     pub lengths: HashMap<usize, Option<IntValue<'a>>>,
     pub output_specs: Vec<crate::compiled_writers::WriterSpec>,
     pub outputs: Vec<Writer<'a>>,
+    pub did_vectorize: &'a mut bool,
 }
 
 #[self_referencing]
@@ -132,20 +149,22 @@ pub fn compile<'a>(
         .map(|(arg, dsl_type)| arg.get_type(dsl_type))
         .collect_vec();
 
+    let mut did_vectorize = false;
     let func = CompiledDSLFunctionTryBuilder {
         ctx,
         f,
         arg_types,
-        compiled_builder: |ctx, f| compile_inner(ctx, f, args),
+        compiled_builder: |ctx, f| compile_inner(ctx, f, args, &mut did_vectorize),
     }
     .try_build()?;
-    RunnableDSLFunction::new(func)
+    RunnableDSLFunction::new(func, did_vectorize)
 }
 
 pub fn compile_inner<'ctx, 'args>(
     ctx: &'ctx Context,
     f: &DSLFunction,
     args: impl IntoIterator<Item = DSLArgument<'args>>,
+    did_vectorize: &mut bool,
 ) -> Result<JitFunction<'ctx, unsafe extern "C" fn(*mut c_void) -> u64>, ArrowKernelError> {
     let module = ctx.create_module("dsl2");
     let args: Vec<_> = args.into_iter().collect();
@@ -197,6 +216,7 @@ pub fn compile_inner<'ctx, 'args>(
     let mut st = HashMap::new();
     let mut access_funcs = HashMap::new();
     let mut next_funcs = HashMap::new();
+    let mut next_block_funcs = HashMap::new();
     let mut writer_funcs = HashMap::new();
     let mut ihs = HashMap::new();
     let mut lengths = HashMap::new();
@@ -338,6 +358,31 @@ pub fn compile_inner<'ctx, 'args>(
         };
     }
 
+    // setup block iterators
+    for idx in f.iterated_parameters() {
+        let param = names_to_params[&idx];
+        let arg = &names_to_args[&idx];
+
+        match &param.ty {
+            DSLType::Scalar(_) | DSLType::Array(..) | DSLType::SetBits(_) => {
+                let ih = &ihs[&idx];
+
+                if let Some(next_func) = generate_next_block::<64>(
+                    &ctx,
+                    &module,
+                    &format!("next_block_{}", param.name),
+                    &arg.data_type(),
+                    ih,
+                ) {
+                    next_block_funcs.insert(param.name, next_func);
+                } else {
+                    continue;
+                }
+            }
+            _ => return Err(ArrowKernelError::NonIterableType(param.ty.clone())),
+        };
+    }
+
     // compute all lengths
     for param in f.params.iter() {
         if let Some(ih) = ihs.get(&param.name) {
@@ -405,11 +450,13 @@ pub fn compile_inner<'ctx, 'args>(
         st,
         access_funcs,
         next_funcs,
+        next_block_funcs,
         writer_funcs,
         reset_funcs,
         output_specs,
         lengths,
         outputs: writers,
+        did_vectorize,
     };
 
     for stmt in f.body.iter() {
@@ -526,6 +573,22 @@ fn compile_stmt<'ctx, 'a>(
                 .unwrap();
             ctx.b.position_at_end(emit_worked);
         }
+        DSLStmt::EmitBlock { index, value } => {
+            let index = index.as_u32().ok_or_else(|| {
+                ArrowKernelError::DSLTypeMismatch(
+                    "block emit requires const index",
+                    DSLType::scalar_of(PrimitiveType::U32),
+                    index.get_type(),
+                )
+            })?;
+
+            let value = compile_expr(ctx, value)?;
+            ctx.outputs[index as usize].llvm_ingest_block(
+                ctx.ctx,
+                ctx.b,
+                value.into_vector_value(),
+            );
+        }
         DSLStmt::Set {
             buf,
             index,
@@ -615,35 +678,28 @@ fn compile_stmt<'ctx, 'a>(
             ctx.b.position_at_end(after_if);
         }
         DSLStmt::ForEach(floop) => {
-            let loop_header = ctx.ctx.append_basic_block(*ctx.func, "loop_header");
-            let loop_body = ctx.ctx.append_basic_block(*ctx.func, "loop_body");
-            let loop_end = ctx.ctx.append_basic_block(*ctx.func, "loop_end");
-
-            floop.iterators.iter().for_each(|itr| {
-                ctx.b
-                    .build_call(
-                        ctx.reset_funcs[&itr.name],
-                        &[ctx.st[&itr.name].into()],
-                        "reset",
-                    )
-                    .unwrap();
-            });
-            ctx.b.build_unconditional_branch(loop_header).unwrap();
-            // in the loop header, call next on all iterators and `and` together
-            // the results
-            ctx.b.position_at_end(loop_header);
+            // attempt to vectorize
+            if let Some(floop) = vectorize::vectorize_for_each(&ctx, &floop) {
+                compile_stmt(ctx, &DSLStmt::ForEachBlock(floop))?;
+                // continue below to generate the tail loop
+            }
 
             let bufs = floop
                 .loop_vars
                 .iter()
                 .map(|iter| iter.ty.llvm_type(ctx.ctx).unwrap())
                 .enumerate()
-                .map(|(i, llvm_type)| {
-                    ctx.b
-                        .build_alloca(llvm_type, &format!("iter_buf{}", i))
-                        .unwrap()
-                })
+                .map(|(i, llvm_type)| build_entry_alloca(ctx, llvm_type, &format!("iter_buf{}", i)))
                 .collect_vec();
+
+            let loop_header = ctx.ctx.append_basic_block(*ctx.func, "loop_header");
+            let loop_body = ctx.ctx.append_basic_block(*ctx.func, "loop_body");
+            let loop_end = ctx.ctx.append_basic_block(*ctx.func, "loop_end");
+
+            ctx.b.build_unconditional_branch(loop_header).unwrap();
+            // in the loop header, call next on all iterators and `and` together
+            // the results
+            ctx.b.position_at_end(loop_header);
 
             let mut last_res = None;
             for (iter, buf_ptr) in floop.iterators.iter().zip(bufs.iter()) {
@@ -704,15 +760,91 @@ fn compile_stmt<'ctx, 'a>(
             }
 
             ctx.b.position_at_end(loop_end);
+            floop.iterators.iter().for_each(|itr| {
+                ctx.b
+                    .build_call(
+                        ctx.reset_funcs[&itr.name],
+                        &[ctx.st[&itr.name].into()],
+                        "reset",
+                    )
+                    .unwrap();
+            });
+        }
+        DSLStmt::ForEachBlock(bfloop) => {
+            *ctx.did_vectorize = true;
+
+            let bufs = bfloop
+                .loop_vars
+                .iter()
+                .map(|iter| iter.ty.llvm_type(ctx.ctx).unwrap())
+                .enumerate()
+                .map(|(i, llvm_type)| build_entry_alloca(ctx, llvm_type, &format!("iter_buf{}", i)))
+                .collect_vec();
+
+            let loop_header = ctx.ctx.append_basic_block(*ctx.func, "bloop_header");
+            let loop_body = ctx.ctx.append_basic_block(*ctx.func, "bloop_body");
+            let loop_end = ctx.ctx.append_basic_block(*ctx.func, "bloop_end");
+
+            ctx.b.build_unconditional_branch(loop_header).unwrap();
+            // in the loop header, call next on all iterators and `and` together
+            // the results
+            ctx.b.position_at_end(loop_header);
+
+            let mut last_res = None;
+            for (iter, buf_ptr) in bfloop.iterators.iter().zip(bufs.iter()) {
+                let next_func = ctx.next_block_funcs[&iter.name];
+                let iter_ptr = ctx.st[&iter.name];
+                let had_next = ctx
+                    .b
+                    .build_call(
+                        next_func,
+                        &[iter_ptr.into(), (*buf_ptr).into()],
+                        &format!("next_block{}", iter.name),
+                    )
+                    .unwrap()
+                    .try_as_basic_value()
+                    .unwrap_basic()
+                    .into_int_value();
+
+                last_res = last_res
+                    .map(|v| ctx.b.build_and(v, had_next, "and").unwrap())
+                    .or(Some(had_next))
+            }
+            ctx.b
+                .build_conditional_branch(last_res.unwrap(), loop_body, loop_end)
+                .unwrap();
+
+            ctx.b.position_at_end(loop_body);
+            for (loop_var, buf_ptr) in bfloop.loop_vars.iter().zip(bufs) {
+                let val = ctx
+                    .b
+                    .build_load(
+                        loop_var.ty.llvm_type(ctx.ctx).unwrap(),
+                        buf_ptr,
+                        &format!("load{}", loop_var.name),
+                    )
+                    .unwrap();
+
+                ctx.st.insert(loop_var.name, val);
+            }
+
+            for stmt in bfloop.body.iter() {
+                compile_stmt(ctx, &stmt)?;
+            }
+
+            // if every loop variable is a scalar, just do one iteration
+            if bfloop.iterators.iter().all(|it| it.ty.is_infinite()) {
+                ctx.b.build_unconditional_branch(loop_end).unwrap();
+            } else {
+                ctx.b.build_unconditional_branch(loop_header).unwrap();
+            }
+            ctx.b.position_at_end(loop_end);
         }
         DSLStmt::ForRange(dslfor) => {
             let start_at = compile_expr(ctx, &dslfor.start)?;
             let end_at = compile_expr(ctx, &dslfor.end)?.into_int_value();
 
-            let counter_ptr = ctx
-                .b
-                .build_alloca(ctx.ctx.i64_type(), "loop_counter")
-                .unwrap();
+            let counter_ptr = build_entry_alloca(ctx, ctx.ctx.i64_type().into(), "loop_counter");
             ctx.b.build_store(counter_ptr, start_at).unwrap();
 
             let loop_header = ctx.ctx.append_basic_block(*ctx.func, "loop_header");
@@ -797,67 +929,129 @@ fn compile_expr<'ctx, 'a>(
                 ));
             }
 
-            let signed = lhs_type.is_signed().unwrap();
             let lhs = compile_expr(ctx, lhs)?;
             let rhs = compile_expr(ctx, rhs)?;
-
-            if lhs.is_float_value() {
-                let cvt = add_float_to_int(ctx.ctx, ctx.module, lhs_type.as_primitive().unwrap());
-                let lhs = ctx
-                    .b
-                    .build_call(cvt, &[lhs.into()], "cvt_lhs_for_total_order")
-                    .unwrap()
-                    .try_as_basic_value()
-                    .unwrap_basic();
-                let rhs = ctx
-                    .b
-                    .build_call(cvt, &[rhs.into()], "cvt_rhs_for_total_order")
-                    .unwrap()
-                    .try_as_basic_value()
-                    .unwrap_basic();
-                Ok(ctx
+            match lhs_type {
+                DSLType::Boolean => Ok(ctx
                     .b
                     .build_int_compare(
-                        op.as_int_predicate(true),
+                        op.as_int_predicate(false),
                         lhs.into_int_value(),
                         rhs.into_int_value(),
                         "cmp",
                     )
                     .unwrap()
-                    .as_basic_value_enum())
-            } else if lhs.is_int_value() {
-                Ok(ctx
-                    .b
-                    .build_int_compare(
-                        op.as_int_predicate(signed),
-                        lhs.into_int_value(),
-                        rhs.into_int_value(),
-                        "cmp",
-                    )
-                    .unwrap()
-                    .as_basic_value_enum())
-            } else if lhs_type.as_primitive() == Some(PrimitiveType::P64x2) {
-                let memcmp = add_memcmp(ctx.ctx, ctx.module);
-                let memcmp_res = ctx
-                    .b
-                    .build_call(memcmp, &[lhs.into(), rhs.into()], "memcmp_res")
-                    .unwrap()
-                    .try_as_basic_value()
-                    .unwrap_basic()
-                    .into_int_value();
+                    .as_basic_value_enum()),
+                DSLType::Primitive(pt) => match pt.comparison_type() {
+                    ComparisonType::Float => {
+                        let cvt = add_float_to_int(ctx.ctx, ctx.module, pt);
+                        let lhs = ctx
+                            .b
+                            .build_call(cvt, &[lhs.into()], "cvt_lhs_for_total_order")
+                            .unwrap()
+                            .try_as_basic_value()
+                            .unwrap_basic();
+                        let rhs = ctx
+                            .b
+                            .build_call(cvt, &[rhs.into()], "cvt_rhs_for_total_order")
+                            .unwrap()
+                            .try_as_basic_value()
+                            .unwrap_basic();
+                        Ok(ctx
+                            .b
+                            .build_int_compare(
+                                op.as_int_predicate(true),
+                                lhs.into_int_value(),
+                                rhs.into_int_value(),
+                                "cmp",
+                            )
+                            .unwrap()
+                            .as_basic_value_enum())
+                    }
+                    ComparisonType::Int { signed } => Ok(ctx
+                        .b
+                        .build_int_compare(
+                            op.as_int_predicate(signed),
+                            lhs.into_int_value(),
+                            rhs.into_int_value(),
+                            "cmp",
+                        )
+                        .unwrap()
+                        .as_basic_value_enum()),
+                    ComparisonType::String => {
+                        let memcmp = add_memcmp(ctx.ctx, ctx.module);
+                        let memcmp_res = ctx
+                            .b
+                            .build_call(memcmp, &[lhs.into(), rhs.into()], "memcmp_res")
+                            .unwrap()
+                            .try_as_basic_value()
+                            .unwrap_basic()
+                            .into_int_value();
 
-                Ok(ctx
-                    .b
-                    .build_int_compare(
-                        op.as_int_predicate(true),
-                        memcmp_res,
-                        ctx.ctx.i64_type().const_zero(),
-                        "cmp",
-                    )
-                    .unwrap()
-                    .as_basic_value_enum())
-            } else {
-                todo!()
+                        Ok(ctx
+                            .b
+                            .build_int_compare(
+                                op.as_int_predicate(true),
+                                memcmp_res,
+                                ctx.ctx.i64_type().const_zero(),
+                                "cmp",
+                            )
+                            .unwrap()
+                            .as_basic_value_enum())
+                    }
+                    ComparisonType::List(t) => match *t {
+                        ComparisonType::Int { signed } => Ok(ctx
+                            .b
+                            .build_int_compare(
+                                op.as_int_predicate(signed),
+                                lhs.into_vector_value(),
+                                rhs.into_vector_value(),
+                                "cmpv",
+                            )
+                            .unwrap()
+                            .as_basic_value_enum()),
+                        ComparisonType::Float => {
+                            let cvt = add_float_vec_to_int_vec(
+                                ctx.ctx,
+                                ctx.module,
+                                64,
+                                pt.list_type_into_inner(),
+                            );
+                            let lhs = ctx
+                                .b
+                                .build_call(cvt, &[lhs.into()], "cvt_lhs_for_total_order")
+                                .unwrap()
+                                .try_as_basic_value()
+                                .unwrap_basic();
+                            let rhs = ctx
+                                .b
+                                .build_call(cvt, &[rhs.into()], "cvt_rhs_for_total_order")
+                                .unwrap()
+                                .try_as_basic_value()
+                                .unwrap_basic();
+                            Ok(ctx
+                                .b
+                                .build_int_compare(
+                                    op.as_int_predicate(true),
+                                    lhs.into_vector_value(),
+                                    rhs.into_vector_value(),
+                                    "cmpfv",
+                                )
+                                .unwrap()
+                                .as_basic_value_enum())
+                        }
+                        ComparisonType::String | ComparisonType::List(_) => {
+                            Err(ArrowKernelError::DSLInvalidType(
+                                "comparison not implemented for this list type",
+                                lhs_type,
+                            ))
+                        }
+                    },
+                },
+                _ => Err(ArrowKernelError::DSLInvalidType(
+                    "comparison requires boolean or primitive values",
+                    lhs_type,
+                )),
             }
         }
         DSLExpr::At(v, i) => {
@@ -1452,8 +1646,25 @@ fn compile_expr<'ctx, 'a>(
                         .build_bit_cast(inverted_bits, pt.llvm_type(ctx.ctx), "bit_not_float")
                         .unwrap())
                 }
+                DSLType::Primitive(pt) if matches!(pt, PrimitiveType::List(_, _)) => {
+                    let int_v_type =
+                        PrimitiveType::int_with_width(pt.list_type_into_inner().width())
+                            .llvm_vec_type(ctx.ctx, 64)
+                            .unwrap();
+
+                    let value_bits = ctx
+                        .b
+                        .build_bit_cast(value, int_v_type, "bit_not_bits")
+                        .unwrap()
+                        .into_vector_value();
+                    let inverted_bits = ctx.b.build_not(value_bits, "bit_not").unwrap();
+                    Ok(ctx
+                        .b
+                        .build_bit_cast(inverted_bits, pt.llvm_type(ctx.ctx), "bit_not_vec")
+                        .unwrap())
+                }
                 _ => Err(ArrowKernelError::DSLInvalidType(
-                    "can only bit_not numeric primitive types or booleans",
+                    "invalid type for bit_not",
                     v.get_type(),
                 )),
             }

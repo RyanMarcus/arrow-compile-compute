@@ -42,6 +42,7 @@ fn concat_with_spec(data: &[&dyn Array], spec: &WriterSpec) -> Result<ArrayRef, 
         CONCAT_PROGRAM_CACHE.get((*arr, &mut alloc), ())?;
     }
 
+    assert_eq!(alloc.len(), total_els);
     let arr = alloc.into_array_ref(nulls);
     coalesce_type(
         arr,
