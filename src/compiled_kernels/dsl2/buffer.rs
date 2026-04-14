@@ -42,6 +42,21 @@ impl DSLBuffer {
         }
     }
 
+    pub fn empty_like(other: &Self) -> Self {
+        Self::new(other.ty, 0)
+    }
+
+    pub fn ensure_capacity(&mut self, capacity: usize) {
+        if self.len as usize >= capacity {
+            return;
+        }
+        let capacity_bytes = capacity * self.ty.width();
+
+        self.buf.resize(capacity_bytes, 0);
+        self.len = capacity as u64;
+        self.ptr = self.buf.as_mut_ptr() as *mut c_void;
+    }
+
     pub fn into_array(mut self) -> ArrayRef {
         self.buf.truncate(self.ty.width() * self.len as usize);
         match self.ty {

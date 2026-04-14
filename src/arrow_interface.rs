@@ -715,55 +715,59 @@ pub mod compute {
 /// Grouped aggregation kernels, following a ["ticketing" approach](https://arxiv.org/abs/2505.04153).
 ///
 /// Aggregators can `ingest` data, `merge` with other aggregators (of the same
-/// type), and `finalize` to produce the final aggregation results.
+/// type), and `finalize` to produce the final aggregation results. Callers are
+/// responsible for allocating enough capacity before ingestion. For grouped
+/// aggregation, reserve at least `max_ticket + 1` slots; for ungrouped
+/// aggregation, reserve one slot when the input is non-empty.
+///
+/// ```
+/// use arrow_array::{cast::AsArray, types::Int32Type, Array, Int32Array};
+/// use arrow_compile_compute::aggregate::{self, Aggregator};
+///
+/// let arr = Int32Array::from(vec![3, 1, 5]);
+/// let mut agg = aggregate::min(arr.data_type()).unwrap();
+/// agg.ensure_capacity(1);
+/// agg.ingest_ungrouped(&[&arr]).unwrap();
+///
+/// let result = agg.finish().unwrap();
+/// let result = result.as_primitive::<Int32Type>();
+/// assert_eq!(result.len(), 1);
+/// assert_eq!(result.value(0), 1);
+/// ```
 ///
 pub mod aggregate {
     use arrow_schema::DataType;
 
     pub use crate::compiled_kernels::{
-        CountAggregator, MaxAggregator, MinAggregator, MostRecentAggregator, SumAggregator,
+        Aggregator, CountAggregator, MaxAggregator, MinAggregator, MostRecentAggregator,
+        SumAggregator,
     };
     use crate::ArrowKernelError;
 
     /// Creates a new sum aggregator. Final results are 64-bit versions of their
     /// inputs (e.g., `f32` is summed to `f64`).
-    pub fn sum(
-        ty: &DataType,
-        expected_unique: Option<usize>,
-    ) -> Result<SumAggregator, ArrowKernelError> {
-        Ok(SumAggregator::new(&[ty], expected_unique.unwrap_or(1024)))
+    pub fn sum(ty: &DataType) -> Result<Box<impl Aggregator>, ArrowKernelError> {
+        SumAggregator::create(&[ty])
     }
 
     /// Creates a new min aggregator. Final results will match the input type.
-    pub fn min(
-        ty: &DataType,
-        expected_unique: Option<usize>,
-    ) -> Result<MinAggregator, ArrowKernelError> {
-        Ok(MinAggregator::new(&[ty], expected_unique.unwrap_or(1024)))
+    pub fn min(ty: &DataType) -> Result<Box<impl Aggregator>, ArrowKernelError> {
+        MinAggregator::create(&[ty])
     }
 
     /// Creates a new max aggregator. Final results will match the input type.
-    pub fn max(
-        ty: &DataType,
-        expected_unique: Option<usize>,
-    ) -> Result<MaxAggregator, ArrowKernelError> {
-        Ok(MaxAggregator::new(&[ty], expected_unique.unwrap_or(1024)))
+    pub fn max(ty: &DataType) -> Result<Box<impl Aggregator>, ArrowKernelError> {
+        MaxAggregator::create(&[ty])
     }
 
     /// Creates a new count aggregator. Final results will be `u64`.
-    pub fn count(expected_unique: Option<usize>) -> Result<CountAggregator, ArrowKernelError> {
-        Ok(CountAggregator::new(&[], expected_unique.unwrap_or(1024)))
+    pub fn count() -> Result<Box<impl Aggregator>, ArrowKernelError> {
+        CountAggregator::create(&[])
     }
 
     /// Creates a new most recent aggregator. Final result will match the input type.
-    pub fn most_recent(
-        ty: &DataType,
-        expected_unique: Option<usize>,
-    ) -> Result<MostRecentAggregator, ArrowKernelError> {
-        Ok(MostRecentAggregator::new(
-            &[ty],
-            expected_unique.unwrap_or(1024),
-        ))
+    pub fn most_recent(ty: &DataType) -> Result<Box<impl Aggregator>, ArrowKernelError> {
+        MostRecentAggregator::create(&[ty])
     }
 }
 

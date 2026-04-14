@@ -3,10 +3,9 @@ mod errors;
 mod expressions;
 mod kernels;
 pub(crate) mod string_funcs;
-#[cfg(test)]
-mod tests;
 mod types;
 
+#[allow(unused_imports)]
 pub use errors::DSLError;
 #[allow(unused_imports)]
 pub use expressions::KernelExpression;
@@ -16,4 +15,4 @@ pub use kernels::{
     KernelParameters, MappedKernelProgram, SealedKernelProgram,
 };
 #[allow(unused_imports)]
-pub use types::{base_type, DictKeyType, KernelInput, KernelOutputType, RunEndType};
+pub use types::{DictKeyType, KernelInput, KernelOutputType, RunEndType};

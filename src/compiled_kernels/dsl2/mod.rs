@@ -2,7 +2,6 @@ use std::collections::HashSet;
 use std::fmt::Debug;
 #[cfg(test)]
 use std::ops::{BitAnd, BitOr, BitXor};
-use std::process::CommandEnvs;
 use std::sync::Arc;
 use std::{ffi::c_void, marker::PhantomData};
 
@@ -21,13 +20,14 @@ use itertools::Itertools;
 use strum_macros::EnumIter;
 
 use crate::compiled_iter::IteratorHolder;
-use crate::compiled_kernels::dsl::base_type;
-use crate::{ArrowKernelError, Predicate, PrimitiveType};
+use crate::compiled_kernels::llvm_utils::StringSaver;
+use crate::{logical_arrow_type, ArrowKernelError, Predicate, PrimitiveType};
 
 mod buffer;
 mod compiler;
 mod resolver;
 mod runtime;
+mod string_codegen;
 mod two_d;
 mod writers;
 
@@ -35,6 +35,7 @@ pub use self::writers::OutputSpec;
 pub use buffer::DSLBuffer;
 pub use compiler::compile;
 pub use runtime::RunnableDSLFunction;
+pub(crate) use string_codegen::{add_str_endswith, add_str_startswith};
 pub use writers::{OutputSlot, WriterSpec};
 
 pub struct DSLContext {
@@ -59,6 +60,7 @@ pub enum DSLArgumentType {
     SetBits,
     TwoDArray(Vec<DataType>),
     Buffer(PrimitiveType),
+    StringSaver,
 }
 
 impl DSLArgumentType {
@@ -126,6 +128,7 @@ impl DSLArgumentType {
                     })
                     .map(|_| ())
             }
+            (DSLArgumentType::StringSaver, DSLArgument::StringSaver(_)) => Ok(()),
             _ => Err(format!("argument type mismatch, expected {:?}", self)),
         }
     }
@@ -143,6 +146,7 @@ pub enum DSLArgument<'a> {
         primitive_type: PrimitiveType,
         _borrow: PhantomData<&'a mut buffer::DSLBuffer>,
     },
+    StringSaver(*mut c_void),
 }
 
 impl<'a> DSLArgument<'a> {
@@ -163,6 +167,10 @@ impl<'a> DSLArgument<'a> {
             primitive_type: value.ty,
             _borrow: PhantomData,
         }
+    }
+
+    pub fn string_saver(value: &mut StringSaver) -> Self {
+        DSLArgument::StringSaver(value as *mut StringSaver as *mut c_void)
     }
 
     pub fn get_type(&self, dsl_ty: &DSLType) -> DSLArgumentType {
@@ -191,14 +199,14 @@ impl<'a> DSLArgument<'a> {
                     .collect_vec(),
             ),
             DSLArgument::Buffer { primitive_type, .. } => DSLArgumentType::Buffer(*primitive_type),
+            DSLArgument::StringSaver(_) => DSLArgumentType::StringSaver,
         }
     }
 
     pub fn as_datum(&self) -> Option<&dyn Datum> {
         match self {
             DSLArgument::Datum(d) => Some(*d),
-            DSLArgument::TwoDArray(_) => None,
-            DSLArgument::Buffer { .. } => todo!(),
+            _ => None,
         }
     }
 
@@ -214,6 +222,7 @@ impl<'a> DSLArgument<'a> {
             DSLArgument::Datum(d) => d.get().0.data_type().clone(),
             DSLArgument::TwoDArray(a) => a[0].get().0.data_type().clone(),
             DSLArgument::Buffer { primitive_type, .. } => primitive_type.as_arrow_type(),
+            DSLArgument::StringSaver(_) => DataType::Utf8,
         }
     }
 
@@ -230,6 +239,7 @@ impl<'a> DSLArgument<'a> {
             (DSLArgument::Datum(..), DSLType::Array(..)) => true,
             (DSLArgument::TwoDArray(..), DSLType::TwoDArray(..)) => true,
             (DSLArgument::Buffer { .. }, DSLType::Buffer(..)) => true,
+            (DSLArgument::StringSaver(..), DSLType::StringSaver) => true,
             _ => false,
         }
     }
@@ -289,6 +299,7 @@ impl Debug for DSLArgument<'_> {
                 .field("ptr", ptr)
                 .field("primitive_type", primitive_type)
                 .finish(),
+            Self::StringSaver(_) => f.debug_tuple("StringSaver").finish(),
         }
     }
 }
@@ -303,6 +314,7 @@ pub enum DSLType {
     SetBits(String),
     TwoDArray(Box<DSLType>),
     Buffer(PrimitiveType, String),
+    StringSaver,
 }
 
 impl PartialEq for DSLType {
@@ -318,6 +330,7 @@ impl PartialEq for DSLType {
             (DSLType::SetBits(a_len), DSLType::SetBits(b_len)) => a_len == b_len,
             (DSLType::TwoDArray(a), DSLType::TwoDArray(b)) => a == b,
             (DSLType::Buffer(a, a_len), DSLType::Buffer(b, b_len)) => a == b && a_len == b_len,
+            (DSLType::StringSaver, DSLType::StringSaver) => true,
             _ => false,
         }
     }
@@ -336,6 +349,7 @@ impl Debug for DSLType {
             }
             DSLType::TwoDArray(ty) => f.debug_tuple("TwoDArray").field(ty).finish(),
             DSLType::Buffer(ty, len) => f.debug_tuple("Buffer").field(ty).field(len).finish(),
+            DSLType::StringSaver => f.debug_tuple("StringSaver").finish(),
         }
     }
 }
@@ -388,6 +402,7 @@ impl DSLType {
             DSLType::Array(t, ..) => t.is_signed(),
             DSLType::TwoDArray(t, ..) => t.is_signed(),
             DSLType::Buffer(t, ..) => Some(t.is_signed()),
+            DSLType::StringSaver => None,
         }
     }
 
@@ -445,7 +460,7 @@ impl DSLType {
 
     pub fn array_like<S: Into<String>>(arr: &dyn Datum, len_expr: S) -> Self {
         let (arr, is_scalar) = arr.get();
-        match base_type(arr.data_type()) {
+        match logical_arrow_type(arr.data_type()) {
             DataType::Null => todo!(),
             DataType::Boolean => {
                 if is_scalar {
@@ -769,10 +784,12 @@ pub enum DSLStmt {
         buf: DSLValue,
         index: DSLExpr,
         value: DSLExpr,
+        saver: Option<DSLValue>,
     },
     If {
         cond: DSLExpr,
         then: Vec<DSLStmt>,
+        else_: Vec<DSLStmt>,
     },
     ForEach(DSLForEach),
     ForRange(DSLForRange),
@@ -836,6 +853,19 @@ impl DSLStmt {
         Ok(DSLStmt::If {
             cond,
             then: then.into(),
+            else_: vec![],
+        })
+    }
+
+    pub fn cond_else<S: Into<Vec<DSLStmt>>, E: Into<Vec<DSLStmt>>>(
+        cond: DSLExpr,
+        then: S,
+        else_: E,
+    ) -> Result<DSLStmt, ArrowKernelError> {
+        Ok(DSLStmt::If {
+            cond,
+            then: then.into(),
+            else_: else_.into(),
         })
     }
 
@@ -859,14 +889,32 @@ impl DSLStmt {
             buf: buf.clone(),
             index: index.clone(),
             value: value.clone(),
+            saver: None,
+        })
+    }
+
+    pub fn set_with_saver(
+        buf: &DSLValue,
+        index: &DSLExpr,
+        value: &DSLExpr,
+        saver: &DSLValue,
+    ) -> Result<DSLStmt, ArrowKernelError> {
+        Ok(DSLStmt::Set {
+            buf: buf.clone(),
+            index: index.clone(),
+            value: value.clone(),
+            saver: Some(saver.clone()),
         })
     }
 
     pub fn accessed_parameters(&self, params: &mut HashSet<usize>) {
         match self {
-            DSLStmt::If { cond, then } => {
+            DSLStmt::If { cond, then, else_ } => {
                 cond.accessed_parameters(params);
                 for stmt in then.iter() {
+                    stmt.accessed_parameters(params);
+                }
+                for stmt in else_.iter() {
                     stmt.accessed_parameters(params);
                 }
             }
@@ -884,7 +932,9 @@ impl DSLStmt {
                 index.accessed_parameters(params);
                 value.accessed_parameters(params);
             }
-            DSLStmt::Set { buf, index, value } => {
+            DSLStmt::Set {
+                buf, index, value, ..
+            } => {
                 params.insert(buf.name);
                 index.accessed_parameters(params);
                 value.accessed_parameters(params);
@@ -900,8 +950,11 @@ impl DSLStmt {
                     stmt.iterated_parameters(params);
                 }
             }
-            DSLStmt::If { then, .. } => {
+            DSLStmt::If { then, else_, .. } => {
                 for stmt in then.iter() {
+                    stmt.iterated_parameters(params);
+                }
+                for stmt in else_.iter() {
                     stmt.iterated_parameters(params);
                 }
             }
@@ -1162,7 +1215,9 @@ impl DSLExpr {
     pub fn vec_sum(&self) -> Result<DSLExpr, ArrowKernelError> {
         match self.get_type() {
             DSLType::Primitive(PrimitiveType::List(item, _))
-                if PrimitiveType::from(item).as_numeric_primitive_type().is_some() =>
+                if PrimitiveType::from(item)
+                    .as_numeric_primitive_type()
+                    .is_some() =>
             {
                 Ok(DSLExpr::VecSum(Box::new(self.clone())))
             }
@@ -1229,7 +1284,9 @@ impl DSLExpr {
                 v.get_type().as_primitive().unwrap().width(),
             )),
             DSLExpr::Bswap(v) | DSLExpr::BitNot(v) | DSLExpr::Sqrt(v) => v.get_type(),
-            DSLExpr::VecSum(v) => DSLType::Primitive(v.get_type().as_primitive().unwrap().list_type_into_inner()),
+            DSLExpr::VecSum(v) => {
+                DSLType::Primitive(v.get_type().as_primitive().unwrap().list_type_into_inner())
+            }
             DSLExpr::Splat(v, size) => DSLType::Primitive(PrimitiveType::List(
                 v.get_type().as_primitive().unwrap().try_into().unwrap(),
                 *size,
@@ -1295,26 +1352,21 @@ impl From<usize> for DSLExpr {
 
 #[cfg(test)]
 mod tests {
-    use std::{collections::HashSet, sync::Arc};
-
     use arrow_array::{
-        builder::{FixedSizeListBuilder, Float32Builder, Int32Builder},
+        builder::{FixedSizeListBuilder, Int32Builder},
         cast::AsArray,
         types::{Float32Type, Int32Type, UInt32Type, UInt64Type},
-        ArrayRef, BooleanArray, Datum, Float32Array, Int32Array, StringArray, UInt32Array,
+        BooleanArray, Float32Array, Int32Array, StringArray, UInt32Array,
     };
-    use arrow_buffer::{Buffer, MutableBuffer, ScalarBuffer};
     use arrow_schema::DataType;
     use itertools::Itertools;
 
     use crate::{
         compiled_kernels::{
             cast::coalesce_type,
-            dsl::DSLKernel,
             dsl2::{
-                buffer::DSLBuffer, compiler::compile, writers::WriterSpec, DSLArgument,
-                DSLComparison, DSLContext, DSLForEach, DSLFunction, DSLStmt, DSLType, DSLValue,
-                OutputSpec,
+                buffer::DSLBuffer, compiler::compile, writers::WriterSpec, DSLComparison,
+                DSLContext, DSLFunction, DSLStmt, DSLType, DSLValue, OutputSpec,
             },
         },
         ListItemType, PrimitiveType,
@@ -1862,7 +1914,10 @@ mod tests {
         let func = compile(func, dsl_args![input]).unwrap();
         let result = func.run(&dsl_args![input]).unwrap();
         let result = result[0].as_fixed_size_list();
-        assert_eq!(result.value(0).as_primitive::<Float32Type>().values(), &[1.0, 1.0]);
+        assert_eq!(
+            result.value(0).as_primitive::<Float32Type>().values(),
+            &[1.0, 1.0]
+        );
         assert_eq!(
             result.value(1).as_primitive::<Float32Type>().values(),
             &[-2.5, -2.5]

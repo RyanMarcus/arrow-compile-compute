@@ -36,7 +36,7 @@ pub use view_writer::StringViewAllocation;
 pub use view_writer::StringViewWriter;
 pub use view_writer::ViewBufferWriter;
 
-use crate::{ListItemType, PrimitiveType};
+use crate::{normalized_base_type, ListItemType, PrimitiveType};
 
 pub trait LeafWriter<'a> {
     type Allocation: LeafWriterAllocation;
@@ -351,21 +351,6 @@ impl WriterSpec {
                 Box::new(Self::for_data_type(values.data_type())),
             ),
         }
-    }
-}
-
-fn normalized_base_type(dt: &DataType) -> DataType {
-    match dt {
-        DataType::Binary
-        | DataType::FixedSizeBinary(_)
-        | DataType::LargeBinary
-        | DataType::BinaryView
-        | DataType::Utf8
-        | DataType::LargeUtf8
-        | DataType::Utf8View => DataType::Utf8,
-        DataType::Dictionary(_, values) => normalized_base_type(values.as_ref()),
-        DataType::RunEndEncoded(_, values) => normalized_base_type(values.data_type()),
-        _ => dt.clone(),
     }
 }
 

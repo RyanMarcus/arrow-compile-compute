@@ -177,6 +177,9 @@ impl RunnableDSLFunction {
                 DSLArgument::Buffer { ptr, .. } => {
                     prepared.ptrs.push(*ptr);
                 }
+                DSLArgument::StringSaver(ptr) => {
+                    prepared.ptrs.push(*ptr);
+                }
             }
         }
 

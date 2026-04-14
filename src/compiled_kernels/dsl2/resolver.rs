@@ -1,12 +1,8 @@
-use std::{
-    collections::{BTreeMap, HashMap},
-    fmt::Error,
-};
+use std::collections::{BTreeMap, HashMap};
 
-use inkwell::llvm_sys::orc2::LLVMOrcSymbolPredicate;
 use itertools::Itertools;
 use lincomdb::{LinComDB, QueryError};
-use num_rational::{Ratio, Rational, Rational32};
+use num_rational::Ratio;
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum SizeTerm {

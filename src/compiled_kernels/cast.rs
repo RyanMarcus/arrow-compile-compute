@@ -3,14 +3,12 @@ use std::sync::Arc;
 use super::{ArrowKernelError, Kernel};
 use crate::{
     compiled_kernels::{
-        dsl::base_type,
         dsl2::{
             compile, dsl_args, DSLArgument, DSLContext, DSLFunction, DSLStmt, DSLType,
             RunnableDSLFunction,
         },
     },
-    compiled_writers::WriterSpec,
-    intersect_and_copy_nulls, PrimitiveType,
+    compiled_writers::WriterSpec, intersect_and_copy_nulls, logical_arrow_type, PrimitiveType,
 };
 use arrow_array::{
     cast::AsArray,
@@ -150,7 +148,7 @@ impl Kernel for CastKernel {
         func.add_ret(w, "n");
         func.add_body(DSLStmt::for_each(&mut ctx, &[arg1], |loop_vars| {
             let v = &loop_vars[0].expr();
-            let v = if base_type(&tar) == DataType::Boolean {
+            let v = if logical_arrow_type(&tar) == DataType::Boolean {
                 v.cast_to_bool()?
             } else {
                 v.primitive_cast(PrimitiveType::for_arrow_type(&tar))?

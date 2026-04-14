@@ -1,8 +1,9 @@
-mod aggregate;
+mod aggregate2;
 mod arith;
 mod cast;
 pub(crate) mod cmp;
 mod concat;
+pub(crate) mod error_types;
 pub mod dsl;
 mod dsl2;
 mod filter;
@@ -18,8 +19,8 @@ mod take;
 mod vec;
 use std::{collections::HashMap, sync::RwLock};
 
-pub use aggregate::{
-    CountAggregator, MaxAggregator, MinAggregator, MostRecentAggregator, SumAggregator,
+pub use aggregate2::{
+    Aggregator, CountAggregator, MaxAggregator, MinAggregator, MostRecentAggregator, SumAggregator,
 };
 pub use arith::BinOpKernel;
 use arrow_schema::DataType;
@@ -41,7 +42,7 @@ pub use take::TakeKernel;
 pub use vec::{DotKernel, NormVecKernel};
 
 use self::{
-    dsl::DSLError,
+    error_types::DSLError,
     dsl2::{DSLExpr, DSLType},
 };
 use inkwell::{
@@ -55,8 +56,8 @@ use inkwell::{
 };
 use thiserror::Error;
 
-use crate::compiled_kernels::llvm_utils::save_to_string_saver;
 use crate::compiled_kernels::llvm_utils::str_view_writer_append_bytes;
+use crate::compiled_kernels::llvm_utils::{save_ptrs_to_string_saver, save_to_string_saver};
 use crate::llvm_debug::debug_i64;
 use crate::llvm_debug::debug_ptr;
 use crate::PrimitiveType;
@@ -212,6 +213,10 @@ pub(crate) fn link_req_helpers(
 
     if let Some(func) = module.get_function("save_to_string_saver") {
         ee.add_global_mapping(&func, save_to_string_saver as *const () as usize);
+    }
+
+    if let Some(func) = module.get_function("save_ptrs_to_string_saver") {
+        ee.add_global_mapping(&func, save_ptrs_to_string_saver as *const () as usize);
     }
 
     if let Some(func) = module.get_function("debug_i64") {

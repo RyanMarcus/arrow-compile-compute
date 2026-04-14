@@ -215,6 +215,21 @@ pub fn logical_arrow_type(dt: &DataType) -> DataType {
     }
 }
 
+pub(crate) fn normalized_base_type(dt: &DataType) -> DataType {
+    match dt {
+        DataType::Binary
+        | DataType::FixedSizeBinary(_)
+        | DataType::LargeBinary
+        | DataType::BinaryView
+        | DataType::Utf8
+        | DataType::LargeUtf8
+        | DataType::Utf8View => DataType::Utf8,
+        DataType::Dictionary(_, values) => normalized_base_type(values.as_ref()),
+        DataType::RunEndEncoded(_, values) => normalized_base_type(values.data_type()),
+        _ => dt.clone(),
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum PrimitiveSuperType {
     Int,

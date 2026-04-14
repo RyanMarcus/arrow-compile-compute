@@ -230,17 +230,3 @@ impl KernelOutputType {
         Ok(())
     }
 }
-
-pub fn base_type(dt: &DataType) -> DataType {
-    match dt {
-        DataType::Binary
-        | DataType::LargeBinary
-        | DataType::BinaryView
-        | DataType::Utf8
-        | DataType::LargeUtf8
-        | DataType::Utf8View => DataType::Utf8,
-        DataType::Dictionary(_k, v) => *v.clone(),
-        DataType::RunEndEncoded(_re, v) => v.data_type().clone(),
-        _ => dt.clone(),
-    }
-}

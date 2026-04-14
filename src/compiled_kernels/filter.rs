@@ -4,13 +4,12 @@ use arrow_buffer::NullBuffer;
 use arrow_schema::DataType;
 
 use crate::compiled_kernels::cast::coalesce_type;
-use crate::compiled_kernels::dsl::base_type;
 use crate::compiled_kernels::dsl2::{
     compile, dsl_args, DSLArgument, DSLContext, DSLFunction, DSLStmt, DSLType, RunnableDSLFunction,
 };
 use crate::compiled_kernels::null_utils::replace_nulls;
 use crate::compiled_writers::WriterSpec;
-use crate::{logical_nulls, ArrowKernelError};
+use crate::{logical_nulls, normalized_base_type, ArrowKernelError};
 
 use crate::compiled_kernels::Kernel;
 
@@ -44,7 +43,7 @@ impl Kernel for FilterKernel {
             res = replace_nulls(res, Some(filtered_nulls));
         }
 
-        let base_dt = base_type(inp.0.data_type());
+        let base_dt = normalized_base_type(inp.0.data_type());
         res = coalesce_type(res, &base_dt)?;
 
         Ok(res)
@@ -167,6 +166,25 @@ mod tests {
         let res = k.call((&data, &filt)).unwrap();
 
         assert_eq!(res.as_primitive::<Int32Type>().values(), &[1, 1, 3, 3]);
+    }
+
+    #[test]
+    fn test_filter_recursive_ree_dict() {
+        let values = Int32Array::from(vec![1, 2, 3]);
+        let values = arrow_cast::cast(
+            &values,
+            &dictionary_data_type(DataType::Int8, DataType::Int32),
+        )
+        .unwrap();
+        let ends = Int32Array::from(vec![2, 4, 6]);
+        let data = RunArray::<Int32Type>::try_new(&ends, values.as_ref()).unwrap();
+        let filt = BooleanArray::from(vec![true, false, true, false, true, false]);
+
+        let k = FilterKernel::compile(&(&data, &filt), ()).unwrap();
+        let res = k.call((&data, &filt)).unwrap();
+
+        assert_eq!(res.data_type(), &DataType::Int32);
+        assert_eq!(res.as_primitive::<Int32Type>().values(), &[1, 2, 3]);
     }
 
     #[test]

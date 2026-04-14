@@ -12,7 +12,6 @@ use itertools::Itertools;
 use crate::{
     compiled_kernels::{
         cast::coalesce_type,
-        dsl::base_type,
         dsl2::{
             compile, DSLArgument, DSLBuffer, DSLContext, DSLFunction, DSLStmt, DSLType, DSLValue,
             RunnableDSLFunction,
@@ -20,7 +19,7 @@ use crate::{
         null_utils::replace_nulls,
         DSLArithBinOp,
     },
-    iter, logical_nulls, ArrowKernelError, Kernel, PrimitiveType,
+    iter, logical_nulls, normalized_base_type, ArrowKernelError, Kernel, PrimitiveType,
 };
 
 pub struct PartitionKernel(RunnableDSLFunction);
@@ -90,7 +89,7 @@ impl Kernel for PartitionKernel {
             res = replace_nulls(res, Some(new_nulls));
         }
 
-        res = coalesce_type(res, &base_type(arr.data_type()))?;
+        res = coalesce_type(res, &normalized_base_type(arr.data_type()))?;
 
         let mut consumed = 0;
         let partitions = part_offsets[..part_offsets.len() - 1]

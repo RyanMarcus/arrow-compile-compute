@@ -18,15 +18,15 @@ use super::{
     context::{CompilationContext, VEC_SIZE},
     errors::DSLError,
     string_funcs::{add_str_endswith, add_str_startswith},
-    types::{base_type, KernelInput, KernelInputType},
+    types::{KernelInput, KernelInputType},
 };
 use crate::{
     compiled_kernels::{
         cmp::{add_float_vec_to_int_vec, add_memcmp},
         gen_convert_numeric_vec,
     },
-    declare_blocks, increment_pointer, pointer_diff, ComparisonType, Predicate, PrimitiveSuperType,
-    PrimitiveType,
+    declare_blocks, increment_pointer, normalized_base_type, pointer_diff, ComparisonType,
+    Predicate, PrimitiveSuperType, PrimitiveType,
 };
 
 macro_rules! vec_or_scalar_op {
@@ -397,7 +397,7 @@ impl<'a> KernelExpression<'a> {
 
     pub(super) fn get_type(&self) -> DataType {
         match self {
-            KernelExpression::Item(kernel_input) => base_type(&kernel_input.data_type()),
+            KernelExpression::Item(kernel_input) => normalized_base_type(&kernel_input.data_type()),
             KernelExpression::Truncate(..) => DataType::Binary,
             KernelExpression::Select { v1, .. } => v1.get_type(),
             KernelExpression::Cmp(..)
@@ -407,7 +407,7 @@ impl<'a> KernelExpression<'a> {
             | KernelExpression::StartsWith(..)
             | KernelExpression::EndsWith(..) => DataType::Boolean,
             KernelExpression::IntConst(..) | KernelExpression::StrLen(..) => DataType::UInt64,
-            KernelExpression::At { iter, .. } => base_type(&iter.data_type()),
+            KernelExpression::At { iter, .. } => normalized_base_type(&iter.data_type()),
             KernelExpression::Convert(_expr, pt) => pt.as_arrow_type(),
             KernelExpression::Add(lhs, _)
             | KernelExpression::Sub(lhs, _)

@@ -4,12 +4,11 @@ use arrow_buffer::NullBuffer;
 use arrow_schema::DataType;
 
 use crate::compiled_kernels::cast::coalesce_type;
-use crate::compiled_kernels::dsl::base_type;
 use crate::compiled_kernels::dsl2::{
     self, dsl_args, DSLContext, DSLFunction, DSLStmt, DSLType, WriterSpec,
 };
 use crate::compiled_kernels::null_utils::replace_nulls;
-use crate::{arrow_interface, logical_nulls, ArrowKernelError, PrimitiveType};
+use crate::{arrow_interface, logical_nulls, normalized_base_type, ArrowKernelError, PrimitiveType};
 
 use crate::compiled_kernels::dsl2::RunnableDSLFunction;
 use crate::compiled_kernels::Kernel;
@@ -50,7 +49,7 @@ impl Kernel for TakeKernel {
         }
 
         let mut res = self.0.run(&dsl_args!(arr, idx))?[0].clone();
-        res = coalesce_type(res, &base_type(arr.data_type()))?;
+        res = coalesce_type(res, &normalized_base_type(arr.data_type()))?;
 
         if let Some(nulls) = logical_nulls(arr)? {
             let ba = BooleanArray::new(nulls.into_inner(), None);
@@ -108,9 +107,10 @@ mod tests {
         BooleanArray, Int32Array, Int64Array, RunArray, StringArray, UInt16Array, UInt32Array,
         UInt8Array,
     };
+    use arrow_schema::DataType;
     use itertools::Itertools;
 
-    use crate::compiled_kernels::Kernel;
+    use crate::{compiled_kernels::Kernel, dictionary_data_type};
 
     use super::TakeKernel;
 
@@ -200,6 +200,25 @@ mod tests {
         let res = k.call((&data, &idxes)).unwrap();
         let res = res.as_primitive::<Int32Type>();
         assert_eq!(res.values(), &[1, 1, 2, 2, 3, 4, 5]);
+    }
+
+    #[test]
+    fn test_take_recursive_ree_dict() {
+        let values = Int32Array::from(vec![1, 2, 3]);
+        let values = arrow_cast::cast(
+            &values,
+            &dictionary_data_type(DataType::Int8, DataType::Int32),
+        )
+        .unwrap();
+        let ends = Int32Array::from(vec![2, 4, 6]);
+        let data = RunArray::<Int32Type>::try_new(&ends, values.as_ref()).unwrap();
+        let idxes = UInt8Array::from(vec![0, 2, 5]);
+
+        let k = TakeKernel::compile(&(&data, &idxes), ()).unwrap();
+        let res = k.call((&data, &idxes)).unwrap();
+
+        assert_eq!(res.data_type(), &DataType::Int32);
+        assert_eq!(res.as_primitive::<Int32Type>().values(), &[1, 2, 3]);
     }
 
     #[test]
