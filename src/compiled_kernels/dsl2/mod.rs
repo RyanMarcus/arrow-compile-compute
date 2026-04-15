@@ -319,6 +319,8 @@ pub enum DSLType {
     Buffer(PrimitiveType, String),
     StringSaver,
 }
+unsafe impl Send for DSLType {}
+unsafe impl Sync for DSLType {}
 
 impl PartialEq for DSLType {
     fn eq(&self, other: &DSLType) -> bool {
