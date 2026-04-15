@@ -238,7 +238,7 @@ impl Aggregator for MostRecentAggregator {
                 "most recent agg ingest takes exactly one input".to_string(),
             ));
         }
-        self.debug_assert_capacity_for_tickets(tickets, self.buf.len as usize);
+        self.ensure_capacity_for_tickets(tickets);
         if self.ss.is_empty() {
             self.ss.push(StringSaver::default());
         }

@@ -209,7 +209,7 @@ impl Aggregator for SumAggregator {
                 "sum ingest takes exactly one input".to_string(),
             ));
         }
-        self.debug_assert_capacity_for_tickets(tickets, self.buf.len as usize);
+        self.ensure_capacity_for_tickets(tickets);
         AGG_PROGRAM_CACHE.get((&mut self.buf, &data[0], tickets), ())?;
         Ok(())
     }

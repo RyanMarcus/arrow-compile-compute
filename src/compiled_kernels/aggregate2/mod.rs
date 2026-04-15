@@ -28,35 +28,10 @@ pub trait Aggregator {
     fn create(tys: &[&DataType]) -> Result<Box<Self>, ArrowKernelError>;
 
     /// Ensures the aggregator has storage for at least `capacity` groups.
-    ///
-    /// This must be called before `ingest` when tickets may address groups that
-    /// are not yet backed by internal buffers.
     fn ensure_capacity(&mut self, capacity: usize);
-
-    /// Checks, in debug and test builds, that the caller reserved enough
-    /// capacity for the provided ticket array.
-    ///
-    /// Release builds skip this check entirely.
-    #[allow(unused_variables)]
-    fn debug_assert_capacity_for_tickets(&self, tickets: &UInt64Array, capacity: usize) {
-        #[cfg(any(debug_assertions, test))]
-        if let Some(max_ticket) = tickets.values().iter().copied().max() {
-            let required_capacity = usize::try_from(max_ticket + 1)
-                .expect("ticket index exceeds addressable buffer size");
-            debug_assert!(
-                capacity >= required_capacity,
-                "aggregator capacity {} is smaller than required ticket capacity {}",
-                capacity,
-                required_capacity
-            );
-        }
-    }
 
     /// Ingests one batch of grouped input using `tickets` to select the target
     /// group for each row.
-    ///
-    /// Callers are responsible for reserving enough capacity before calling
-    /// this method.
     ///
     /// ```
     /// use arrow_array::{cast::AsArray, types::UInt64Type, Int32Array, UInt64Array};
@@ -66,7 +41,6 @@ pub trait Aggregator {
     /// let tickets = UInt64Array::from(vec![0, 1, 0, 1]);
     ///
     /// let mut agg = aggregate::count().unwrap();
-    /// agg.ensure_capacity(2);
     /// agg.ingest(&[&arr], &tickets).unwrap();
     ///
     /// let result = agg.finish().unwrap();
@@ -85,10 +59,16 @@ pub trait Aggregator {
     /// the partial results.
     fn merge(&mut self, other: Self) -> Result<(), ArrowKernelError>;
 
+    fn ensure_capacity_for_tickets(&mut self, tickets: &UInt64Array) {
+        if tickets.is_empty() {
+            return;
+        }
+
+        let req_capacity = tickets.iter().map(|x| x.unwrap()).max().unwrap_or(0) + 1;
+        self.ensure_capacity(req_capacity as usize);
+    }
+
     /// Finalizes the aggregation and returns the output array.
-    ///
-    /// Consumes the aggregator because implementations may need to move or
-    /// reinterpret internal buffers during finalization.
     fn finish(self: Box<Self>) -> Result<ArrayRef, ArrowKernelError>;
 
     /// Ingests one ungrouped batch by routing every row to ticket `0`.
@@ -99,7 +79,6 @@ pub trait Aggregator {
     ///
     /// let arr = Int32Array::from(vec![7, 2, 5]);
     /// let mut agg = aggregate::min(arr.data_type()).unwrap();
-    /// agg.ensure_capacity(1);
     /// agg.ingest_ungrouped(&[&arr]).unwrap();
     ///
     /// let result = agg.finish().unwrap();

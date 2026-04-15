@@ -173,7 +173,7 @@ impl Aggregator for CountAggregator {
         _data: &[&dyn Array],
         tickets: &UInt64Array,
     ) -> Result<(), ArrowKernelError> {
-        self.debug_assert_capacity_for_tickets(tickets, self.buf.len as usize);
+        self.ensure_capacity_for_tickets(tickets);
         AGG_PROGRAM_CACHE.get((&mut self.buf, tickets), ())?;
         Ok(())
     }
