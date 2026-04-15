@@ -28,6 +28,8 @@ pub struct DSLBuffer {
     pub buf: MutableBuffer,
     pub ptr: *mut c_void,
 }
+unsafe impl Send for DSLBuffer {}
+unsafe impl Sync for DSLBuffer {}
 
 impl DSLBuffer {
     pub fn new(ty: PrimitiveType, len: usize) -> Self {
