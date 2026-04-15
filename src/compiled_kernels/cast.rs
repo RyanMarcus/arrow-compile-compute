@@ -3,8 +3,7 @@ use std::sync::Arc;
 use super::{ArrowKernelError, Kernel};
 use crate::{
     compiled_kernels::dsl2::{
-        compile, dsl_args, DSLArgument, DSLContext, DSLFunction, DSLStmt, DSLType,
-        RunnableDSLFunction,
+        compile, DSLArgument, DSLContext, DSLFunction, DSLStmt, DSLType, RunnableDSLFunction,
     },
     compiled_writers::WriterSpec,
     intersect_and_copy_nulls, logical_arrow_type, PrimitiveType,
@@ -127,7 +126,7 @@ impl Kernel for CastKernel {
         if inp.data_type() == &self.tar {
             return Ok(make_array(inp.to_data()));
         }
-        let res = self.k.run(&dsl_args![inp])?[0].clone();
+        let res = self.k.run(&[DSLArgument::datum(&inp)])?[0].clone();
         assert_eq!(
             inp.len(),
             res.len(),

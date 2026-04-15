@@ -192,7 +192,7 @@ impl Aggregator for SumAggregator {
                 "sum create takes exactly one input".to_string(),
             ));
         }
-        Ok(Box::new(Self::new(PrimitiveType::for_arrow_type(&tys[0]))?))
+        Ok(Box::new(Self::new(PrimitiveType::for_arrow_type(tys[0]))?))
     }
 
     fn ensure_capacity(&mut self, capacity: usize) {

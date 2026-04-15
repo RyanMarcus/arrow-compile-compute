@@ -81,7 +81,7 @@ impl Kernel for ConcatKernel {
 
     fn compile(inp: &Self::Input<'_>, _params: Self::Params) -> Result<Self, ArrowKernelError> {
         let (arr, _output) = inp;
-        let datum = &*arr as &dyn Datum;
+        let datum = arr as &dyn Datum;
 
         let mut ctx = DSLContext::new();
         let mut func = DSLFunction::new("concat");

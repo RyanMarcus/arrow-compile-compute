@@ -37,6 +37,7 @@ pub trait Aggregator {
     /// capacity for the provided ticket array.
     ///
     /// Release builds skip this check entirely.
+    #[allow(unused_variables)]
     fn debug_assert_capacity_for_tickets(&self, tickets: &UInt64Array, capacity: usize) {
         #[cfg(any(debug_assertions, test))]
         if let Some(max_ticket) = tickets.values().iter().copied().max() {

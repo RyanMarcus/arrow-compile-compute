@@ -148,7 +148,7 @@ impl PrimitiveIterator {
     }
 
     pub fn data_type(&self) -> &DataType {
-        &self.array_ref.data_type()
+        self.array_ref.data_type()
     }
 }
 

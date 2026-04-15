@@ -17,8 +17,8 @@ impl SizeTerm {
         if input.is_empty() {
             return Err("input ended unexpectedly".to_string());
         }
-        if input.starts_with("<=") {
-            return Ok(SizeTerm::AtLeast(Box::new(SizeTerm::parse(&input[2..])?)));
+        if let Some(stripped) = input.strip_prefix("<=") {
+            return Ok(SizeTerm::AtLeast(Box::new(SizeTerm::parse(stripped)?)));
         }
 
         match input.split_once("+") {
@@ -30,7 +30,7 @@ impl SizeTerm {
                 if !input.chars().all(|c| c.is_alphabetic()) {
                     return Err(format!("invalid term {}", input));
                 }
-                return Ok(SizeTerm::Term(input.trim_ascii().to_string()));
+                Ok(SizeTerm::Term(input.trim_ascii().to_string()))
             }
         }
     }

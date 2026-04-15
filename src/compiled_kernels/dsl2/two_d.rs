@@ -28,10 +28,10 @@ impl TwoDArrayRuntime {
     }
 }
 
-pub fn generate_two_d_access<'ctx, 'args>(
+pub fn generate_two_d_access<'ctx>(
     ctx: &'ctx Context,
     module: &Module<'ctx>,
-    arrs: &[&'args dyn Datum],
+    arrs: &[&dyn Datum],
 ) -> Result<FunctionValue<'ctx>, ArrowKernelError> {
     let witness_type = PrimitiveType::for_arrow_type(arrs[0].get().0.data_type());
     let mut funcs = Vec::new();

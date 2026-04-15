@@ -581,10 +581,7 @@ impl PrimitiveType {
     pub fn as_list(&self, s: usize) -> Option<PrimitiveType> {
         match self {
             PrimitiveType::List(_, _) => None,
-            _ => Some(PrimitiveType::List(
-                ListItemType::try_from(self.clone()).ok()?,
-                s,
-            )),
+            _ => Some(PrimitiveType::List(ListItemType::try_from(*self).ok()?, s)),
         }
     }
 }
@@ -651,12 +648,10 @@ impl NumericPrimitiveType {
     }
 
     pub fn is_float(&self) -> bool {
-        match self {
-            NumericPrimitiveType::F16 => true,
-            NumericPrimitiveType::F32 => true,
-            NumericPrimitiveType::F64 => true,
-            _ => false,
-        }
+        matches!(
+            self,
+            NumericPrimitiveType::F16 | NumericPrimitiveType::F32 | NumericPrimitiveType::F64
+        )
     }
 
     pub fn is_integer(&self) -> bool {

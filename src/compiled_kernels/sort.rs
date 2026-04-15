@@ -48,7 +48,7 @@ pub fn sort_col(data: &dyn Datum, opts: SortOptions) -> Result<UInt32Array, Arro
         PrimitiveType::F32 => sort_primitive::<Float32Type>(&arr, &opts),
         PrimitiveType::F64 => sort_primitive::<Float64Type>(&arr, &opts),
         PrimitiveType::P64x2 => {
-            let normed = normalize_columns(&[(&arr.as_ref(), opts.clone())])?;
+            let normed = normalize_columns(&[(&arr.as_ref(), opts)])?;
             Ok(sort_indices_from_normalized(&normed))
         }
         PrimitiveType::List(_, _) => todo!(),

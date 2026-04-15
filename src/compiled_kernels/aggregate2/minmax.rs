@@ -245,7 +245,7 @@ impl<const IS_MIN: bool> Aggregator for MinMaxAggregator<IS_MIN> {
             ));
         }
 
-        Ok(Box::new(Self::new(PrimitiveType::for_arrow_type(&tys[0]))))
+        Ok(Box::new(Self::new(PrimitiveType::for_arrow_type(tys[0]))))
     }
     fn ensure_capacity(&mut self, capacity: usize) {
         self.used.ensure_capacity(capacity);
@@ -271,7 +271,7 @@ impl<const IS_MIN: bool> Aggregator for MinMaxAggregator<IS_MIN> {
                 &mut self.used,
                 &mut self.buf,
                 &data[0],
-                &tickets,
+                tickets,
                 self.ss.last_mut().unwrap(),
             ),
             IS_MIN,

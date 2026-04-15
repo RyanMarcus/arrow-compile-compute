@@ -430,7 +430,7 @@ impl Kernel for StringStartEndKernel {
 
     fn compile(inp: &Self::Input<'_>, params: Self::Params) -> Result<Self, ArrowKernelError> {
         let (arr, needle) = inp;
-        let haystack = &*arr as &dyn Datum;
+        let haystack = arr as &dyn Datum;
 
         let mut ctx = DSLContext::new();
         let mut func = DSLFunction::new("str_start_end");

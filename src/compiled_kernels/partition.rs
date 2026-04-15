@@ -80,7 +80,7 @@ impl Kernel for PartitionKernel {
             for (data_idx, part_idx) in iter::iter_nonnull_u64(idxes)?.enumerate() {
                 let my_pos = part_offsets[part_idx as usize];
                 part_offsets[part_idx as usize] += 1;
-                perm[my_pos as usize] = data_idx as usize;
+                perm[my_pos as usize] = data_idx;
             }
 
             let new_nulls = NullBuffer::new(BooleanBuffer::collect_bool(nulls.len(), |idx| {
@@ -93,7 +93,7 @@ impl Kernel for PartitionKernel {
 
         let mut consumed = 0;
         let partitions = part_offsets[..part_offsets.len() - 1]
-            .into_iter()
+            .iter()
             .map(|offset| {
                 let offset = offset - consumed;
                 let part = res.slice(0, offset as usize);
@@ -135,7 +135,7 @@ pub fn partition_kernel(
 
     // compute histogram of partition indexes (number of entries in each partition)
     func.add_body(
-        DSLStmt::for_each(&mut ctx, &[idxes_arg.clone()], |loop_vars| {
+        DSLStmt::for_each(&mut ctx, std::slice::from_ref(&idxes_arg), |loop_vars| {
             let idx = loop_vars[0].expr().primitive_cast(PrimitiveType::U64)?;
             let idx = idx.arith(
                 DSLArithBinOp::Add,

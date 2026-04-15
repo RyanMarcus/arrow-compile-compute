@@ -220,7 +220,7 @@ impl Aggregator for MostRecentAggregator {
                 "most recent agg create takes exactly one input".to_string(),
             ));
         }
-        Ok(Box::new(Self::new(PrimitiveType::for_arrow_type(&tys[0]))))
+        Ok(Box::new(Self::new(PrimitiveType::for_arrow_type(tys[0]))))
     }
 
     fn ensure_capacity(&mut self, capacity: usize) {
@@ -288,12 +288,11 @@ impl Aggregator for MostRecentAggregator {
             PrimitiveType::P64x2 => {
                 let mut builder = BinaryBuilder::new();
                 let values = bytemuck::cast_slice::<u8, u128>(&buf.buf.as_slice()[..len * 16]);
-                for idx in 0..len {
+                for (idx, &raw) in values.iter().enumerate() {
                     if used.buf.as_slice()[idx] == 0 {
                         builder.append_null();
                         continue;
                     }
-                    let raw = values[idx];
                     let start_ptr = raw as u64 as *const u8;
                     let end_ptr = (raw >> 64) as u64 as *const u8;
                     let value = unsafe {

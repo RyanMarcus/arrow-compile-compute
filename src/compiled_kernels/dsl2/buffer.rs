@@ -81,7 +81,7 @@ impl DSLBuffer {
                     assert!(end_ptr >= start_ptr);
 
                     let value = unsafe {
-                        let len = end_ptr.offset_from_unsigned(start_ptr) as usize;
+                        let len = end_ptr.offset_from_unsigned(start_ptr);
                         std::slice::from_raw_parts(start_ptr, len)
                     };
                     b.append_value(value);

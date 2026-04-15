@@ -421,10 +421,7 @@ impl DSLType {
 
     /// True if the resulting type, when iterated, never ends (scalars)
     pub fn is_infinite(&self) -> bool {
-        match self {
-            DSLType::ConstScalar(..) | DSLType::Scalar(..) => true,
-            _ => false,
-        }
+        matches!(self, DSLType::ConstScalar(..) | DSLType::Scalar(..))
     }
 
     pub fn is_buffer(&self) -> bool {
@@ -810,9 +807,9 @@ pub enum DSLStmt {
     ForRange(DSLForRange),
 }
 
-impl Into<Vec<DSLStmt>> for DSLStmt {
-    fn into(self) -> Vec<DSLStmt> {
-        vec![self]
+impl From<DSLStmt> for Vec<DSLStmt> {
+    fn from(stmt: DSLStmt) -> Self {
+        vec![stmt]
     }
 }
 
@@ -1003,7 +1000,7 @@ pub struct DSLForRange {
 pub enum DSLExpr {
     Compare(DSLComparison, Box<DSLExpr>, Box<DSLExpr>),
     StringPredicate(DSLStringPredicate, Box<DSLExpr>, Box<DSLExpr>),
-    At(Box<DSLValue>, Vec<Box<DSLExpr>>),
+    At(Box<DSLValue>, Vec<DSLExpr>),
     Value(DSLValue),
     Cast(Box<DSLExpr>, PrimitiveType),
     CastToBool(Box<DSLExpr>),
@@ -1068,15 +1065,12 @@ impl DSLExpr {
 
     pub fn at(&self, index: &DSLExpr) -> Result<DSLExpr, ArrowKernelError> {
         match self {
-            DSLExpr::Value(v) => Ok(DSLExpr::At(
-                Box::new(v.clone()),
-                vec![Box::new(index.clone())],
-            )),
+            DSLExpr::Value(v) => Ok(DSLExpr::At(Box::new(v.clone()), vec![index.clone()])),
             DSLExpr::At(base2d, outer_idx) => {
                 if outer_idx.len() != 1 {
                     return Err(ArrowKernelError::InvalidAtSource(self.clone()));
                 }
-                let idxes = vec![outer_idx[0].clone(), Box::new(index.clone())];
+                let idxes = vec![outer_idx[0].clone(), index.clone()];
                 Ok(DSLExpr::At(base2d.clone(), idxes))
             }
             _ => Err(ArrowKernelError::InvalidAtSource(self.clone())),
@@ -1292,7 +1286,7 @@ impl DSLExpr {
                 for _ in idxes {
                     t = t
                         .iter_type()
-                        .expect(&format!("unable to iterate type: {:?}", t));
+                        .unwrap_or_else(|| panic!("unable to iterate type: {:?}", t));
                 }
                 t
             }

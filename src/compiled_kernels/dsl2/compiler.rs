@@ -82,7 +82,7 @@ fn dsl_type_to_llvm_type<'a>(ctx: &'a Context, v: &DSLType) -> BasicTypeEnum<'a>
             let dt = datum.get().0.data_type();
             match dt {
                 DataType::Boolean => ctx.bool_type().as_basic_type_enum(),
-                _ => PrimitiveType::for_arrow_type(&dt).llvm_type(ctx),
+                _ => PrimitiveType::for_arrow_type(dt).llvm_type(ctx),
             }
         }
         DSLType::Buffer(..)
@@ -198,7 +198,7 @@ pub fn compile_inner<'ctx, 'args>(
         let llvm_params = f
             .params
             .iter()
-            .map(|arg| dsl_type_to_llvm_type(&ctx, &arg.ty))
+            .map(|arg| dsl_type_to_llvm_type(ctx, &arg.ty))
             .chain(std::iter::repeat_n(
                 ctx.ptr_type(AddressSpace::default()).into(),
                 f.ret.len(),
@@ -241,7 +241,7 @@ pub fn compile_inner<'ctx, 'args>(
                     arg.as_datum()
                         .ok_or_else(|| ArrowKernelError::NonIterableType(param.ty.clone()))?,
                 )?;
-                let ptr = ih.localize_struct(&ctx, &b, st[&param.name].into_pointer_value());
+                let ptr = ih.localize_struct(ctx, &b, st[&param.name].into_pointer_value());
                 st.insert(param.name, ptr.as_basic_value_enum());
                 ihs.insert(param.name, ih);
             }
@@ -251,7 +251,7 @@ pub fn compile_inner<'ctx, 'args>(
                 }
 
                 let ih = array_to_setbit_iter(&BooleanArray::new_null(0))?;
-                let ptr = ih.localize_struct(&ctx, &b, st[&param.name].into_pointer_value());
+                let ptr = ih.localize_struct(ctx, &b, st[&param.name].into_pointer_value());
                 st.insert(param.name, ptr.as_basic_value_enum());
                 ihs.insert(param.name, ih);
             }
@@ -277,11 +277,11 @@ pub fn compile_inner<'ctx, 'args>(
                 }
 
                 let access_func = generate_random_access(
-                    &ctx,
+                    ctx,
                     &module,
                     &format!("access_{}", param.name),
                     &arg.data_type(),
-                    &ih,
+                    ih,
                 )
                 .unwrap();
                 access_funcs.insert(param.name, access_func);
@@ -289,17 +289,17 @@ pub fn compile_inner<'ctx, 'args>(
             DSLType::Buffer(t, _) => {
                 access_funcs.insert(
                     param.name,
-                    DSLBuffer::generate_buffer_accessor(&ctx, &module, *t),
+                    DSLBuffer::generate_buffer_accessor(ctx, &module, *t),
                 );
                 writer_funcs.insert(
                     param.name,
-                    DSLBuffer::generate_buffer_writer(&ctx, &module, *t),
+                    DSLBuffer::generate_buffer_writer(ctx, &module, *t),
                 );
             }
             DSLType::TwoDArray(..) => {
                 access_funcs.insert(
                     param.name,
-                    two_d::generate_two_d_access(&ctx, &module, arg.as_two_d().unwrap())?,
+                    two_d::generate_two_d_access(ctx, &module, arg.as_two_d().unwrap())?,
                 );
             }
             _ => return Err(ArrowKernelError::NonRandomAccessType(param.ty.clone())),
@@ -324,7 +324,7 @@ pub fn compile_inner<'ctx, 'args>(
                 }
 
                 let next_func = generate_next(
-                    &ctx,
+                    ctx,
                     &module,
                     &format!("next_{}", param.name),
                     &arg.data_type(),
@@ -334,24 +334,24 @@ pub fn compile_inner<'ctx, 'args>(
                 next_funcs.insert(param.name, next_func);
 
                 let reset_func =
-                    generate_reset_iterator(&ctx, &module, &format!("{}", param.name), ih).unwrap();
+                    generate_reset_iterator(ctx, &module, &format!("{}", param.name), ih).unwrap();
                 reset_funcs.insert(param.name, reset_func);
             }
             DSLType::SetBits(_) => {
                 let ih = &ihs[&idx];
 
                 let next_func = generate_next(
-                    &ctx,
+                    ctx,
                     &module,
                     &format!("next_setbit_{}", param.name),
                     &arg.data_type(),
-                    &ih,
+                    ih,
                 )
                 .unwrap();
                 next_funcs.insert(param.name, next_func);
 
                 let reset_func =
-                    generate_reset_iterator(&ctx, &module, &format!("{}", param.name), ih).unwrap();
+                    generate_reset_iterator(ctx, &module, &format!("{}", param.name), ih).unwrap();
                 reset_funcs.insert(param.name, reset_func);
             }
             _ => return Err(ArrowKernelError::NonIterableType(param.ty.clone())),
@@ -368,7 +368,7 @@ pub fn compile_inner<'ctx, 'args>(
                 let ih = &ihs[&idx];
 
                 if let Some(next_func) = generate_next_block::<64>(
-                    &ctx,
+                    ctx,
                     &module,
                     &format!("next_block_{}", param.name),
                     &arg.data_type(),
@@ -386,7 +386,7 @@ pub fn compile_inner<'ctx, 'args>(
     // compute all lengths
     for param in f.params.iter() {
         if let Some(ih) = ihs.get(&param.name) {
-            let length = get_iterator_length(&ctx, &b, ih, st[&param.name].into_pointer_value());
+            let length = get_iterator_length(ctx, &b, ih, st[&param.name].into_pointer_value());
             lengths.insert(param.name, length);
         } else if param.ty.is_buffer() {
             let len = DSLBuffer::buffer_len(ctx, &b, st[&param.name].into_pointer_value());
@@ -432,7 +432,7 @@ pub fn compile_inner<'ctx, 'args>(
         let os = ret.allocate(0);
         output_specs.push(ret.spec().clone());
         let w = os.llvm_init(
-            &ctx,
+            ctx,
             &module,
             &b,
             func.get_nth_param((output_param_offset + idx) as u32)
@@ -443,7 +443,7 @@ pub fn compile_inner<'ctx, 'args>(
     }
 
     let mut dsl_ctx = DSLCompilationContext {
-        ctx: &ctx,
+        ctx,
         module: &module,
         func: &func,
         b: &b,
@@ -460,7 +460,7 @@ pub fn compile_inner<'ctx, 'args>(
     };
 
     for stmt in f.body.iter() {
-        compile_stmt(&mut dsl_ctx, &stmt)?;
+        compile_stmt(&mut dsl_ctx, stmt)?;
     }
 
     // flush all outputs
@@ -620,7 +620,7 @@ fn compile_stmt<'ctx, 'a>(
                     .as_basic_value_enum();
             } else if let Some(saver) = saver.as_ref() {
                 if value.get_type() == DSLType::Primitive(PrimitiveType::P64x2) {
-                    let save = llvm_add_save_ptrs_string_saver(&ctx.ctx, &ctx.module);
+                    let save = llvm_add_save_ptrs_string_saver(ctx.ctx, ctx.module);
 
                     let ptr1 = ctx
                         .b
@@ -679,7 +679,7 @@ fn compile_stmt<'ctx, 'a>(
         }
         DSLStmt::ForEach(floop) => {
             // attempt to vectorize
-            if let Some(floop) = vectorize::vectorize_for_each(&ctx, &floop) {
+            if let Some(floop) = vectorize::vectorize_for_each(ctx, floop) {
                 compile_stmt(ctx, &DSLStmt::ForEachBlock(floop))?;
                 // continue below to generate the tail loop
             }
@@ -749,7 +749,7 @@ fn compile_stmt<'ctx, 'a>(
                 ctx.st.insert(loop_var.name, val);
             }
             for stmt in floop.body.iter() {
-                compile_stmt(ctx, &stmt)?;
+                compile_stmt(ctx, stmt)?;
             }
 
             // if every loop variable is a scalar, just do one iteration
@@ -829,7 +829,7 @@ fn compile_stmt<'ctx, 'a>(
             }
 
             for stmt in bfloop.body.iter() {
-                compile_stmt(ctx, &stmt)?;
+                compile_stmt(ctx, stmt)?;
             }
 
             // if every loop variable is a scalar, just do one iteration
@@ -877,7 +877,7 @@ fn compile_stmt<'ctx, 'a>(
                 .insert(dslfor.loop_var.name, curr_counter.as_basic_value_enum());
 
             for stmt in dslfor.body.iter() {
-                compile_stmt(ctx, &stmt)?;
+                compile_stmt(ctx, stmt)?;
             }
 
             let next_counter = ctx
@@ -1158,7 +1158,7 @@ fn compile_expr<'ctx, 'a>(
         DSLExpr::Cast(val, tar_pt) => {
             let orig_type = val.get_type();
             let tar_type = DSLType::Primitive(*tar_pt);
-            let tar_llvm_type = tar_pt.llvm_type(&ctx.ctx);
+            let tar_llvm_type = tar_pt.llvm_type(ctx.ctx);
             let val = compile_expr(ctx, val)?;
 
             match orig_type {
@@ -1219,13 +1219,11 @@ fn compile_expr<'ctx, 'a>(
                                     )?
                                     .as_basic_value_enum())
                                 }
-                                _ => {
-                                    return Err(ArrowKernelError::DSLTypeMismatch(
-                                        "cannot cast between string and non-string vectors",
-                                        orig_type,
-                                        tar_type,
-                                    ));
-                                }
+                                _ => Err(ArrowKernelError::DSLTypeMismatch(
+                                    "cannot cast between string and non-string vectors",
+                                    orig_type,
+                                    tar_type,
+                                )),
                             }
                         }
                         _ => Err(ArrowKernelError::DSLTypeMismatch(
@@ -1608,7 +1606,7 @@ fn compile_expr<'ctx, 'a>(
 
             let bswap_in = Intrinsic::find("llvm.bswap").unwrap();
             let func = bswap_in
-                .get_declaration(&ctx.module, &[v.get_type().into()])
+                .get_declaration(ctx.module, &[v.get_type().into()])
                 .unwrap();
             let res = ctx
                 .b
@@ -1756,7 +1754,7 @@ fn cast_numeric_vec<'ctx, 'a>(
     tar_pt: NumericPrimitiveType,
 ) -> Result<VectorValue<'a>, ArrowKernelError> {
     let tar_type = PrimitiveType::from(tar_pt)
-        .llvm_vec_type(&ctx.ctx, val.get_type().get_size())
+        .llvm_vec_type(ctx.ctx, val.get_type().get_size())
         .unwrap();
     Ok(match (orig_pt.is_integer(), tar_pt.is_integer()) {
         // int to int
@@ -1842,7 +1840,7 @@ fn scalar_to_llvm<'ctx, 'a>(
         PrimitiveType::U64 => arr.as_primitive_opt::<UInt64Type>().map(|x| {
             ctx.ctx
                 .i64_type()
-                .const_int(x.value(0) as u64, false)
+                .const_int(x.value(0), false)
                 .as_basic_value_enum()
         }),
         PrimitiveType::F16 => arr.as_primitive_opt::<Float16Type>().map(|x| {

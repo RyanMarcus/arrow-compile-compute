@@ -113,7 +113,7 @@ pub struct SetBitIterator {
 impl From<&BooleanArray> for SetBitIterator {
     fn from(array: &BooleanArray) -> Self {
         assert!(
-            array.nulls().is_none() || array.len() == 0,
+            array.nulls().is_none() || array.is_empty(),
             "cannot iterate over set bits of array with nulls"
         );
 

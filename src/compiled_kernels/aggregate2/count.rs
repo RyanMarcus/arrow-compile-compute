@@ -159,9 +159,9 @@ pub struct CountAggregator {
 
 impl Aggregator for CountAggregator {
     fn create(_tys: &[&DataType]) -> Result<Box<Self>, ArrowKernelError> {
-        return Ok(Box::new(Self {
+        Ok(Box::new(Self {
             buf: DSLBuffer::new(PrimitiveType::U64, 0),
-        }));
+        }))
     }
 
     fn ensure_capacity(&mut self, capacity: usize) {

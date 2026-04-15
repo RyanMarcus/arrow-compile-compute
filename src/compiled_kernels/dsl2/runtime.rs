@@ -34,7 +34,7 @@ impl RunnableDSLFunction {
             .borrow_f()
             .params
             .iter()
-            .filter_map(|p| p.ty.size_tag().map(|t| t))
+            .filter_map(|p| p.ty.size_tag())
             .map(|t| SizeTerm::parse(t).unwrap())
             .collect_vec();
 
