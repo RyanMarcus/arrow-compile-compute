@@ -22,11 +22,13 @@ use itertools::Itertools;
 use strum_macros::EnumIter;
 
 use crate::compiled_iter::IteratorHolder;
+use crate::compiled_kernels::dsl2::reduce::{DSLReduce, DSLReductionType};
 use crate::compiled_kernels::llvm_utils::StringSaver;
 use crate::{logical_arrow_type, ArrowKernelError, ListItemType, Predicate, PrimitiveType};
 
 mod buffer;
 mod compiler;
+mod reduce;
 mod resolver;
 mod runtime;
 mod string_codegen;
@@ -789,6 +791,8 @@ pub enum DSLStmt {
         index: DSLExpr,
         value: DSLExpr,
     },
+
+    /// exclusively added by the vectorizer
     EmitBlock {
         index: DSLExpr,
         value: DSLExpr,
@@ -807,6 +811,14 @@ pub enum DSLStmt {
     ForEach(DSLForEach),
     ForEachBlock(DSLForEach),
     ForRange(DSLForRange),
+    Reduce(DSLReduce),
+}
+
+#[derive(Debug)]
+/// A statement that produces a particular value, such as a reduction.
+pub struct DSLBoundStmt {
+    pub stmt: DSLStmt,
+    pub value: DSLValue,
 }
 
 impl From<DSLStmt> for Vec<DSLStmt> {
@@ -858,6 +870,48 @@ impl DSLStmt {
             end,
             body: body.into(),
         }))
+    }
+
+    pub fn reduce<E, F>(
+        ctx: &mut DSLContext,
+        rt: DSLReductionType,
+        to_iter: &[DSLValue],
+        f: F,
+    ) -> Result<DSLBoundStmt, ArrowKernelError>
+    where
+        E: Into<DSLExpr>,
+        F: FnOnce(&[DSLValue]) -> Result<E, ArrowKernelError>,
+    {
+        let loop_vars: Vec<DSLValue> = to_iter
+            .iter()
+            .map(|dv| {
+                dv.ty
+                    .iter_type()
+                    .ok_or_else(|| ArrowKernelError::NonIterableType(dv.ty.clone()))
+                    .map(|dt| DSLValue::new(ctx, dt))
+            })
+            .try_collect()?;
+
+        let body = f(&loop_vars)?.into();
+        if !rt.can_reduce_expr(&body) {
+            return Err(ArrowKernelError::DSLInvalidType(
+                "cannot use reduction {} over this type",
+                body.get_type(),
+            ));
+        }
+
+        let result = DSLValue::new(ctx, rt.out_type());
+
+        Ok(DSLBoundStmt {
+            stmt: DSLStmt::Reduce(DSLReduce {
+                loop_vars,
+                iterators: to_iter.iter().cloned().collect_vec(),
+                body,
+                result: result.clone(),
+                reduction_type: rt,
+            }),
+            value: result,
+        })
     }
 
     pub fn cond<S: Into<Vec<DSLStmt>>>(
@@ -943,6 +997,9 @@ impl DSLStmt {
                     stmt.accessed_parameters(params);
                 }
             }
+            DSLStmt::Reduce(dslred) => {
+                dslred.body.accessed_parameters(params);
+            }
             DSLStmt::Emit { index, value } | DSLStmt::EmitBlock { index, value } => {
                 index.accessed_parameters(params);
                 value.accessed_parameters(params);
@@ -972,6 +1029,9 @@ impl DSLStmt {
                 for stmt in else_.iter() {
                     stmt.iterated_parameters(params);
                 }
+            }
+            DSLStmt::Reduce(dslred) => {
+                params.extend(dslred.iterators.iter().map(|x| x.name));
             }
             _ => {}
         }
@@ -1380,7 +1440,7 @@ mod tests {
             cast::coalesce_type,
             dsl2::{
                 buffer::DSLBuffer, compiler::compile, writers::WriterSpec, DSLComparison,
-                DSLContext, DSLFunction, DSLStmt, DSLType, DSLValue, OutputSpec,
+                DSLContext, DSLFunction, DSLReductionType, DSLStmt, DSLType, DSLValue, OutputSpec,
             },
         },
         ListItemType, PrimitiveType,
@@ -1941,6 +2001,106 @@ mod tests {
         let result = func.run(&dsl_args![input]).unwrap();
         let result = result[0].as_primitive::<Int32Type>();
         assert_eq!(result.values(), &[6, 1]);
+    }
+
+    #[test]
+    fn test_dsl2_reduce_bound_value() {
+        let mut ctx = DSLContext::new();
+        let mut func = DSLFunction::new("reduce_bound_value");
+        let arr_input = BooleanArray::new_null(0);
+
+        let arr = func.add_arg(&mut ctx, DSLType::array_like(&arr_input, "n"));
+        let reduced = DSLStmt::reduce(&mut ctx, DSLReductionType::And, &[arr], |loop_vars| {
+            Ok(loop_vars[0].expr())
+        })
+        .unwrap();
+
+        func.add_body(reduced.stmt);
+        func.add_body(DSLStmt::emit(0, reduced.value.expr()).unwrap());
+        func.add_ret(WriterSpec::Boolean, "<= n");
+
+        let func = compile(func, dsl_args![arr_input]).unwrap();
+
+        let result = func
+            .run(&dsl_args![BooleanArray::from(vec![true, true, true])])
+            .unwrap();
+        let out = result[0].as_boolean();
+        assert_eq!(out.iter().map(|x| x.unwrap()).collect_vec(), vec![true]);
+
+        let result = func
+            .run(&dsl_args![BooleanArray::from(vec![true, false, true])])
+            .unwrap();
+        let out = result[0].as_boolean();
+        assert_eq!(out.iter().map(|x| x.unwrap()).collect_vec(), vec![false]);
+    }
+
+    #[test]
+    fn test_dsl2_multiple_reductions_can_be_emitted_later() {
+        let mut ctx = DSLContext::new();
+        let mut func = DSLFunction::new("multiple_reductions");
+        let arr_input = BooleanArray::new_null(0);
+
+        let arr = func.add_arg(&mut ctx, DSLType::array_like(&arr_input, "n"));
+        let any_gt_ten = DSLStmt::reduce(
+            &mut ctx,
+            DSLReductionType::Or,
+            &[arr.clone()],
+            |loop_vars| Ok(loop_vars[0].expr()),
+        )
+        .unwrap();
+        let all_nonzero = DSLStmt::reduce(&mut ctx, DSLReductionType::And, &[arr], |loop_vars| {
+            Ok(loop_vars[0].expr())
+        })
+        .unwrap();
+
+        func.add_body(any_gt_ten.stmt);
+        func.add_body(all_nonzero.stmt);
+        func.add_body(DSLStmt::emit(0, any_gt_ten.value.expr()).unwrap());
+        func.add_body(DSLStmt::emit(1, all_nonzero.value.expr()).unwrap());
+        func.add_ret(WriterSpec::Boolean, "<= n");
+        func.add_ret(WriterSpec::Boolean, "<= n");
+
+        let func = compile(func, dsl_args![arr_input]).unwrap();
+
+        let result = func
+            .run(&dsl_args![BooleanArray::from(vec![false, true, true])])
+            .unwrap();
+        assert_eq!(
+            result[0]
+                .as_boolean()
+                .iter()
+                .map(|x| x.unwrap())
+                .collect_vec(),
+            vec![true]
+        );
+        assert_eq!(
+            result[1]
+                .as_boolean()
+                .iter()
+                .map(|x| x.unwrap())
+                .collect_vec(),
+            vec![false]
+        );
+
+        let result = func
+            .run(&dsl_args![BooleanArray::from(vec![false, true, false])])
+            .unwrap();
+        assert_eq!(
+            result[0]
+                .as_boolean()
+                .iter()
+                .map(|x| x.unwrap())
+                .collect_vec(),
+            vec![true]
+        );
+        assert_eq!(
+            result[1]
+                .as_boolean()
+                .iter()
+                .map(|x| x.unwrap())
+                .collect_vec(),
+            vec![false]
+        );
     }
 
     #[test]

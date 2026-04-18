@@ -840,6 +840,116 @@ fn compile_stmt<'ctx, 'a>(
             }
             ctx.b.position_at_end(loop_end);
         }
+        DSLStmt::Reduce(dslred) => {
+            let bufs = dslred
+                .loop_vars
+                .iter()
+                .map(|iter| iter.ty.llvm_type(ctx.ctx).unwrap())
+                .enumerate()
+                .map(|(i, llvm_type)| build_entry_alloca(ctx, llvm_type, &format!("iter_buf{}", i)))
+                .collect_vec();
+
+            let loop_header = ctx.ctx.append_basic_block(*ctx.func, "reduce_loop_header");
+            let loop_body = ctx.ctx.append_basic_block(*ctx.func, "reduce_loop_body");
+            let loop_end = ctx.ctx.append_basic_block(*ctx.func, "reduce_loop_end");
+            let accum_ptr =
+                build_entry_alloca(ctx, dslred.reduction_type.accum_type(ctx.ctx), "accum");
+            ctx.b
+                .build_store(accum_ptr, dslred.reduction_type.initial_value(ctx.ctx))
+                .unwrap();
+            ctx.b.build_unconditional_branch(loop_header).unwrap();
+
+            // in the loop header, call next on all iterators and `and` together
+            // the results
+            ctx.b.position_at_end(loop_header);
+
+            let mut last_res = None;
+            for (iter, buf_ptr) in dslred.iterators.iter().zip(bufs.iter()) {
+                let next_func = ctx.next_funcs[&iter.name];
+                let iter_ptr = ctx.st[&iter.name];
+                let had_next = ctx
+                    .b
+                    .build_call(
+                        next_func,
+                        &[iter_ptr.into(), (*buf_ptr).into()],
+                        &format!("next{}", iter.name),
+                    )
+                    .unwrap()
+                    .try_as_basic_value()
+                    .unwrap_basic()
+                    .into_int_value();
+
+                last_res = last_res
+                    .map(|v| ctx.b.build_and(v, had_next, "and").unwrap())
+                    .or(Some(had_next))
+            }
+            ctx.b
+                .build_conditional_branch(last_res.unwrap(), loop_body, loop_end)
+                .unwrap();
+
+            ctx.b.position_at_end(loop_body);
+            for (loop_var, buf_ptr) in dslred.loop_vars.iter().zip(bufs) {
+                let val = ctx
+                    .b
+                    .build_load(
+                        loop_var.ty.llvm_type(ctx.ctx).unwrap(),
+                        buf_ptr,
+                        &format!("load{}", loop_var.name),
+                    )
+                    .unwrap();
+
+                // truncate to boolean if neeeded
+                let val = match loop_var.ty {
+                    DSLType::Boolean => ctx
+                        .b
+                        .build_int_truncate(val.into_int_value(), ctx.ctx.bool_type(), "to_bool")
+                        .unwrap()
+                        .as_basic_value_enum(),
+                    _ => val,
+                };
+
+                ctx.st.insert(loop_var.name, val);
+            }
+
+            let next = compile_expr(ctx, &dslred.body)?;
+            let accum = ctx
+                .b
+                .build_load(
+                    dslred.reduction_type.accum_type(ctx.ctx),
+                    accum_ptr,
+                    "accum",
+                )
+                .unwrap();
+            let new = dslred.reduction_type.update(ctx, accum, next);
+            ctx.b.build_store(accum_ptr, new).unwrap();
+
+            // if every loop variable is a scalar, just do one iteration
+            if dslred.iterators.iter().all(|it| it.ty.is_infinite()) {
+                ctx.b.build_unconditional_branch(loop_end).unwrap();
+            } else {
+                ctx.b.build_unconditional_branch(loop_header).unwrap();
+            }
+
+            ctx.b.position_at_end(loop_end);
+            let result = ctx
+                .b
+                .build_load(
+                    dslred.reduction_type.accum_type(ctx.ctx),
+                    accum_ptr,
+                    "reduce_result",
+                )
+                .unwrap();
+            ctx.st.insert(dslred.result.name, result);
+            dslred.iterators.iter().for_each(|itr| {
+                ctx.b
+                    .build_call(
+                        ctx.reset_funcs[&itr.name],
+                        &[ctx.st[&itr.name].into()],
+                        "reset",
+                    )
+                    .unwrap();
+            });
+        }
         DSLStmt::ForRange(dslfor) => {
             let start_at = compile_expr(ctx, &dslfor.start)?;
             let end_at = compile_expr(ctx, &dslfor.end)?.into_int_value();
