@@ -31,20 +31,20 @@ pub enum DSLReductionType {
 }
 
 impl DSLReductionType {
-    pub fn accum_type<'a>(&self, ctx: &'a Context) -> BasicTypeEnum<'a> {
+    pub(crate) fn accum_type<'a>(&self, ctx: &'a Context) -> BasicTypeEnum<'a> {
         match self {
             DSLReductionType::And | DSLReductionType::Or => ctx.bool_type().as_basic_type_enum(),
         }
     }
 
-    pub fn initial_value<'a>(&self, ctx: &'a Context) -> BasicValueEnum<'a> {
+    pub(crate) fn initial_value<'a>(&self, ctx: &'a Context) -> BasicValueEnum<'a> {
         match self {
             DSLReductionType::And => ctx.bool_type().const_all_ones().as_basic_value_enum(),
             DSLReductionType::Or => ctx.bool_type().const_zero().as_basic_value_enum(),
         }
     }
 
-    pub fn update<'ctx, 'a>(
+    pub(crate) fn update<'ctx, 'a>(
         &self,
         ctx: &mut DSLCompilationContext<'ctx, 'a>,
         accum: BasicValueEnum<'a>,

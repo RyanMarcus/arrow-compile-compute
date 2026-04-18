@@ -22,7 +22,7 @@ use itertools::Itertools;
 use strum_macros::EnumIter;
 
 use crate::compiled_iter::IteratorHolder;
-use crate::compiled_kernels::dsl2::reduce::{DSLReduce, DSLReductionType};
+use crate::compiled_kernels::dsl2::reduce::DSLReduce;
 use crate::compiled_kernels::llvm_utils::StringSaver;
 use crate::{logical_arrow_type, ArrowKernelError, ListItemType, Predicate, PrimitiveType};
 
@@ -39,6 +39,7 @@ mod writers;
 pub use self::writers::OutputSpec;
 pub use buffer::DSLBuffer;
 pub use compiler::compile;
+pub use reduce::DSLReductionType;
 pub use runtime::RunnableDSLFunction;
 pub(crate) use string_codegen::{add_str_endswith, add_str_startswith};
 pub use writers::{OutputSlot, WriterSpec};

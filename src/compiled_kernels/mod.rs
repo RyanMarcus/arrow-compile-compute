@@ -1,5 +1,6 @@
 mod aggregate2;
 mod arith;
+mod bounds;
 mod cast;
 pub(crate) mod cmp;
 mod concat;
@@ -24,14 +25,15 @@ pub use aggregate2::{
 };
 pub use arith::BinOpKernel;
 use arrow_schema::DataType;
+pub use bounds::BoundsKernel;
 pub use cast::CastKernel;
 pub use cmp::ComparisonKernel;
 pub use concat::concat_all;
 pub use dsl2::DSLArithBinOp;
 pub use filter::FilterKernel;
 pub use ht::{HashFunction, HashKernel};
-pub use interleave::InterleaveKernel;
 use inkwell::execution_engine::ExecutionEngine;
+pub use interleave::InterleaveKernel;
 use llvm_utils::str_writer_append_bytes;
 pub use null_utils::intersect_and_copy_nulls;
 pub use partition::PartitionKernel;

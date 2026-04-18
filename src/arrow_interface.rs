@@ -36,6 +36,7 @@ pub mod cmp {
 
     use crate::compiled_kernels;
     use crate::compiled_kernels::cmp::BetweenKernel;
+    use crate::compiled_kernels::BoundsKernel;
     pub use crate::compiled_kernels::ComparisonKernel;
     use crate::compiled_kernels::KernelCache;
     use crate::compiled_kernels::StringKernelType;
@@ -47,6 +48,9 @@ pub mod cmp {
         LazyLock::new(KernelCache::new);
 
     static BETWEEN_PROGRAM_CACHE: LazyLock<KernelCache<BetweenKernel>> =
+        LazyLock::new(KernelCache::new);
+
+    static BOUNDS_PROGRAM_CACHE: LazyLock<KernelCache<BoundsKernel>> =
         LazyLock::new(KernelCache::new);
 
     static STR_STARTEND_CACHE: LazyLock<KernelCache<StringStartEndKernel>> =
@@ -89,6 +93,26 @@ pub mod cmp {
         ub: &dyn Datum,
     ) -> Result<BooleanArray, ArrowKernelError> {
         BETWEEN_PROGRAM_CACHE.get((arr, lb, ub), ())
+    }
+
+    /// Returns `true` when every element of `arr` satisfies `lb <= x < ub`.
+    ///
+    /// ```
+    /// use arrow_array::{Int32Array, Scalar};
+    /// use arrow_compile_compute::cmp;
+    ///
+    /// let values = Int32Array::from(vec![2, 3, 4]);
+    /// let lb = Scalar::new(Int32Array::from(vec![2]));
+    /// let ub = Scalar::new(Int32Array::from(vec![5]));
+    ///
+    /// assert!(cmp::bounds(&values, &lb, &ub).unwrap());
+    /// ```
+    pub fn bounds(
+        arr: &dyn Datum,
+        lb: &dyn Datum,
+        ub: &dyn Datum,
+    ) -> Result<bool, ArrowKernelError> {
+        BOUNDS_PROGRAM_CACHE.get((arr, lb, ub), ())
     }
 
     /// String prefix check.
