@@ -52,8 +52,8 @@ impl Kernel for BinOpKernel {
 
         func.add_body(
             DSLStmt::for_each(&mut ctx, &[arg1, arg2], |loop_vars| {
-                let v1 = loop_vars[0].expr();
-                let v2 = loop_vars[1].expr();
+                let v1 = loop_vars[0].expr().primitive_cast(res)?;
+                let v2 = loop_vars[1].expr().primitive_cast(res)?;
                 let el = v1.arith(params, v2)?;
                 DSLStmt::emit(0, el)
             })
@@ -83,8 +83,8 @@ impl Kernel for BinOpKernel {
 mod tests {
     use arrow_array::{
         cast::AsArray,
-        types::{Float32Type, Int32Type, UInt32Type},
-        Float32Array, Int32Array, UInt32Array,
+        types::{Float32Type, Float64Type, Int32Type, UInt32Type},
+        Float32Array, Float64Array, Int32Array, UInt32Array,
     };
     use strum::IntoEnumIterator;
 
@@ -179,6 +179,22 @@ mod tests {
 
             let arrow_res = op.arrow_compute(&arr1, &arr2);
             let arrow_res = arrow_res.as_primitive::<UInt32Type>();
+            assert_eq!(res, arrow_res, "failed for op {:?}", op);
+        }
+    }
+
+    #[test]
+    fn test_arith_u32_f64() {
+        let arr1 = UInt32Array::from(vec![1, 0, 2]);
+        let arr1_f = Float64Array::from(vec![1.0, 0.0, 2.0]);
+        let arr2 = Float64Array::from(vec![2.0, 1.0, 3.0]);
+        for op in DSLArithBinOp::iter() {
+            let k = BinOpKernel::compile(&(&arr1, &arr2), op).unwrap();
+            let res = k.call((&arr1, &arr2)).unwrap();
+            let res = res.as_primitive::<Float64Type>();
+
+            let arrow_res = op.arrow_compute(&arr1_f, &arr2);
+            let arrow_res = arrow_res.as_primitive::<Float64Type>();
             assert_eq!(res, arrow_res, "failed for op {:?}", op);
         }
     }

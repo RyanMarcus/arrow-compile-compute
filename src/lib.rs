@@ -510,6 +510,10 @@ impl PrimitiveType {
     /// Returns the "best" common value to cast both types to in order to
     /// perform a comparison. Returns `None` if there is no compatible type.
     fn dominant(lhs_prim: PrimitiveType, rhs_prim: PrimitiveType) -> Option<PrimitiveType> {
+        if lhs_prim == rhs_prim {
+            return Some(lhs_prim);
+        }
+
         if let PrimitiveType::List(lt, ls) = lhs_prim {
             if let PrimitiveType::List(rt, rs) = rhs_prim {
                 if lt == rt && ls == rs {
@@ -528,6 +532,8 @@ impl PrimitiveType {
             || matches!(rhs_prim, PrimitiveType::P64x2)
         {
             None
+        } else if lhs_prim.is_float() || rhs_prim.is_float() {
+            Some(PrimitiveType::F64)
         } else if lhs_prim.is_signed() != rhs_prim.is_signed() {
             Some(PrimitiveType::I64)
         } else if lhs_prim.width() >= rhs_prim.width() {
