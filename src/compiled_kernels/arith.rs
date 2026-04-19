@@ -84,7 +84,7 @@ mod tests {
     use arrow_array::{
         cast::AsArray,
         types::{Float32Type, Float64Type, Int32Type, UInt32Type},
-        Float32Array, Float64Array, Int32Array, UInt32Array,
+        Float32Array, Float64Array, Int32Array, UInt32Array, UInt64Array,
     };
     use strum::IntoEnumIterator;
 
@@ -212,6 +212,21 @@ mod tests {
             let arrow_res = arrow_res.as_primitive::<UInt32Type>();
             assert_eq!(res, arrow_res, "failed for op {:?}", op);
         }
+    }
+
+    #[test]
+    fn test_arith_scalar_f64_u64_len32() {
+        let lhs = Float64Array::new_scalar(1.0);
+        let rhs = UInt64Array::from((1_u64..=32).collect::<Vec<_>>());
+        let op = DSLArithBinOp::Div;
+        let k = BinOpKernel::compile(&(&lhs, &rhs), op).unwrap();
+        let res = k.call((&lhs, &rhs)).unwrap();
+        let res = res.as_primitive::<Float64Type>();
+
+        let rhs_f = Float64Array::from((1_u64..=32).map(|v| v as f64).collect::<Vec<_>>());
+        let arrow_res = op.arrow_compute(&lhs, &rhs_f);
+        let arrow_res = arrow_res.as_primitive::<Float64Type>();
+        assert_eq!(res, arrow_res, "failed for op {:?}", op);
     }
 
     #[test]

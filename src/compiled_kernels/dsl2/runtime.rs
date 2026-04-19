@@ -171,7 +171,9 @@ impl RunnableDSLFunction {
                     prepared
                         .ptrs
                         .push(prepared.ihs.last().unwrap().get_ptr() as *mut c_void);
-                    prepared.input_lengths.push(datum.get().0.len());
+                    if !datum.get().1 {
+                        prepared.input_lengths.push(datum.get().0.len());
+                    }
                 }
                 DSLArgument::TwoDArray(datums) => {
                     let twod = TwoDArrayRuntime::new(datums)?;
