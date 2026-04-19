@@ -7,7 +7,7 @@ use crate::{
         DSLReductionType, DSLStmt, DSLType, RunnableDSLFunction,
     },
     compiled_writers::WriterSpec,
-    ArrowKernelError, Kernel,
+    ArrowKernelError, Kernel, PrimitiveType,
 };
 
 pub struct BoundsKernel {
@@ -57,17 +57,26 @@ impl Kernel for BoundsKernel {
         let ub_arg = func.add_arg(&mut ctx, DSLType::array_like(*ub, "n"));
         func.add_ret(w, "<= n");
 
+        let dom_type = [
+            PrimitiveType::for_arrow_type(x.get().0.data_type()).clone(),
+            PrimitiveType::for_arrow_type(lb.get().0.data_type()).clone(),
+            PrimitiveType::for_arrow_type(ub.get().0.data_type()).clone(),
+        ]
+        .into_iter()
+        .reduce(|acc, v| PrimitiveType::dominant(acc, v).unwrap())
+        .unwrap();
+
         let reduction = DSLStmt::reduce(
             &mut ctx,
             DSLReductionType::And,
             &[x_arg, lb_arg, ub_arg],
             |loop_vars| {
-                let x = &loop_vars[0];
-                let lb = &loop_vars[1];
-                let ub = &loop_vars[2];
+                let x = &loop_vars[0].expr().primitive_cast(dom_type)?;
+                let lb = &loop_vars[1].expr().primitive_cast(dom_type)?;
+                let ub = &loop_vars[2].expr().primitive_cast(dom_type)?;
 
-                let is_gte_lb = x.expr().cmp(&lb.expr(), DSLComparison::Gte)?;
-                let is_lt_ub = x.expr().cmp(&ub.expr(), DSLComparison::Lt)?;
+                let is_gte_lb = x.cmp(&lb, DSLComparison::Gte)?;
+                let is_lt_ub = x.cmp(&ub, DSLComparison::Lt)?;
 
                 is_gte_lb.bitwise(DSLBitwiseBinOp::And, is_lt_ub)
             },
@@ -108,7 +117,7 @@ impl Kernel for BoundsKernel {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use arrow_array::{Int32Array, Scalar};
+    use arrow_array::{Int32Array, Int64Array, Scalar, UInt32Array};
     use std::sync::Arc;
 
     #[test]
@@ -197,6 +206,33 @@ mod tests {
         let x = Arc::new(Int32Array::from(Vec::<i32>::new()));
         let lb = Scalar::new(Int32Array::from(vec![1]));
         let ub = Scalar::new(Int32Array::from(vec![4]));
+
+        let kernel = BoundsKernel::compile(
+            &(
+                x.as_ref() as &dyn Datum,
+                &lb as &dyn Datum,
+                &ub as &dyn Datum,
+            ),
+            (),
+        )
+        .unwrap();
+
+        let result = kernel
+            .call((
+                x.as_ref() as &dyn Datum,
+                &lb as &dyn Datum,
+                &ub as &dyn Datum,
+            ))
+            .unwrap();
+
+        assert!(result);
+    }
+
+    #[test]
+    fn test_bounds_kernel_uint32_array_with_i64_bounds() {
+        let x = Arc::new(UInt32Array::from(vec![1_u32, 2, 3]));
+        let lb = Scalar::new(Int64Array::from(vec![1_i64]));
+        let ub = Scalar::new(Int64Array::from(vec![4_i64]));
 
         let kernel = BoundsKernel::compile(
             &(

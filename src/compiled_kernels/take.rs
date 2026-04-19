@@ -41,12 +41,12 @@ impl Kernel for TakeKernel {
         }
 
         // bounds checking
-        let in_bounds = arrow_interface::cmp::between(
+        let in_bounds = arrow_interface::cmp::bounds(
             &idx,
             &UInt64Array::new_scalar(0),
             &UInt64Array::new_scalar(arr.len() as u64),
         )?;
-        if in_bounds.true_count() != idx.len() {
+        if !in_bounds {
             return Err(ArrowKernelError::OutOfBounds(arr.len()));
         }
 
