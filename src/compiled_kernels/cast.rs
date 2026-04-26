@@ -12,7 +12,7 @@ use arrow_array::{
     cast::AsArray,
     make_array,
     types::{Int16Type, Int32Type, Int64Type, Int8Type, UInt8Type},
-    Array, ArrayRef, BooleanArray, StringArray, StringViewArray,
+    Array, ArrayRef, BooleanArray, LargeStringArray, StringArray, StringViewArray,
 };
 use arrow_data::ArrayDataBuilder;
 use arrow_schema::DataType;
@@ -36,6 +36,15 @@ pub fn coalesce_type(res: ArrayRef, tar: &DataType) -> Result<ArrayRef, ArrowKer
                 StringArray::try_new(offsets.clone(), data.clone(), nulls.clone()).is_ok()
             );
             let s = Arc::new(unsafe { StringArray::new_unchecked(offsets, data, nulls) });
+            Ok(s)
+        }
+        (DataType::LargeBinary, DataType::LargeUtf8) => {
+            let res = res.as_binary::<i64>();
+            let (offsets, data, nulls) = res.clone().into_parts();
+            debug_assert!(
+                LargeStringArray::try_new(offsets.clone(), data.clone(), nulls.clone()).is_ok()
+            );
+            let s = Arc::new(unsafe { LargeStringArray::new_unchecked(offsets, data, nulls) });
             Ok(s)
         }
         (DataType::BinaryView, DataType::Utf8View) => {
@@ -427,5 +436,18 @@ mod tests {
 
         assert_eq!(res.len(), 2);
         assert_eq!(values.values(), &[1.0, 2.5, 3.25, 4.0, 1.0, 2.5, 3.25, 4.0]);
+    }
+
+    #[test]
+    fn test_utf8_to_large_utf8() {
+        let data = StringArray::from(vec!["hello", "world", "large utf8"]);
+        let k = CastKernel::compile(&(&data as &dyn Array), DataType::LargeUtf8).unwrap();
+        let res = k.call(&data).unwrap();
+        let res = res.as_string::<i64>();
+
+        assert_eq!(res.len(), data.len());
+        for (ours, orig) in res.iter().zip(data.iter()) {
+            assert_eq!(ours, orig);
+        }
     }
 }
