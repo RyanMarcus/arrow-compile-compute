@@ -36,7 +36,8 @@ use crate::{
         dsl2::{
             add_str_endswith, add_str_startswith, buffer::DSLBuffer, runtime::RunnableDSLFunction,
             two_d, vectorize, writers::accepted_type, DSLArgument, DSLArgumentType, DSLArithBinOp,
-            DSLBitwiseBinOp, DSLExpr, DSLFunction, DSLStmt, DSLStringPredicate, DSLType, DSLValue,
+            DSLBitwiseBinOp, DSLComparison, DSLExpr, DSLFunction, DSLStmt, DSLStringPredicate,
+            DSLType, DSLValue,
         },
         link_req_helpers,
         llvm_utils::llvm_add_save_ptrs_string_saver,
@@ -50,6 +51,7 @@ use crate::{
 pub enum KernelReturnCode {
     Success,
     InvalidEmitIndex,
+    EmptyReduction,
     Unknown(u64),
 }
 
@@ -58,6 +60,7 @@ impl From<KernelReturnCode> for u64 {
         match code {
             KernelReturnCode::Success => 0,
             KernelReturnCode::InvalidEmitIndex => 1,
+            KernelReturnCode::EmptyReduction => 2,
             KernelReturnCode::Unknown(code) => code,
         }
     }
@@ -68,6 +71,7 @@ impl From<u64> for KernelReturnCode {
         match code {
             0 => KernelReturnCode::Success,
             1 => KernelReturnCode::InvalidEmitIndex,
+            2 => KernelReturnCode::EmptyReduction,
             code => KernelReturnCode::Unknown(code),
         }
     }
@@ -529,6 +533,9 @@ fn compile_stmt<'ctx, 'a>(
             }
 
             if let Some(idx) = index.as_u32() {
+                if idx as usize >= ctx.outputs.len() {
+                    return Err(ArrowKernelError::InvalidIndex("emit index out of range"));
+                }
                 let accepted = accepted_type(&ctx.output_specs[idx as usize]);
                 if value.get_type() != accepted {
                     return Err(ArrowKernelError::DSLTypeMismatch(
@@ -537,7 +544,22 @@ fn compile_stmt<'ctx, 'a>(
                         value.get_type(),
                     ));
                 }
+                let value = compile_expr(ctx, value)?;
+                ctx.outputs[idx as usize].llvm_ingest(ctx.ctx, ctx.b, value);
+                return Ok(());
+            } else {
+                for spec in ctx.output_specs.iter() {
+                    let accepted = accepted_type(spec);
+                    if value.get_type() != accepted {
+                        return Err(ArrowKernelError::DSLTypeMismatch(
+                            "dynamic emit",
+                            accepted,
+                            value.get_type(),
+                        ));
+                    }
+                }
             }
+
             let index = compile_expr(ctx, index)?;
             let value = compile_expr(ctx, value)?;
 
@@ -841,6 +863,9 @@ fn compile_stmt<'ctx, 'a>(
             ctx.b.position_at_end(loop_end);
         }
         DSLStmt::Reduce(dslred) => {
+            let body_type = dslred.body.get_type();
+            let accum_type = dslred.reduction_type.accum_type(ctx.ctx, &body_type);
+
             let bufs = dslred
                 .loop_vars
                 .iter()
@@ -852,11 +877,14 @@ fn compile_stmt<'ctx, 'a>(
             let loop_header = ctx.ctx.append_basic_block(*ctx.func, "reduce_loop_header");
             let loop_body = ctx.ctx.append_basic_block(*ctx.func, "reduce_loop_body");
             let loop_end = ctx.ctx.append_basic_block(*ctx.func, "reduce_loop_end");
-            let accum_ptr =
-                build_entry_alloca(ctx, dslred.reduction_type.accum_type(ctx.ctx), "accum");
+            let accum_ptr = build_entry_alloca(ctx, accum_type, "accum");
             ctx.b
-                .build_store(accum_ptr, dslred.reduction_type.initial_value(ctx.ctx))
+                .build_store(
+                    accum_ptr,
+                    dslred.reduction_type.initial_value(ctx.ctx, &body_type),
+                )
                 .unwrap();
+
             ctx.b.build_unconditional_branch(loop_header).unwrap();
 
             // in the loop header, call next on all iterators and `and` together
@@ -912,15 +940,15 @@ fn compile_stmt<'ctx, 'a>(
             }
 
             let next = compile_expr(ctx, &dslred.body)?;
-            let accum = ctx
-                .b
-                .build_load(
-                    dslred.reduction_type.accum_type(ctx.ctx),
-                    accum_ptr,
-                    "accum",
-                )
-                .unwrap();
-            let new = dslred.reduction_type.update(ctx, accum, next);
+            let include = if let Some(include) = &dslred.include {
+                compile_expr(ctx, include)?.into_int_value()
+            } else {
+                ctx.ctx.bool_type().const_all_ones()
+            };
+            let accum = ctx.b.build_load(accum_type, accum_ptr, "accum").unwrap();
+            let new = dslred
+                .reduction_type
+                .update(ctx, &body_type, accum, next, include)?;
             ctx.b.build_store(accum_ptr, new).unwrap();
 
             // if every loop variable is a scalar, just do one iteration
@@ -933,12 +961,9 @@ fn compile_stmt<'ctx, 'a>(
             ctx.b.position_at_end(loop_end);
             let result = ctx
                 .b
-                .build_load(
-                    dslred.reduction_type.accum_type(ctx.ctx),
-                    accum_ptr,
-                    "reduce_result",
-                )
+                .build_load(accum_type, accum_ptr, "reduce_result")
                 .unwrap();
+            let result = dslred.reduction_type.output_value(ctx, result)?;
             ctx.st.insert(dslred.result.name, result);
             dslred.iterators.iter().for_each(|itr| {
                 ctx.b
@@ -1007,6 +1032,137 @@ fn compile_stmt<'ctx, 'a>(
     Ok(())
 }
 
+pub fn compile_compare_values<'ctx, 'a>(
+    ctx: &DSLCompilationContext<'ctx, 'a>,
+    op: DSLComparison,
+    lhs_type: &DSLType,
+    lhs: BasicValueEnum<'a>,
+    rhs: BasicValueEnum<'a>,
+) -> Result<BasicValueEnum<'a>, ArrowKernelError> {
+    match lhs_type {
+        DSLType::Boolean => Ok(ctx
+            .b
+            .build_int_compare(
+                op.as_int_predicate(false),
+                lhs.into_int_value(),
+                rhs.into_int_value(),
+                "cmp",
+            )
+            .unwrap()
+            .as_basic_value_enum()),
+        DSLType::Primitive(pt) => match pt.comparison_type() {
+            ComparisonType::Float => {
+                let cvt = add_float_to_int(ctx.ctx, ctx.module, *pt);
+                let lhs = ctx
+                    .b
+                    .build_call(cvt, &[lhs.into()], "cvt_lhs_for_total_order")
+                    .unwrap()
+                    .try_as_basic_value()
+                    .unwrap_basic();
+                let rhs = ctx
+                    .b
+                    .build_call(cvt, &[rhs.into()], "cvt_rhs_for_total_order")
+                    .unwrap()
+                    .try_as_basic_value()
+                    .unwrap_basic();
+                Ok(ctx
+                    .b
+                    .build_int_compare(
+                        op.as_int_predicate(true),
+                        lhs.into_int_value(),
+                        rhs.into_int_value(),
+                        "cmp",
+                    )
+                    .unwrap()
+                    .as_basic_value_enum())
+            }
+            ComparisonType::Int { signed } => Ok(ctx
+                .b
+                .build_int_compare(
+                    op.as_int_predicate(signed),
+                    lhs.into_int_value(),
+                    rhs.into_int_value(),
+                    "cmp",
+                )
+                .unwrap()
+                .as_basic_value_enum()),
+            ComparisonType::String => {
+                let memcmp = add_memcmp(ctx.ctx, ctx.module);
+                let memcmp_res = ctx
+                    .b
+                    .build_call(memcmp, &[lhs.into(), rhs.into()], "memcmp_res")
+                    .unwrap()
+                    .try_as_basic_value()
+                    .unwrap_basic()
+                    .into_int_value();
+
+                Ok(ctx
+                    .b
+                    .build_int_compare(
+                        op.as_int_predicate(true),
+                        memcmp_res,
+                        ctx.ctx.i64_type().const_zero(),
+                        "cmp",
+                    )
+                    .unwrap()
+                    .as_basic_value_enum())
+            }
+            ComparisonType::List(t) => match *t {
+                ComparisonType::Int { signed } => Ok(ctx
+                    .b
+                    .build_int_compare(
+                        op.as_int_predicate(signed),
+                        lhs.into_vector_value(),
+                        rhs.into_vector_value(),
+                        "cmpv",
+                    )
+                    .unwrap()
+                    .as_basic_value_enum()),
+                ComparisonType::Float => {
+                    let cvt = add_float_vec_to_int_vec(
+                        ctx.ctx,
+                        ctx.module,
+                        64,
+                        pt.list_type_into_inner(),
+                    );
+                    let lhs = ctx
+                        .b
+                        .build_call(cvt, &[lhs.into()], "cvt_lhs_for_total_order")
+                        .unwrap()
+                        .try_as_basic_value()
+                        .unwrap_basic();
+                    let rhs = ctx
+                        .b
+                        .build_call(cvt, &[rhs.into()], "cvt_rhs_for_total_order")
+                        .unwrap()
+                        .try_as_basic_value()
+                        .unwrap_basic();
+                    Ok(ctx
+                        .b
+                        .build_int_compare(
+                            op.as_int_predicate(true),
+                            lhs.into_vector_value(),
+                            rhs.into_vector_value(),
+                            "cmpfv",
+                        )
+                        .unwrap()
+                        .as_basic_value_enum())
+                }
+                ComparisonType::String | ComparisonType::List(_) => {
+                    Err(ArrowKernelError::DSLInvalidType(
+                        "comparison not implemented for this list type",
+                        lhs_type.clone(),
+                    ))
+                }
+            },
+        },
+        _ => Err(ArrowKernelError::DSLInvalidType(
+            "comparison requires boolean or primitive values",
+            lhs_type.clone(),
+        )),
+    }
+}
+
 fn compile_expr<'ctx, 'a>(
     ctx: &DSLCompilationContext<'ctx, 'a>,
     expr: &DSLExpr,
@@ -1041,128 +1197,7 @@ fn compile_expr<'ctx, 'a>(
 
             let lhs = compile_expr(ctx, lhs)?;
             let rhs = compile_expr(ctx, rhs)?;
-            match lhs_type {
-                DSLType::Boolean => Ok(ctx
-                    .b
-                    .build_int_compare(
-                        op.as_int_predicate(false),
-                        lhs.into_int_value(),
-                        rhs.into_int_value(),
-                        "cmp",
-                    )
-                    .unwrap()
-                    .as_basic_value_enum()),
-                DSLType::Primitive(pt) => match pt.comparison_type() {
-                    ComparisonType::Float => {
-                        let cvt = add_float_to_int(ctx.ctx, ctx.module, pt);
-                        let lhs = ctx
-                            .b
-                            .build_call(cvt, &[lhs.into()], "cvt_lhs_for_total_order")
-                            .unwrap()
-                            .try_as_basic_value()
-                            .unwrap_basic();
-                        let rhs = ctx
-                            .b
-                            .build_call(cvt, &[rhs.into()], "cvt_rhs_for_total_order")
-                            .unwrap()
-                            .try_as_basic_value()
-                            .unwrap_basic();
-                        Ok(ctx
-                            .b
-                            .build_int_compare(
-                                op.as_int_predicate(true),
-                                lhs.into_int_value(),
-                                rhs.into_int_value(),
-                                "cmp",
-                            )
-                            .unwrap()
-                            .as_basic_value_enum())
-                    }
-                    ComparisonType::Int { signed } => Ok(ctx
-                        .b
-                        .build_int_compare(
-                            op.as_int_predicate(signed),
-                            lhs.into_int_value(),
-                            rhs.into_int_value(),
-                            "cmp",
-                        )
-                        .unwrap()
-                        .as_basic_value_enum()),
-                    ComparisonType::String => {
-                        let memcmp = add_memcmp(ctx.ctx, ctx.module);
-                        let memcmp_res = ctx
-                            .b
-                            .build_call(memcmp, &[lhs.into(), rhs.into()], "memcmp_res")
-                            .unwrap()
-                            .try_as_basic_value()
-                            .unwrap_basic()
-                            .into_int_value();
-
-                        Ok(ctx
-                            .b
-                            .build_int_compare(
-                                op.as_int_predicate(true),
-                                memcmp_res,
-                                ctx.ctx.i64_type().const_zero(),
-                                "cmp",
-                            )
-                            .unwrap()
-                            .as_basic_value_enum())
-                    }
-                    ComparisonType::List(t) => match *t {
-                        ComparisonType::Int { signed } => Ok(ctx
-                            .b
-                            .build_int_compare(
-                                op.as_int_predicate(signed),
-                                lhs.into_vector_value(),
-                                rhs.into_vector_value(),
-                                "cmpv",
-                            )
-                            .unwrap()
-                            .as_basic_value_enum()),
-                        ComparisonType::Float => {
-                            let cvt = add_float_vec_to_int_vec(
-                                ctx.ctx,
-                                ctx.module,
-                                64,
-                                pt.list_type_into_inner(),
-                            );
-                            let lhs = ctx
-                                .b
-                                .build_call(cvt, &[lhs.into()], "cvt_lhs_for_total_order")
-                                .unwrap()
-                                .try_as_basic_value()
-                                .unwrap_basic();
-                            let rhs = ctx
-                                .b
-                                .build_call(cvt, &[rhs.into()], "cvt_rhs_for_total_order")
-                                .unwrap()
-                                .try_as_basic_value()
-                                .unwrap_basic();
-                            Ok(ctx
-                                .b
-                                .build_int_compare(
-                                    op.as_int_predicate(true),
-                                    lhs.into_vector_value(),
-                                    rhs.into_vector_value(),
-                                    "cmpfv",
-                                )
-                                .unwrap()
-                                .as_basic_value_enum())
-                        }
-                        ComparisonType::String | ComparisonType::List(_) => {
-                            Err(ArrowKernelError::DSLInvalidType(
-                                "comparison not implemented for this list type",
-                                lhs_type,
-                            ))
-                        }
-                    },
-                },
-                _ => Err(ArrowKernelError::DSLInvalidType(
-                    "comparison requires boolean or primitive values",
-                    lhs_type,
-                )),
-            }
+            compile_compare_values(ctx, *op, &lhs_type, lhs, rhs)
         }
         DSLExpr::At(v, i) => {
             let res = match &v.ty {

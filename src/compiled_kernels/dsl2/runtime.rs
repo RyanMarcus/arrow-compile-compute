@@ -204,6 +204,7 @@ impl RunnableDSLFunction {
         match result {
             KernelReturnCode::Success => Ok(()),
             KernelReturnCode::InvalidEmitIndex => Err(ArrowKernelError::RuntimeInvalidEmitIndex),
+            KernelReturnCode::EmptyReduction => Err(ArrowKernelError::RuntimeEmptyReduction),
             KernelReturnCode::Unknown(c) => Err(ArrowKernelError::RuntimeUnknownReturnCode(c)),
         }
     }

@@ -883,6 +883,39 @@ impl DSLStmt {
         E: Into<DSLExpr>,
         F: FnOnce(&[DSLValue]) -> Result<E, ArrowKernelError>,
     {
+        Self::reduce_inner(ctx, rt, to_iter, f, |_| Ok(None))
+    }
+
+    pub fn reduce_where<E, I, F, G>(
+        ctx: &mut DSLContext,
+        rt: DSLReductionType,
+        to_iter: &[DSLValue],
+        f: F,
+        include: G,
+    ) -> Result<DSLBoundStmt, ArrowKernelError>
+    where
+        E: Into<DSLExpr>,
+        I: Into<DSLExpr>,
+        F: FnOnce(&[DSLValue]) -> Result<E, ArrowKernelError>,
+        G: FnOnce(&[DSLValue]) -> Result<I, ArrowKernelError>,
+    {
+        Self::reduce_inner(ctx, rt, to_iter, f, |loop_vars| {
+            Ok(Some(include(loop_vars)?.into()))
+        })
+    }
+
+    fn reduce_inner<E, F, G>(
+        ctx: &mut DSLContext,
+        rt: DSLReductionType,
+        to_iter: &[DSLValue],
+        f: F,
+        include: G,
+    ) -> Result<DSLBoundStmt, ArrowKernelError>
+    where
+        E: Into<DSLExpr>,
+        F: FnOnce(&[DSLValue]) -> Result<E, ArrowKernelError>,
+        G: FnOnce(&[DSLValue]) -> Result<Option<DSLExpr>, ArrowKernelError>,
+    {
         let loop_vars: Vec<DSLValue> = to_iter
             .iter()
             .map(|dv| {
@@ -894,6 +927,17 @@ impl DSLStmt {
             .try_collect()?;
 
         let body = f(&loop_vars)?.into();
+        let include = include(&loop_vars)?;
+        if let Some(include) = &include {
+            if include.get_type() != DSLType::Boolean {
+                return Err(ArrowKernelError::DSLTypeMismatch(
+                    "reduction include expression must be a boolean",
+                    DSLType::Boolean,
+                    include.get_type(),
+                ));
+            }
+        }
+
         if !rt.can_reduce_expr(&body) {
             return Err(ArrowKernelError::DSLInvalidType(
                 "cannot use reduction {} over this type",
@@ -901,13 +945,14 @@ impl DSLStmt {
             ));
         }
 
-        let result = DSLValue::new(ctx, rt.out_type());
+        let result = DSLValue::new(ctx, rt.out_type(&body));
 
         Ok(DSLBoundStmt {
             stmt: DSLStmt::Reduce(DSLReduce {
                 loop_vars,
                 iterators: to_iter.iter().cloned().collect_vec(),
                 body,
+                include,
                 result: result.clone(),
                 reduction_type: rt,
             }),
@@ -1000,6 +1045,9 @@ impl DSLStmt {
             }
             DSLStmt::Reduce(dslred) => {
                 dslred.body.accessed_parameters(params);
+                if let Some(include) = &dslred.include {
+                    include.accessed_parameters(params);
+                }
             }
             DSLStmt::Emit { index, value } | DSLStmt::EmitBlock { index, value } => {
                 index.accessed_parameters(params);
@@ -1444,7 +1492,7 @@ mod tests {
                 DSLContext, DSLFunction, DSLReductionType, DSLStmt, DSLType, DSLValue, OutputSpec,
             },
         },
-        ListItemType, PrimitiveType,
+        ArrowKernelError, ListItemType, PrimitiveType,
     };
 
     #[test]
@@ -2102,6 +2150,254 @@ mod tests {
                 .collect_vec(),
             vec![false]
         );
+    }
+
+    #[test]
+    fn test_dsl2_reduce_min_signed() {
+        let mut ctx = DSLContext::new();
+        let mut func = DSLFunction::new("reduce_min_signed");
+        let arr_input = Int32Array::new_null(0);
+
+        let arr = func.add_arg(&mut ctx, DSLType::array_like(&arr_input, "n"));
+        let reduced = DSLStmt::reduce(&mut ctx, DSLReductionType::Min, &[arr], |loop_vars| {
+            Ok(loop_vars[0].expr())
+        })
+        .unwrap();
+
+        func.add_body(reduced.stmt);
+        func.add_body(DSLStmt::emit(0, reduced.value.expr()).unwrap());
+        func.add_ret(WriterSpec::Primitive(PrimitiveType::I32), "<= n");
+
+        let func = compile(func, dsl_args![arr_input]).unwrap();
+        let result = func
+            .run(&dsl_args![Int32Array::from(vec![7, -2, 5, -2])])
+            .unwrap();
+        assert_eq!(result[0].as_primitive::<Int32Type>().values(), &[-2]);
+    }
+
+    #[test]
+    fn test_dsl2_reduce_min_unsigned_and_float() {
+        let mut ctx = DSLContext::new();
+        let mut func = DSLFunction::new("reduce_min_unsigned");
+        let uint_input = UInt32Array::new_null(0);
+        let float_input = Float32Array::new_null(0);
+
+        let uints = func.add_arg(&mut ctx, DSLType::array_like(&uint_input, "n"));
+        let floats = func.add_arg(&mut ctx, DSLType::array_like(&float_input, "n"));
+        let uint_min = DSLStmt::reduce(&mut ctx, DSLReductionType::Min, &[uints], |loop_vars| {
+            Ok(loop_vars[0].expr())
+        })
+        .unwrap();
+        let float_min = DSLStmt::reduce(&mut ctx, DSLReductionType::Min, &[floats], |loop_vars| {
+            Ok(loop_vars[0].expr())
+        })
+        .unwrap();
+
+        func.add_body(uint_min.stmt);
+        func.add_body(float_min.stmt);
+        func.add_body(DSLStmt::emit(0, uint_min.value.expr()).unwrap());
+        func.add_body(DSLStmt::emit(1, float_min.value.expr()).unwrap());
+        func.add_ret(WriterSpec::Primitive(PrimitiveType::U32), "<= n");
+        func.add_ret(WriterSpec::Primitive(PrimitiveType::F32), "<= n");
+
+        let func = compile(func, dsl_args![uint_input, float_input]).unwrap();
+        let uints = UInt32Array::from(vec![9, 2, 4]);
+        let floats = Float32Array::from(vec![3.5, -1.25, 0.0]);
+        let result = func.run(&dsl_args![uints, floats]).unwrap();
+        assert_eq!(result[0].as_primitive::<UInt32Type>().values(), &[2]);
+        assert_eq!(result[1].as_primitive::<Float32Type>().values(), &[-1.25]);
+    }
+
+    #[test]
+    fn test_dsl2_reduce_argmin_first_tie() {
+        let mut ctx = DSLContext::new();
+        let mut func = DSLFunction::new("reduce_argmin_first_tie");
+        let arr_input = Int32Array::new_null(0);
+
+        let arr = func.add_arg(&mut ctx, DSLType::array_like(&arr_input, "n"));
+        let reduced = DSLStmt::reduce(&mut ctx, DSLReductionType::ArgMin, &[arr], |loop_vars| {
+            Ok(loop_vars[0].expr())
+        })
+        .unwrap();
+
+        func.add_body(reduced.stmt);
+        func.add_body(DSLStmt::emit(0, reduced.value.expr()).unwrap());
+        func.add_ret(WriterSpec::Primitive(PrimitiveType::U64), "<= n");
+
+        let func = compile(func, dsl_args![arr_input]).unwrap();
+        let result = func
+            .run(&dsl_args![Int32Array::from(vec![7, -2, 5, -2])])
+            .unwrap();
+        assert_eq!(result[0].as_primitive::<UInt64Type>().values(), &[1]);
+    }
+
+    #[test]
+    fn test_dsl2_reduce_where_argmin_uses_physical_index() {
+        let mut ctx = DSLContext::new();
+        let mut func = DSLFunction::new("reduce_where_argmin");
+        let arr_input = Int32Array::new_null(0);
+        let valid_input = BooleanArray::new_null(0);
+
+        let arr = func.add_arg(&mut ctx, DSLType::array_like(&arr_input, "n"));
+        let valid = func.add_arg(&mut ctx, DSLType::array_like(&valid_input, "n"));
+        let reduced = DSLStmt::reduce_where(
+            &mut ctx,
+            DSLReductionType::ArgMin,
+            &[arr, valid],
+            |loop_vars| Ok(loop_vars[0].expr()),
+            |loop_vars| Ok(loop_vars[1].expr()),
+        )
+        .unwrap();
+
+        func.add_body(reduced.stmt);
+        func.add_body(DSLStmt::emit(0, reduced.value.expr()).unwrap());
+        func.add_ret(WriterSpec::Primitive(PrimitiveType::U64), "<= n");
+
+        let func = compile(func, dsl_args![arr_input, valid_input]).unwrap();
+        let values = Int32Array::from(vec![-100, 7, -2, 5, -2]);
+        let valid = BooleanArray::from(vec![false, true, true, true, true]);
+        let result = func.run(&dsl_args![values, valid]).unwrap();
+        assert_eq!(result[0].as_primitive::<UInt64Type>().values(), &[2]);
+    }
+
+    #[test]
+    fn test_dsl2_reduce_max_signed() {
+        let mut ctx = DSLContext::new();
+        let mut func = DSLFunction::new("reduce_max_signed");
+        let arr_input = Int32Array::new_null(0);
+
+        let arr = func.add_arg(&mut ctx, DSLType::array_like(&arr_input, "n"));
+        let reduced = DSLStmt::reduce(&mut ctx, DSLReductionType::Max, &[arr], |loop_vars| {
+            Ok(loop_vars[0].expr())
+        })
+        .unwrap();
+
+        func.add_body(reduced.stmt);
+        func.add_body(DSLStmt::emit(0, reduced.value.expr()).unwrap());
+        func.add_ret(WriterSpec::Primitive(PrimitiveType::I32), "<= n");
+
+        let func = compile(func, dsl_args![arr_input]).unwrap();
+        let result = func
+            .run(&dsl_args![Int32Array::from(vec![7, -2, 9, 9, 5])])
+            .unwrap();
+        assert_eq!(result[0].as_primitive::<Int32Type>().values(), &[9]);
+    }
+
+    #[test]
+    fn test_dsl2_reduce_max_unsigned_and_float() {
+        let mut ctx = DSLContext::new();
+        let mut func = DSLFunction::new("reduce_max_unsigned");
+        let uint_input = UInt32Array::new_null(0);
+        let float_input = Float32Array::new_null(0);
+
+        let uints = func.add_arg(&mut ctx, DSLType::array_like(&uint_input, "n"));
+        let floats = func.add_arg(&mut ctx, DSLType::array_like(&float_input, "n"));
+        let uint_max = DSLStmt::reduce(&mut ctx, DSLReductionType::Max, &[uints], |loop_vars| {
+            Ok(loop_vars[0].expr())
+        })
+        .unwrap();
+        let float_max = DSLStmt::reduce(&mut ctx, DSLReductionType::Max, &[floats], |loop_vars| {
+            Ok(loop_vars[0].expr())
+        })
+        .unwrap();
+
+        func.add_body(uint_max.stmt);
+        func.add_body(float_max.stmt);
+        func.add_body(DSLStmt::emit(0, uint_max.value.expr()).unwrap());
+        func.add_body(DSLStmt::emit(1, float_max.value.expr()).unwrap());
+        func.add_ret(WriterSpec::Primitive(PrimitiveType::U32), "<= n");
+        func.add_ret(WriterSpec::Primitive(PrimitiveType::F32), "<= n");
+
+        let func = compile(func, dsl_args![uint_input, float_input]).unwrap();
+        let uints = UInt32Array::from(vec![9, 12, 4]);
+        let floats = Float32Array::from(vec![3.5, -1.25, 8.0]);
+        let result = func.run(&dsl_args![uints, floats]).unwrap();
+        assert_eq!(result[0].as_primitive::<UInt32Type>().values(), &[12]);
+        assert_eq!(result[1].as_primitive::<Float32Type>().values(), &[8.0]);
+    }
+
+    #[test]
+    fn test_dsl2_reduce_argmax_first_tie() {
+        let mut ctx = DSLContext::new();
+        let mut func = DSLFunction::new("reduce_argmax_first_tie");
+        let arr_input = Int32Array::new_null(0);
+
+        let arr = func.add_arg(&mut ctx, DSLType::array_like(&arr_input, "n"));
+        let reduced = DSLStmt::reduce(&mut ctx, DSLReductionType::ArgMax, &[arr], |loop_vars| {
+            Ok(loop_vars[0].expr())
+        })
+        .unwrap();
+
+        func.add_body(reduced.stmt);
+        func.add_body(DSLStmt::emit(0, reduced.value.expr()).unwrap());
+        func.add_ret(WriterSpec::Primitive(PrimitiveType::U64), "<= n");
+
+        let func = compile(func, dsl_args![arr_input]).unwrap();
+        let result = func
+            .run(&dsl_args![Int32Array::from(vec![7, 9, 5, 9])])
+            .unwrap();
+        assert_eq!(result[0].as_primitive::<UInt64Type>().values(), &[1]);
+    }
+
+    #[test]
+    fn test_dsl2_reduce_min_empty_errors() {
+        let mut ctx = DSLContext::new();
+        let mut func = DSLFunction::new("reduce_min_empty_errors");
+        let arr_input = Int32Array::new_null(0);
+
+        let arr = func.add_arg(&mut ctx, DSLType::array_like(&arr_input, "n"));
+        let reduced = DSLStmt::reduce(&mut ctx, DSLReductionType::Min, &[arr], |loop_vars| {
+            Ok(loop_vars[0].expr())
+        })
+        .unwrap();
+
+        func.add_body(reduced.stmt);
+        func.add_body(DSLStmt::emit(0, reduced.value.expr()).unwrap());
+        func.add_ret(WriterSpec::Primitive(PrimitiveType::I32), "<= n");
+
+        let func = compile(func, dsl_args![arr_input]).unwrap();
+        let err = func
+            .run(&dsl_args![Int32Array::from(Vec::<i32>::new())])
+            .unwrap_err();
+        assert!(matches!(err, ArrowKernelError::RuntimeEmptyReduction));
+    }
+
+    #[test]
+    fn test_dsl2_reduce_max_empty_errors() {
+        let mut ctx = DSLContext::new();
+        let mut func = DSLFunction::new("reduce_max_empty_errors");
+        let arr_input = Int32Array::new_null(0);
+
+        let arr = func.add_arg(&mut ctx, DSLType::array_like(&arr_input, "n"));
+        let reduced = DSLStmt::reduce(&mut ctx, DSLReductionType::Max, &[arr], |loop_vars| {
+            Ok(loop_vars[0].expr())
+        })
+        .unwrap();
+
+        func.add_body(reduced.stmt);
+        func.add_body(DSLStmt::emit(0, reduced.value.expr()).unwrap());
+        func.add_ret(WriterSpec::Primitive(PrimitiveType::I32), "<= n");
+
+        let func = compile(func, dsl_args![arr_input]).unwrap();
+        let err = func
+            .run(&dsl_args![Int32Array::from(Vec::<i32>::new())])
+            .unwrap_err();
+        assert!(matches!(err, ArrowKernelError::RuntimeEmptyReduction));
+    }
+
+    #[test]
+    fn test_dsl2_reduce_min_rejects_boolean() {
+        let mut ctx = DSLContext::new();
+        let mut func = DSLFunction::new("reduce_min_rejects_boolean");
+        let arr_input = BooleanArray::new_null(0);
+
+        let arr = func.add_arg(&mut ctx, DSLType::array_like(&arr_input, "n"));
+        let err = DSLStmt::reduce(&mut ctx, DSLReductionType::Min, &[arr], |loop_vars| {
+            Ok(loop_vars[0].expr())
+        })
+        .unwrap_err();
+
+        assert!(matches!(err, ArrowKernelError::DSLInvalidType(_, _)));
     }
 
     #[test]

@@ -679,14 +679,121 @@ pub mod select {
 pub mod compute {
     use std::sync::LazyLock;
 
-    use arrow_array::{Array, Datum, UInt64Array};
+    use arrow_array::types::UInt64Type;
+    use arrow_array::{cast::AsArray, Array, ArrayRef, Datum, UInt64Array};
 
     use crate::{
-        compiled_kernels::{HashFunction, HashKernel, KernelCache},
+        compiled_kernels::{
+            HashFunction, HashKernel, KernelCache, ReductionKernel, ReductionKernelType,
+        },
         ArrowKernelError,
     };
 
     static HASH_PROGRAM_CACHE: LazyLock<KernelCache<HashKernel>> = LazyLock::new(KernelCache::new);
+    static REDUCTION_PROGRAM_CACHE: LazyLock<KernelCache<ReductionKernel>> =
+        LazyLock::new(KernelCache::new);
+
+    /// Return the minimum non-null value as a one-element array.
+    ///
+    /// Null values are skipped. If there are no non-null values, the returned
+    /// one-element array is null.
+    ///
+    /// This is a single-array reduction. For groupbys or multi-array
+    /// aggregation, prefer the [`crate::aggregate`] module.
+    ///
+    /// # Example
+    ///
+    /// ```
+    /// use arrow_array::{cast::AsArray, Int32Array};
+    /// use arrow_compile_compute::compute;
+    ///
+    /// let values = Int32Array::from(vec![5, -3, 7, -3]);
+    /// let result = compute::min(&values).unwrap();
+    /// assert_eq!(result.as_primitive::<arrow_array::types::Int32Type>().value(0), -3);
+    ///
+    /// let nullable = Int32Array::from(vec![None, Some(4), Some(2)]);
+    /// let result = compute::min(&nullable).unwrap();
+    /// assert_eq!(result.as_primitive::<arrow_array::types::Int32Type>().iter().next().unwrap(), Some(2));
+    /// ```
+    pub fn min(data: &dyn Datum) -> Result<ArrayRef, ArrowKernelError> {
+        REDUCTION_PROGRAM_CACHE.get(data, ReductionKernelType::Min)
+    }
+
+    /// Return the maximum non-null value as a one-element array.
+    ///
+    /// Null values are skipped. If there are no non-null values, the returned
+    /// one-element array is null.
+    ///
+    /// This is a single-array reduction. For groupbys or multi-array
+    /// aggregation, prefer the [`crate::aggregate`] module.
+    ///
+    /// # Example
+    ///
+    /// ```
+    /// use arrow_array::{cast::AsArray, Int32Array};
+    /// use arrow_compile_compute::compute;
+    ///
+    /// let values = Int32Array::from(vec![5, -3, 7, 7]);
+    /// let result = compute::max(&values).unwrap();
+    /// assert_eq!(result.as_primitive::<arrow_array::types::Int32Type>().value(0), 7);
+    ///
+    /// let nullable = Int32Array::from(vec![None, Some(4), Some(2)]);
+    /// let result = compute::max(&nullable).unwrap();
+    /// assert_eq!(result.as_primitive::<arrow_array::types::Int32Type>().iter().next().unwrap(), Some(4));
+    /// ```
+    pub fn max(data: &dyn Datum) -> Result<ArrayRef, ArrowKernelError> {
+        REDUCTION_PROGRAM_CACHE.get(data, ReductionKernelType::Max)
+    }
+
+    /// Return the zero-based index of the first minimum non-null value.
+    ///
+    /// Null values are skipped. If there are no non-null values, returns
+    /// `None`.
+    ///
+    /// This is a single-array reduction. For groupbys or multi-array
+    /// aggregation, prefer the [`crate::aggregate`] module.
+    ///
+    /// # Example
+    ///
+    /// ```
+    /// use arrow_array::Int32Array;
+    /// use arrow_compile_compute::compute;
+    ///
+    /// let values = Int32Array::from(vec![5, -3, 7, -3]);
+    /// assert_eq!(compute::argmin(&values).unwrap(), Some(1));
+    ///
+    /// let all_null = Int32Array::from(vec![None::<i32>, None]);
+    /// assert_eq!(compute::argmin(&all_null).unwrap(), None);
+    /// ```
+    pub fn argmin(data: &dyn Datum) -> Result<Option<u64>, ArrowKernelError> {
+        let result = REDUCTION_PROGRAM_CACHE.get(data, ReductionKernelType::ArgMin)?;
+        Ok(result.as_primitive::<UInt64Type>().iter().next().unwrap())
+    }
+
+    /// Return the zero-based index of the first maximum non-null value.
+    ///
+    /// Null values are skipped. If there are no non-null values, returns
+    /// `None`.
+    ///
+    /// This is a single-array reduction. For groupbys or multi-array
+    /// aggregation, prefer the [`crate::aggregate`] module.
+    ///
+    /// # Example
+    ///
+    /// ```
+    /// use arrow_array::Int32Array;
+    /// use arrow_compile_compute::compute;
+    ///
+    /// let values = Int32Array::from(vec![5, 7, -3, 7]);
+    /// assert_eq!(compute::argmax(&values).unwrap(), Some(1));
+    ///
+    /// let all_null = Int32Array::from(vec![None::<i32>, None]);
+    /// assert_eq!(compute::argmax(&all_null).unwrap(), None);
+    /// ```
+    pub fn argmax(data: &dyn Datum) -> Result<Option<u64>, ArrowKernelError> {
+        let result = REDUCTION_PROGRAM_CACHE.get(data, ReductionKernelType::ArgMax)?;
+        Ok(result.as_primitive::<UInt64Type>().iter().next().unwrap())
+    }
 
     /// Compute a 64-bit modified murmurhash for each element in `data`.
     ///

@@ -12,6 +12,7 @@ mod interleave;
 mod llvm_utils;
 mod null_utils;
 mod partition;
+mod reduction;
 mod rust_iter;
 mod sort;
 mod sort_norm;
@@ -37,6 +38,7 @@ pub use interleave::InterleaveKernel;
 use llvm_utils::str_writer_append_bytes;
 pub use null_utils::intersect_and_copy_nulls;
 pub use partition::PartitionKernel;
+pub use reduction::{ReductionKernel, ReductionKernelType};
 pub use rust_iter::{ArrowIter, ArrowNullableIter, IterFuncHolder};
 pub use sort::{lower_bound, sort_col, sort_multi_col, top_k, SortOptions};
 pub use sort_norm::normalize_columns;
@@ -135,6 +137,9 @@ pub enum ArrowKernelError {
 
     #[error("invalid emit index during kernel runtime")]
     RuntimeInvalidEmitIndex,
+
+    #[error("empty min/argmin reduction during kernel runtime")]
+    RuntimeEmptyReduction,
 
     #[error("unknown kernel runtime return code: {0}")]
     RuntimeUnknownReturnCode(u64),
