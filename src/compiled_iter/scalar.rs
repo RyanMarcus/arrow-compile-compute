@@ -4,7 +4,7 @@ use half::f16;
 use inkwell::{
     builder::Builder,
     context::Context,
-    values::{PointerValue, VectorValue},
+    values::{BasicValue, PointerValue, VectorValue},
     AddressSpace,
 };
 use repr_offset::ReprOffset;
@@ -292,6 +292,10 @@ impl ScalarVectorIterator {
             .build_load(vec_type, val_ptr, "val")
             .unwrap()
             .into_vector_value();
+        val.as_instruction_value()
+            .unwrap()
+            .set_alignment(1)
+            .unwrap();
         mark_load_invariant!(ctx, val);
 
         val

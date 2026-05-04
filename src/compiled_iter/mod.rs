@@ -1598,6 +1598,10 @@ pub fn generate_next<'a>(
             let data_ptr = iter.llvm_data(ctx, &build, iter_ptr);
             let data_ptr = increment_pointer!(ctx, build, data_ptr, ptype.width(), curr_pos);
             let out = build.build_load(llvm_type, data_ptr, "elem").unwrap();
+            out.as_instruction_value()
+                .unwrap()
+                .set_alignment(1)
+                .unwrap();
             build.build_store(out_ptr, out).unwrap();
             iter.llvm_increment_pos(ctx, &build, iter_ptr, i64_type.const_int(1, false));
             build
@@ -1823,6 +1827,10 @@ pub fn generate_random_access<'a>(
             let data_ptr = iter.llvm_data(ctx, &build, iter_ptr);
             let data_ptr = increment_pointer!(ctx, build, data_ptr, ptype.width(), idx);
             let out = build.build_load(llvm_type, data_ptr, "elem").unwrap();
+            out.as_instruction_value()
+                .unwrap()
+                .set_alignment(1)
+                .unwrap();
             build.build_return(Some(&out)).unwrap();
 
             Some(access_f)

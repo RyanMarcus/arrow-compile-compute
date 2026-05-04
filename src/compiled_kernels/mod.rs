@@ -44,7 +44,7 @@ pub use sort::{lower_bound, sort_col, sort_multi_col, top_k, SortOptions};
 pub use sort_norm::normalize_columns;
 pub use string::{compile_string_like, string_contains, StringKernelType, StringStartEndKernel};
 pub use take::TakeKernel;
-pub use vec::{DotKernel, NormVecKernel};
+pub use vec::{DotKernel, NearestNeighborKernel, NormVecKernel};
 
 use self::{
     dsl2::{DSLExpr, DSLType},

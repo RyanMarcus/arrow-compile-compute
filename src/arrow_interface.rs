@@ -987,15 +987,17 @@ pub mod arith {
 pub mod vec {
     use std::sync::{Arc, LazyLock};
 
-    use arrow_array::{Array, ArrayRef, Datum};
+    use arrow_array::{Array, ArrayRef, Datum, Float32Array};
 
     use crate::{
-        compiled_kernels::{DotKernel, KernelCache, NormVecKernel},
+        compiled_kernels::{DotKernel, KernelCache, NearestNeighborKernel, NormVecKernel},
         ArrowKernelError,
     };
 
     static DOT_KERNEL_CACHE: LazyLock<KernelCache<DotKernel>> = LazyLock::new(KernelCache::new);
     static NORM_VEC_KERNEL_CACHE: LazyLock<KernelCache<NormVecKernel>> =
+        LazyLock::new(KernelCache::new);
+    static NEAREST_NEIGHBOR_KERNEL_CACHE: LazyLock<KernelCache<NearestNeighborKernel>> =
         LazyLock::new(KernelCache::new);
 
     pub fn dot(left: &dyn Datum, right: &dyn Array) -> Result<ArrayRef, ArrowKernelError> {
@@ -1004,5 +1006,45 @@ pub mod vec {
 
     pub fn norm(left: &dyn Datum) -> Result<Arc<dyn Datum>, ArrowKernelError> {
         NORM_VEC_KERNEL_CACHE.get(left, ())
+    }
+
+    /// Return the index of the closest value vector to a scalar query vector.
+    ///
+    /// Uses squared L2 distance without the query norm term:
+    /// `value_squared_norm - 2 * dot(query, value)`.
+    ///
+    /// # Example
+    ///
+    /// ```
+    /// use arrow_array::{
+    ///     builder::{FixedSizeListBuilder, Float32Builder},
+    ///     Float32Array, Scalar,
+    /// };
+    /// use arrow_compile_compute::vec::nearest_neighbor;
+    ///
+    /// let mut values = FixedSizeListBuilder::new(Float32Builder::new(), 2);
+    /// values.values().append_slice(&[1.0, 0.0]);
+    /// values.append(true);
+    /// values.values().append_slice(&[0.0, 2.0]);
+    /// values.append(true);
+    /// let values = values.finish();
+    /// let value_squared_norms = Float32Array::from(vec![1.0, 4.0]);
+    ///
+    /// let mut query = FixedSizeListBuilder::new(Float32Builder::new(), 2);
+    /// query.values().append_slice(&[0.0, 1.5]);
+    /// query.append(true);
+    /// let query = Scalar::new(query.finish());
+    ///
+    /// assert_eq!(
+    ///     nearest_neighbor(&query, &values, &value_squared_norms).unwrap(),
+    ///     Some(1)
+    /// );
+    /// ```
+    pub fn nearest_neighbor(
+        query: &dyn Datum,
+        values: &dyn Array,
+        value_squared_norms: &Float32Array,
+    ) -> Result<Option<u64>, ArrowKernelError> {
+        NEAREST_NEIGHBOR_KERNEL_CACHE.get((query, values, value_squared_norms), ())
     }
 }

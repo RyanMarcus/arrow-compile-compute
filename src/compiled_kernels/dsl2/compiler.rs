@@ -1295,6 +1295,11 @@ fn compile_expr<'ctx, 'a>(
                         .i8_type()
                         .const_int(v.as_primitive::<UInt8Type>().value(0) as u64, false)
                         .as_basic_value_enum()),
+                    DataType::Float32 => Ok(ctx
+                        .ctx
+                        .f32_type()
+                        .const_float(v.as_primitive::<Float32Type>().value(0) as f64)
+                        .as_basic_value_enum()),
                     _ => todo!(),
                 }
             }

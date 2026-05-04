@@ -1,13 +1,13 @@
 use std::sync::Arc;
 
-use arrow_array::{cast::AsArray, Array, ArrayRef, Datum, Scalar};
+use arrow_array::{cast::AsArray, Array, ArrayRef, Datum, Float32Array, Scalar};
 use arrow_schema::DataType;
 
 use crate::{
     compiled_kernels::{
         dsl2::{
-            compile, DSLArgument, DSLArithBinOp, DSLContext, DSLFunction, DSLStmt, DSLType,
-            RunnableDSLFunction, WriterSpec,
+            compile, DSLArgument, DSLArithBinOp, DSLContext, DSLFunction, DSLReductionType,
+            DSLStmt, DSLType, DSLValue, RunnableDSLFunction, WriterSpec,
         },
         null_utils::replace_nulls,
     },
@@ -204,6 +204,166 @@ impl Kernel for NormVecKernel {
     ) -> Result<Self::Key, ArrowKernelError> {
         Ok(i.get().0.data_type().clone())
     }
+}
+
+pub struct NearestNeighborKernel(RunnableDSLFunction);
+unsafe impl Sync for NearestNeighborKernel {}
+unsafe impl Send for NearestNeighborKernel {}
+
+impl Kernel for NearestNeighborKernel {
+    type Key = (DataType, DataType, DataType);
+
+    type Input<'a>
+        = (&'a dyn Datum, &'a dyn Array, &'a Float32Array)
+    where
+        Self: 'a;
+
+    type Params = ();
+
+    type Output = Option<u64>;
+
+    fn call(&self, inp: Self::Input<'_>) -> Result<Self::Output, ArrowKernelError> {
+        validate_nearest_neighbor_input(inp)?;
+
+        match self.0.run(&[
+            DSLArgument::Datum(inp.0),
+            DSLArgument::datum(&inp.1),
+            DSLArgument::Datum(inp.2),
+        ]) {
+            Ok(result) => Ok(result[0]
+                .as_primitive::<arrow_array::types::UInt64Type>()
+                .iter()
+                .next()
+                .unwrap()),
+            Err(ArrowKernelError::RuntimeEmptyReduction) => Ok(None),
+            Err(err) => Err(err),
+        }
+    }
+
+    fn compile(inp: &Self::Input<'_>, _params: Self::Params) -> Result<Self, ArrowKernelError> {
+        validate_nearest_neighbor_input(*inp)?;
+
+        let mut ctx = DSLContext::new();
+        let mut func = DSLFunction::new("nearest_neighbor");
+        let query_arg = func.add_arg(&mut ctx, DSLType::array_like(inp.0, "n"));
+        let values_arg = func.add_arg(&mut ctx, DSLType::array_like(&inp.1, "n"));
+        let norms_arg = func.add_arg(&mut ctx, DSLType::array_like(inp.2, "n"));
+
+        let reduced = DSLStmt::reduce(
+            &mut ctx,
+            DSLReductionType::ArgMin,
+            &[values_arg, norms_arg, query_arg],
+            |loop_vars| {
+                let value = loop_vars[0].expr();
+                let squared_norm = loop_vars[1].expr();
+                let query = loop_vars[2].expr();
+                let dot = query.arith(DSLArithBinOp::Mul, value)?.vec_sum()?;
+                let scaled_dot = DSLValue::f32(-2.0)
+                    .as_primitive_expr()?
+                    .arith(DSLArithBinOp::Mul, dot)?;
+                squared_norm.arith(DSLArithBinOp::Add, scaled_dot)
+            },
+        )?;
+
+        func.add_body(reduced.stmt);
+        func.add_body(DSLStmt::emit(0, reduced.value.expr())?);
+        func.add_ret(WriterSpec::Primitive(PrimitiveType::U64), "<= n");
+
+        Ok(Self(compile(
+            func,
+            [
+                DSLArgument::Datum(inp.0),
+                DSLArgument::datum(&inp.1),
+                DSLArgument::Datum(inp.2),
+            ],
+        )?))
+    }
+
+    fn get_key_for_input(
+        i: &Self::Input<'_>,
+        _p: &Self::Params,
+    ) -> Result<Self::Key, ArrowKernelError> {
+        validate_nearest_neighbor_input(*i)?;
+        Ok((
+            i.0.get().0.data_type().clone(),
+            i.1.data_type().clone(),
+            i.2.data_type().clone(),
+        ))
+    }
+}
+
+fn validate_nearest_neighbor_input(
+    input: (&dyn Datum, &dyn Array, &Float32Array),
+) -> Result<(), ArrowKernelError> {
+    let (query, values, norms) = input;
+    let (query_arr, query_is_scalar) = query.get();
+    if !query_is_scalar {
+        return Err(ArrowKernelError::UnsupportedArguments(
+            "nearest neighbor query must be scalar".to_string(),
+        ));
+    }
+
+    let query = query_arr.as_fixed_size_list_opt().ok_or_else(|| {
+        ArrowKernelError::UnsupportedArguments(format!(
+            "nearest neighbor query must be fixed size list, got {}",
+            query_arr.data_type()
+        ))
+    })?;
+    let values = values.as_fixed_size_list_opt().ok_or_else(|| {
+        ArrowKernelError::UnsupportedArguments(format!(
+            "nearest neighbor values must be fixed size list, got {}",
+            values.data_type()
+        ))
+    })?;
+
+    if query.value_type() != DataType::Float32 || values.value_type() != DataType::Float32 {
+        return Err(ArrowKernelError::UnsupportedArguments(format!(
+            "nearest neighbor requires Float32 vectors, got query {} and values {}",
+            query.value_type(),
+            values.value_type()
+        )));
+    }
+    if query.value_length() != values.value_length() {
+        return Err(ArrowKernelError::UnsupportedArguments(format!(
+            "nearest neighbor query and values must have the same dimension, got {} and {}",
+            query.value_length(),
+            values.value_length()
+        )));
+    }
+    if norms.len() != values.len() {
+        return Err(ArrowKernelError::ArgumentMismatch(format!(
+            "nearest neighbor norm length must match values length, got {} and {}",
+            norms.len(),
+            values.len()
+        )));
+    }
+    if query.is_null(0) {
+        return Err(ArrowKernelError::UnsupportedArguments(
+            "nearest neighbor query must not be null".to_string(),
+        ));
+    }
+    if logical_nulls(values)?.is_some() {
+        return Err(ArrowKernelError::UnsupportedArguments(
+            "nearest neighbor values must not contain null vectors".to_string(),
+        ));
+    }
+    if query.values().is_nullable() && query.values().null_count() > 0 {
+        return Err(ArrowKernelError::UnsupportedArguments(
+            "nearest neighbor query vector values must not contain nulls".to_string(),
+        ));
+    }
+    if values.values().is_nullable() && values.values().null_count() > 0 {
+        return Err(ArrowKernelError::UnsupportedArguments(
+            "nearest neighbor value vector values must not contain nulls".to_string(),
+        ));
+    }
+    if norms.null_count() > 0 {
+        return Err(ArrowKernelError::UnsupportedArguments(
+            "nearest neighbor norms must not contain nulls".to_string(),
+        ));
+    }
+
+    Ok(())
 }
 
 #[cfg(test)]

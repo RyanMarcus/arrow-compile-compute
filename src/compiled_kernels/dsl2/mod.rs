@@ -12,7 +12,7 @@ use arrow_array::{ArrowPrimitiveType, PrimitiveArray};
 
 #[cfg(test)]
 use arrow_array::ArrayRef;
-use arrow_array::{BooleanArray, UInt16Array, UInt8Array};
+use arrow_array::{BooleanArray, Float32Array, UInt16Array, UInt8Array};
 use arrow_array::{Datum, UInt32Array, UInt64Array};
 use arrow_schema::DataType;
 use inkwell::context::Context;
@@ -704,6 +704,13 @@ impl DSLValue {
         Self {
             name: 0,
             ty: DSLType::ConstScalar(Arc::new(BooleanArray::new_scalar(value))),
+        }
+    }
+
+    pub fn f32(value: f32) -> Self {
+        Self {
+            name: 0,
+            ty: DSLType::ConstScalar(Arc::new(Float32Array::new_scalar(value))),
         }
     }
 
