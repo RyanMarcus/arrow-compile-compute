@@ -1,9 +1,9 @@
 use std::{ffi::c_void, sync::Arc};
 
 use arrow_array::{
-    builder::BinaryBuilder, ArrayRef, FixedSizeListArray, Float16Array, Float32Array, Float64Array,
-    Int16Array, Int32Array, Int64Array, Int8Array, UInt16Array, UInt32Array, UInt64Array,
-    UInt8Array,
+    builder::BinaryBuilder, ArrayRef, BooleanArray, FixedSizeListArray, Float16Array, Float32Array,
+    Float64Array, Int16Array, Int32Array, Int64Array, Int8Array, UInt16Array, UInt32Array,
+    UInt64Array, UInt8Array,
 };
 use arrow_buffer::MutableBuffer;
 use arrow_schema::Field;
@@ -93,6 +93,12 @@ impl DSLBuffer {
             }
             PrimitiveType::List(ty, size) => {
                 let values: ArrayRef = match ty {
+                    ListItemType::Boolean => {
+                        let bytes = self.buf.as_slice();
+                        Arc::new(BooleanArray::from(
+                            bytes.iter().map(|v| *v != 0).collect::<Vec<_>>(),
+                        ))
+                    }
                     ListItemType::I8 => Arc::new(Int8Array::new(self.buf.into(), None)),
                     ListItemType::I16 => Arc::new(Int16Array::new(self.buf.into(), None)),
                     ListItemType::I32 => Arc::new(Int32Array::new(self.buf.into(), None)),

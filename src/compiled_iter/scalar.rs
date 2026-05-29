@@ -1,10 +1,12 @@
-use arrow_array::{Array, ArrowPrimitiveType, PrimitiveArray};
+use std::sync::Arc;
+
+use arrow_array::{Array, ArrayRef, ArrowPrimitiveType, BooleanArray, PrimitiveArray};
 use arrow_buffer::ToByteSlice;
 use half::f16;
 use inkwell::{
     builder::Builder,
     context::Context,
-    values::{BasicValue, PointerValue, VectorValue},
+    values::{BasicValue, BasicValueEnum, PointerValue},
     AddressSpace,
 };
 use repr_offset::ReprOffset;
@@ -254,6 +256,8 @@ pub struct ScalarVectorIterator {
     ptype: ListItemType,
     l: usize,
     val: Box<[u8]>,
+    #[allow(dead_code)]
+    owner: Option<ArrayRef>,
 }
 
 impl ScalarVectorIterator {
@@ -268,7 +272,39 @@ impl ScalarVectorIterator {
             .to_byte_slice()
             .to_vec()
             .into_boxed_slice();
-        Box::new(ScalarVectorIterator { ptype, l, val })
+        Box::new(ScalarVectorIterator {
+            ptype,
+            l,
+            val,
+            owner: None,
+        })
+    }
+
+    pub fn from_boolean(arr: &BooleanArray) -> Box<Self> {
+        let l = arr.len();
+        let val = (0..l)
+            .map(|idx| arr.value(idx) as u8)
+            .collect::<Vec<_>>()
+            .into_boxed_slice();
+        Box::new(ScalarVectorIterator {
+            ptype: ListItemType::Boolean,
+            l,
+            val,
+            owner: Some(Arc::new(arr.clone())),
+        })
+    }
+
+    pub fn from_pointer_pairs(ptype: ListItemType, ptrs: Vec<u128>, owner: ArrayRef) -> Box<Self> {
+        let l = ptrs.len();
+        let val = bytemuck::cast_slice::<u128, u8>(&ptrs)
+            .to_vec()
+            .into_boxed_slice();
+        Box::new(ScalarVectorIterator {
+            ptype,
+            l,
+            val,
+            owner: Some(owner),
+        })
     }
 
     pub fn llvm_val<'a>(
@@ -276,7 +312,7 @@ impl ScalarVectorIterator {
         ctx: &'a Context,
         builder: &'a Builder,
         ptr: PointerValue<'a>,
-    ) -> VectorValue<'a> {
+    ) -> BasicValueEnum<'a> {
         let ptr_type = ctx.ptr_type(AddressSpace::default());
         let val_ptr_ptr = increment_pointer!(ctx, builder, ptr, ScalarBinaryIterator::OFFSET_VAL);
         let val_ptr = builder
@@ -285,20 +321,51 @@ impl ScalarVectorIterator {
             .into_pointer_value();
         mark_load_invariant!(ctx, val_ptr);
 
-        let vec_type = PrimitiveType::from(self.ptype)
-            .llvm_vec_type(ctx, self.l as u32)
-            .unwrap();
-        let val = builder
-            .build_load(vec_type, val_ptr, "val")
-            .unwrap()
-            .into_vector_value();
-        val.as_instruction_value()
-            .unwrap()
-            .set_alignment(1)
-            .unwrap();
-        mark_load_invariant!(ctx, val);
-
-        val
+        match self.ptype {
+            ListItemType::Boolean => {
+                let mut out = self.ptype().llvm_type(ctx).into_array_type().const_zero();
+                for idx in 0..self.l {
+                    let lane_ptr = increment_pointer!(ctx, builder, val_ptr, idx);
+                    let byte = builder
+                        .build_load(ctx.i8_type(), lane_ptr, "bool_byte")
+                        .unwrap()
+                        .into_int_value();
+                    let bit = builder
+                        .build_int_truncate(byte, ctx.bool_type(), "bool_bit")
+                        .unwrap();
+                    out = builder
+                        .build_insert_value(out, bit, idx as u32, "bool_insert")
+                        .unwrap()
+                        .into_array_value();
+                }
+                out.as_basic_value_enum()
+            }
+            ListItemType::P64x2 => {
+                let mut out = self.ptype().llvm_type(ctx).into_array_type().const_zero();
+                let lane_ty = PrimitiveType::P64x2.llvm_type(ctx);
+                for idx in 0..self.l {
+                    let lane_ptr = increment_pointer!(ctx, builder, val_ptr, 16 * idx);
+                    let lane = builder.build_load(lane_ty, lane_ptr, "str_lane").unwrap();
+                    out = builder
+                        .build_insert_value(out, lane, idx as u32, "str_insert")
+                        .unwrap()
+                        .into_array_value();
+                }
+                out.as_basic_value_enum()
+            }
+            _ => {
+                let vec_type = PrimitiveType::from(self.ptype)
+                    .llvm_vec_type(ctx, self.l as u32)
+                    .unwrap();
+                let val = builder.build_load(vec_type, val_ptr, "val").unwrap();
+                val.as_instruction_value()
+                    .unwrap()
+                    .set_alignment(1)
+                    .unwrap();
+                mark_load_invariant!(ctx, val);
+                val.as_basic_value_enum()
+            }
+        }
     }
 
     pub fn ptype(&self) -> PrimitiveType {

@@ -44,8 +44,8 @@ use crate::{
         optimize_module,
     },
     compiled_writers::Writer,
-    increment_pointer, set_noalias_params, ArrowKernelError, ComparisonType, NumericPrimitiveType,
-    PrimitiveType,
+    increment_pointer, set_noalias_params, ArrowKernelError, ComparisonType, ListItemType,
+    NumericPrimitiveType, PrimitiveType,
 };
 
 pub enum KernelReturnCode {
@@ -1107,59 +1107,167 @@ pub fn compile_compare_values<'ctx, 'a>(
                     .unwrap()
                     .as_basic_value_enum())
             }
-            ComparisonType::List(t) => match *t {
-                ComparisonType::Int { signed } => Ok(ctx
-                    .b
-                    .build_int_compare(
-                        op.as_int_predicate(signed),
-                        lhs.into_vector_value(),
-                        rhs.into_vector_value(),
-                        "cmpv",
-                    )
-                    .unwrap()
-                    .as_basic_value_enum()),
-                ComparisonType::Float => {
-                    let cvt = add_float_vec_to_int_vec(
-                        ctx.ctx,
-                        ctx.module,
-                        64,
-                        pt.list_type_into_inner(),
-                    );
-                    let lhs = ctx
-                        .b
-                        .build_call(cvt, &[lhs.into()], "cvt_lhs_for_total_order")
-                        .unwrap()
-                        .try_as_basic_value()
-                        .unwrap_basic();
-                    let rhs = ctx
-                        .b
-                        .build_call(cvt, &[rhs.into()], "cvt_rhs_for_total_order")
-                        .unwrap()
-                        .try_as_basic_value()
-                        .unwrap_basic();
-                    Ok(ctx
-                        .b
-                        .build_int_compare(
-                            op.as_int_predicate(true),
-                            lhs.into_vector_value(),
-                            rhs.into_vector_value(),
-                            "cmpfv",
-                        )
-                        .unwrap()
-                        .as_basic_value_enum())
-                }
-                ComparisonType::String | ComparisonType::List(_) => {
-                    Err(ArrowKernelError::DSLInvalidType(
-                        "comparison not implemented for this list type",
-                        lhs_type.clone(),
-                    ))
-                }
-            },
+            ComparisonType::List(_) => compare_list_values(ctx, op, *pt, lhs, rhs),
         },
         _ => Err(ArrowKernelError::DSLInvalidType(
             "comparison requires boolean or primitive values",
             lhs_type.clone(),
         )),
+    }
+}
+
+fn compare_list_values<'ctx, 'a>(
+    ctx: &DSLCompilationContext<'ctx, 'a>,
+    op: DSLComparison,
+    pt: PrimitiveType,
+    lhs: BasicValueEnum<'a>,
+    rhs: BasicValueEnum<'a>,
+) -> Result<BasicValueEnum<'a>, ArrowKernelError> {
+    let PrimitiveType::List(item, size) = pt else {
+        unreachable!("compare_list_values called with non-list type");
+    };
+
+    if lhs.is_vector_value() && rhs.is_vector_value() {
+        return match PrimitiveType::from(item).comparison_type() {
+            ComparisonType::Int { signed } => Ok(ctx
+                .b
+                .build_int_compare(
+                    op.as_int_predicate(signed),
+                    lhs.into_vector_value(),
+                    rhs.into_vector_value(),
+                    "cmpv",
+                )
+                .unwrap()
+                .as_basic_value_enum()),
+            ComparisonType::Float => {
+                let cvt = add_float_vec_to_int_vec(
+                    ctx.ctx,
+                    ctx.module,
+                    size as u32,
+                    pt.list_type_into_inner(),
+                );
+                let lhs = ctx
+                    .b
+                    .build_call(cvt, &[lhs.into()], "cvt_lhs_for_total_order")
+                    .unwrap()
+                    .try_as_basic_value()
+                    .unwrap_basic();
+                let rhs = ctx
+                    .b
+                    .build_call(cvt, &[rhs.into()], "cvt_rhs_for_total_order")
+                    .unwrap()
+                    .try_as_basic_value()
+                    .unwrap_basic();
+                Ok(ctx
+                    .b
+                    .build_int_compare(
+                        op.as_int_predicate(true),
+                        lhs.into_vector_value(),
+                        rhs.into_vector_value(),
+                        "cmpfv",
+                    )
+                    .unwrap()
+                    .as_basic_value_enum())
+            }
+            ComparisonType::String | ComparisonType::List(_) => {
+                Err(ArrowKernelError::DSLInvalidType(
+                    "comparison not implemented for this vectorized list type",
+                    DSLType::Primitive(pt),
+                ))
+            }
+        };
+    }
+
+    let bool_type = ctx.ctx.bool_type();
+    let mut all_equal = bool_type.const_all_ones();
+    let mut any_less = bool_type.const_zero();
+    let mut any_greater = bool_type.const_zero();
+
+    for idx in 0..size {
+        let (lhs_el, rhs_el, el_ty) = extract_list_compare_elements(ctx, item, idx, lhs, rhs);
+        let eq = compile_compare_values(ctx, DSLComparison::Eq, &el_ty, lhs_el, rhs_el)?
+            .into_int_value();
+        let lt = compile_compare_values(ctx, DSLComparison::Lt, &el_ty, lhs_el, rhs_el)?
+            .into_int_value();
+        let gt = compile_compare_values(ctx, DSLComparison::Gt, &el_ty, lhs_el, rhs_el)?
+            .into_int_value();
+
+        let less_at_idx = ctx.b.build_and(all_equal, lt, "list_less_at_idx").unwrap();
+        let greater_at_idx = ctx
+            .b
+            .build_and(all_equal, gt, "list_greater_at_idx")
+            .unwrap();
+        any_less = ctx
+            .b
+            .build_or(any_less, less_at_idx, "list_any_less")
+            .unwrap();
+        any_greater = ctx
+            .b
+            .build_or(any_greater, greater_at_idx, "list_any_greater")
+            .unwrap();
+        all_equal = ctx.b.build_and(all_equal, eq, "list_all_equal").unwrap();
+    }
+
+    let result = match op {
+        DSLComparison::Eq => all_equal,
+        DSLComparison::Neq => ctx.b.build_not(all_equal, "list_neq").unwrap(),
+        DSLComparison::Lt => any_less,
+        DSLComparison::Gt => any_greater,
+        DSLComparison::Lte => ctx.b.build_or(any_less, all_equal, "list_lte").unwrap(),
+        DSLComparison::Gte => ctx.b.build_or(any_greater, all_equal, "list_gte").unwrap(),
+    };
+
+    Ok(result.as_basic_value_enum())
+}
+
+fn extract_list_compare_elements<'ctx, 'a>(
+    ctx: &DSLCompilationContext<'ctx, 'a>,
+    item: ListItemType,
+    idx: usize,
+    lhs: BasicValueEnum<'a>,
+    rhs: BasicValueEnum<'a>,
+) -> (BasicValueEnum<'a>, BasicValueEnum<'a>, DSLType) {
+    let i = ctx.ctx.i64_type().const_int(idx as u64, false);
+    match item {
+        ListItemType::Boolean => {
+            let lhs = ctx
+                .b
+                .build_extract_value(lhs.into_array_value(), idx as u32, "lhs_bool")
+                .unwrap()
+                .as_basic_value_enum();
+            let rhs = ctx
+                .b
+                .build_extract_value(rhs.into_array_value(), idx as u32, "rhs_bool")
+                .unwrap()
+                .as_basic_value_enum();
+            (lhs, rhs, DSLType::Boolean)
+        }
+        ListItemType::P64x2 => {
+            let lhs = ctx
+                .b
+                .build_extract_value(lhs.into_array_value(), idx as u32, "lhs_str")
+                .unwrap()
+                .as_basic_value_enum();
+            let rhs = ctx
+                .b
+                .build_extract_value(rhs.into_array_value(), idx as u32, "rhs_str")
+                .unwrap()
+                .as_basic_value_enum();
+            (lhs, rhs, DSLType::Primitive(PrimitiveType::P64x2))
+        }
+        _ => {
+            let lhs = ctx
+                .b
+                .build_extract_element(lhs.into_vector_value(), i, "lhs_lane")
+                .unwrap()
+                .as_basic_value_enum();
+            let rhs = ctx
+                .b
+                .build_extract_element(rhs.into_vector_value(), i, "rhs_lane")
+                .unwrap()
+                .as_basic_value_enum();
+            (lhs, rhs, DSLType::Primitive(PrimitiveType::from(item)))
+        }
     }
 }
 
@@ -1351,6 +1459,13 @@ fn compile_expr<'ctx, 'a>(
                             if s_l != t_l {
                                 return Err(ArrowKernelError::DSLTypeMismatch(
                                     "cannot cast between vectors of different sizes",
+                                    orig_type,
+                                    tar_type,
+                                ));
+                            }
+                            if !s_t.is_numeric() || !t_t.is_numeric() {
+                                return Err(ArrowKernelError::DSLTypeMismatch(
+                                    "can only cast fixed-size-lists with numeric child types",
                                     orig_type,
                                     tar_type,
                                 ));

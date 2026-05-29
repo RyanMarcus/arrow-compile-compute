@@ -17,7 +17,7 @@ use arrow_schema::{DataType, Field};
 use inkwell::{
     attributes::{Attribute, AttributeLoc},
     context::Context,
-    types::{BasicTypeEnum, VectorType},
+    types::{BasicType, BasicTypeEnum, VectorType},
     values::FunctionValue,
     AddressSpace,
 };
@@ -226,6 +226,14 @@ pub(crate) fn normalized_base_type(dt: &DataType) -> DataType {
         | DataType::Utf8View => DataType::Utf8,
         DataType::Dictionary(_, values) => normalized_base_type(values.as_ref()),
         DataType::RunEndEncoded(_, values) => normalized_base_type(values.data_type()),
+        DataType::FixedSizeList(field, len) => DataType::FixedSizeList(
+            Arc::new(Field::new(
+                field.name(),
+                normalized_base_type(field.data_type()),
+                field.is_nullable(),
+            )),
+            *len,
+        ),
         _ => dt.clone(),
     }
 }
@@ -268,6 +276,7 @@ impl From<PrimitiveType> for PrimitiveSuperType {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum ListItemType {
+    Boolean,
     I8,
     I16,
     I32,
@@ -287,6 +296,11 @@ impl TryFrom<PrimitiveType> for ListItemType {
 
     fn try_from(value: PrimitiveType) -> Result<Self, Self::Error> {
         Ok(match value {
+            PrimitiveType::List(_, _) => {
+                return Err(ArrowKernelError::UnsupportedArguments(
+                    "nested lists not supported".to_string(),
+                ))
+            }
             PrimitiveType::I8 => ListItemType::I8,
             PrimitiveType::I16 => ListItemType::I16,
             PrimitiveType::I32 => ListItemType::I32,
@@ -299,12 +313,37 @@ impl TryFrom<PrimitiveType> for ListItemType {
             PrimitiveType::F32 => ListItemType::F32,
             PrimitiveType::F64 => ListItemType::F64,
             PrimitiveType::P64x2 => ListItemType::P64x2,
-            PrimitiveType::List(_, _) => {
-                return Err(ArrowKernelError::UnsupportedArguments(
-                    "nested lists not supported".to_string(),
-                ))
-            }
         })
+    }
+}
+
+impl ListItemType {
+    pub fn for_arrow_type(dt: &DataType) -> Self {
+        match dt {
+            DataType::Boolean => ListItemType::Boolean,
+            DataType::FixedSizeList(_, _) => {
+                panic!("nested fixed-size-list values are not supported")
+            }
+            _ => PrimitiveType::for_arrow_type(dt).try_into().unwrap(),
+        }
+    }
+
+    pub fn data_type(self) -> DataType {
+        match self {
+            ListItemType::Boolean => DataType::Boolean,
+            _ => PrimitiveType::from(self).as_arrow_type(),
+        }
+    }
+
+    pub fn physical_primitive_type(self) -> PrimitiveType {
+        match self {
+            ListItemType::Boolean => PrimitiveType::U8,
+            _ => PrimitiveType::from(self),
+        }
+    }
+
+    pub fn is_numeric(self) -> bool {
+        !matches!(self, ListItemType::Boolean | ListItemType::P64x2)
     }
 }
 
@@ -383,6 +422,13 @@ impl PrimitiveType {
             PrimitiveType::F16 => ctx.f16_type().into(),
             PrimitiveType::F32 => ctx.f32_type().into(),
             PrimitiveType::F64 => ctx.f64_type().into(),
+            PrimitiveType::List(ListItemType::Boolean, s) => {
+                ctx.bool_type().array_type(*s as u32).into()
+            }
+            PrimitiveType::List(ListItemType::P64x2, s) => PrimitiveType::P64x2
+                .llvm_type(ctx)
+                .array_type(*s as u32)
+                .into(),
             PrimitiveType::List(t, s) => PrimitiveType::from(*t)
                 .llvm_vec_type(ctx, *s as u32)
                 .unwrap()
@@ -425,12 +471,9 @@ impl PrimitiveType {
             DataType::LargeBinary => PrimitiveType::P64x2, // binary
             DataType::LargeUtf8 => PrimitiveType::P64x2, // string view
             DataType::Utf8View => PrimitiveType::P64x2, // string view
-            DataType::FixedSizeList(f, l) => PrimitiveType::List(
-                PrimitiveType::for_arrow_type(f.data_type())
-                    .try_into()
-                    .unwrap(),
-                *l as usize,
-            ),
+            DataType::FixedSizeList(f, l) => {
+                PrimitiveType::List(ListItemType::for_arrow_type(f.data_type()), *l as usize)
+            }
             _ => todo!("no prim type for {:?}", dt),
         }
     }
@@ -450,10 +493,7 @@ impl PrimitiveType {
             PrimitiveType::F32 => DataType::Float32,
             PrimitiveType::F64 => DataType::Float64,
             PrimitiveType::List(t, s) => DataType::FixedSizeList(
-                Arc::new(Field::new_list_field(
-                    PrimitiveType::from(*t).as_arrow_type(),
-                    false,
-                )),
+                Arc::new(Field::new_list_field(t.data_type(), false)),
                 *s as i32,
             ),
         }
@@ -595,6 +635,7 @@ impl PrimitiveType {
 impl From<ListItemType> for PrimitiveType {
     fn from(value: ListItemType) -> Self {
         match value {
+            ListItemType::Boolean => PrimitiveType::U8,
             ListItemType::I8 => PrimitiveType::I8,
             ListItemType::I16 => PrimitiveType::I16,
             ListItemType::I32 => PrimitiveType::I32,

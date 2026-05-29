@@ -14,7 +14,7 @@ use crate::{
         KernelCache,
     },
     compiled_writers::WriterSpec,
-    logical_arrow_type, logical_nulls, ArrowKernelError, Kernel, PrimitiveType,
+    logical_arrow_type, logical_nulls, ArrowKernelError, Kernel, ListItemType, PrimitiveType,
 };
 
 pub fn concat_all(data: &[&dyn Array]) -> Result<ArrayRef, ArrowKernelError> {
@@ -113,9 +113,7 @@ fn concat_writer_spec(dt: &DataType) -> WriterSpec {
         | DataType::LargeBinary
         | DataType::BinaryView => WriterSpec::StringView,
         DataType::FixedSizeList(field, len) => WriterSpec::FixedSizeList(
-            PrimitiveType::for_arrow_type(field.data_type())
-                .try_into()
-                .unwrap(),
+            ListItemType::for_arrow_type(field.data_type()),
             len as usize,
         ),
         dt => WriterSpec::Primitive(PrimitiveType::for_arrow_type(&dt)),

@@ -291,9 +291,7 @@ impl WriterSpec {
             | DataType::LargeUtf8
             | DataType::Utf8View => Self::String,
             DataType::FixedSizeList(field, len) => Self::FixedSizeList(
-                PrimitiveType::for_arrow_type(field.data_type())
-                    .try_into()
-                    .unwrap(),
+                ListItemType::for_arrow_type(field.data_type()),
                 len as usize,
             ),
             dt => Self::Primitive(PrimitiveType::for_arrow_type(&dt)),
@@ -328,9 +326,7 @@ impl WriterSpec {
             DataType::List(_) => todo!(),
             DataType::ListView(_) => todo!(),
             DataType::FixedSizeList(field, len) => Self::FixedSizeList(
-                PrimitiveType::for_arrow_type(field.data_type())
-                    .try_into()
-                    .unwrap(),
+                ListItemType::for_arrow_type(field.data_type()),
                 *len as usize,
             ),
             DataType::LargeList(_) => todo!(),

@@ -102,10 +102,20 @@ pub fn coalesce_type(res: ArrayRef, tar: &DataType) -> Result<ArrayRef, ArrowKer
                     .build_unchecked()
             }))
         }
-        (DataType::FixedSizeList(src, src_len), DataType::FixedSizeList(tar, tar_len))
-            if src_len == tar_len && src.data_type() == tar.data_type() =>
+        (DataType::FixedSizeList(_src, src_len), DataType::FixedSizeList(tar, tar_len))
+            if src_len == tar_len =>
         {
-            Ok(res)
+            let arr = res.into_data();
+            let child = make_array(arr.child_data()[0].clone());
+            let child = coalesce_type(child, tar.data_type())?;
+
+            Ok(make_array(unsafe {
+                ArrayDataBuilder::new(DataType::FixedSizeList(tar.clone(), *tar_len))
+                    .len(arr.len())
+                    .nulls(arr.nulls().cloned())
+                    .add_child_data(child.into_data())
+                    .build_unchecked()
+            }))
         }
 
         _ => todo!("unable to coalesce {} into {}", res.data_type(), tar),

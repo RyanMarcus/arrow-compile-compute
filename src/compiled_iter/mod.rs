@@ -46,8 +46,94 @@ use crate::{
         view::ViewIterator,
     },
     declare_blocks, increment_pointer, mark_load_invariant, set_noalias_params, ArrowKernelError,
-    PrimitiveType,
+    ListItemType, PrimitiveType,
 };
+
+fn build_fixed_size_list_value<'a>(
+    ctx: &'a Context,
+    llvm_mod: &Module<'a>,
+    build: &Builder<'a>,
+    label: &str,
+    dt: &DataType,
+    iter: &FixedSizeListIterator,
+    iter_ptr: PointerValue<'a>,
+    row_idx: IntValue<'a>,
+) -> Option<inkwell::values::BasicValueEnum<'a>> {
+    let DataType::FixedSizeList(field, list_size) = dt else {
+        unreachable!("fixed-size-list iterator with non-list data type {dt:?}");
+    };
+
+    let child_access = generate_random_access(
+        ctx,
+        llvm_mod,
+        &format!("{}_child", label),
+        field.data_type(),
+        iter.child(),
+    )?;
+    let child_iter_ptr = iter.llvm_child_iter(ctx, build, iter_ptr);
+    let i64_type = ctx.i64_type();
+    let list_size_i64 = i64_type.const_int(*list_size as u64, false);
+    let base_idx = build
+        .build_int_mul(row_idx, list_size_i64, "fsl_child_base")
+        .unwrap();
+    let ptype = PrimitiveType::for_arrow_type(dt);
+    let llvm_type = ptype.llvm_type(ctx);
+
+    match ptype {
+        PrimitiveType::List(ListItemType::Boolean, _)
+        | PrimitiveType::List(ListItemType::P64x2, _) => {
+            let mut out = llvm_type.into_array_type().const_zero();
+            for lane in 0..*list_size as u64 {
+                let child_idx = build
+                    .build_int_add(base_idx, i64_type.const_int(lane, false), "fsl_child_idx")
+                    .unwrap();
+                let mut value = build
+                    .build_call(
+                        child_access,
+                        &[child_iter_ptr.into(), child_idx.into()],
+                        "fsl_child_value",
+                    )
+                    .unwrap()
+                    .try_as_basic_value()
+                    .unwrap_basic();
+                if matches!(ptype, PrimitiveType::List(ListItemType::Boolean, _)) {
+                    value = build
+                        .build_int_truncate(value.into_int_value(), ctx.bool_type(), "fsl_bool")
+                        .unwrap()
+                        .as_basic_value_enum();
+                }
+                out = build
+                    .build_insert_value(out, value, lane as u32, "fsl_insert")
+                    .unwrap()
+                    .into_array_value();
+            }
+            Some(out.as_basic_value_enum())
+        }
+        PrimitiveType::List(item, _) => {
+            let inner = PrimitiveType::from(item);
+            let mut out = inner.llvm_vec_type(ctx, *list_size as u32)?.const_zero();
+            for lane in 0..*list_size as u64 {
+                let child_idx = build
+                    .build_int_add(base_idx, i64_type.const_int(lane, false), "fsl_child_idx")
+                    .unwrap();
+                let value = build
+                    .build_call(
+                        child_access,
+                        &[child_iter_ptr.into(), child_idx.into()],
+                        "fsl_child_value",
+                    )
+                    .unwrap()
+                    .try_as_basic_value()
+                    .unwrap_basic();
+                out = build
+                    .build_insert_element(out, value, i64_type.const_int(lane, false), "fsl_insert")
+                    .unwrap();
+            }
+            Some(out.as_basic_value_enum())
+        }
+        _ => unreachable!("fixed-size-list data type did not map to list primitive type"),
+    }
+}
 
 pub fn array_to_setbit_iter(arr: &BooleanArray) -> Result<IteratorHolder, ArrowKernelError> {
     Ok(IteratorHolder::SetBit(Box::new(SetBitIterator::from(arr))))
@@ -249,6 +335,63 @@ pub fn datum_to_iter(val: &dyn Datum) -> Result<IteratorHolder, ArrowKernelError
                     DataType::Float64 => Ok(IteratorHolder::ScalarVec(
                         ScalarVectorIterator::from_primitive(value.as_primitive::<Float64Type>()),
                     )),
+                    DataType::Boolean => Ok(IteratorHolder::ScalarVec(
+                        ScalarVectorIterator::from_boolean(value.as_boolean()),
+                    )),
+                    DataType::Utf8 => {
+                        let arr = value.as_string::<i32>();
+                        let ptrs = (0..arr.len())
+                            .map(|idx| {
+                                let value = arr.value(idx);
+                                let start = value.as_ptr() as u128;
+                                let end = value.as_ptr().wrapping_add(value.len()) as u128;
+                                start | (end << 64)
+                            })
+                            .collect::<Vec<_>>();
+                        Ok(IteratorHolder::ScalarVec(
+                            ScalarVectorIterator::from_pointer_pairs(
+                                ListItemType::P64x2,
+                                ptrs,
+                                value.clone(),
+                            ),
+                        ))
+                    }
+                    DataType::LargeUtf8 => {
+                        let arr = value.as_string::<i64>();
+                        let ptrs = (0..arr.len())
+                            .map(|idx| {
+                                let value = arr.value(idx);
+                                let start = value.as_ptr() as u128;
+                                let end = value.as_ptr().wrapping_add(value.len()) as u128;
+                                start | (end << 64)
+                            })
+                            .collect::<Vec<_>>();
+                        Ok(IteratorHolder::ScalarVec(
+                            ScalarVectorIterator::from_pointer_pairs(
+                                ListItemType::P64x2,
+                                ptrs,
+                                value.clone(),
+                            ),
+                        ))
+                    }
+                    DataType::Utf8View => {
+                        let arr = value.as_string_view();
+                        let ptrs = (0..arr.len())
+                            .map(|idx| {
+                                let value = arr.value(idx);
+                                let start = value.as_ptr() as u128;
+                                let end = value.as_ptr().wrapping_add(value.len()) as u128;
+                                start | (end << 64)
+                            })
+                            .collect::<Vec<_>>();
+                        Ok(IteratorHolder::ScalarVec(
+                            ScalarVectorIterator::from_pointer_pairs(
+                                ListItemType::P64x2,
+                                ptrs,
+                                value.clone(),
+                            ),
+                        ))
+                    }
                     _ => todo!(),
                 }
             }
@@ -1594,14 +1737,9 @@ pub fn generate_next<'a>(
                 .unwrap();
 
             build.position_at_end(get_next);
-            // there are at least n elements left, we can load them and increment
-            let data_ptr = iter.llvm_data(ctx, &build, iter_ptr);
-            let data_ptr = increment_pointer!(ctx, build, data_ptr, ptype.width(), curr_pos);
-            let out = build.build_load(llvm_type, data_ptr, "elem").unwrap();
-            out.as_instruction_value()
-                .unwrap()
-                .set_alignment(1)
-                .unwrap();
+            let out = build_fixed_size_list_value(
+                ctx, llvm_mod, &build, label, dt, iter, iter_ptr, curr_pos,
+            )?;
             build.build_store(out_ptr, out).unwrap();
             iter.llvm_increment_pos(ctx, &build, iter_ptr, i64_type.const_int(1, false));
             build
@@ -1824,13 +1962,8 @@ pub fn generate_random_access<'a>(
             declare_blocks!(ctx, access_f, entry);
 
             build.position_at_end(entry);
-            let data_ptr = iter.llvm_data(ctx, &build, iter_ptr);
-            let data_ptr = increment_pointer!(ctx, build, data_ptr, ptype.width(), idx);
-            let out = build.build_load(llvm_type, data_ptr, "elem").unwrap();
-            out.as_instruction_value()
-                .unwrap()
-                .set_alignment(1)
-                .unwrap();
+            let out =
+                build_fixed_size_list_value(ctx, llvm_mod, &build, label, dt, iter, iter_ptr, idx)?;
             build.build_return(Some(&out)).unwrap();
 
             Some(access_f)

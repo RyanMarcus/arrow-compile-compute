@@ -1,14 +1,7 @@
 use std::{ffi::c_void, sync::Arc};
 
 use crate::{increment_pointer, mark_load_invariant, ListItemType, PrimitiveType};
-use arrow_array::{
-    cast::AsArray,
-    types::{
-        Float16Type, Float32Type, Float64Type, Int16Type, Int32Type, Int64Type, Int8Type,
-        UInt16Type, UInt32Type, UInt64Type, UInt8Type,
-    },
-    Array, FixedSizeListArray,
-};
+use arrow_array::{Array, FixedSizeListArray};
 use inkwell::{
     builder::Builder,
     context::Context,
@@ -17,68 +10,38 @@ use inkwell::{
 };
 use repr_offset::ReprOffset;
 
+use super::{array_to_iter, IteratorHolder};
+
 /// An iterator for fixed-size list data. Only lists that contain primitive
 /// values and strings are supported.
 #[repr(C)]
 #[derive(ReprOffset, Debug)]
 #[roff(usize_offsets)]
 pub struct FixedSizeListIterator {
-    data: *const c_void,
+    child_iter: *const c_void,
+    initial_pos: u64,
     pos: u64,
     len: u64,
     list_size: usize,
     list_ptype: ListItemType,
+    child: Box<IteratorHolder>,
     array_ref: Arc<dyn Array>,
 }
 
 impl From<&FixedSizeListArray> for Box<FixedSizeListIterator> {
     fn from(arr: &FixedSizeListArray) -> Self {
-        let list_ptype: ListItemType = PrimitiveType::for_arrow_type(&arr.value_type())
-            .try_into()
-            .unwrap();
-        let data_ptr = match list_ptype {
-            ListItemType::I8 => {
-                arr.values().as_primitive::<Int8Type>().values().as_ptr() as *const c_void
-            }
-            ListItemType::I16 => {
-                arr.values().as_primitive::<Int16Type>().values().as_ptr() as *const c_void
-            }
-            ListItemType::I32 => {
-                arr.values().as_primitive::<Int32Type>().values().as_ptr() as *const c_void
-            }
-            ListItemType::I64 => {
-                arr.values().as_primitive::<Int64Type>().values().as_ptr() as *const c_void
-            }
-            ListItemType::U8 => {
-                arr.values().as_primitive::<UInt8Type>().values().as_ptr() as *const c_void
-            }
-            ListItemType::U16 => {
-                arr.values().as_primitive::<UInt16Type>().values().as_ptr() as *const c_void
-            }
-            ListItemType::U32 => {
-                arr.values().as_primitive::<UInt32Type>().values().as_ptr() as *const c_void
-            }
-            ListItemType::U64 => {
-                arr.values().as_primitive::<UInt64Type>().values().as_ptr() as *const c_void
-            }
-            ListItemType::F16 => {
-                arr.values().as_primitive::<Float16Type>().values().as_ptr() as *const c_void
-            }
-            ListItemType::F32 => {
-                arr.values().as_primitive::<Float32Type>().values().as_ptr() as *const c_void
-            }
-            ListItemType::F64 => {
-                arr.values().as_primitive::<Float64Type>().values().as_ptr() as *const c_void
-            }
-            ListItemType::P64x2 => todo!(),
-        };
+        let list_ptype = ListItemType::for_arrow_type(&arr.value_type());
+        let child = Box::new(array_to_iter(arr.values().as_ref()));
+        let child_iter = child.get_ptr();
 
         Box::new(FixedSizeListIterator {
-            data: data_ptr,
+            child_iter,
+            initial_pos: arr.offset() as u64,
             pos: arr.offset() as u64,
             len: (arr.offset() + arr.len()) as u64,
             list_size: arr.value_length() as usize,
             list_ptype,
+            child,
             array_ref: Arc::new(arr.clone()),
         })
     }
@@ -87,6 +50,10 @@ impl From<&FixedSizeListArray> for Box<FixedSizeListIterator> {
 impl FixedSizeListIterator {
     pub fn ptype(&self) -> PrimitiveType {
         PrimitiveType::List(self.list_ptype, self.list_size)
+    }
+
+    pub fn child(&self) -> &IteratorHolder {
+        &self.child
     }
 }
 
@@ -300,7 +267,7 @@ impl FixedSizeListIterator {
     pub fn llvm_len<'a>(
         &self,
         ctx: &'a Context,
-        builder: &'a Builder,
+        builder: &Builder<'a>,
         ptr: PointerValue<'a>,
     ) -> IntValue<'a> {
         let len_ptr = increment_pointer!(ctx, builder, ptr, FixedSizeListIterator::OFFSET_LEN);
@@ -318,7 +285,7 @@ impl FixedSizeListIterator {
     pub fn llvm_pos<'a>(
         &self,
         ctx: &'a Context,
-        builder: &'a Builder,
+        builder: &Builder<'a>,
         ptr: PointerValue<'a>,
     ) -> IntValue<'a> {
         let offset_ptr = increment_pointer!(ctx, builder, ptr, FixedSizeListIterator::OFFSET_POS);
@@ -328,14 +295,14 @@ impl FixedSizeListIterator {
             .into_int_value()
     }
 
-    pub fn llvm_data<'a>(
+    pub fn llvm_child_iter<'a>(
         &self,
         ctx: &'a Context,
-        builder: &'a Builder,
+        builder: &Builder<'a>,
         ptr: PointerValue<'a>,
     ) -> PointerValue<'a> {
         let data_ptr_ptr =
-            increment_pointer!(ctx, builder, ptr, FixedSizeListIterator::OFFSET_DATA);
+            increment_pointer!(ctx, builder, ptr, FixedSizeListIterator::OFFSET_CHILD_ITER);
         let ptr = builder
             .build_load(
                 ctx.ptr_type(AddressSpace::default()),
@@ -351,7 +318,7 @@ impl FixedSizeListIterator {
     pub fn llvm_increment_pos<'a>(
         &self,
         ctx: &'a Context,
-        builder: &'a Builder,
+        builder: &Builder<'a>,
         ptr: PointerValue<'a>,
         amt: IntValue<'a>,
     ) {
@@ -364,39 +331,24 @@ impl FixedSizeListIterator {
         builder.build_store(pos_ptr, new_pos).unwrap();
     }
 
-    pub fn llvm_reset<'a>(&self, ctx: &'a Context, builder: &'a Builder, ptr: PointerValue<'a>) {
+    pub fn llvm_reset<'a>(&self, ctx: &'a Context, builder: &Builder<'a>, ptr: PointerValue<'a>) {
         let pos_ptr = increment_pointer!(ctx, builder, ptr, FixedSizeListIterator::OFFSET_POS);
-        builder
-            .build_store(pos_ptr, ctx.i64_type().const_zero())
-            .unwrap();
+        let initial_pos_ptr =
+            increment_pointer!(ctx, builder, ptr, FixedSizeListIterator::OFFSET_INITIAL_POS);
+        let initial_pos = builder
+            .build_load(ctx.i64_type(), initial_pos_ptr, "initial_pos")
+            .unwrap()
+            .into_int_value();
+        mark_load_invariant!(ctx, initial_pos);
+        builder.build_store(pos_ptr, initial_pos).unwrap();
     }
 
     pub fn localize_struct<'a>(
         &self,
-        ctx: &'a Context,
-        b: &Builder<'a>,
+        _ctx: &'a Context,
+        _b: &Builder<'a>,
         ptr: PointerValue<'a>,
     ) -> PointerValue<'a> {
-        let stype = ctx.struct_type(
-            &[
-                ctx.ptr_type(AddressSpace::default()).into(),
-                ctx.i64_type().into(),
-                ctx.i64_type().into(),
-            ],
-            false,
-        );
-        let new_ptr = b.build_alloca(stype, "local_struct").unwrap();
-        b.build_store(new_ptr, self.llvm_data(ctx, b, ptr)).unwrap();
-        b.build_store(
-            increment_pointer!(ctx, b, new_ptr, 8),
-            self.llvm_pos(ctx, b, ptr),
-        )
-        .unwrap();
-        b.build_store(
-            increment_pointer!(ctx, b, new_ptr, 16),
-            self.llvm_len(ctx, b, ptr),
-        )
-        .unwrap();
-        new_ptr
+        ptr
     }
 }

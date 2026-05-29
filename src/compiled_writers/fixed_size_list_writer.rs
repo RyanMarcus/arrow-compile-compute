@@ -1,7 +1,9 @@
 use std::{ffi::c_void, sync::Arc};
 
-use crate::{declare_blocks, declare_global_pointer, increment_pointer, PrimitiveType};
-use arrow_array::{make_array, ArrayRef, FixedSizeListArray};
+use crate::{
+    declare_blocks, declare_global_pointer, increment_pointer, ListItemType, PrimitiveType,
+};
+use arrow_array::{builder::BinaryBuilder, make_array, ArrayRef, BooleanArray, FixedSizeListArray};
 use arrow_buffer::{Buffer, NullBuffer};
 use arrow_data::ArrayDataBuilder;
 use arrow_schema::Field;
@@ -27,6 +29,7 @@ pub struct FixedSizeListWriter<'a> {
 pub struct FixedSizeListWriterAlloc {
     out_ptr: *mut c_void,
     out: Vec<u128>,
+    list_item: ListItemType,
     element_pt: PrimitiveType,
     list_size: usize,
 }
@@ -64,23 +67,51 @@ impl LeafWriterAllocation for FixedSizeListWriterAlloc {
     }
 
     fn to_array(self, len: usize, nulls: Option<NullBuffer>) -> Self::Output {
-        let buf = Buffer::from(self.out);
-        let buf = buf.slice_with_length(0, len * self.element_pt.width() * self.list_size);
-        let ad = unsafe {
-            ArrayDataBuilder::new(self.element_pt.as_arrow_type())
-                .add_buffer(buf)
-                .len(len * self.list_size)
-                .build_unchecked()
+        let list_size = self.list_size;
+        let element_pt = self.element_pt;
+        let list_item = self.list_item;
+        let out = self.out;
+        let values_len = len * list_size;
+        let flat_data = match element_pt {
+            PrimitiveType::U8 if matches!(list_item, ListItemType::Boolean) => {
+                let bytes =
+                    unsafe { std::slice::from_raw_parts(out.as_ptr() as *const u8, values_len) };
+                let bools = bytes.iter().map(|v| *v != 0).collect::<Vec<_>>();
+                Arc::new(BooleanArray::from(bools)) as ArrayRef
+            }
+            PrimitiveType::P64x2 => {
+                let ptrs =
+                    unsafe { std::slice::from_raw_parts(out.as_ptr() as *const u128, values_len) };
+                let mut b = BinaryBuilder::new();
+                for &v in ptrs {
+                    let start_ptr = (v as u64) as *const u8;
+                    let end_ptr = ((v >> 64) as u64) as *const u8;
+                    assert!(end_ptr >= start_ptr);
+                    let value = unsafe {
+                        let len = end_ptr.offset_from_unsigned(start_ptr);
+                        std::slice::from_raw_parts(start_ptr, len)
+                    };
+                    b.append_value(value);
+                }
+                Arc::new(b.finish()) as ArrayRef
+            }
+            _ => {
+                let buf = Buffer::from(out);
+                let buf = buf.slice_with_length(0, len * element_pt.width() * list_size);
+                let ad = unsafe {
+                    ArrayDataBuilder::new(element_pt.as_arrow_type())
+                        .add_buffer(buf)
+                        .len(values_len)
+                        .build_unchecked()
+                };
+                make_array(ad)
+            }
         };
-        let flat_data = make_array(ad);
 
         FixedSizeListArray::new(
-            Arc::new(Field::new_list_field(
-                self.element_pt.as_arrow_type(),
-                false,
-            )),
-            self.list_size as i32,
-            Arc::new(flat_data),
+            Arc::new(Field::new_list_field(flat_data.data_type().clone(), false)),
+            list_size as i32,
+            flat_data,
             nulls,
         )
     }
@@ -111,7 +142,8 @@ impl<'a> LeafWriter<'a> for FixedSizeListWriter<'a> {
                     out_ptr: data_ptr,
                     out: data,
                     list_size,
-                    element_pt: el_type.into(),
+                    list_item: el_type,
+                    element_pt: el_type.physical_primitive_type(),
                 }
             }
             _ => panic!("Unsupported type {} for FixedSizeListWriter", ty),
@@ -133,7 +165,10 @@ impl<'a> LeafWriter<'a> for FixedSizeListWriter<'a> {
         build.build_store(global_alloc_ptr_ptr, alloc_ptr).unwrap();
 
         let width = ty.width();
-        let func_name = format!("ingest_fsl_{}b", width);
+        let func_name = format!("ingest_fsl_{ty}")
+            .chars()
+            .map(|c| if c.is_ascii_alphanumeric() { c } else { '_' })
+            .collect::<String>();
 
         let ingest_func = {
             let b2 = ctx.create_builder();
@@ -152,7 +187,23 @@ impl<'a> LeafWriter<'a> for FixedSizeListWriter<'a> {
                 .unwrap()
                 .into_pointer_value();
 
-            b2.build_store(curr_ptr, val).unwrap();
+            if let PrimitiveType::List(ListItemType::Boolean, list_size) = ty {
+                let i8_type = ctx.i8_type();
+                let val = val.into_array_value();
+                for idx in 0..list_size {
+                    let bool_val = b2
+                        .build_extract_value(val, idx as u32, "bool_lane")
+                        .unwrap()
+                        .into_int_value();
+                    let byte_val = b2
+                        .build_int_z_extend(bool_val, i8_type, "bool_byte")
+                        .unwrap();
+                    let lane_ptr = increment_pointer!(ctx, b2, curr_ptr, idx);
+                    b2.build_store(lane_ptr, byte_val).unwrap();
+                }
+            } else {
+                b2.build_store(curr_ptr, val).unwrap();
+            }
             let new_ptr = increment_pointer!(ctx, b2, curr_ptr, width);
             b2.build_store(alloc_ptr, new_ptr).unwrap();
             b2.build_return(None).unwrap();

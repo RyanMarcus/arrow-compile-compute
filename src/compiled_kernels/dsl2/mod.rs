@@ -1262,6 +1262,21 @@ impl DSLExpr {
                 rhs.get_type(),
             ));
         }
+        match self.get_type() {
+            DSLType::Primitive(PrimitiveType::List(item, _)) if !item.is_numeric() => {
+                return Err(ArrowKernelError::DSLInvalidType(
+                    "arith operators require numeric fixed-size-list elements",
+                    self.get_type(),
+                ))
+            }
+            DSLType::Primitive(PrimitiveType::P64x2) => {
+                return Err(ArrowKernelError::DSLInvalidType(
+                    "arith operators do not support string values",
+                    self.get_type(),
+                ))
+            }
+            _ => {}
+        }
 
         Ok(DSLExpr::ArithBinOp(
             op,
@@ -1276,6 +1291,18 @@ impl DSLExpr {
                 "bitwise bin op",
                 self.get_type(),
                 rhs.get_type(),
+            ));
+        }
+        if matches!(
+            self.get_type(),
+            DSLType::Primitive(PrimitiveType::List(
+                ListItemType::Boolean | ListItemType::P64x2,
+                _
+            ))
+        ) {
+            return Err(ArrowKernelError::DSLInvalidType(
+                "bitwise operators require numeric fixed-size-list elements",
+                self.get_type(),
             ));
         }
 
@@ -1345,9 +1372,10 @@ impl DSLExpr {
     pub fn vec_sum(&self) -> Result<DSLExpr, ArrowKernelError> {
         match self.get_type() {
             DSLType::Primitive(PrimitiveType::List(item, _))
-                if PrimitiveType::from(item)
-                    .as_numeric_primitive_type()
-                    .is_some() =>
+                if item.is_numeric()
+                    && PrimitiveType::from(item)
+                        .as_numeric_primitive_type()
+                        .is_some() =>
             {
                 Ok(DSLExpr::VecSum(Box::new(self.clone())))
             }
