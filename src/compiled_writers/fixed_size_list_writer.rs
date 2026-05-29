@@ -3,7 +3,7 @@ use std::{ffi::c_void, sync::Arc};
 use crate::{
     declare_blocks, declare_global_pointer, increment_pointer, ListItemType, PrimitiveType,
 };
-use arrow_array::{builder::BinaryBuilder, make_array, ArrayRef, BooleanArray, FixedSizeListArray};
+use arrow_array::{builder::BinaryBuilder, make_array, ArrayRef, FixedSizeListArray};
 use arrow_buffer::{Buffer, NullBuffer};
 use arrow_data::ArrayDataBuilder;
 use arrow_schema::Field;
@@ -14,23 +14,33 @@ use inkwell::{
     values::{BasicValueEnum, FunctionValue, PointerValue},
     AddressSpace,
 };
-use repr_offset::ReprOffset;
 
-use super::{LeafWriter, LeafWriterAllocation};
+use super::{BooleanAllocation, BooleanWriter, LeafWriter, LeafWriterAllocation};
 
 /// Writer for fixed-size lists of primitives
-pub struct FixedSizeListWriter<'a> {
-    ingest_func: FunctionValue<'a>,
+pub enum FixedSizeListWriter<'a> {
+    Raw {
+        ingest_func: FunctionValue<'a>,
+    },
+    Boolean {
+        writer: BooleanWriter<'a>,
+        list_size: usize,
+    },
 }
 
-#[repr(C)]
-#[derive(ReprOffset, Debug)]
-#[roff(usize_offsets)]
+#[derive(Debug)]
+enum FixedSizeListWriterAllocStorage {
+    Raw {
+        out_ptr: *mut c_void,
+        out: Vec<u128>,
+        element_pt: PrimitiveType,
+    },
+    Boolean(BooleanAllocation),
+}
+
+#[derive(Debug)]
 pub struct FixedSizeListWriterAlloc {
-    out_ptr: *mut c_void,
-    out: Vec<u128>,
-    list_item: ListItemType,
-    element_pt: PrimitiveType,
+    storage: FixedSizeListWriterAllocStorage,
     list_size: usize,
 }
 
@@ -38,74 +48,96 @@ impl LeafWriterAllocation for FixedSizeListWriterAlloc {
     type Output = FixedSizeListArray;
 
     fn get_ptr(&mut self) -> *mut c_void {
-        &mut self.out_ptr as *mut *mut c_void as *mut c_void
+        match &mut self.storage {
+            FixedSizeListWriterAllocStorage::Raw { out_ptr, .. } => {
+                out_ptr as *mut *mut c_void as *mut c_void
+            }
+            FixedSizeListWriterAllocStorage::Boolean(alloc) => alloc.get_ptr(),
+        }
     }
 
     fn reserve_for_additional(&mut self, count: usize) {
-        unsafe {
-            let bytes_written = self
-                .out_ptr
-                .offset_from_unsigned(self.out.as_ptr() as *mut c_void);
-            let items_to_preserve = bytes_written.div_ceil(16);
-            self.out.set_len(items_to_preserve);
-            self.out.resize(
-                items_to_preserve + (count * self.element_pt.width() * self.list_size).div_ceil(16),
-                0,
-            );
-            let new_base = self.out.as_mut_ptr() as *mut c_void;
-            self.out_ptr = new_base.byte_add(bytes_written);
+        match &mut self.storage {
+            FixedSizeListWriterAllocStorage::Raw {
+                out_ptr,
+                out,
+                element_pt,
+            } => unsafe {
+                let bytes_written = out_ptr.offset_from_unsigned(out.as_ptr() as *mut c_void);
+                let items_to_preserve = bytes_written.div_ceil(16);
+                out.set_len(items_to_preserve);
+                out.resize(
+                    items_to_preserve + (count * element_pt.width() * self.list_size).div_ceil(16),
+                    0,
+                );
+                let new_base = out.as_mut_ptr() as *mut c_void;
+                *out_ptr = new_base.byte_add(bytes_written);
+            },
+            FixedSizeListWriterAllocStorage::Boolean(alloc) => {
+                alloc.reserve_for_additional(count * self.list_size)
+            }
         }
     }
 
     fn rewind_one(&mut self) {
-        unsafe {
-            let width = self.element_pt.width() * self.list_size;
-            let base = self.out.as_mut_ptr() as *mut c_void;
-            let bytes_written = self.out_ptr.offset_from_unsigned(base);
-            self.out_ptr = base.byte_add(bytes_written - width);
+        match &mut self.storage {
+            FixedSizeListWriterAllocStorage::Raw {
+                out_ptr,
+                out,
+                element_pt,
+            } => unsafe {
+                let width = element_pt.width() * self.list_size;
+                let base = out.as_mut_ptr() as *mut c_void;
+                let bytes_written = out_ptr.offset_from_unsigned(base);
+                *out_ptr = base.byte_add(bytes_written - width);
+            },
+            FixedSizeListWriterAllocStorage::Boolean(alloc) => {
+                for _ in 0..self.list_size {
+                    alloc.rewind_one();
+                }
+            }
         }
     }
 
     fn to_array(self, len: usize, nulls: Option<NullBuffer>) -> Self::Output {
         let list_size = self.list_size;
-        let element_pt = self.element_pt;
-        let list_item = self.list_item;
-        let out = self.out;
         let values_len = len * list_size;
-        let flat_data = match element_pt {
-            PrimitiveType::U8 if matches!(list_item, ListItemType::Boolean) => {
-                let bytes =
-                    unsafe { std::slice::from_raw_parts(out.as_ptr() as *const u8, values_len) };
-                let bools = bytes.iter().map(|v| *v != 0).collect::<Vec<_>>();
-                Arc::new(BooleanArray::from(bools)) as ArrayRef
+        let flat_data = match self.storage {
+            FixedSizeListWriterAllocStorage::Boolean(alloc) => {
+                Arc::new(alloc.to_array(values_len, None)) as ArrayRef
             }
-            PrimitiveType::P64x2 => {
-                let ptrs =
-                    unsafe { std::slice::from_raw_parts(out.as_ptr() as *const u128, values_len) };
-                let mut b = BinaryBuilder::new();
-                for &v in ptrs {
-                    let start_ptr = (v as u64) as *const u8;
-                    let end_ptr = ((v >> 64) as u64) as *const u8;
-                    assert!(end_ptr >= start_ptr);
-                    let value = unsafe {
-                        let len = end_ptr.offset_from_unsigned(start_ptr);
-                        std::slice::from_raw_parts(start_ptr, len)
+            FixedSizeListWriterAllocStorage::Raw {
+                out, element_pt, ..
+            } => match element_pt {
+                PrimitiveType::P64x2 => {
+                    let ptrs = unsafe {
+                        std::slice::from_raw_parts(out.as_ptr() as *const u128, values_len)
                     };
-                    b.append_value(value);
+                    let mut b = BinaryBuilder::new();
+                    for &v in ptrs {
+                        let start_ptr = (v as u64) as *const u8;
+                        let end_ptr = ((v >> 64) as u64) as *const u8;
+                        assert!(end_ptr >= start_ptr);
+                        let value = unsafe {
+                            let len = end_ptr.offset_from_unsigned(start_ptr);
+                            std::slice::from_raw_parts(start_ptr, len)
+                        };
+                        b.append_value(value);
+                    }
+                    Arc::new(b.finish()) as ArrayRef
                 }
-                Arc::new(b.finish()) as ArrayRef
-            }
-            _ => {
-                let buf = Buffer::from(out);
-                let buf = buf.slice_with_length(0, len * element_pt.width() * list_size);
-                let ad = unsafe {
-                    ArrayDataBuilder::new(element_pt.as_arrow_type())
-                        .add_buffer(buf)
-                        .len(values_len)
-                        .build_unchecked()
-                };
-                make_array(ad)
-            }
+                _ => {
+                    let buf = Buffer::from(out);
+                    let buf = buf.slice_with_length(0, len * element_pt.width() * list_size);
+                    let ad = unsafe {
+                        ArrayDataBuilder::new(element_pt.as_arrow_type())
+                            .add_buffer(buf)
+                            .len(values_len)
+                            .build_unchecked()
+                    };
+                    make_array(ad)
+                }
+            },
         };
 
         FixedSizeListArray::new(
@@ -122,11 +154,23 @@ impl LeafWriterAllocation for FixedSizeListWriterAlloc {
     }
 
     fn len(&self) -> usize {
-        let offset = unsafe { self.out_ptr.byte_offset_from(self.out.as_ptr()) };
-        let offset = usize::try_from(offset).unwrap();
-        let width = self.element_pt.width() * self.list_size;
-        assert_eq!(offset % width, 0);
-        offset / width
+        match &self.storage {
+            FixedSizeListWriterAllocStorage::Raw {
+                out_ptr,
+                out,
+                element_pt,
+            } => {
+                let offset = unsafe { out_ptr.byte_offset_from(out.as_ptr()) };
+                let offset = usize::try_from(offset).unwrap();
+                let width = element_pt.width() * self.list_size;
+                assert_eq!(offset % width, 0);
+                offset / width
+            }
+            FixedSizeListWriterAllocStorage::Boolean(alloc) => {
+                assert_eq!(alloc.len() % self.list_size, 0);
+                alloc.len() / self.list_size
+            }
+        }
     }
 }
 
@@ -135,16 +179,22 @@ impl<'a> LeafWriter<'a> for FixedSizeListWriter<'a> {
     fn allocate(expected_count: usize, ty: PrimitiveType) -> Self::Allocation {
         match ty {
             PrimitiveType::List(el_type, list_size) => {
-                let mut data = vec![0_u128; (ty.width() * expected_count).div_ceil(16)];
-                assert!(data.capacity() > 0 || expected_count == 0);
-                let data_ptr = data.as_mut_ptr() as *mut c_void;
-                FixedSizeListWriterAlloc {
-                    out_ptr: data_ptr,
-                    out: data,
-                    list_size,
-                    list_item: el_type,
-                    element_pt: el_type.physical_primitive_type(),
-                }
+                let storage = if matches!(el_type, ListItemType::Boolean) {
+                    FixedSizeListWriterAllocStorage::Boolean(BooleanWriter::allocate(
+                        expected_count * list_size,
+                        PrimitiveType::U8,
+                    ))
+                } else {
+                    let mut data = vec![0_u128; (ty.width() * expected_count).div_ceil(16)];
+                    assert!(data.capacity() > 0 || expected_count == 0);
+                    let data_ptr = data.as_mut_ptr() as *mut c_void;
+                    FixedSizeListWriterAllocStorage::Raw {
+                        out_ptr: data_ptr,
+                        out: data,
+                        element_pt: el_type.physical_primitive_type(),
+                    }
+                };
+                FixedSizeListWriterAlloc { storage, list_size }
             }
             _ => panic!("Unsupported type {} for FixedSizeListWriter", ty),
         }
@@ -157,6 +207,19 @@ impl<'a> LeafWriter<'a> for FixedSizeListWriter<'a> {
         ty: PrimitiveType,
         alloc_ptr: PointerValue<'a>,
     ) -> Self {
+        if let PrimitiveType::List(ListItemType::Boolean, list_size) = ty {
+            return FixedSizeListWriter::Boolean {
+                writer: BooleanWriter::llvm_init(
+                    ctx,
+                    llvm_mod,
+                    build,
+                    PrimitiveType::U8,
+                    alloc_ptr,
+                ),
+                list_size,
+            };
+        }
+
         let ptr_type = ctx.ptr_type(AddressSpace::default());
 
         let global_alloc_ptr_ptr =
@@ -187,40 +250,40 @@ impl<'a> LeafWriter<'a> for FixedSizeListWriter<'a> {
                 .unwrap()
                 .into_pointer_value();
 
-            if let PrimitiveType::List(ListItemType::Boolean, list_size) = ty {
-                let i8_type = ctx.i8_type();
-                let val = val.into_array_value();
-                for idx in 0..list_size {
-                    let bool_val = b2
-                        .build_extract_value(val, idx as u32, "bool_lane")
-                        .unwrap()
-                        .into_int_value();
-                    let byte_val = b2
-                        .build_int_z_extend(bool_val, i8_type, "bool_byte")
-                        .unwrap();
-                    let lane_ptr = increment_pointer!(ctx, b2, curr_ptr, idx);
-                    b2.build_store(lane_ptr, byte_val).unwrap();
-                }
-            } else {
-                b2.build_store(curr_ptr, val).unwrap();
-            }
+            b2.build_store(curr_ptr, val).unwrap();
             let new_ptr = increment_pointer!(ctx, b2, curr_ptr, width);
             b2.build_store(alloc_ptr, new_ptr).unwrap();
             b2.build_return(None).unwrap();
             func
         };
 
-        FixedSizeListWriter { ingest_func }
+        FixedSizeListWriter::Raw { ingest_func }
     }
 
-    fn llvm_ingest(&self, _ctx: &'a Context, build: &Builder<'a>, val: BasicValueEnum<'a>) {
-        build
-            .build_call(self.ingest_func, &[val.into()], "ingest")
-            .unwrap();
+    fn llvm_ingest(&self, ctx: &'a Context, build: &Builder<'a>, val: BasicValueEnum<'a>) {
+        match self {
+            FixedSizeListWriter::Raw { ingest_func } => {
+                build
+                    .build_call(*ingest_func, &[val.into()], "ingest")
+                    .unwrap();
+            }
+            FixedSizeListWriter::Boolean { writer, list_size } => {
+                let val = val.into_array_value();
+                for idx in 0..*list_size {
+                    let bool_val = build
+                        .build_extract_value(val, idx as u32, "bool_lane")
+                        .unwrap();
+                    writer.llvm_ingest(ctx, build, bool_val);
+                }
+            }
+        }
     }
 
-    fn llvm_flush(&self, _ctx: &'a Context, _build: &Builder<'a>) {
-        // no-op
+    fn llvm_flush(&self, ctx: &'a Context, build: &Builder<'a>) {
+        match self {
+            FixedSizeListWriter::Raw { .. } => {}
+            FixedSizeListWriter::Boolean { writer, .. } => writer.llvm_flush(ctx, build),
+        }
     }
 }
 
@@ -229,7 +292,7 @@ mod tests {
     use std::ffi::c_void;
 
     use arrow_array::{cast::AsArray, types::Int32Type};
-    use inkwell::{context::Context, AddressSpace, OptimizationLevel};
+    use inkwell::{context::Context, values::BasicValue, AddressSpace, OptimizationLevel};
 
     use crate::{
         compiled_writers::{
@@ -331,6 +394,94 @@ mod tests {
             assert_eq!(
                 el.as_primitive::<Int32Type>().values(),
                 &[i, i + 1, i + 2, i + 3]
+            );
+        }
+    }
+
+    #[test]
+    fn test_fsl_writer_boolean_uses_packed_values() {
+        let ctx = Context::create();
+
+        let bool_type = ctx.bool_type();
+        let list_type = bool_type.array_type(3);
+
+        let llvm_mod = ctx.create_module("test_fsl_bool_writer");
+        let build = ctx.create_builder();
+        let ptr_type = ctx.ptr_type(AddressSpace::default());
+
+        let func = llvm_mod.add_function(
+            "test",
+            ctx.void_type().fn_type(&[ptr_type.into()], false),
+            None,
+        );
+
+        declare_blocks!(ctx, func, entry);
+        build.position_at_end(entry);
+        let dest = func.get_nth_param(0).unwrap().into_pointer_value();
+        let writer = FixedSizeListWriter::llvm_init(
+            &ctx,
+            &llvm_mod,
+            &build,
+            PrimitiveType::List(ListItemType::Boolean, 3),
+            dest,
+        );
+
+        let rows = [
+            [true, false, true],
+            [false, false, true],
+            [true, true, false],
+            [false, true, false],
+            [true, false, false],
+        ];
+
+        for row in rows {
+            let mut to_write = list_type.const_zero();
+            for (idx, value) in row.into_iter().enumerate() {
+                to_write = build
+                    .build_insert_value(
+                        to_write,
+                        bool_type.const_int(value as u64, false),
+                        idx as u32,
+                        "insert_bool",
+                    )
+                    .unwrap()
+                    .into_array_value();
+            }
+            writer.llvm_ingest(&ctx, &build, to_write.as_basic_value_enum());
+        }
+
+        writer.llvm_flush(&ctx, &build);
+        build.build_return(None).unwrap();
+
+        llvm_mod.verify().unwrap();
+        let ee = llvm_mod
+            .create_jit_execution_engine(OptimizationLevel::None)
+            .unwrap();
+
+        let f = unsafe {
+            ee.get_function::<unsafe extern "C" fn(*mut c_void)>(func.get_name().to_str().unwrap())
+                .unwrap()
+        };
+
+        let mut data =
+            FixedSizeListWriter::allocate(5, PrimitiveType::List(ListItemType::Boolean, 3));
+        unsafe {
+            f.call(data.get_ptr());
+        }
+        data.reserve_for_additional(5);
+        unsafe {
+            f.call(data.get_ptr());
+        }
+        let data = data.to_array(10, None);
+
+        assert_eq!(data.values().as_boolean().values().len(), 30);
+        for i in 0..10 {
+            let el = data.value(i);
+            let bools = el.as_boolean();
+            let expected = rows[i % rows.len()];
+            assert_eq!(
+                bools.iter().map(|v| v.unwrap()).collect::<Vec<_>>(),
+                expected
             );
         }
     }
