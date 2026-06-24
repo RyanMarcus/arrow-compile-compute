@@ -21,6 +21,7 @@ use arrow_array::{
     Array, BooleanArray, Datum, GenericStringArray, Int16RunArray, Int32RunArray, Int64RunArray,
 };
 
+use arrow_buffer::bit_util;
 use arrow_schema::DataType;
 use bitmap::BitmapIterator;
 use dictionary::DictionaryIterator;
@@ -48,6 +49,45 @@ use crate::{
     declare_blocks, increment_pointer, mark_load_invariant, set_noalias_params, ArrowKernelError,
     ListItemType, PrimitiveType,
 };
+
+// Load up to 64 Arrow-packed boolean values into the low bits of a u64.
+pub(crate) unsafe extern "C" fn load_packed_bool_chunk(
+    data: *const u8,
+    start_bit: u64,
+    len: u64,
+) -> u64 {
+    debug_assert!(len <= 64);
+    let mut out = 0_u64;
+    for bit in 0..len {
+        if unsafe { bit_util::get_bit_raw(data, (start_bit + bit) as usize) } {
+            out |= 1_u64 << bit;
+        }
+    }
+    out
+}
+
+pub(crate) fn add_load_packed_bool_chunk<'a>(
+    ctx: &'a Context,
+    module: &Module<'a>,
+) -> FunctionValue<'a> {
+    module
+        .get_function("load_packed_bool_chunk")
+        .unwrap_or_else(|| {
+            let ptr_type = ctx.ptr_type(AddressSpace::default());
+            module.add_function(
+                "load_packed_bool_chunk",
+                ctx.i64_type().fn_type(
+                    &[
+                        ptr_type.into(),
+                        ctx.i64_type().into(),
+                        ctx.i64_type().into(),
+                    ],
+                    false,
+                ),
+                None,
+            )
+        })
+}
 
 fn build_fixed_size_list_value<'a>(
     ctx: &'a Context,
@@ -80,14 +120,53 @@ fn build_fixed_size_list_value<'a>(
     let llvm_type = ptype.llvm_type(ctx);
 
     match ptype {
-        PrimitiveType::List(ListItemType::Boolean, _)
-        | PrimitiveType::List(ListItemType::P64x2, _) => {
+        PrimitiveType::List(ListItemType::Boolean, size) => {
+            let IteratorHolder::Bitmap(child_iter) = iter.child() else {
+                unreachable!("fixed-size-list boolean child must use a bitmap iterator");
+            };
+            let data_ptr = child_iter.llvm_get_data_ptr(ctx, build, child_iter_ptr);
+            let slice_offset = child_iter.llvm_slice_offset(ctx, build, child_iter_ptr);
+            let start_bit = build
+                .build_int_add(slice_offset, base_idx, "fsl_bool_start_bit")
+                .unwrap();
+            let load_chunk = add_load_packed_bool_chunk(ctx, llvm_mod);
+            let mut out = llvm_type.into_array_type().const_zero();
+            for chunk in 0..size.div_ceil(64) {
+                let chunk_start = build
+                    .build_int_add(
+                        start_bit,
+                        i64_type.const_int((chunk * 64) as u64, false),
+                        "fsl_bool_chunk_start",
+                    )
+                    .unwrap();
+                let chunk_len = (size - chunk * 64).min(64);
+                let value = build
+                    .build_call(
+                        load_chunk,
+                        &[
+                            data_ptr.into(),
+                            chunk_start.into(),
+                            i64_type.const_int(chunk_len as u64, false).into(),
+                        ],
+                        "fsl_bool_chunk",
+                    )
+                    .unwrap()
+                    .try_as_basic_value()
+                    .unwrap_basic();
+                out = build
+                    .build_insert_value(out, value, chunk as u32, "fsl_bool_insert_chunk")
+                    .unwrap()
+                    .into_array_value();
+            }
+            Some(out.as_basic_value_enum())
+        }
+        PrimitiveType::List(ListItemType::P64x2, _) => {
             let mut out = llvm_type.into_array_type().const_zero();
             for lane in 0..*list_size as u64 {
                 let child_idx = build
                     .build_int_add(base_idx, i64_type.const_int(lane, false), "fsl_child_idx")
                     .unwrap();
-                let mut value = build
+                let value = build
                     .build_call(
                         child_access,
                         &[child_iter_ptr.into(), child_idx.into()],
@@ -96,12 +175,6 @@ fn build_fixed_size_list_value<'a>(
                     .unwrap()
                     .try_as_basic_value()
                     .unwrap_basic();
-                if matches!(ptype, PrimitiveType::List(ListItemType::Boolean, _)) {
-                    value = build
-                        .build_int_truncate(value.into_int_value(), ctx.bool_type(), "fsl_bool")
-                        .unwrap()
-                        .as_basic_value_enum();
-                }
                 out = build
                     .build_insert_value(out, value, lane as u32, "fsl_insert")
                     .unwrap()

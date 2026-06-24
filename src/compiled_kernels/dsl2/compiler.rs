@@ -1230,14 +1230,35 @@ fn extract_list_compare_elements<'ctx, 'a>(
     let i = ctx.ctx.i64_type().const_int(idx as u64, false);
     match item {
         ListItemType::Boolean => {
+            let chunk_idx = idx / 64;
+            let bit_idx = idx % 64;
             let lhs = ctx
                 .b
-                .build_extract_value(lhs.into_array_value(), idx as u32, "lhs_bool")
+                .build_extract_value(lhs.into_array_value(), chunk_idx as u32, "lhs_bool_chunk")
+                .unwrap()
+                .into_int_value();
+            let rhs = ctx
+                .b
+                .build_extract_value(rhs.into_array_value(), chunk_idx as u32, "rhs_bool_chunk")
+                .unwrap()
+                .into_int_value();
+            let shift = ctx.ctx.i64_type().const_int(bit_idx as u64, false);
+            let lhs = ctx
+                .b
+                .build_right_shift(lhs, shift, false, "lhs_bool_shifted")
+                .unwrap();
+            let rhs = ctx
+                .b
+                .build_right_shift(rhs, shift, false, "rhs_bool_shifted")
+                .unwrap();
+            let lhs = ctx
+                .b
+                .build_int_truncate(lhs, ctx.ctx.bool_type(), "lhs_bool")
                 .unwrap()
                 .as_basic_value_enum();
             let rhs = ctx
                 .b
-                .build_extract_value(rhs.into_array_value(), idx as u32, "rhs_bool")
+                .build_int_truncate(rhs, ctx.ctx.bool_type(), "rhs_bool")
                 .unwrap()
                 .as_basic_value_enum();
             (lhs, rhs, DSLType::Boolean)

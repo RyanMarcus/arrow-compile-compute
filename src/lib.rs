@@ -423,7 +423,7 @@ impl PrimitiveType {
             PrimitiveType::F32 => ctx.f32_type().into(),
             PrimitiveType::F64 => ctx.f64_type().into(),
             PrimitiveType::List(ListItemType::Boolean, s) => {
-                ctx.bool_type().array_type(*s as u32).into()
+                ctx.i64_type().array_type(s.div_ceil(64) as u32).into()
             }
             PrimitiveType::List(ListItemType::P64x2, s) => PrimitiveType::P64x2
                 .llvm_type(ctx)

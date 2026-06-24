@@ -102,14 +102,16 @@ impl Kernel for TakeKernel {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::Arc;
+
     use arrow_array::{
         builder::{FixedSizeListBuilder, Float32Builder},
         cast::AsArray,
         types::{Float32Type, Int32Type, Int64Type},
-        BooleanArray, Int32Array, Int64Array, RunArray, StringArray, UInt16Array, UInt32Array,
-        UInt8Array,
+        BooleanArray, FixedSizeListArray, Int32Array, Int64Array, RunArray, StringArray,
+        UInt16Array, UInt32Array, UInt8Array,
     };
-    use arrow_schema::DataType;
+    use arrow_schema::{DataType, Field};
     use itertools::Itertools;
 
     use crate::{compiled_kernels::Kernel, dictionary_data_type};
@@ -231,6 +233,30 @@ mod tests {
         let res = k.call((&data, &idxes)).unwrap();
         let res = res.as_boolean();
         assert_eq!(res.values().iter().collect_vec(), &[true, true, false]);
+    }
+
+    #[test]
+    fn test_take_fixed_size_list_bool() {
+        let values = BooleanArray::from(vec![
+            true, false, true, false, true, false, false, false, true,
+        ]);
+        let data = FixedSizeListArray::try_new(
+            Arc::new(Field::new_list_field(DataType::Boolean, false)),
+            3,
+            Arc::new(values),
+            None,
+        )
+        .unwrap();
+        let idxes = UInt32Array::from(vec![2, 0]);
+
+        let k = TakeKernel::compile(&(&data, &idxes), ()).unwrap();
+        let res = k.call((&data, &idxes)).unwrap();
+        let res = res.as_fixed_size_list();
+
+        assert_eq!(
+            res.values().as_boolean().values().iter().collect_vec(),
+            &[false, false, true, true, false, true]
+        );
     }
 
     #[test]
