@@ -39,7 +39,7 @@ impl BitmapIterator {
     pub fn llvm_get_data_ptr<'a>(
         &self,
         ctx: &'a Context,
-        build: &'a Builder,
+        build: &Builder<'a>,
         ptr: PointerValue<'a>,
     ) -> PointerValue<'a> {
         let data_ptr_ptr = increment_pointer!(ctx, build, ptr, BitmapIterator::OFFSET_DATA);
@@ -57,7 +57,7 @@ impl BitmapIterator {
     pub fn llvm_slice_offset<'a>(
         &self,
         ctx: &'a Context,
-        build: &'a Builder,
+        build: &Builder<'a>,
         ptr: PointerValue<'a>,
     ) -> IntValue<'a> {
         let slice_offset_ptr =
@@ -73,7 +73,7 @@ impl BitmapIterator {
     pub fn llvm_pos<'a>(
         &self,
         ctx: &'a Context,
-        build: &'a Builder,
+        build: &Builder<'a>,
         ptr: PointerValue<'a>,
     ) -> IntValue<'a> {
         let pos_ptr = increment_pointer!(ctx, build, ptr, BitmapIterator::OFFSET_POS);
@@ -86,7 +86,7 @@ impl BitmapIterator {
     pub fn llvm_len<'a>(
         &self,
         ctx: &'a Context,
-        build: &'a Builder,
+        build: &Builder<'a>,
         ptr: PointerValue<'a>,
     ) -> IntValue<'a> {
         let len_ptr = increment_pointer!(ctx, build, ptr, BitmapIterator::OFFSET_LEN);
@@ -98,7 +98,7 @@ impl BitmapIterator {
     pub fn llvm_increment_pos<'a>(
         &self,
         ctx: &'a Context,
-        builder: &'a Builder,
+        builder: &Builder<'a>,
         ptr: PointerValue<'a>,
         amt: IntValue<'a>,
     ) {
@@ -111,7 +111,7 @@ impl BitmapIterator {
         builder.build_store(pos_ptr, new_pos).unwrap();
     }
 
-    pub fn llvm_reset<'a>(&self, ctx: &'a Context, builder: &'a Builder, ptr: PointerValue<'a>) {
+    pub fn llvm_reset<'a>(&self, ctx: &'a Context, builder: &Builder<'a>, ptr: PointerValue<'a>) {
         let pos_ptr = increment_pointer!(ctx, builder, ptr, BitmapIterator::OFFSET_POS);
         builder
             .build_store(pos_ptr, ctx.i64_type().const_zero())
