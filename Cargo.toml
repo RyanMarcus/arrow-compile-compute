@@ -64,6 +64,10 @@ name = "take_bench"
 harness = false
 
 [[bench]]
+name = "take_fsl_bool_bench"
+harness = false
+
+[[bench]]
 name = "filter_bench"
 harness = false
 
