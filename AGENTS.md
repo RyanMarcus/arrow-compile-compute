@@ -9,4 +9,4 @@ This is a standard Rust project.
 ## Code style
 
 * Use `unsafe` only when it leads to large performance improvements or is otherwise required (e.g., JIT).
-
+* Do not introduce new helper functions that are only called from a single place.
