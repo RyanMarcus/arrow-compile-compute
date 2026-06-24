@@ -36,6 +36,8 @@ fn add_noinline<'a>(ctx: &'a Context, func: &FunctionValue<'a>) {
 #[repr(C)]
 #[derive(ReprOffset, Debug)]
 #[roff(usize_offsets)]
+/// A non-concurrent "ticketing" hash table which can be used by LLVM code to
+/// assign a unique, sequential value to keys. Used for dictionary encoding.
 pub struct TicketTable {
     max_size: usize,
     keys: *mut u8,
