@@ -496,6 +496,8 @@ impl IteratorHolder {
         match self {
             IteratorHolder::Primitive(i) => i.localize_struct(ctx, b, ptr),
             IteratorHolder::FixedSizeList(i) => i.localize_struct(ctx, b, ptr),
+            IteratorHolder::String(i) => i.localize_struct(ctx, b, ptr),
+            IteratorHolder::LargeString(i) => i.localize_struct(ctx, b, ptr),
             _ => ptr,
         }
     }
@@ -1153,7 +1155,18 @@ pub fn generate_next<'a>(
     );
     let iter_ptr = next.get_nth_param(0).unwrap().into_pointer_value();
     let out_ptr = next.get_nth_param(1).unwrap().into_pointer_value();
-    set_noalias_params(&next);
+    // SetBit, String, and LargeString iterators use raw heap pointers with loop-carried
+    // mutable state. Marking their parameters noalias causes LLVM to insert
+    // @llvm.experimental.noalias.scope.decl in every outer loop iteration when inlined,
+    // which incorrectly tells the optimizer it can discard stores from the previous
+    // iteration (e.g. tail_idx, pos). Primitive and FixedSizeList are safe because
+    // localize_struct copies their state to a stack alloca that LLVM can track precisely.
+    if !matches!(
+        ih,
+        IteratorHolder::SetBit(_) | IteratorHolder::String(_) | IteratorHolder::LargeString(_)
+    ) {
+        set_noalias_params(&next);
+    }
     match ih {
         IteratorHolder::Primitive(primitive_iter) => {
             declare_blocks!(ctx, next, entry, none_left, get_next);

@@ -313,8 +313,20 @@ impl<'a> REEWriter<'a> {
             let converted = b2
                 .build_int_truncate_or_bit_cast(curr_run_end, llvm_run_end_type, "casted_run_end")
                 .unwrap();
-            run_end_writer.llvm_ingest(ctx, &b2, converted.into());
-            value_writer.llvm_ingest(ctx, &b2, last_val);
+            // run_end_writer.alloc_ptr is an SSA value from the outer function;
+            // using it here (inside b2's function) would be a cross-function
+            // reference that LLVM rejects.  Derive fresh pointers instead from
+            // the alloc_ptr we just loaded from the module global.
+            let re_ptr = b2
+                .build_load(ptr_type, increment_pointer!(ctx, b2, alloc_ptr, REEAllocation::OFFSET_RES_PTR), "re_ptr")
+                .unwrap()
+                .into_pointer_value();
+            b2.build_call(run_end_writer.ingest_func, &[re_ptr.into(), converted.into()], "re_ingest").unwrap();
+            let val_ptr = b2
+                .build_load(ptr_type, increment_pointer!(ctx, b2, alloc_ptr, REEAllocation::OFFSET_VALUES_PTR), "val_ptr")
+                .unwrap()
+                .into_pointer_value();
+            value_writer.call_ingest_with_explicit_alloc(ctx, &b2, val_ptr, last_val);
             b2.build_store(last_val_ptr, val_to_insert).unwrap();
             let num_unique_ptr =
                 increment_pointer!(ctx, b2, alloc_ptr, REEAllocation::OFFSET_NUM_UNIQUE);
@@ -391,8 +403,18 @@ impl<'a> REEWriter<'a> {
                 .build_int_truncate_or_bit_cast(curr_run_end, llvm_run_end_type, "casted_run_end")
                 .unwrap();
             let last_val = b2.build_load(llvm_ty, last_val_ptr, "last_val").unwrap();
-            run_end_writer.llvm_ingest(ctx, &b2, converted_run_end.into());
-            value_writer.llvm_ingest(ctx, &b2, last_val);
+            // Same as in ingest_func: fresh pointers from the global-loaded
+            // alloc_ptr to avoid cross-function SSA references.
+            let re_ptr = b2
+                .build_load(ptr_type, increment_pointer!(ctx, b2, alloc_ptr, REEAllocation::OFFSET_RES_PTR), "re_ptr")
+                .unwrap()
+                .into_pointer_value();
+            b2.build_call(run_end_writer.ingest_func, &[re_ptr.into(), converted_run_end.into()], "re_ingest").unwrap();
+            let val_ptr = b2
+                .build_load(ptr_type, increment_pointer!(ctx, b2, alloc_ptr, REEAllocation::OFFSET_VALUES_PTR), "val_ptr")
+                .unwrap()
+                .into_pointer_value();
+            value_writer.call_ingest_with_explicit_alloc(ctx, &b2, val_ptr, last_val);
             b2.build_unconditional_branch(no_value).unwrap();
 
             b2.position_at_end(no_value);

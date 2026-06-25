@@ -112,6 +112,10 @@ impl DictAllocation {
 
 pub struct DictWriter<'a> {
     ht_ptr: PointerValue<'a>,
+    // Stored so llvm_ingest can pass them as explicit arguments to ingest_func
+    // on every call, avoiding the shared-global race described in array_writer.rs.
+    keys_alloc_ptr: PointerValue<'a>,
+    values_alloc_ptr: PointerValue<'a>,
     ingest_func: FunctionValue<'a>,
 }
 
@@ -161,7 +165,12 @@ impl<'a> DictWriter<'a> {
         build
             .build_call(
                 self.ingest_func,
-                &[self.ht_ptr.into(), val.into()],
+                &[
+                    self.ht_ptr.into(),
+                    self.keys_alloc_ptr.into(),
+                    self.values_alloc_ptr.into(),
+                    val.into(),
+                ],
                 "dict_ingest",
             )
             .unwrap();
@@ -184,21 +193,22 @@ impl<'a> DictWriter<'a> {
     ) -> Self {
         let ptr_type = ctx.ptr_type(AddressSpace::default());
         let value_type = value_spec.storage_type();
+        let keys_alloc_ptr = build
+            .build_load(
+                ptr_type,
+                increment_pointer!(ctx, build, alloc_ptr, DictAllocation::OFFSET_KEYS_PTR),
+                "keys_ptr",
+            )
+            .unwrap()
+            .into_pointer_value();
         let key_writer = PrimitiveArrayWriter::llvm_init(
             ctx,
             llvm_mod,
             build,
             PrimitiveType::for_arrow_type(&K::DATA_TYPE),
-            build
-                .build_load(
-                    ptr_type,
-                    increment_pointer!(ctx, build, alloc_ptr, DictAllocation::OFFSET_KEYS_PTR),
-                    "keys_ptr",
-                )
-                .unwrap()
-                .into_pointer_value(),
+            keys_alloc_ptr,
         );
-        let value_writer_ptr = build
+        let values_alloc_ptr = build
             .build_load(
                 ptr_type,
                 increment_pointer!(ctx, build, alloc_ptr, DictAllocation::OFFSET_VALUES_PTR),
@@ -206,7 +216,7 @@ impl<'a> DictWriter<'a> {
             )
             .unwrap()
             .into_pointer_value();
-        let value_writer = value_spec.llvm_init(ctx, llvm_mod, build, value_writer_ptr);
+        let value_writer = value_spec.llvm_init(ctx, llvm_mod, build, values_alloc_ptr);
 
         let dummy_ht = TicketTable::new(0, value_type.as_arrow_type(), K::DATA_TYPE);
         let hash_func = generate_hash_func(ctx, llvm_mod, value_type);
@@ -214,19 +224,25 @@ impl<'a> DictWriter<'a> {
         let ht_ptr = increment_pointer!(ctx, build, alloc_ptr, DictAllocation::OFFSET_TT);
         let i8_type = ctx.i8_type();
 
+        // ingest_func receives keys_alloc_ptr and values_alloc_ptr as explicit
+        // parameters so that concurrent callers each pass their own allocation
+        // pointers.  This replaces the old module-level global approach which
+        // caused data races when multiple JIT modules were active simultaneously.
         let ingest_func = {
             let b = ctx.create_builder();
             let func_type = ctx
                 .bool_type()
-                .fn_type(&[ptr_type.into(), value_type.llvm_type(ctx).into()], false);
+                .fn_type(&[ptr_type.into(), ptr_type.into(), ptr_type.into(), value_type.llvm_type(ctx).into()], false);
             let func = llvm_mod.add_function(
                 &format!("dict_writer_ingest_{}_{}", K::DATA_TYPE, value_type),
                 func_type,
                 Some(Linkage::Private),
             );
 
-            let ht_ptr = func.get_nth_param(0).unwrap().into_pointer_value();
-            let value = func.get_nth_param(1).unwrap();
+            let ht_ptr_param = func.get_nth_param(0).unwrap().into_pointer_value();
+            let keys_alloc_param = func.get_nth_param(1).unwrap().into_pointer_value();
+            let values_alloc_param = func.get_nth_param(2).unwrap().into_pointer_value();
+            let value = func.get_nth_param(3).unwrap();
 
             declare_blocks!(ctx, func, entry, is_new, not_new, table_full);
             b.position_at_end(entry);
@@ -240,7 +256,7 @@ impl<'a> DictWriter<'a> {
             let ticket_val = b
                 .build_call(
                     ht_lookup,
-                    &[ht_ptr.into(), value.into(), hash.into(), is_new_ptr.into()],
+                    &[ht_ptr_param.into(), value.into(), hash.into(), is_new_ptr.into()],
                     "ht_lookup",
                 )
                 .unwrap()
@@ -263,13 +279,16 @@ impl<'a> DictWriter<'a> {
             .unwrap();
 
             b.position_at_end(not_new);
-            key_writer.llvm_ingest(ctx, &b, ticket_val.into());
+            // Call ingest_func directly (bypassing llvm_ingest) so we can
+            // supply the alloc pointer that arrived as a parameter to this
+            // inner function, not the one captured from the outer context.
+            b.build_call(key_writer.ingest_func, &[keys_alloc_param.into(), ticket_val.into()], "key_ingest").unwrap();
             b.build_return(Some(&ctx.bool_type().const_int(1, false)))
                 .unwrap();
 
             b.position_at_end(is_new);
-            key_writer.llvm_ingest(ctx, &b, ticket_val.into());
-            value_writer.llvm_ingest(ctx, &b, value);
+            b.build_call(key_writer.ingest_func, &[keys_alloc_param.into(), ticket_val.into()], "key_ingest").unwrap();
+            value_writer.call_ingest_with_explicit_alloc(ctx, &b, values_alloc_param, value);
             b.build_return(Some(&ctx.bool_type().const_int(1, false)))
                 .unwrap();
 
@@ -282,6 +301,8 @@ impl<'a> DictWriter<'a> {
 
         Self {
             ht_ptr,
+            keys_alloc_ptr,
+            values_alloc_ptr,
             ingest_func,
         }
     }

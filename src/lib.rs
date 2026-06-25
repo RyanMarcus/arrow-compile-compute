@@ -60,7 +60,12 @@ macro_rules! declare_global_pointer {
     ($module:expr, $label:ident) => {{
         let ptr_type = $module.get_context().ptr_type(AddressSpace::default());
         let global_var = $module.add_global(ptr_type, None, stringify!($label));
-        global_var.set_thread_local(true);
+        // LLVM MCJIT on macOS/ARM64 cannot resolve TLS symbols at JIT link time,
+        // so we removed set_thread_local(true).  Without TLS these globals are
+        // shared across all concurrent JIT calls; PrimitiveArrayWriter avoids
+        // the resulting race by passing the allocation pointer as an explicit
+        // function parameter instead (see array_writer.rs).
+        // global_var.set_thread_local(true);
         global_var.set_initializer(&ptr_type.const_null());
         global_var.set_linkage(inkwell::module::Linkage::Private);
         global_var

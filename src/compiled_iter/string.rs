@@ -146,6 +146,43 @@ impl StringIterator {
             .build_store(pos_ptr, ctx.i64_type().const_zero())
             .unwrap();
     }
+
+    /// Copy the four hot fields (offsets, data, pos, len) from the Rust heap
+    /// struct into a local alloca so that LLVM's alias analysis works on a
+    /// stack-based pointer rather than an opaque heap pointer parameter.  This
+    /// matches what `PrimitiveIterator::localize_struct` does and prevents
+    /// incorrect LICM / CSE under optimization.
+    pub fn localize_struct<'a>(
+        &self,
+        ctx: &'a Context,
+        b: &Builder<'a>,
+        ptr: PointerValue<'a>,
+    ) -> PointerValue<'a> {
+        let ptr_type = ctx.ptr_type(AddressSpace::default());
+        let i64_type = ctx.i64_type();
+        let stype = ctx.struct_type(
+            &[ptr_type.into(), ptr_type.into(), i64_type.into(), i64_type.into()],
+            false,
+        );
+        let local = b.build_alloca(stype, "local_str_iter").unwrap();
+        b.build_store(local, self.llvm_get_offset_ptr(ctx, b, ptr)).unwrap();
+        b.build_store(
+            increment_pointer!(ctx, b, local, StringIterator::OFFSET_DATA),
+            self.llvm_get_data_ptr(ctx, b, ptr),
+        )
+        .unwrap();
+        b.build_store(
+            increment_pointer!(ctx, b, local, StringIterator::OFFSET_POS),
+            self.llvm_pos(ctx, b, ptr),
+        )
+        .unwrap();
+        b.build_store(
+            increment_pointer!(ctx, b, local, StringIterator::OFFSET_LEN),
+            self.llvm_len(ctx, b, ptr),
+        )
+        .unwrap();
+        local
+    }
 }
 
 /// Same as `StringIterator`, but with 64 bit offsets.
@@ -243,6 +280,38 @@ impl LargeStringIterator {
         builder
             .build_store(pos_ptr, ctx.i64_type().const_zero())
             .unwrap();
+    }
+
+    pub fn localize_struct<'a>(
+        &self,
+        ctx: &'a Context,
+        b: &Builder<'a>,
+        ptr: PointerValue<'a>,
+    ) -> PointerValue<'a> {
+        let ptr_type = ctx.ptr_type(AddressSpace::default());
+        let i64_type = ctx.i64_type();
+        let stype = ctx.struct_type(
+            &[ptr_type.into(), ptr_type.into(), i64_type.into(), i64_type.into()],
+            false,
+        );
+        let local = b.build_alloca(stype, "local_large_str_iter").unwrap();
+        b.build_store(local, self.llvm_get_offset_ptr(ctx, b, ptr)).unwrap();
+        b.build_store(
+            increment_pointer!(ctx, b, local, LargeStringIterator::OFFSET_DATA),
+            self.llvm_get_data_ptr(ctx, b, ptr),
+        )
+        .unwrap();
+        b.build_store(
+            increment_pointer!(ctx, b, local, LargeStringIterator::OFFSET_POS),
+            self.llvm_pos(ctx, b, ptr),
+        )
+        .unwrap();
+        b.build_store(
+            increment_pointer!(ctx, b, local, LargeStringIterator::OFFSET_LEN),
+            self.llvm_len(ctx, b, ptr),
+        )
+        .unwrap();
+        local
     }
 }
 

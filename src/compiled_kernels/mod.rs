@@ -19,7 +19,7 @@ mod sort_norm;
 mod string;
 mod take;
 mod vec;
-use std::{collections::HashMap, sync::RwLock};
+use std::{collections::HashMap, sync::{OnceLock, RwLock}};
 
 pub use aggregate2::{
     Aggregator, CountAggregator, MaxAggregator, MinAggregator, MostRecentAggregator, SumAggregator,
@@ -235,8 +235,14 @@ pub(crate) fn link_req_helpers(
     Ok(())
 }
 
+// LLVM panics if initialize_native is called more than once in the same
+// process.  Concurrent tests triggered this, so we gate it behind a OnceLock.
+static LLVM_INIT: OnceLock<()> = OnceLock::new();
+
 pub(crate) fn create_native_target_machine() -> Result<TargetMachine, ArrowKernelError> {
-    Target::initialize_native(&inkwell::targets::InitializationConfig::default()).unwrap();
+    LLVM_INIT.get_or_init(|| {
+        Target::initialize_native(&inkwell::targets::InitializationConfig::default()).unwrap();
+    });
     let triple = TargetMachine::get_default_triple();
     let cpu = TargetMachine::get_host_cpu_name().to_string();
     let features = TargetMachine::get_host_cpu_features().to_string();
@@ -267,9 +273,19 @@ pub(crate) fn configure_module_for_native_target(
 fn optimize_module(module: &Module) -> Result<(), ArrowKernelError> {
     let machine = configure_module_for_native_target(module)?;
 
+    if std::env::var("PRINT_IR").is_ok() {
+        let _ = std::fs::write("/tmp/ir_before.ll", module.to_string());
+    }
+
     module
         .run_passes("default<O3>", &machine, PassBuilderOptions::create())
-        .map_err(|e| ArrowKernelError::LLVMError(e.to_string()))
+        .map_err(|e| ArrowKernelError::LLVMError(e.to_string()))?;
+
+    if std::env::var("PRINT_IR").is_ok() {
+        let _ = std::fs::write("/tmp/ir_after.ll", module.to_string());
+    }
+
+    Ok(())
 }
 
 /// Emit code to convert a vector of numeric values to a different numeric type,

@@ -1,6 +1,6 @@
 use std::ffi::c_void;
 
-use crate::{declare_blocks, declare_global_pointer, increment_pointer, PrimitiveType};
+use crate::{declare_blocks, increment_pointer, PrimitiveType};
 use arrow_array::{make_array, ArrayRef, ArrowPrimitiveType, PrimitiveArray};
 use arrow_buffer::{Buffer, NullBuffer};
 use arrow_data::ArrayDataBuilder;
@@ -17,7 +17,8 @@ use super::{LeafWriter, LeafWriterAllocation};
 
 /// Writer for primitive arrays (ints and floats).
 pub struct PrimitiveArrayWriter<'a> {
-    ingest_func: FunctionValue<'a>,
+    alloc_ptr: PointerValue<'a>,
+    pub(super) ingest_func: FunctionValue<'a>,
     ingest_vec_func: FunctionValue<'a>,
 }
 
@@ -123,40 +124,40 @@ impl<'a> LeafWriter<'a> for PrimitiveArrayWriter<'a> {
     fn llvm_init(
         ctx: &'a Context,
         llvm_mod: &Module<'a>,
-        build: &Builder<'a>,
+        _build: &Builder<'a>,
         ty: PrimitiveType,
         alloc_ptr: PointerValue<'a>,
     ) -> Self {
         let ptr_type = ctx.ptr_type(AddressSpace::default());
-
-        let global_alloc_ptr_ptr =
-            declare_global_pointer!(llvm_mod, ARRAY_WRITER_ALLOC_PTR).as_pointer_value();
-
-        build.build_store(global_alloc_ptr_ptr, alloc_ptr).unwrap();
-
         let width = ty.width();
         let func_name = format!("ingest_prim_{}b", width);
 
+        // The allocation pointer is passed as the first parameter to each ingest
+        // function rather than being stored in a module-level global.  Globals were
+        // previously used with thread_local storage, but LLVM MCJIT on macOS/ARM64
+        // cannot resolve TLS.  Regular (non-TLS) globals are shared across all
+        // concurrent calls to the same cached JIT function, which causes data races
+        // when multiple tests run in parallel.  Passing the pointer explicitly is
+        // the race-free alternative.
         let ingest_func = {
             let b2 = ctx.create_builder();
-            let fn_type = ctx.void_type().fn_type(&[ty.llvm_type(ctx).into()], false);
+            let fn_type = ctx
+                .void_type()
+                .fn_type(&[ptr_type.into(), ty.llvm_type(ctx).into()], false);
             let func = llvm_mod.add_function(&func_name, fn_type, Some(Linkage::Private));
             declare_blocks!(ctx, func, entry);
             b2.position_at_end(entry);
-            let val = func.get_nth_param(0).unwrap();
+            let alloc_ptr_param = func.get_nth_param(0).unwrap().into_pointer_value();
+            let val = func.get_nth_param(1).unwrap();
 
-            let alloc_ptr = b2
-                .build_load(ptr_type, global_alloc_ptr_ptr, "alloc_ptr")
-                .unwrap()
-                .into_pointer_value();
             let curr_ptr = b2
-                .build_load(ptr_type, alloc_ptr, "curr_ptr")
+                .build_load(ptr_type, alloc_ptr_param, "curr_ptr")
                 .unwrap()
                 .into_pointer_value();
 
             b2.build_store(curr_ptr, val).unwrap();
             let new_ptr = increment_pointer!(ctx, b2, curr_ptr, width);
-            b2.build_store(alloc_ptr, new_ptr).unwrap();
+            b2.build_store(alloc_ptr_param, new_ptr).unwrap();
             b2.build_return(None).unwrap();
             func
         };
@@ -165,30 +166,28 @@ impl<'a> LeafWriter<'a> for PrimitiveArrayWriter<'a> {
             let b2 = ctx.create_builder();
             let fn_type = ctx
                 .void_type()
-                .fn_type(&[ty.llvm_vec_type(ctx, 64).unwrap().into()], false);
+                .fn_type(&[ptr_type.into(), ty.llvm_vec_type(ctx, 64).unwrap().into()], false);
             let func = llvm_mod.add_function(&func_name, fn_type, Some(Linkage::Private));
             declare_blocks!(ctx, func, entry);
             b2.position_at_end(entry);
-            let val = func.get_nth_param(0).unwrap();
+            let alloc_ptr_param = func.get_nth_param(0).unwrap().into_pointer_value();
+            let val = func.get_nth_param(1).unwrap();
 
-            let alloc_ptr = b2
-                .build_load(ptr_type, global_alloc_ptr_ptr, "alloc_ptr")
-                .unwrap()
-                .into_pointer_value();
             let curr_ptr = b2
-                .build_load(ptr_type, alloc_ptr, "curr_ptr")
+                .build_load(ptr_type, alloc_ptr_param, "curr_ptr")
                 .unwrap()
                 .into_pointer_value();
 
             let store = b2.build_store(curr_ptr, val).unwrap();
             store.set_alignment(1).unwrap();
             let new_ptr = increment_pointer!(ctx, b2, curr_ptr, width * 64);
-            b2.build_store(alloc_ptr, new_ptr).unwrap();
+            b2.build_store(alloc_ptr_param, new_ptr).unwrap();
             b2.build_return(None).unwrap();
             func
         };
 
         PrimitiveArrayWriter {
+            alloc_ptr,
             ingest_func,
             ingest_vec_func,
         }
@@ -196,7 +195,7 @@ impl<'a> LeafWriter<'a> for PrimitiveArrayWriter<'a> {
 
     fn llvm_ingest(&self, _ctx: &'a Context, build: &Builder<'a>, val: BasicValueEnum<'a>) {
         build
-            .build_call(self.ingest_func, &[val.into()], "ingest")
+            .build_call(self.ingest_func, &[self.alloc_ptr.into(), val.into()], "ingest")
             .unwrap();
     }
 
@@ -207,7 +206,7 @@ impl<'a> LeafWriter<'a> for PrimitiveArrayWriter<'a> {
         vals: inkwell::values::VectorValue<'a>,
     ) {
         build
-            .build_call(self.ingest_vec_func, &[vals.into()], "ingest")
+            .build_call(self.ingest_vec_func, &[self.alloc_ptr.into(), vals.into()], "ingest")
             .unwrap();
     }
 

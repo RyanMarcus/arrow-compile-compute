@@ -8,7 +8,7 @@ use inkwell::{
     builder::Builder,
     context::Context,
     module::Module,
-    values::{BasicValueEnum, PointerValue, VectorValue},
+    values::{BasicMetadataValueEnum, BasicValueEnum, PointerValue, VectorValue},
 };
 
 mod array_writer;
@@ -502,6 +502,43 @@ impl<'a> Writer<'a> {
                     writer.llvm_ingest(ctx, build, val);
                 }
             }
+        }
+    }
+
+    /// Call the writer's ingest function from inside a nested LLVM function
+    /// (i.e., one built with a different builder than the one used in
+    /// `llvm_init`).
+    ///
+    /// For `Primitive` writers the stored `alloc_ptr` comes from the outer
+    /// function's SSA context and cannot be referenced inside an inner
+    /// function; the caller must supply a freshly-derived `alloc_ptr` that
+    /// was computed inside the inner function.
+    ///
+    /// For all other writer types (String, LargeString, …) the ingest
+    /// function loads its allocation pointer from a module-level global at
+    /// runtime, so the regular `llvm_ingest` path is used and `alloc_ptr`
+    /// is ignored.
+    pub(super) fn call_ingest_with_explicit_alloc(
+        &self,
+        ctx: &'a Context,
+        build: &Builder<'a>,
+        alloc_ptr: PointerValue<'a>,
+        val: BasicValueEnum<'a>,
+    ) {
+        match self {
+            Self::Primitive(w) => {
+                build
+                    .build_call(
+                        w.ingest_func,
+                        &[
+                            BasicMetadataValueEnum::PointerValue(alloc_ptr),
+                            BasicMetadataValueEnum::from(val),
+                        ],
+                        "ingest",
+                    )
+                    .unwrap();
+            }
+            _ => self.llvm_ingest(ctx, build, val),
         }
     }
 

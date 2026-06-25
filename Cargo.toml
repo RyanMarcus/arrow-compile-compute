@@ -23,6 +23,7 @@ memchr = "2.7.6"
 paste = "1.0.15"
 num-rational = { version = "0.4.2" }
 lincomdb = { git = "https://github.com/RyanMarcus/lincomdb" }
+cfg-if = "1"
 
 [dev-dependencies]
 float-ord = "0.3.2"
