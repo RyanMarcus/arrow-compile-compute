@@ -43,7 +43,7 @@ use crate::{
         llvm_utils::llvm_add_save_ptrs_string_saver,
         optimize_module,
     },
-    compiled_writers::Writer,
+    compiled_writers::BoundWriter,
     increment_pointer, set_noalias_params, ArrowKernelError, ComparisonType, ListItemType,
     NumericPrimitiveType, PrimitiveType,
 };
@@ -126,7 +126,7 @@ pub struct DSLCompilationContext<'ctx, 'a> {
     pub reset_funcs: HashMap<usize, FunctionValue<'a>>,
     pub lengths: HashMap<usize, Option<IntValue<'a>>>,
     pub output_specs: Vec<crate::compiled_writers::WriterSpec>,
-    pub outputs: Vec<Writer<'a>>,
+    pub outputs: Vec<BoundWriter<'a, 'a>>,
     pub did_vectorize: &'a mut bool,
 }
 

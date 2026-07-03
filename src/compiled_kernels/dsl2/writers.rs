@@ -6,7 +6,7 @@ use inkwell::{builder::Builder, context::Context, module::Module, values::Pointe
 
 use crate::{
     compiled_kernels::dsl2::DSLType,
-    compiled_writers::{Writer, WriterAllocation},
+    compiled_writers::{BoundWriter, WriterAllocation},
     PrimitiveType,
 };
 
@@ -74,7 +74,7 @@ impl OutputSlot {
         llvm_mod: &Module<'a>,
         build: &Builder<'a>,
         alloc_ptr: PointerValue<'a>,
-    ) -> Writer<'a> {
+    ) -> BoundWriter<'a, 'a> {
         self.spec.llvm_init(ctx, llvm_mod, build, alloc_ptr)
     }
 }

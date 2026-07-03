@@ -16,12 +16,12 @@ use inkwell::{
 use repr_offset::ReprOffset;
 
 use super::{
-    ArrayOutput, LeafWriter, LeafWriterAllocation, PrimitiveArrayWriter, RunEndType,
+    ArrayOutput, LeafWriter, LeafWriterAllocation, PrimitiveArrayWriter, RunEndType, Writer,
     WriterAllocation, WriterSpec,
 };
 use crate::{
-    compiled_kernels::cmp::add_memcmp, declare_blocks, declare_global_pointer, increment_pointer,
-    ComparisonType, PrimitiveType,
+    compiled_kernels::cmp::add_memcmp, declare_blocks, increment_pointer, ComparisonType,
+    PrimitiveType,
 };
 
 #[repr(C)]
@@ -149,23 +149,31 @@ impl<'a> REEWriter<'a> {
         }
     }
 
-    pub fn llvm_ingest(
+    pub(super) fn emit_ingest(
         &self,
         _ctx: &'a inkwell::context::Context,
         build: &inkwell::builder::Builder<'a>,
+        alloc_ptr: PointerValue<'a>,
         val: inkwell::values::BasicValueEnum<'a>,
     ) {
         build
-            .build_call(self.ingest_func, &[val.into()], "ingest_ree")
+            .build_call(
+                self.ingest_func,
+                &[alloc_ptr.into(), val.into()],
+                "ingest_ree",
+            )
             .unwrap();
     }
 
-    pub fn llvm_flush(
+    pub(super) fn emit_flush(
         &self,
         _ctx: &'a inkwell::context::Context,
         build: &inkwell::builder::Builder<'a>,
+        alloc_ptr: PointerValue<'a>,
     ) {
-        build.build_call(self.flush_func, &[], "flush").unwrap();
+        build
+            .build_call(self.flush_func, &[alloc_ptr.into()], "flush")
+            .unwrap();
     }
 
     fn llvm_init_typed<K: RunEndIndexType>(
@@ -177,10 +185,6 @@ impl<'a> REEWriter<'a> {
     ) -> Self {
         let ptr_type = ctx.ptr_type(AddressSpace::default());
         let value_type = value_spec.storage_type();
-        let alloc_ptr_ptr = declare_global_pointer!(llvm_mod, REE_ALLOC_PTR);
-        build
-            .build_store(alloc_ptr_ptr.as_pointer_value(), alloc_ptr)
-            .unwrap();
 
         let run_end_ptr = build
             .build_load(
@@ -197,6 +201,7 @@ impl<'a> REEWriter<'a> {
             PrimitiveType::for_arrow_type(&K::DATA_TYPE),
             run_end_ptr,
         );
+        let run_end_writer = Writer::Primitive(run_end_writer).bind(run_end_ptr);
 
         let value_ptr = build
             .build_load(
@@ -206,18 +211,23 @@ impl<'a> REEWriter<'a> {
             )
             .unwrap()
             .into_pointer_value();
-        let value_writer = value_spec.llvm_init(ctx, llvm_mod, build, value_ptr);
+        let value_writer = value_spec
+            .llvm_writer(ctx, llvm_mod, build, value_ptr)
+            .bind(value_ptr);
 
         let ingest_func = {
             let i64_type = ctx.i64_type();
             let llvm_ty = value_type.llvm_type(ctx);
-            let func_type = ctx.void_type().fn_type(&[llvm_ty.into()], false);
+            let func_type = ctx
+                .void_type()
+                .fn_type(&[ptr_type.into(), llvm_ty.into()], false);
             let func = llvm_mod.add_function(
                 &format!("ingest_ree_{}_{}", K::DATA_TYPE, value_type),
                 func_type,
                 Some(Linkage::Private),
             );
-            let val_to_insert = func.get_nth_param(0).unwrap();
+            let alloc_ptr = func.get_nth_param(0).unwrap().into_pointer_value();
+            let val_to_insert = func.get_nth_param(1).unwrap();
             declare_blocks!(
                 ctx,
                 func,
@@ -229,8 +239,20 @@ impl<'a> REEWriter<'a> {
             );
             let b2 = ctx.create_builder();
             b2.position_at_end(entry);
-            let alloc_ptr = b2
-                .build_load(ptr_type, alloc_ptr_ptr.as_pointer_value(), "alloc_ptr")
+            let run_end_ptr = b2
+                .build_load(
+                    ptr_type,
+                    increment_pointer!(ctx, b2, alloc_ptr, REEAllocation::OFFSET_RES_PTR),
+                    "re_ptr",
+                )
+                .unwrap()
+                .into_pointer_value();
+            let value_ptr = b2
+                .build_load(
+                    ptr_type,
+                    increment_pointer!(ctx, b2, alloc_ptr, REEAllocation::OFFSET_VALUES_PTR),
+                    "val_ptr",
+                )
                 .unwrap()
                 .into_pointer_value();
             let curr_run_end_ptr =
@@ -313,8 +335,12 @@ impl<'a> REEWriter<'a> {
             let converted = b2
                 .build_int_truncate_or_bit_cast(curr_run_end, llvm_run_end_type, "casted_run_end")
                 .unwrap();
-            run_end_writer.llvm_ingest(ctx, &b2, converted.into());
-            value_writer.llvm_ingest(ctx, &b2, last_val);
+            run_end_writer
+                .with_alloc(run_end_ptr)
+                .llvm_ingest(ctx, &b2, converted.into());
+            value_writer
+                .with_alloc(value_ptr)
+                .llvm_ingest(ctx, &b2, last_val);
             b2.build_store(last_val_ptr, val_to_insert).unwrap();
             let num_unique_ptr =
                 increment_pointer!(ctx, b2, alloc_ptr, REEAllocation::OFFSET_NUM_UNIQUE);
@@ -347,7 +373,7 @@ impl<'a> REEWriter<'a> {
         let flush_func = {
             let i64_type = ctx.i64_type();
             let llvm_ty = value_type.llvm_type(ctx);
-            let func_type = ctx.void_type().fn_type(&[], false);
+            let func_type = ctx.void_type().fn_type(&[ptr_type.into()], false);
             let func = llvm_mod.add_function(
                 &format!("flush_ree_{}_{}", K::DATA_TYPE, value_type),
                 func_type,
@@ -356,8 +382,21 @@ impl<'a> REEWriter<'a> {
             declare_blocks!(ctx, func, entry, has_value, no_value);
             let b2 = ctx.create_builder();
             b2.position_at_end(entry);
-            let alloc_ptr = b2
-                .build_load(ptr_type, alloc_ptr_ptr.as_pointer_value(), "alloc_ptr")
+            let alloc_ptr = func.get_nth_param(0).unwrap().into_pointer_value();
+            let run_end_ptr = b2
+                .build_load(
+                    ptr_type,
+                    increment_pointer!(ctx, b2, alloc_ptr, REEAllocation::OFFSET_RES_PTR),
+                    "re_ptr",
+                )
+                .unwrap()
+                .into_pointer_value();
+            let value_ptr = b2
+                .build_load(
+                    ptr_type,
+                    increment_pointer!(ctx, b2, alloc_ptr, REEAllocation::OFFSET_VALUES_PTR),
+                    "val_ptr",
+                )
                 .unwrap()
                 .into_pointer_value();
             let curr_run_end_ptr =
@@ -391,13 +430,17 @@ impl<'a> REEWriter<'a> {
                 .build_int_truncate_or_bit_cast(curr_run_end, llvm_run_end_type, "casted_run_end")
                 .unwrap();
             let last_val = b2.build_load(llvm_ty, last_val_ptr, "last_val").unwrap();
-            run_end_writer.llvm_ingest(ctx, &b2, converted_run_end.into());
-            value_writer.llvm_ingest(ctx, &b2, last_val);
+            run_end_writer
+                .with_alloc(run_end_ptr)
+                .llvm_ingest(ctx, &b2, converted_run_end.into());
+            value_writer
+                .with_alloc(value_ptr)
+                .llvm_ingest(ctx, &b2, last_val);
             b2.build_unconditional_branch(no_value).unwrap();
 
             b2.position_at_end(no_value);
-            run_end_writer.llvm_flush(ctx, &b2);
-            value_writer.llvm_flush(ctx, &b2);
+            run_end_writer.with_alloc(run_end_ptr).llvm_flush(ctx, &b2);
+            value_writer.with_alloc(value_ptr).llvm_flush(ctx, &b2);
             b2.build_return(None).unwrap();
             func
         };

@@ -759,13 +759,15 @@ impl Kernel for HashKernel {
                 let iter_ptr = func.get_nth_param(0).unwrap().into_pointer_value();
                 let out_ptr = func.get_nth_param(1).unwrap().into_pointer_value();
                 let buf_ptr = b.build_alloca(p_llvm, "buf_ptr").unwrap();
-                let writer = PrimitiveArrayWriter::llvm_init(
-                    ctx,
-                    &llvm_mod,
-                    &b,
-                    PrimitiveType::U64,
-                    out_ptr,
-                );
+                let writer =
+                    crate::compiled_writers::Writer::Primitive(PrimitiveArrayWriter::llvm_init(
+                        ctx,
+                        &llvm_mod,
+                        &b,
+                        PrimitiveType::U64,
+                        out_ptr,
+                    ))
+                    .bind(out_ptr);
                 b.build_unconditional_branch(loop_cond).unwrap();
 
                 b.position_at_end(loop_cond);
