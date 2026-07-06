@@ -1,3 +1,73 @@
+//! LLVM-backed Arrow array writers.
+//!
+//! This module is the bridge between the Rust objects that own output buffers
+//! and the LLVM IR that appends values into those buffers. There are four
+//! related concepts:
+//!
+//! 1. [`WriterSpec`] describes the logical output type. It is cheap, cloneable
+//!    metadata such as "primitive i32", "string", or "dictionary with i32
+//!    values".
+//! 2. [`WriterAllocation`] owns the Rust-side allocation for one output column.
+//!    The allocation is created before the JIT function runs, passed to LLVM as
+//!    an opaque pointer, and converted into an Arrow array after the JIT
+//!    function returns.
+//! 3. [`Writer`] owns the generated writer logic for a spec. It may contain
+//!    LLVM helper functions and nested child writers, but it is deliberately not
+//!    the public append API because it is not tied to a particular allocation
+//!    pointer.
+//! 4. [`BoundWriter`] is a writer bound to the allocation pointer that is valid
+//!    in the current LLVM IR context. It is the public IR-generation API for
+//!    appending values and flushing buffered state.
+//!
+//! The distinction between [`Writer`] and [`BoundWriter`] is important. An LLVM
+//! [`PointerValue`] is an SSA value: a pointer computed in one function, helper,
+//! or block is not automatically valid in another. Earlier versions of this
+//! module hid the current allocation pointer in a thread-local LLVM global, but
+//! that was fragile for JIT linking on macOS and also made the active allocation
+//! implicit. The current design passes allocation pointers explicitly and makes
+//! Rust code bind writer logic to the pointer that is valid at the place where
+//! IR is being emitted.
+//!
+//! A typical consumer follows this lifecycle:
+//!
+//! ```ignore
+//! use arrow_compile_compute::{compiled_writers::WriterSpec, PrimitiveType};
+//!
+//! let spec = WriterSpec::Primitive(PrimitiveType::I32);
+//! let mut allocation = spec.allocate(expected_rows);
+//!
+//! // Pass this pointer to the compiled function as an opaque output pointer.
+//! let output_ptr = allocation.get_ptr();
+//!
+//! // After the compiled function has run, consume the allocation as an Arrow
+//! // array. The length normally comes from the kernel's output-length logic.
+//! let array = allocation.into_array_ref_with_len(output_len, None);
+//! ```
+//!
+//! During IR generation, the opaque output pointer is materialized as an LLVM
+//! [`PointerValue`] and bound to the writer:
+//!
+//! ```ignore
+//! let writer = spec.llvm_init(ctx, llvm_mod, build, output_alloc_ptr);
+//!
+//! writer.llvm_ingest(ctx, build, value);
+//! writer.llvm_flush(ctx, build);
+//! ```
+//!
+//! Composite writers use the same rule recursively. If a dictionary or
+//! run-end-encoded helper derives a child allocation pointer from the parent
+//! allocation, it calls [`BoundWriter::with_alloc`] and emits child writes
+//! through that rebound writer:
+//!
+//! ```ignore
+//! child_writer.with_alloc(child_alloc_ptr).llvm_ingest(ctx, build, child_value);
+//! ```
+//!
+//! The author of IR-generation code is responsible for ensuring that a
+//! [`BoundWriter`] is used only where its allocation pointer is valid LLVM IR.
+//! Misuse should be caught by LLVM verification or compilation; the Rust object
+//! itself does not extend the lifetime or dominance of the underlying SSA value.
+
 use std::ffi::c_void;
 use std::sync::Arc;
 
@@ -49,23 +119,6 @@ pub trait LeafWriter<'a> {
         ty: PrimitiveType,
         alloc_ptr: PointerValue<'a>,
     ) -> Self;
-
-    fn llvm_ingest(&self, ctx: &'a Context, build: &Builder<'a>, val: BasicValueEnum<'a>);
-    fn llvm_flush(&self, ctx: &'a Context, build: &Builder<'a>);
-
-    fn llvm_ingest_block(&self, ctx: &'a Context, build: &Builder<'a>, vals: VectorValue<'a>) {
-        let i64_type = ctx.i64_type();
-        for idx in 0..vals.get_type().get_size() {
-            let val = build
-                .build_extract_element(
-                    vals,
-                    i64_type.const_int(idx as u64, false),
-                    &format!("val{}", idx),
-                )
-                .unwrap();
-            self.llvm_ingest(ctx, build, val);
-        }
-    }
 }
 
 pub trait LeafWriterAllocation {
@@ -158,6 +211,16 @@ impl RunEndType {
     }
 }
 
+/// Logical description of an output writer.
+///
+/// A `WriterSpec` is schema-like metadata. Use it to allocate the Rust-side
+/// output storage with [`WriterSpec::allocate`] and to create LLVM writer logic
+/// with [`WriterSpec::llvm_init`].
+///
+/// ```ignore
+/// let spec = WriterSpec::for_data_type(&arrow_schema::DataType::Int32);
+/// let mut allocation = spec.allocate(expected_rows);
+/// ```
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub enum WriterSpec {
     Primitive(PrimitiveType),
@@ -187,6 +250,12 @@ impl WriterSpec {
         }
     }
 
+    /// Allocate Rust-side output storage for this writer spec.
+    ///
+    /// The returned allocation owns the buffers that the compiled function will
+    /// mutate. Pass [`WriterAllocation::get_ptr`] to the JIT function, then
+    /// consume the allocation with [`WriterAllocation::into_array_ref`] or
+    /// [`WriterAllocation::into_array_ref_with_len`].
     pub fn allocate(&self, expected_count: usize) -> WriterAllocation {
         match self {
             Self::Primitive(pt) => {
@@ -220,7 +289,14 @@ impl WriterSpec {
         }
     }
 
-    pub fn llvm_init<'a>(
+    /// Create the unbound LLVM writer logic for this spec.
+    ///
+    /// This is crate-private because callers should normally use
+    /// [`WriterSpec::llvm_init`], which binds the writer to the allocation
+    /// pointer immediately. Composite writers use this lower-level form to
+    /// create child writer logic once and later bind it to child allocation
+    /// pointers derived inside helper functions.
+    pub(crate) fn llvm_writer<'a>(
         &self,
         ctx: &'a Context,
         llvm_mod: &Module<'a>,
@@ -278,6 +354,22 @@ impl WriterSpec {
                 REEWriter::llvm_init(ctx, llvm_mod, build, *run_end, values, alloc_ptr),
             )),
         }
+    }
+
+    /// Create a [`BoundWriter`] for this spec and allocation pointer.
+    ///
+    /// The `alloc_ptr` must be valid in the LLVM function or helper where
+    /// subsequent [`BoundWriter::llvm_ingest`] and [`BoundWriter::llvm_flush`]
+    /// calls are emitted.
+    pub fn llvm_init<'a>(
+        &self,
+        ctx: &'a Context,
+        llvm_mod: &Module<'a>,
+        build: &Builder<'a>,
+        alloc_ptr: PointerValue<'a>,
+    ) -> BoundWriter<'a, 'a> {
+        self.llvm_writer(ctx, llvm_mod, build, alloc_ptr)
+            .bind(alloc_ptr)
     }
 
     pub fn for_base_type_of_datum(datum: &dyn Datum) -> Self {
@@ -348,6 +440,20 @@ impl WriterSpec {
     }
 }
 
+/// Rust-side storage owned by an output writer.
+///
+/// `WriterAllocation` values live outside the generated LLVM function. The JIT
+/// receives [`WriterAllocation::get_ptr`] as an opaque pointer, writes into it,
+/// and the Rust caller later consumes the allocation as an Arrow array.
+///
+/// ```ignore
+/// let mut allocation = spec.allocate(expected_rows);
+/// let raw_ptr = allocation.get_ptr();
+///
+/// run_compiled_kernel(raw_ptr);
+///
+/// let array = allocation.into_array_ref_with_len(output_len, nulls);
+/// ```
 pub enum WriterAllocation {
     Primitive(ArrayOutput),
     Boolean(BooleanAllocation),
@@ -443,6 +549,14 @@ impl WriterAllocation {
     }
 }
 
+/// Generated writer logic that is not bound to an allocation pointer.
+///
+/// This type owns LLVM helper functions and nested writer state, but it does
+/// not expose public ingest or flush methods. Bind it to a valid LLVM allocation
+/// pointer with [`Writer::bind`] before emitting writes.
+///
+/// Most callers should use [`WriterSpec::llvm_init`], which creates a
+/// [`Writer`] and immediately returns a [`BoundWriter`].
 pub enum Writer<'a> {
     Primitive(PrimitiveArrayWriter<'a>),
     Boolean(BooleanWriter<'a>),
@@ -455,27 +569,60 @@ pub enum Writer<'a> {
 }
 
 impl<'a> Writer<'a> {
-    pub fn llvm_ingest(&self, ctx: &'a Context, build: &Builder<'a>, val: BasicValueEnum<'a>) {
-        match self {
-            Self::Primitive(writer) => writer.llvm_ingest(ctx, build, val),
-            Self::Boolean(writer) => writer.llvm_ingest(ctx, build, val),
-            Self::String(writer) => writer.llvm_ingest(ctx, build, val),
-            Self::LargeString(writer) => writer.llvm_ingest(ctx, build, val),
-            Self::StringView(writer) => writer.llvm_ingest(ctx, build, val),
-            Self::FixedSizeList(writer) => writer.llvm_ingest(ctx, build, val),
-            Self::Dictionary(writer) => writer.llvm_ingest(ctx, build, val),
-            Self::RunEndEncoded(writer) => writer.llvm_ingest(ctx, build, val),
+    /// Attach this writer logic to the allocation pointer currently valid in
+    /// the emitted LLVM IR.
+    pub fn bind(self, alloc_ptr: PointerValue<'a>) -> BoundWriter<'a, 'a> {
+        BoundWriter {
+            writer: BoundWriterTarget::Owned(self),
+            alloc_ptr,
         }
     }
 
-    pub fn llvm_ingest_block(&self, ctx: &'a Context, build: &Builder<'a>, vals: VectorValue<'a>) {
+    fn emit_ingest(
+        &self,
+        ctx: &'a Context,
+        build: &Builder<'a>,
+        alloc_ptr: PointerValue<'a>,
+        val: BasicValueEnum<'a>,
+    ) {
         match self {
-            Self::Primitive(writer) => writer.llvm_ingest_block(ctx, build, vals),
-            Self::Boolean(writer) => writer.llvm_ingest_block(ctx, build, vals),
-            Self::String(writer) => writer.llvm_ingest_block(ctx, build, vals),
-            Self::LargeString(writer) => writer.llvm_ingest_block(ctx, build, vals),
-            Self::StringView(writer) => writer.llvm_ingest_block(ctx, build, vals),
-            Self::FixedSizeList(writer) => writer.llvm_ingest_block(ctx, build, vals),
+            Self::Primitive(writer) => writer.emit_ingest(build, alloc_ptr, val),
+            Self::Boolean(writer) => writer.emit_ingest(ctx, build, alloc_ptr, val),
+            Self::String(writer) => writer.emit_ingest(build, alloc_ptr, val),
+            Self::LargeString(writer) => writer.emit_ingest(build, alloc_ptr, val),
+            Self::StringView(writer) => writer.emit_ingest(build, alloc_ptr, val),
+            Self::FixedSizeList(writer) => writer.emit_ingest(ctx, build, alloc_ptr, val),
+            Self::Dictionary(writer) => writer.emit_ingest(ctx, build, alloc_ptr, val),
+            Self::RunEndEncoded(writer) => writer.emit_ingest(ctx, build, alloc_ptr, val),
+        }
+    }
+
+    fn emit_ingest_block(
+        &self,
+        ctx: &'a Context,
+        build: &Builder<'a>,
+        alloc_ptr: PointerValue<'a>,
+        vals: VectorValue<'a>,
+    ) {
+        match self {
+            Self::Primitive(writer) => writer.emit_ingest_block(build, alloc_ptr, vals),
+            Self::Boolean(writer) => writer.emit_ingest_block(ctx, build, alloc_ptr, vals),
+            Self::String(_)
+            | Self::LargeString(_)
+            | Self::StringView(_)
+            | Self::FixedSizeList(_) => {
+                let i64_type = ctx.i64_type();
+                for idx in 0..vals.get_type().get_size() {
+                    let val = build
+                        .build_extract_element(
+                            vals,
+                            i64_type.const_int(idx as u64, false),
+                            &format!("val{}", idx),
+                        )
+                        .unwrap();
+                    self.emit_ingest(ctx, build, alloc_ptr, val);
+                }
+            }
             Self::Dictionary(writer) => {
                 let i64_type = ctx.i64_type();
                 for idx in 0..vals.get_type().get_size() {
@@ -486,7 +633,7 @@ impl<'a> Writer<'a> {
                             &format!("val{}", idx),
                         )
                         .unwrap();
-                    writer.llvm_ingest(ctx, build, val);
+                    writer.emit_ingest(ctx, build, alloc_ptr, val);
                 }
             }
             Self::RunEndEncoded(writer) => {
@@ -499,22 +646,83 @@ impl<'a> Writer<'a> {
                             &format!("val{}", idx),
                         )
                         .unwrap();
-                    writer.llvm_ingest(ctx, build, val);
+                    writer.emit_ingest(ctx, build, alloc_ptr, val);
                 }
             }
         }
     }
 
-    pub fn llvm_flush(&self, ctx: &'a Context, build: &Builder<'a>) {
+    fn emit_flush(&self, ctx: &'a Context, build: &Builder<'a>, alloc_ptr: PointerValue<'a>) {
         match self {
-            Self::Primitive(writer) => writer.llvm_flush(ctx, build),
-            Self::Boolean(writer) => writer.llvm_flush(ctx, build),
-            Self::String(writer) => writer.llvm_flush(ctx, build),
-            Self::LargeString(writer) => writer.llvm_flush(ctx, build),
-            Self::StringView(writer) => writer.llvm_flush(ctx, build),
-            Self::FixedSizeList(writer) => writer.llvm_flush(ctx, build),
-            Self::Dictionary(writer) => writer.llvm_flush(ctx, build),
-            Self::RunEndEncoded(writer) => writer.llvm_flush(ctx, build),
+            Self::Primitive(writer) => writer.emit_flush(ctx, build, alloc_ptr),
+            Self::Boolean(writer) => writer.emit_flush(ctx, build, alloc_ptr),
+            Self::String(writer) => writer.emit_flush(build, alloc_ptr),
+            Self::LargeString(writer) => writer.emit_flush(build, alloc_ptr),
+            Self::StringView(writer) => writer.emit_flush(build, alloc_ptr),
+            Self::FixedSizeList(writer) => writer.emit_flush(ctx, build, alloc_ptr),
+            Self::Dictionary(writer) => writer.emit_flush(ctx, build, alloc_ptr),
+            Self::RunEndEncoded(writer) => writer.emit_flush(ctx, build, alloc_ptr),
         }
+    }
+}
+
+enum BoundWriterTarget<'a, 'w> {
+    Owned(Writer<'a>),
+    Borrowed(&'w Writer<'a>),
+}
+
+/// Writer logic attached to a specific LLVM allocation pointer.
+///
+/// `BoundWriter` is the public API for appending to an output allocation during
+/// IR generation. The allocation pointer must be valid at the point where the
+/// emitted call is inserted.
+///
+/// ```ignore
+/// let writer = spec.llvm_init(ctx, llvm_mod, build, output_alloc_ptr);
+/// writer.llvm_ingest(ctx, build, value);
+/// writer.llvm_flush(ctx, build);
+/// ```
+pub struct BoundWriter<'a, 'w> {
+    writer: BoundWriterTarget<'a, 'w>,
+    alloc_ptr: PointerValue<'a>,
+}
+
+impl<'a, 'w> BoundWriter<'a, 'w> {
+    fn writer(&self) -> &Writer<'a> {
+        match &self.writer {
+            BoundWriterTarget::Owned(writer) => writer,
+            BoundWriterTarget::Borrowed(writer) => writer,
+        }
+    }
+
+    /// Reuse this writer logic with another allocation pointer.
+    ///
+    /// This is primarily for composite writers. For example, a dictionary
+    /// writer can derive the keys and values allocation pointers from its
+    /// parent allocation and temporarily bind child writer logic to those
+    /// derived pointers before emitting child appends.
+    pub fn with_alloc<'b>(&'b self, alloc_ptr: PointerValue<'a>) -> BoundWriter<'a, 'b> {
+        BoundWriter {
+            writer: BoundWriterTarget::Borrowed(self.writer()),
+            alloc_ptr,
+        }
+    }
+
+    /// Emit IR that appends one value into this bound allocation.
+    pub fn llvm_ingest(&self, ctx: &'a Context, build: &Builder<'a>, val: BasicValueEnum<'a>) {
+        self.writer().emit_ingest(ctx, build, self.alloc_ptr, val);
+    }
+
+    /// Emit IR that appends each lane of a vector value into this bound
+    /// allocation.
+    pub fn llvm_ingest_block(&self, ctx: &'a Context, build: &Builder<'a>, vals: VectorValue<'a>) {
+        self.writer()
+            .emit_ingest_block(ctx, build, self.alloc_ptr, vals);
+    }
+
+    /// Emit IR that flushes any buffered writer state into this bound
+    /// allocation.
+    pub fn llvm_flush(&self, ctx: &'a Context, build: &Builder<'a>) {
+        self.writer().emit_flush(ctx, build, self.alloc_ptr);
     }
 }

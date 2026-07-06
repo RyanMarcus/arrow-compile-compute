@@ -9,7 +9,7 @@ use repr_offset::ReprOffset;
 
 use crate::{
     compiled_writers::{LeafWriter, LeafWriterAllocation},
-    declare_blocks, declare_global_pointer, increment_pointer, pointer_diff, PrimitiveType,
+    declare_blocks, increment_pointer, pointer_diff, PrimitiveType,
 };
 
 pub struct ViewBufferWriter {
@@ -136,9 +136,9 @@ impl<'a> LeafWriter<'a> for StringViewWriter<'a> {
     fn llvm_init(
         ctx: &'a inkwell::context::Context,
         llvm_mod: &inkwell::module::Module<'a>,
-        build: &inkwell::builder::Builder<'a>,
+        _build: &inkwell::builder::Builder<'a>,
         ty: crate::PrimitiveType,
-        alloc_ptr: inkwell::values::PointerValue<'a>,
+        _alloc_ptr: inkwell::values::PointerValue<'a>,
     ) -> Self {
         assert_eq!(
             ty,
@@ -148,11 +148,6 @@ impl<'a> LeafWriter<'a> for StringViewWriter<'a> {
         let ptr_type = ctx.ptr_type(AddressSpace::default());
         let i128_type = ctx.i128_type();
         let i64_type = ctx.i64_type();
-
-        let alloc_global = declare_global_pointer!(llvm_mod, STRING_VIEW_ALLOC_PTR_PTR);
-        build
-            .build_store(alloc_global.as_pointer_value(), alloc_ptr)
-            .unwrap();
 
         let extend_f = llvm_mod
             .get_function("str_view_writer_append_bytes")
@@ -184,18 +179,16 @@ impl<'a> LeafWriter<'a> for StringViewWriter<'a> {
         let ingest_func_name = "ingest_str_view";
         let ingest_func = {
             let b2 = ctx.create_builder();
-            let fn_type = ctx
-                .void_type()
-                .fn_type(&[PrimitiveType::P64x2.llvm_type(ctx).into()], false);
+            let fn_type = ctx.void_type().fn_type(
+                &[ptr_type.into(), PrimitiveType::P64x2.llvm_type(ctx).into()],
+                false,
+            );
 
             let func = llvm_mod.add_function(ingest_func_name, fn_type, Some(Linkage::Private));
             declare_blocks!(ctx, func, entry, short_string, long_string, exit);
             b2.position_at_end(entry);
-            let val = func.get_nth_param(0).unwrap().into_struct_value();
-            let alloc_ptr = b2
-                .build_load(ptr_type, alloc_global.as_pointer_value(), "alloc_ptr")
-                .unwrap()
-                .into_pointer_value();
+            let alloc_ptr = func.get_nth_param(0).unwrap().into_pointer_value();
+            let val = func.get_nth_param(1).unwrap().into_struct_value();
             let out_ptr_ptr =
                 increment_pointer!(ctx, b2, alloc_ptr, StringViewAllocation::OFFSET_VIEWS_PTR);
             let out_ptr = b2
@@ -266,22 +259,28 @@ impl<'a> LeafWriter<'a> for StringViewWriter<'a> {
 
         StringViewWriter { ingest_func }
     }
+}
 
-    fn llvm_ingest(
+impl<'a> StringViewWriter<'a> {
+    pub(super) fn emit_ingest(
         &self,
-        _ctx: &'a inkwell::context::Context,
         build: &inkwell::builder::Builder<'a>,
+        alloc_ptr: inkwell::values::PointerValue<'a>,
         val: inkwell::values::BasicValueEnum<'a>,
     ) {
         build
-            .build_call(self.ingest_func, &[val.into()], "ingest_view")
+            .build_call(
+                self.ingest_func,
+                &[alloc_ptr.into(), val.into()],
+                "ingest_view",
+            )
             .unwrap();
     }
 
-    fn llvm_flush(
+    pub(super) fn emit_flush(
         &self,
-        _ctx: &'a inkwell::context::Context,
         _build: &inkwell::builder::Builder<'a>,
+        _alloc_ptr: inkwell::values::PointerValue<'a>,
     ) {
         // no op
     }
@@ -295,7 +294,9 @@ mod tests {
     use itertools::Itertools;
 
     use super::{LeafWriter, LeafWriterAllocation, StringViewWriter, ViewBufferWriter};
-    use crate::{compiled_kernels::link_req_helpers, declare_blocks, PrimitiveType};
+    use crate::{
+        compiled_kernels::link_req_helpers, compiled_writers::Writer, declare_blocks, PrimitiveType,
+    };
 
     #[test]
     fn test_view_buffer_writer() {
@@ -339,8 +340,14 @@ mod tests {
         build.position_at_end(entry);
         let alloc_ptr = func.get_nth_param(0).unwrap().into_pointer_value();
 
-        let writer =
-            StringViewWriter::llvm_init(&ctx, &llvm_mod, &build, PrimitiveType::P64x2, alloc_ptr);
+        let writer = Writer::StringView(StringViewWriter::llvm_init(
+            &ctx,
+            &llvm_mod,
+            &build,
+            PrimitiveType::P64x2,
+            alloc_ptr,
+        ))
+        .bind(alloc_ptr);
 
         let strs = [
             "this",

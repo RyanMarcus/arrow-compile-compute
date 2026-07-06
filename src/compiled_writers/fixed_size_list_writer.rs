@@ -1,8 +1,6 @@
 use std::{ffi::c_void, sync::Arc};
 
-use crate::{
-    declare_blocks, declare_global_pointer, increment_pointer, ListItemType, PrimitiveType,
-};
+use crate::{declare_blocks, increment_pointer, ListItemType, PrimitiveType};
 use arrow_array::{builder::BinaryBuilder, make_array, ArrayRef, FixedSizeListArray};
 use arrow_buffer::{Buffer, NullBuffer};
 use arrow_data::ArrayDataBuilder;
@@ -205,7 +203,7 @@ impl<'a> LeafWriter<'a> for FixedSizeListWriter<'a> {
         llvm_mod: &Module<'a>,
         build: &Builder<'a>,
         ty: PrimitiveType,
-        alloc_ptr: PointerValue<'a>,
+        _alloc_ptr: PointerValue<'a>,
     ) -> Self {
         if let PrimitiveType::List(ListItemType::Boolean, list_size) = ty {
             return FixedSizeListWriter::Boolean {
@@ -214,18 +212,13 @@ impl<'a> LeafWriter<'a> for FixedSizeListWriter<'a> {
                     llvm_mod,
                     build,
                     PrimitiveType::U8,
-                    alloc_ptr,
+                    _alloc_ptr,
                 ),
                 list_size,
             };
         }
 
         let ptr_type = ctx.ptr_type(AddressSpace::default());
-
-        let global_alloc_ptr_ptr =
-            declare_global_pointer!(llvm_mod, FSL_WRITER_ALLOC_PTR).as_pointer_value();
-
-        build.build_store(global_alloc_ptr_ptr, alloc_ptr).unwrap();
 
         let width = ty.width();
         let func_name = format!("ingest_fsl_{ty}")
@@ -235,16 +228,14 @@ impl<'a> LeafWriter<'a> for FixedSizeListWriter<'a> {
 
         let ingest_func = {
             let b2 = ctx.create_builder();
-            let fn_type = ctx.void_type().fn_type(&[ty.llvm_type(ctx).into()], false);
+            let fn_type = ctx
+                .void_type()
+                .fn_type(&[ptr_type.into(), ty.llvm_type(ctx).into()], false);
             let func = llvm_mod.add_function(&func_name, fn_type, Some(Linkage::Private));
             declare_blocks!(ctx, func, entry);
             b2.position_at_end(entry);
-            let val = func.get_nth_param(0).unwrap();
-
-            let alloc_ptr = b2
-                .build_load(ptr_type, global_alloc_ptr_ptr, "alloc_ptr")
-                .unwrap()
-                .into_pointer_value();
+            let alloc_ptr = func.get_nth_param(0).unwrap().into_pointer_value();
+            let val = func.get_nth_param(1).unwrap();
             let curr_ptr = b2
                 .build_load(ptr_type, alloc_ptr, "curr_ptr")
                 .unwrap()
@@ -259,12 +250,20 @@ impl<'a> LeafWriter<'a> for FixedSizeListWriter<'a> {
 
         FixedSizeListWriter::Raw { ingest_func }
     }
+}
 
-    fn llvm_ingest(&self, ctx: &'a Context, build: &Builder<'a>, val: BasicValueEnum<'a>) {
+impl<'a> FixedSizeListWriter<'a> {
+    pub(super) fn emit_ingest(
+        &self,
+        ctx: &'a Context,
+        build: &Builder<'a>,
+        alloc_ptr: PointerValue<'a>,
+        val: BasicValueEnum<'a>,
+    ) {
         match self {
-            FixedSizeListWriter::Raw { ingest_func } => {
+            FixedSizeListWriter::Raw { ingest_func, .. } => {
                 build
-                    .build_call(*ingest_func, &[val.into()], "ingest")
+                    .build_call(*ingest_func, &[alloc_ptr.into(), val.into()], "ingest")
                     .unwrap();
             }
             FixedSizeListWriter::Boolean { writer, list_size } => {
@@ -274,7 +273,7 @@ impl<'a> LeafWriter<'a> for FixedSizeListWriter<'a> {
                     let chunk = build
                         .build_extract_value(val, chunk_idx as u32, "bool_chunk")
                         .unwrap();
-                    writer.llvm_ingest_64_bools(ctx, build, chunk);
+                    writer.emit_ingest_64_bools(ctx, build, alloc_ptr, chunk);
                 }
 
                 let tail = list_size % 64;
@@ -296,17 +295,22 @@ impl<'a> LeafWriter<'a> for FixedSizeListWriter<'a> {
                             .build_int_truncate(shifted, ctx.bool_type(), "bool_tail_bit")
                             .unwrap()
                             .as_basic_value_enum();
-                        writer.llvm_ingest(ctx, build, bool_val);
+                        writer.emit_ingest(ctx, build, alloc_ptr, bool_val);
                     }
                 }
             }
         }
     }
 
-    fn llvm_flush(&self, ctx: &'a Context, build: &Builder<'a>) {
+    pub(super) fn emit_flush(
+        &self,
+        ctx: &'a Context,
+        build: &Builder<'a>,
+        alloc_ptr: PointerValue<'a>,
+    ) {
         match self {
             FixedSizeListWriter::Raw { .. } => {}
-            FixedSizeListWriter::Boolean { writer, .. } => writer.llvm_flush(ctx, build),
+            FixedSizeListWriter::Boolean { writer, .. } => writer.emit_flush(ctx, build, alloc_ptr),
         }
     }
 }
@@ -320,7 +324,7 @@ mod tests {
 
     use crate::{
         compiled_writers::{
-            fixed_size_list_writer::FixedSizeListWriter, LeafWriter, LeafWriterAllocation,
+            fixed_size_list_writer::FixedSizeListWriter, LeafWriter, LeafWriterAllocation, Writer,
         },
         declare_blocks, ListItemType, PrimitiveType,
     };
@@ -344,13 +348,14 @@ mod tests {
         declare_blocks!(ctx, func, entry);
         build.position_at_end(entry);
         let dest = func.get_nth_param(0).unwrap().into_pointer_value();
-        let writer = FixedSizeListWriter::llvm_init(
+        let writer = Writer::FixedSizeList(FixedSizeListWriter::llvm_init(
             &ctx,
             &llvm_mod,
             &build,
             PrimitiveType::List(ListItemType::I32, 4),
             dest,
-        );
+        ))
+        .bind(dest);
 
         for i in 0..10 {
             let to_write = i32_type.vec_type(4).const_zero();
@@ -443,13 +448,14 @@ mod tests {
         declare_blocks!(ctx, func, entry);
         build.position_at_end(entry);
         let dest = func.get_nth_param(0).unwrap().into_pointer_value();
-        let writer = FixedSizeListWriter::llvm_init(
+        let writer = Writer::FixedSizeList(FixedSizeListWriter::llvm_init(
             &ctx,
             &llvm_mod,
             &build,
             PrimitiveType::List(ListItemType::Boolean, 3),
             dest,
-        );
+        ))
+        .bind(dest);
 
         let rows = [
             [true, false, true],

@@ -571,14 +571,29 @@ pub fn generate_hash_func<'a>(
 fn generate_unchained_hash32<'a>(ctx: &'a Context, llvm_mod: &Module<'a>) -> FunctionValue<'a> {
     let i64_type = ctx.i64_type();
     let i32_type = ctx.i32_type();
-    let crc32 = Intrinsic::find("llvm.x86.sse42.crc32.32.32").unwrap();
+
+    // x86 uses the SSE4.2 crc32 intrinsic; ARM64 uses its own crc32w.
+    // The feature attribute name also differs (+crc32 vs +crc).
+    let (crc32, feat) = cfg_select! {
+        target_arch = "aarch64" => {
+            (
+                Intrinsic::find("llvm.aarch64.crc32w").unwrap(),
+                ctx.create_string_attribute("target-features", "+crc"),
+            )
+        }
+        _ => {
+            (
+                Intrinsic::find("llvm.x86.sse42.crc32.32.32").unwrap(),
+                ctx.create_string_attribute("target-features", "+crc32"),
+            )
+        }
+    };
 
     let func = llvm_mod.add_function(
         "uc_hash32",
         i64_type.fn_type(&[i32_type.into()], false),
         None,
     );
-    let feat = ctx.create_string_attribute("target-features", "+crc32");
     func.add_attribute(AttributeLoc::Function, feat);
     add_noinline(ctx, &func);
 
@@ -608,14 +623,34 @@ fn generate_unchained_hash32<'a>(ctx: &'a Context, llvm_mod: &Module<'a>) -> Fun
 
 fn generate_unchained_hash64<'a>(ctx: &'a Context, llvm_mod: &Module<'a>) -> FunctionValue<'a> {
     let i64_type = ctx.i64_type();
-    let crc32 = Intrinsic::find("llvm.x86.sse42.crc32.64.64").unwrap();
+
+    // x86 uses the SSE4.2 crc32 intrinsic; ARM64 uses its own crc32x.
+    // aarch64 crc32x takes an i32 accumulator, so its seeds are the lower
+    // 32 bits of the splitmix64 mixing constants used on x86.
+    let (crc32, feat, seed1, seed2) = cfg_select! {
+        target_arch = "aarch64" => {
+            (
+                Intrinsic::find("llvm.aarch64.crc32x").unwrap(),
+                ctx.create_string_attribute("target-features", "+crc"),
+                ctx.i32_type().const_int(0x1CE4E5B9, false),
+                ctx.i32_type().const_int(0x133111EB, false),
+            )
+        }
+        _ => {
+            (
+                Intrinsic::find("llvm.x86.sse42.crc32.64.64").unwrap(),
+                ctx.create_string_attribute("target-features", "+crc32"),
+                i64_type.const_int(0xBF58476D1CE4E5B9, false),
+                i64_type.const_int(0x94D049BB133111EB, false),
+            )
+        }
+    };
 
     let func = llvm_mod.add_function(
         "uc_hash64",
         i64_type.fn_type(&[i64_type.into()], false),
         None,
     );
-    let feat = ctx.create_string_attribute("target-features", "+crc32");
     func.add_attribute(AttributeLoc::Function, feat);
     add_noinline(ctx, &func);
     let input = func.get_nth_param(0).unwrap().into_int_value();
@@ -626,8 +661,6 @@ fn generate_unchained_hash64<'a>(ctx: &'a Context, llvm_mod: &Module<'a>) -> Fun
     let build = ctx.create_builder();
     build.position_at_end(entry);
     let k = i64_type.const_int(0x2545F4914F6CDD1D, false);
-    let seed1 = i64_type.const_int(0xBF58476D1CE4E5B9, false);
-    let seed2 = i64_type.const_int(0x94D049BB133111EB, false);
 
     let crc1 = build
         .build_call(crc_f, &[seed1.into(), input.into()], "crc1")
@@ -642,6 +675,19 @@ fn generate_unchained_hash64<'a>(ctx: &'a Context, llvm_mod: &Module<'a>) -> Fun
         .try_as_basic_value()
         .unwrap_basic()
         .into_int_value();
+
+    // aarch64 crc32x returns i32; the combine step below uses i64 OR/shift,
+    // so we zero-extend before merging the two halves. On x86 the results are
+    // already i64, so they pass through unchanged.
+    let (crc1, crc2) = cfg_select! {
+        target_arch = "aarch64" => {
+            (
+                build.build_int_z_extend(crc1, i64_type, "crc1_ext").unwrap(),
+                build.build_int_z_extend(crc2, i64_type, "crc2_ext").unwrap(),
+            )
+        }
+        _ => (crc1, crc2),
+    };
 
     let combined = build
         .build_or(
@@ -759,13 +805,15 @@ impl Kernel for HashKernel {
                 let iter_ptr = func.get_nth_param(0).unwrap().into_pointer_value();
                 let out_ptr = func.get_nth_param(1).unwrap().into_pointer_value();
                 let buf_ptr = b.build_alloca(p_llvm, "buf_ptr").unwrap();
-                let writer = PrimitiveArrayWriter::llvm_init(
-                    ctx,
-                    &llvm_mod,
-                    &b,
-                    PrimitiveType::U64,
-                    out_ptr,
-                );
+                let writer =
+                    crate::compiled_writers::Writer::Primitive(PrimitiveArrayWriter::llvm_init(
+                        ctx,
+                        &llvm_mod,
+                        &b,
+                        PrimitiveType::U64,
+                        out_ptr,
+                    ))
+                    .bind(out_ptr);
                 b.build_unconditional_branch(loop_cond).unwrap();
 
                 b.position_at_end(loop_cond);

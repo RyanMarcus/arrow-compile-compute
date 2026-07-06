@@ -2,9 +2,7 @@ use std::ffi::c_void;
 use std::marker::PhantomData;
 use std::sync::Arc;
 
-use crate::{
-    declare_blocks, declare_global_pointer, increment_pointer, pointer_diff, PrimitiveType,
-};
+use crate::{declare_blocks, increment_pointer, pointer_diff, PrimitiveType};
 
 use arrow_array::{ArrayRef, GenericBinaryArray, GenericByteArray, OffsetSizeTrait};
 use arrow_buffer::{Buffer, OffsetBuffer, ScalarBuffer};
@@ -122,9 +120,9 @@ impl<'a, T: OffsetSizeTrait> LeafWriter<'a> for StringArrayWriter<'a, T> {
     fn llvm_init(
         ctx: &'a Context,
         llvm_mod: &Module<'a>,
-        build: &Builder<'a>,
+        _build: &Builder<'a>,
         ty: PrimitiveType,
-        alloc_ptr: PointerValue<'a>,
+        _alloc_ptr: PointerValue<'a>,
     ) -> Self {
         assert_eq!(ty, PrimitiveType::P64x2, "string writer type must be P64x2");
         let ptr_type = ctx.ptr_type(AddressSpace::default());
@@ -134,10 +132,6 @@ impl<'a, T: OffsetSizeTrait> LeafWriter<'a> for StringArrayWriter<'a, T> {
         } else {
             ctx.i32_type()
         };
-
-        let global_alloc_ptr_ptr =
-            declare_global_pointer!(llvm_mod, STRING_WRITER_ALLOC_PTR_PTR).as_pointer_value();
-        build.build_store(global_alloc_ptr_ptr, alloc_ptr).unwrap();
 
         let extend_f = llvm_mod
             .get_function("str_writer_append_bytes")
@@ -154,13 +148,15 @@ impl<'a, T: OffsetSizeTrait> LeafWriter<'a> for StringArrayWriter<'a, T> {
         let func_name = format!("ingest_str_{}b", T::get_byte_width());
         let ingest_func = llvm_mod.get_function(&func_name).unwrap_or_else(|| {
             let b2 = ctx.create_builder();
-            let fn_type = ctx
-                .void_type()
-                .fn_type(&[PrimitiveType::P64x2.llvm_type(ctx).into()], false);
+            let fn_type = ctx.void_type().fn_type(
+                &[ptr_type.into(), PrimitiveType::P64x2.llvm_type(ctx).into()],
+                false,
+            );
             let func = llvm_mod.add_function(&func_name, fn_type, Some(Linkage::Private));
             declare_blocks!(ctx, func, entry);
             b2.position_at_end(entry);
-            let val = func.get_nth_param(0).unwrap().into_struct_value();
+            let alloc_ptr = func.get_nth_param(0).unwrap().into_pointer_value();
+            let val = func.get_nth_param(1).unwrap().into_struct_value();
 
             let ptr1 = b2
                 .build_extract_value(val, 0, "ptr1")
@@ -172,10 +168,6 @@ impl<'a, T: OffsetSizeTrait> LeafWriter<'a> for StringArrayWriter<'a, T> {
                 .into_pointer_value();
             let len = pointer_diff!(ctx, b2, ptr1, ptr2);
 
-            let alloc_ptr = b2
-                .build_load(ptr_type, global_alloc_ptr_ptr, "alloc_ptr")
-                .unwrap()
-                .into_pointer_value();
             let offset_ptr_ptr = increment_pointer!(
                 ctx,
                 b2,
@@ -222,14 +214,21 @@ impl<'a, T: OffsetSizeTrait> LeafWriter<'a> for StringArrayWriter<'a, T> {
             _pd: PhantomData,
         }
     }
+}
 
-    fn llvm_ingest(&self, _ctx: &'a Context, build: &Builder<'a>, val: BasicValueEnum<'a>) {
+impl<'a, T: OffsetSizeTrait> StringArrayWriter<'a, T> {
+    pub(super) fn emit_ingest(
+        &self,
+        build: &Builder<'a>,
+        alloc_ptr: PointerValue<'a>,
+        val: BasicValueEnum<'a>,
+    ) {
         build
-            .build_call(self.ingest_func, &[val.into()], "ingest")
+            .build_call(self.ingest_func, &[alloc_ptr.into(), val.into()], "ingest")
             .unwrap();
     }
 
-    fn llvm_flush(&self, _ctx: &'a Context, _build: &Builder<'a>) {
+    pub(super) fn emit_flush(&self, _build: &Builder<'a>, _alloc_ptr: PointerValue<'a>) {
         // No-op for string arrays
     }
 }
@@ -239,7 +238,7 @@ mod tests {
     use super::StringArrayWriter;
     use crate::{
         compiled_kernels::link_req_helpers,
-        compiled_writers::{LeafWriter, LeafWriterAllocation},
+        compiled_writers::{LeafWriter, LeafWriterAllocation, Writer},
         declare_blocks, PrimitiveType,
     };
     use arrow_array::{LargeStringArray, StringArray};
@@ -266,13 +265,14 @@ mod tests {
         build.position_at_end(entry);
         let alloc_ptr = func.get_nth_param(0).unwrap().into_pointer_value();
 
-        let writer = StringArrayWriter::<i32>::llvm_init(
+        let writer = Writer::String(StringArrayWriter::<i32>::llvm_init(
             &ctx,
             &llvm_mod,
             &build,
             PrimitiveType::P64x2,
             alloc_ptr,
-        );
+        ))
+        .bind(alloc_ptr);
 
         let strs = ["this", "is", "a", "test!"];
 
@@ -340,13 +340,14 @@ mod tests {
         build.position_at_end(entry);
         let alloc_ptr = func.get_nth_param(0).unwrap().into_pointer_value();
 
-        let writer = StringArrayWriter::<i64>::llvm_init(
+        let writer = Writer::LargeString(StringArrayWriter::<i64>::llvm_init(
             &ctx,
             &llvm_mod,
             &build,
             PrimitiveType::P64x2,
             alloc_ptr,
-        );
+        ))
+        .bind(alloc_ptr);
 
         let strs = ["this", "is", "a", "test!"];
 

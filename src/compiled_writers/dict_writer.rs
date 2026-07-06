@@ -16,7 +16,7 @@ use inkwell::{
 use repr_offset::ReprOffset;
 
 use super::{
-    ArrayOutput, DictionaryKeyType, LeafWriter, LeafWriterAllocation, PrimitiveArrayWriter,
+    ArrayOutput, DictionaryKeyType, LeafWriter, LeafWriterAllocation, PrimitiveArrayWriter, Writer,
     WriterAllocation, WriterSpec,
 };
 use crate::{
@@ -111,7 +111,6 @@ impl DictAllocation {
 }
 
 pub struct DictWriter<'a> {
-    ht_ptr: PointerValue<'a>,
     ingest_func: FunctionValue<'a>,
 }
 
@@ -152,25 +151,27 @@ impl<'a> DictWriter<'a> {
         }
     }
 
-    pub fn llvm_ingest(
+    pub(super) fn emit_ingest(
         &self,
         _ctx: &'a inkwell::context::Context,
         build: &inkwell::builder::Builder<'a>,
+        alloc_ptr: PointerValue<'a>,
         val: inkwell::values::BasicValueEnum<'a>,
     ) {
         build
             .build_call(
                 self.ingest_func,
-                &[self.ht_ptr.into(), val.into()],
+                &[alloc_ptr.into(), val.into()],
                 "dict_ingest",
             )
             .unwrap();
     }
 
-    pub fn llvm_flush(
+    pub(super) fn emit_flush(
         &self,
         _ctx: &'a inkwell::context::Context,
         _build: &inkwell::builder::Builder<'a>,
+        _alloc_ptr: PointerValue<'a>,
     ) {
         // no-op for dictionary writers
     }
@@ -184,20 +185,22 @@ impl<'a> DictWriter<'a> {
     ) -> Self {
         let ptr_type = ctx.ptr_type(AddressSpace::default());
         let value_type = value_spec.storage_type();
+        let key_writer_ptr = build
+            .build_load(
+                ptr_type,
+                increment_pointer!(ctx, build, alloc_ptr, DictAllocation::OFFSET_KEYS_PTR),
+                "keys_ptr",
+            )
+            .unwrap()
+            .into_pointer_value();
         let key_writer = PrimitiveArrayWriter::llvm_init(
             ctx,
             llvm_mod,
             build,
             PrimitiveType::for_arrow_type(&K::DATA_TYPE),
-            build
-                .build_load(
-                    ptr_type,
-                    increment_pointer!(ctx, build, alloc_ptr, DictAllocation::OFFSET_KEYS_PTR),
-                    "keys_ptr",
-                )
-                .unwrap()
-                .into_pointer_value(),
+            key_writer_ptr,
         );
+        let key_writer = Writer::Primitive(key_writer).bind(key_writer_ptr);
         let value_writer_ptr = build
             .build_load(
                 ptr_type,
@@ -206,12 +209,13 @@ impl<'a> DictWriter<'a> {
             )
             .unwrap()
             .into_pointer_value();
-        let value_writer = value_spec.llvm_init(ctx, llvm_mod, build, value_writer_ptr);
+        let value_writer = value_spec
+            .llvm_writer(ctx, llvm_mod, build, value_writer_ptr)
+            .bind(value_writer_ptr);
 
         let dummy_ht = TicketTable::new(0, value_type.as_arrow_type(), K::DATA_TYPE);
         let hash_func = generate_hash_func(ctx, llvm_mod, value_type);
         let ht_lookup = generate_lookup_or_insert(ctx, llvm_mod, &dummy_ht);
-        let ht_ptr = increment_pointer!(ctx, build, alloc_ptr, DictAllocation::OFFSET_TT);
         let i8_type = ctx.i8_type();
 
         let ingest_func = {
@@ -225,11 +229,28 @@ impl<'a> DictWriter<'a> {
                 Some(Linkage::Private),
             );
 
-            let ht_ptr = func.get_nth_param(0).unwrap().into_pointer_value();
+            let alloc_ptr = func.get_nth_param(0).unwrap().into_pointer_value();
             let value = func.get_nth_param(1).unwrap();
 
             declare_blocks!(ctx, func, entry, is_new, not_new, table_full);
             b.position_at_end(entry);
+            let ht_ptr = increment_pointer!(ctx, b, alloc_ptr, DictAllocation::OFFSET_TT);
+            let keys_ptr = b
+                .build_load(
+                    ptr_type,
+                    increment_pointer!(ctx, b, alloc_ptr, DictAllocation::OFFSET_KEYS_PTR),
+                    "keys_ptr",
+                )
+                .unwrap()
+                .into_pointer_value();
+            let values_ptr = b
+                .build_load(
+                    ptr_type,
+                    increment_pointer!(ctx, b, alloc_ptr, DictAllocation::OFFSET_VALUES_PTR),
+                    "values_ptr",
+                )
+                .unwrap()
+                .into_pointer_value();
             let hash = b
                 .build_call(hash_func, &[value.into()], "hash")
                 .unwrap()
@@ -263,13 +284,19 @@ impl<'a> DictWriter<'a> {
             .unwrap();
 
             b.position_at_end(not_new);
-            key_writer.llvm_ingest(ctx, &b, ticket_val.into());
+            key_writer
+                .with_alloc(keys_ptr)
+                .llvm_ingest(ctx, &b, ticket_val.into());
             b.build_return(Some(&ctx.bool_type().const_int(1, false)))
                 .unwrap();
 
             b.position_at_end(is_new);
-            key_writer.llvm_ingest(ctx, &b, ticket_val.into());
-            value_writer.llvm_ingest(ctx, &b, value);
+            key_writer
+                .with_alloc(keys_ptr)
+                .llvm_ingest(ctx, &b, ticket_val.into());
+            value_writer
+                .with_alloc(values_ptr)
+                .llvm_ingest(ctx, &b, value);
             b.build_return(Some(&ctx.bool_type().const_int(1, false)))
                 .unwrap();
 
@@ -280,10 +307,7 @@ impl<'a> DictWriter<'a> {
             func
         };
 
-        Self {
-            ht_ptr,
-            ingest_func,
-        }
+        Self { ingest_func }
     }
 }
 

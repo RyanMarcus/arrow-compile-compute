@@ -17,10 +17,6 @@ pub struct BooleanWriter<'a> {
     ingest_func: FunctionValue<'a>,
     ingest_u64_func: FunctionValue<'a>,
     flush_func: FunctionValue<'a>,
-    buf_ptr: PointerValue<'a>,
-    len_ptr: PointerValue<'a>,
-    buf_idx_ptr: PointerValue<'a>,
-    out_ptr_ptr: PointerValue<'a>,
 }
 
 #[repr(C)]
@@ -105,20 +101,12 @@ impl<'a> LeafWriter<'a> for BooleanWriter<'a> {
     fn llvm_init(
         ctx: &'a Context,
         llvm_mod: &Module<'a>,
-        build: &Builder<'a>,
+        _build: &Builder<'a>,
         ty: PrimitiveType,
-        alloc_ptr: PointerValue<'a>,
+        _alloc_ptr: PointerValue<'a>,
     ) -> Self {
         assert_eq!(ty, PrimitiveType::U8);
         let ptr_type = ctx.ptr_type(AddressSpace::default());
-
-        let buf_ptr = increment_pointer!(ctx, build, alloc_ptr, BooleanAllocation::OFFSET_BUF);
-        let buf_idx_ptr =
-            increment_pointer!(ctx, build, alloc_ptr, BooleanAllocation::OFFSET_BUF_IDX);
-        let out_ptr_ptr =
-            increment_pointer!(ctx, build, alloc_ptr, BooleanAllocation::OFFSET_DATA_PTR);
-        let len_ptr =
-            increment_pointer!(ctx, build, alloc_ptr, BooleanAllocation::OFFSET_NUM_WRITTEN);
 
         let ingest_func = llvm_mod.get_function("ingest_boolean").unwrap_or_else(|| {
             let build = ctx.create_builder();
@@ -335,26 +323,38 @@ impl<'a> LeafWriter<'a> for BooleanWriter<'a> {
         });
 
         BooleanWriter {
-            buf_ptr,
-            buf_idx_ptr,
-            out_ptr_ptr,
-            len_ptr,
             ingest_func,
             ingest_u64_func,
             flush_func,
         }
     }
+}
 
-    fn llvm_ingest(&self, _ctx: &'a Context, build: &Builder<'a>, val: BasicValueEnum<'a>) {
+impl<'a> BooleanWriter<'a> {
+    pub(super) fn emit_ingest(
+        &self,
+        ctx: &'a Context,
+        build: &Builder<'a>,
+        alloc_ptr: PointerValue<'a>,
+        val: BasicValueEnum<'a>,
+    ) {
         let val = val.into_int_value();
+        let buf_ptr = increment_pointer!(ctx, build, alloc_ptr, BooleanAllocation::OFFSET_BUF);
+        let buf_idx_ptr =
+            increment_pointer!(ctx, build, alloc_ptr, BooleanAllocation::OFFSET_BUF_IDX);
+        let out_ptr_ptr =
+            increment_pointer!(ctx, build, alloc_ptr, BooleanAllocation::OFFSET_DATA_PTR);
+        let len_ptr =
+            increment_pointer!(ctx, build, alloc_ptr, BooleanAllocation::OFFSET_NUM_WRITTEN);
+
         build
             .build_call(
                 self.ingest_func,
                 &[
-                    self.buf_ptr.into(),
-                    self.buf_idx_ptr.into(),
-                    self.out_ptr_ptr.into(),
-                    self.len_ptr.into(),
+                    buf_ptr.into(),
+                    buf_idx_ptr.into(),
+                    out_ptr_ptr.into(),
+                    len_ptr.into(),
                     val.into(),
                 ],
                 "ingest",
@@ -362,51 +362,64 @@ impl<'a> LeafWriter<'a> for BooleanWriter<'a> {
             .unwrap();
     }
 
-    fn llvm_ingest_block(
+    pub(super) fn emit_ingest_block(
         &self,
         ctx: &'a Context,
         build: &Builder<'a>,
+        alloc_ptr: PointerValue<'a>,
         vals: inkwell::values::VectorValue<'a>,
     ) {
         assert_eq!(vals.get_type().get_size(), 64);
         let val = build
             .build_bit_cast(vals, ctx.i64_type(), "as_i64")
             .unwrap();
-        self.llvm_ingest_64_bools(ctx, build, val);
+        self.emit_ingest_64_bools(ctx, build, alloc_ptr, val);
     }
 
-    fn llvm_flush(&self, _ctx: &'a Context, build: &Builder<'a>) {
+    pub(super) fn emit_flush(
+        &self,
+        ctx: &'a Context,
+        build: &Builder<'a>,
+        alloc_ptr: PointerValue<'a>,
+    ) {
+        let buf_ptr = increment_pointer!(ctx, build, alloc_ptr, BooleanAllocation::OFFSET_BUF);
+        let buf_idx_ptr =
+            increment_pointer!(ctx, build, alloc_ptr, BooleanAllocation::OFFSET_BUF_IDX);
+        let out_ptr_ptr =
+            increment_pointer!(ctx, build, alloc_ptr, BooleanAllocation::OFFSET_DATA_PTR);
+        let len_ptr =
+            increment_pointer!(ctx, build, alloc_ptr, BooleanAllocation::OFFSET_NUM_WRITTEN);
+
         build
             .build_call(
                 self.flush_func,
                 &[
-                    self.buf_ptr.into(),
-                    self.buf_idx_ptr.into(),
-                    self.out_ptr_ptr.into(),
-                    self.len_ptr.into(),
+                    buf_ptr.into(),
+                    buf_idx_ptr.into(),
+                    out_ptr_ptr.into(),
+                    len_ptr.into(),
                 ],
                 "flush",
             )
             .unwrap();
     }
-}
 
-impl<'a> BooleanWriter<'a> {
-    /// Ingests 64 booleans at once from an LLVM i64. This bypasses the writer's
-    /// buffer, and writes directly to the output array. Thus, you should not
-    /// interleave calls to this function with calls to `llvm_ingest`. Instead,
-    /// call this function exclusively for the "body" of the array, then call
-    /// `llvm_ingest` for the "tail" of the array.
-    pub fn llvm_ingest_64_bools(
+    pub(super) fn emit_ingest_64_bools(
         &self,
-        _ctx: &'a Context,
+        ctx: &'a Context,
         build: &Builder<'a>,
+        alloc_ptr: PointerValue<'a>,
         val: BasicValueEnum<'a>,
     ) {
+        let out_ptr_ptr =
+            increment_pointer!(ctx, build, alloc_ptr, BooleanAllocation::OFFSET_DATA_PTR);
+        let len_ptr =
+            increment_pointer!(ctx, build, alloc_ptr, BooleanAllocation::OFFSET_NUM_WRITTEN);
+
         build
             .build_call(
                 self.ingest_u64_func,
-                &[self.out_ptr_ptr.into(), self.len_ptr.into(), val.into()],
+                &[out_ptr_ptr.into(), len_ptr.into(), val.into()],
                 "ingest_u64",
             )
             .unwrap();
@@ -424,7 +437,7 @@ mod tests {
     use itertools::Itertools;
 
     use crate::{
-        compiled_writers::{LeafWriter, LeafWriterAllocation},
+        compiled_writers::{LeafWriter, LeafWriterAllocation, Writer},
         declare_blocks, PrimitiveType,
     };
 
@@ -447,7 +460,14 @@ mod tests {
         declare_blocks!(ctx, func, entry);
         build.position_at_end(entry);
         let dest = func.get_nth_param(0).unwrap().into_pointer_value();
-        let writer = BooleanWriter::llvm_init(&ctx, &llvm_mod, &build, PrimitiveType::U8, dest);
+        let writer = Writer::Boolean(BooleanWriter::llvm_init(
+            &ctx,
+            &llvm_mod,
+            &build,
+            PrimitiveType::U8,
+            dest,
+        ))
+        .bind(dest);
 
         for _ in 0..10 {
             writer.llvm_ingest(
@@ -528,7 +548,14 @@ mod tests {
         declare_blocks!(ctx, func, entry);
         build.position_at_end(entry);
         let dest = func.get_nth_param(0).unwrap().into_pointer_value();
-        let writer = BooleanWriter::llvm_init(&ctx, &llvm_mod, &build, PrimitiveType::U8, dest);
+        let writer = Writer::Boolean(BooleanWriter::llvm_init(
+            &ctx,
+            &llvm_mod,
+            &build,
+            PrimitiveType::U8,
+            dest,
+        ))
+        .bind(dest);
 
         for i in 0..1000 {
             writer.llvm_ingest(
@@ -582,7 +609,14 @@ mod tests {
         declare_blocks!(ctx, func, entry);
         build.position_at_end(entry);
         let dest = func.get_nth_param(0).unwrap().into_pointer_value();
-        let writer = BooleanWriter::llvm_init(&ctx, &llvm_mod, &build, PrimitiveType::U8, dest);
+        let writer = Writer::Boolean(BooleanWriter::llvm_init(
+            &ctx,
+            &llvm_mod,
+            &build,
+            PrimitiveType::U8,
+            dest,
+        ))
+        .bind(dest);
 
         let vals = (0..64)
             .map(|i| {
