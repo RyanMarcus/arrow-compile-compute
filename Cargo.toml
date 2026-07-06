@@ -6,7 +6,6 @@ license = "GPL-3.0"
 
 [dependencies]
 inkwell = { version = "0.8.0", features = ["llvm21-1"] }
-cfg-if = "1"
 arrow-schema = "55.2"
 arrow-buffer = "55.2"
 arrow-data = "55.2"
