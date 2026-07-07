@@ -317,6 +317,7 @@ pub enum DSLType {
     ConstScalar(Arc<dyn Datum>),
     Scalar(Box<DSLType>),
     Array(Box<DSLType>, String),
+    VarList(Box<DSLType>),
     SetBits(String),
     TwoDArray(Box<DSLType>),
     Buffer(PrimitiveType, String),
@@ -335,6 +336,7 @@ impl PartialEq for DSLType {
             }
             (DSLType::Scalar(a), DSLType::Scalar(b)) => a == b,
             (DSLType::Array(a, a_len), DSLType::Array(b, b_len)) => a == b && a_len == b_len,
+            (DSLType::VarList(a), DSLType::VarList(b)) => a == b,
             (DSLType::SetBits(a_len), DSLType::SetBits(b_len)) => a_len == b_len,
             (DSLType::TwoDArray(a), DSLType::TwoDArray(b)) => a == b,
             (DSLType::Buffer(a, a_len), DSLType::Buffer(b, b_len)) => a == b && a_len == b_len,
@@ -355,6 +357,7 @@ impl Debug for DSLType {
             DSLType::Array(ty, len_expr) => {
                 f.debug_tuple("Array").field(ty).field(len_expr).finish()
             }
+            DSLType::VarList(ty) => f.debug_tuple("VarList").field(ty).finish(),
             DSLType::TwoDArray(ty) => f.debug_tuple("TwoDArray").field(ty).finish(),
             DSLType::Buffer(ty, len) => f.debug_tuple("Buffer").field(ty).field(len).finish(),
             DSLType::StringSaver => f.debug_tuple("StringSaver").finish(),
@@ -400,6 +403,12 @@ impl DSLType {
             IteratorHolder::Dictionary { values, .. } => Self::of_iterator_holder(values),
             IteratorHolder::RunEnd { values, .. } => Self::of_iterator_holder(values),
             IteratorHolder::FixedSizeList(it) => Self::array_of(it.ptype(), ""),
+            IteratorHolder::List(it) => DSLType::Array(
+                Box::new(DSLType::VarList(Box::new(
+                    Self::of_iterator_holder(it.child()).iter_type().unwrap(),
+                ))),
+                String::new(),
+            ),
             IteratorHolder::ScalarPrimitive(it) => DSLType::scalar_of(it.ptype),
             IteratorHolder::ScalarBoolean(..) => DSLType::Scalar(Box::new(DSLType::Boolean)),
             IteratorHolder::ScalarString(..) => DSLType::scalar_of(PrimitiveType::P64x2),
@@ -418,6 +427,7 @@ impl DSLType {
             }
             DSLType::Scalar(t) => t.is_signed(),
             DSLType::Array(t, ..) => t.is_signed(),
+            DSLType::VarList(_) => None,
             DSLType::TwoDArray(t, ..) => t.is_signed(),
             DSLType::Buffer(t, ..) => Some(t.is_signed()),
             DSLType::StringSaver => None,
@@ -438,6 +448,17 @@ impl DSLType {
             DSLType::Boolean => Some(ctx.bool_type().as_basic_type_enum()),
             DSLType::Primitive(pt) => Some(pt.llvm_type(ctx)),
             DSLType::SetBits(..) => Some(ctx.i64_type().as_basic_type_enum()),
+            DSLType::VarList(_) => Some(
+                ctx.struct_type(
+                    &[
+                        ctx.ptr_type(inkwell::AddressSpace::default()).into(),
+                        ctx.i64_type().into(),
+                        ctx.i64_type().into(),
+                    ],
+                    false,
+                )
+                .as_basic_type_enum(),
+            ),
             _ => None,
         }
     }
@@ -484,6 +505,18 @@ impl DSLType {
                     DSLType::Array(Box::new(DSLType::Boolean), len_expr.into())
                 }
             }
+            DataType::List(field) | DataType::LargeList(field) => {
+                if is_scalar {
+                    todo!("list scalars are not supported")
+                } else {
+                    DSLType::Array(
+                        Box::new(DSLType::VarList(Box::new(Self::value_type_for_arrow(
+                            field.data_type(),
+                        )))),
+                        len_expr.into(),
+                    )
+                }
+            }
             _ => {
                 let pt = PrimitiveType::for_arrow_type(arr.data_type());
                 if is_scalar {
@@ -505,6 +538,16 @@ impl DSLType {
 
     pub fn buffer_of<S: Into<String>>(pt: PrimitiveType, len_expr: S) -> Self {
         DSLType::Buffer(pt, len_expr.into())
+    }
+
+    fn value_type_for_arrow(dt: &DataType) -> DSLType {
+        match logical_arrow_type(dt) {
+            DataType::Boolean => DSLType::Boolean,
+            DataType::List(field) | DataType::LargeList(field) => {
+                DSLType::VarList(Box::new(Self::value_type_for_arrow(field.data_type())))
+            }
+            _ => DSLType::Primitive(PrimitiveType::for_arrow_type(dt)),
+        }
     }
 }
 
@@ -1130,6 +1173,7 @@ pub enum DSLExpr {
     BitNot(Box<DSLExpr>),
     Sqrt(Box<DSLExpr>),
     VecSum(Box<DSLExpr>),
+    ListLen(Box<DSLExpr>),
     Splat(Box<DSLExpr>, usize),
     Len(Box<DSLValue>),
     Select(Box<DSLExpr>, Box<DSLExpr>, Box<DSLExpr>),
@@ -1323,6 +1367,18 @@ impl DSLExpr {
         }
     }
 
+    pub fn list_len(&self) -> Result<DSLExpr, ArrowKernelError> {
+        match self.get_type() {
+            DSLType::VarList(_) | DSLType::Primitive(PrimitiveType::List(_, _)) => {
+                Ok(DSLExpr::ListLen(Box::new(self.clone())))
+            }
+            _ => Err(ArrowKernelError::DSLInvalidType(
+                "list_len requires a list row value",
+                self.get_type(),
+            )),
+        }
+    }
+
     pub fn bswap(&self) -> Result<DSLExpr, ArrowKernelError> {
         let pt = self.get_type().as_primitive().ok_or_else(|| {
             ArrowKernelError::DSLInvalidType(
@@ -1445,6 +1501,7 @@ impl DSLExpr {
             DSLExpr::VecSum(v) => {
                 DSLType::Primitive(v.get_type().as_primitive().unwrap().list_type_into_inner())
             }
+            DSLExpr::ListLen(_) => DSLType::Primitive(PrimitiveType::U64),
             DSLExpr::Splat(v, size) => DSLType::Primitive(PrimitiveType::List(
                 v.get_type().as_primitive().unwrap().try_into().unwrap(),
                 *size,
@@ -1483,6 +1540,7 @@ impl DSLExpr {
             | DSLExpr::FloatToTotalOrderSInt(val)
             | DSLExpr::Sqrt(val)
             | DSLExpr::VecSum(val)
+            | DSLExpr::ListLen(val)
             | DSLExpr::Splat(val, _) => val.accessed_parameters(params),
         }
     }

@@ -1,6 +1,7 @@
 mod bitmap;
 mod dictionary;
 mod fixed_size_list;
+mod list;
 mod primitive;
 #[cfg(test)]
 mod reset_tests;
@@ -43,6 +44,7 @@ use string::{LargeStringIterator, StringIterator};
 use crate::{
     compiled_iter::{
         fixed_size_list::FixedSizeListIterator,
+        list::ListIterator,
         scalar::{ScalarBinaryIterator, ScalarBooleanIterator, ScalarVectorIterator},
         view::ViewIterator,
     },
@@ -71,21 +73,106 @@ pub(crate) fn add_load_packed_bool_chunk<'a>(
     module: &Module<'a>,
 ) -> FunctionValue<'a> {
     module
-        .get_function("load_packed_bool_chunk")
+        .get_function("load_packed_bool_chunk_ir")
         .unwrap_or_else(|| {
             let ptr_type = ctx.ptr_type(AddressSpace::default());
-            module.add_function(
-                "load_packed_bool_chunk",
-                ctx.i64_type().fn_type(
-                    &[
-                        ptr_type.into(),
-                        ctx.i64_type().into(),
-                        ctx.i64_type().into(),
-                    ],
+            let i64_type = ctx.i64_type();
+            let i8_type = ctx.i8_type();
+            let func = module.add_function(
+                "load_packed_bool_chunk_ir",
+                i64_type.fn_type(&[ptr_type.into(), i64_type.into(), i64_type.into()], false),
+                Some(Linkage::Private),
+            );
+            let build = ctx.create_builder();
+            declare_blocks!(ctx, func, entry, loop_cond, loop_body, done);
+
+            build.position_at_end(entry);
+            let data_ptr = func.get_nth_param(0).unwrap().into_pointer_value();
+            let start_bit = func.get_nth_param(1).unwrap().into_int_value();
+            let len = func.get_nth_param(2).unwrap().into_int_value();
+            let out_ptr = build.build_alloca(i64_type, "packed_out").unwrap();
+            let bit_ptr = build.build_alloca(i64_type, "packed_bit").unwrap();
+            build.build_store(out_ptr, i64_type.const_zero()).unwrap();
+            build.build_store(bit_ptr, i64_type.const_zero()).unwrap();
+            build.build_unconditional_branch(loop_cond).unwrap();
+
+            build.position_at_end(loop_cond);
+            let bit = build
+                .build_load(i64_type, bit_ptr, "packed_bit")
+                .unwrap()
+                .into_int_value();
+            let keep_going = build
+                .build_int_compare(IntPredicate::ULT, bit, len, "packed_keep_going")
+                .unwrap();
+            build
+                .build_conditional_branch(keep_going, loop_body, done)
+                .unwrap();
+
+            build.position_at_end(loop_body);
+            let absolute_bit = build
+                .build_int_add(start_bit, bit, "packed_absolute_bit")
+                .unwrap();
+            let byte_idx = build
+                .build_right_shift(
+                    absolute_bit,
+                    i64_type.const_int(3, false),
                     false,
-                ),
-                None,
-            )
+                    "packed_byte_idx",
+                )
+                .unwrap();
+            let bit_in_byte = build
+                .build_and(
+                    absolute_bit,
+                    i64_type.const_int(7, false),
+                    "packed_bit_in_byte",
+                )
+                .unwrap();
+            let byte_ptr = increment_pointer!(ctx, build, data_ptr, 1, byte_idx);
+            let byte = build
+                .build_load(i8_type, byte_ptr, "packed_byte")
+                .unwrap()
+                .into_int_value();
+            let bit_in_byte_i8 = build
+                .build_int_truncate(bit_in_byte, i8_type, "packed_bit_in_byte_i8")
+                .unwrap();
+            let shifted_byte = build
+                .build_right_shift(byte, bit_in_byte_i8, false, "packed_shifted_byte")
+                .unwrap();
+            let loaded_bit = build
+                .build_and(
+                    shifted_byte,
+                    i8_type.const_int(1, false),
+                    "packed_loaded_bit",
+                )
+                .unwrap();
+            let loaded_bit_i64 = build
+                .build_int_z_extend(loaded_bit, i64_type, "packed_loaded_bit_i64")
+                .unwrap();
+            let shifted_out_bit = build
+                .build_left_shift(loaded_bit_i64, bit, "packed_shifted_out_bit")
+                .unwrap();
+            let old_out = build
+                .build_load(i64_type, out_ptr, "packed_old_out")
+                .unwrap()
+                .into_int_value();
+            let new_out = build
+                .build_or(old_out, shifted_out_bit, "packed_new_out")
+                .unwrap();
+            build.build_store(out_ptr, new_out).unwrap();
+            let next_bit = build
+                .build_int_add(bit, i64_type.const_int(1, false), "packed_next_bit")
+                .unwrap();
+            build.build_store(bit_ptr, next_bit).unwrap();
+            build.build_unconditional_branch(loop_cond).unwrap();
+
+            build.position_at_end(done);
+            let out = build
+                .build_load(i64_type, out_ptr, "packed_out")
+                .unwrap()
+                .into_int_value();
+            build.build_return(Some(&out)).unwrap();
+
+            func
         })
 }
 
@@ -208,6 +295,72 @@ fn build_fixed_size_list_value<'a>(
     }
 }
 
+fn list_value_llvm_type<'a>(ctx: &'a Context) -> inkwell::types::StructType<'a> {
+    let ptr_type = ctx.ptr_type(AddressSpace::default());
+    ctx.struct_type(
+        &[
+            ptr_type.into(),
+            ctx.i64_type().into(),
+            ctx.i64_type().into(),
+        ],
+        false,
+    )
+}
+
+// Most iterators produce values represented by PrimitiveType, including
+// fixed-size lists whose row width is known at compile time. Variable lists are
+// different: each row has a runtime width, so the iterator yields a descriptor
+// { child_iter, start, end } instead of a primitive/fixed-width value.
+fn iterator_value_llvm_type<'a>(
+    ctx: &'a Context,
+    dt: &DataType,
+    ih: &IteratorHolder,
+) -> Option<inkwell::types::BasicTypeEnum<'a>> {
+    match ih {
+        IteratorHolder::List(_) => Some(list_value_llvm_type(ctx).into()),
+        IteratorHolder::Dictionary { values, .. } => match dt {
+            DataType::Dictionary(_, value_type) => {
+                iterator_value_llvm_type(ctx, value_type, values)
+            }
+            _ => None,
+        },
+        _ => Some(PrimitiveType::for_arrow_type(dt).llvm_type(ctx)),
+    }
+}
+
+fn build_variable_list_value<'a>(
+    ctx: &'a Context,
+    build: &Builder<'a>,
+    iter: &ListIterator,
+    iter_ptr: PointerValue<'a>,
+    row_idx: IntValue<'a>,
+) -> inkwell::values::BasicValueEnum<'a> {
+    let i64_type = ctx.i64_type();
+    let offsets = iter.llvm_offsets(ctx, build, iter_ptr);
+    let start = iter.llvm_offset_at(ctx, build, offsets, row_idx);
+    let end = iter.llvm_offset_at(
+        ctx,
+        build,
+        offsets,
+        build
+            .build_int_add(row_idx, i64_type.const_int(1, false), "list_next_row")
+            .unwrap(),
+    );
+    let child_iter = iter.llvm_child_iter(ctx, build, iter_ptr);
+    let row_type = list_value_llvm_type(ctx);
+    let row = row_type.const_zero();
+    let row = build
+        .build_insert_value(row, child_iter, 0, "list_row_child")
+        .unwrap();
+    let row = build
+        .build_insert_value(row, start, 1, "list_row_start")
+        .unwrap();
+    build
+        .build_insert_value(row, end, 2, "list_row_end")
+        .unwrap()
+        .as_basic_value_enum()
+}
+
 pub fn array_to_setbit_iter(arr: &BooleanArray) -> Result<IteratorHolder, ArrowKernelError> {
     Ok(IteratorHolder::SetBit(Box::new(SetBitIterator::from(arr))))
 }
@@ -281,12 +434,14 @@ fn array_to_iter(arr: &dyn Array) -> IteratorHolder {
         arrow_schema::DataType::Utf8View => {
             IteratorHolder::View(arr.as_byte_view::<StringViewType>().into())
         }
-        arrow_schema::DataType::List(_field) => todo!(),
+        arrow_schema::DataType::List(_field) => IteratorHolder::List(arr.as_list::<i32>().into()),
         arrow_schema::DataType::ListView(_field) => todo!(),
         arrow_schema::DataType::FixedSizeList(_field, _) => {
             IteratorHolder::FixedSizeList(arr.as_fixed_size_list().into())
         }
-        arrow_schema::DataType::LargeList(_field) => todo!(),
+        arrow_schema::DataType::LargeList(_field) => {
+            IteratorHolder::List(arr.as_list::<i64>().into())
+        }
         arrow_schema::DataType::LargeListView(_field) => todo!(),
         arrow_schema::DataType::Struct(_fields) => todo!(),
         arrow_schema::DataType::Union(_union_fields, _union_mode) => todo!(),
@@ -501,6 +656,7 @@ pub enum IteratorHolder {
         values: Box<IteratorHolder>,
     },
     FixedSizeList(Box<FixedSizeListIterator>),
+    List(Box<ListIterator>),
     ScalarPrimitive(Box<ScalarPrimitiveIterator>),
     ScalarBoolean(Box<ScalarBooleanIterator>),
     ScalarString(Box<ScalarStringIterator>),
@@ -522,6 +678,7 @@ impl IteratorHolder {
             IteratorHolder::Dictionary { arr: iter, .. } => &mut **iter as *mut _ as *mut c_void,
             IteratorHolder::RunEnd { arr: iter, .. } => &mut **iter as *mut _ as *mut c_void,
             IteratorHolder::FixedSizeList(iter) => &mut **iter as *mut _ as *mut c_void,
+            IteratorHolder::List(iter) => &mut **iter as *mut _ as *mut c_void,
             IteratorHolder::ScalarPrimitive(iter) => &mut **iter as *mut _ as *mut c_void,
             IteratorHolder::ScalarBoolean(iter) => &mut **iter as *mut _ as *mut c_void,
             IteratorHolder::ScalarString(iter) => &mut **iter as *mut _ as *mut c_void,
@@ -550,6 +707,7 @@ impl IteratorHolder {
             IteratorHolder::Dictionary { arr: iter, .. } => &**iter as *const _ as *const c_void,
             IteratorHolder::RunEnd { arr: iter, .. } => &**iter as *const _ as *const c_void,
             IteratorHolder::FixedSizeList(iter) => &**iter as *const _ as *const c_void,
+            IteratorHolder::List(iter) => &**iter as *const _ as *const c_void,
             IteratorHolder::ScalarPrimitive(iter) => &**iter as *const _ as *const c_void,
             IteratorHolder::ScalarBoolean(iter) => &**iter as *const _ as *const c_void,
             IteratorHolder::ScalarString(iter) => &**iter as *const _ as *const c_void,
@@ -570,6 +728,14 @@ impl IteratorHolder {
             IteratorHolder::Primitive(i) => i.localize_struct(ctx, b, ptr),
             IteratorHolder::FixedSizeList(i) => i.localize_struct(ctx, b, ptr),
             _ => ptr,
+        }
+    }
+
+    fn is_variable_list_like(&self) -> bool {
+        match self {
+            IteratorHolder::List(_) => true,
+            IteratorHolder::Dictionary { values, .. } => values.is_variable_list_like(),
+            _ => false,
         }
     }
 }
@@ -703,6 +869,21 @@ pub fn generate_reset_iterator<'a>(
             build.build_return(None).unwrap();
             Some(reset)
         }
+        IteratorHolder::List(iter) => {
+            let child_reset =
+                generate_reset_iterator(ctx, llvm_mod, &format!("{}_child", label), iter.child())
+                    .unwrap();
+
+            declare_blocks!(ctx, reset, entry);
+            build.position_at_end(entry);
+            let child_ptr = iter.llvm_child_iter(ctx, &build, iter_ptr);
+            build
+                .build_call(child_reset, &[child_ptr.into()], "reset_list_child_iter")
+                .unwrap();
+            iter.llvm_reset(ctx, &build, iter_ptr);
+            build.build_return(None).unwrap();
+            Some(reset)
+        }
         IteratorHolder::ScalarPrimitive(_)
         | IteratorHolder::ScalarBoolean(_)
         | IteratorHolder::ScalarString(_)
@@ -730,6 +911,9 @@ pub fn generate_next_block<'a, const N: u32>(
     ih: &IteratorHolder,
 ) -> Option<FunctionValue<'a>> {
     let build = ctx.create_builder();
+    if ih.is_variable_list_like() {
+        return None;
+    }
     let ptype = PrimitiveType::for_arrow_type(dt);
     let vec_type = ptype.llvm_vec_type(ctx, N)?;
     let llvm_type = ptype.llvm_type(ctx);
@@ -1146,6 +1330,7 @@ pub fn generate_next_block<'a, const N: u32>(
             _ => unreachable!("run-end iterator but not run-end data type ({:?})", dt),
         },
         IteratorHolder::FixedSizeList(_) => None,
+        IteratorHolder::List(_) => None,
         IteratorHolder::ScalarPrimitive(s) => {
             assert_eq!(ptype.width(), s.width as usize);
             let get_next_single = generate_next(
@@ -1207,8 +1392,7 @@ pub fn generate_next<'a>(
     ih: &IteratorHolder,
 ) -> Option<FunctionValue<'a>> {
     let build = ctx.create_builder();
-    let ptype = PrimitiveType::for_arrow_type(dt);
-    let llvm_type = ptype.llvm_type(ctx);
+    let llvm_type = iterator_value_llvm_type(ctx, dt, ih)?;
     let bool_type = ctx.bool_type();
     let ptr_type = ctx.ptr_type(AddressSpace::default());
     let i64_type = ctx.i64_type();
@@ -1229,6 +1413,7 @@ pub fn generate_next<'a>(
     set_noalias_params(&next);
     match ih {
         IteratorHolder::Primitive(primitive_iter) => {
+            let ptype = PrimitiveType::for_arrow_type(dt);
             declare_blocks!(ctx, next, entry, none_left, get_next);
 
             build.position_at_end(entry);
@@ -1821,7 +2006,36 @@ pub fn generate_next<'a>(
 
             Some(next)
         }
+        IteratorHolder::List(iter) => {
+            declare_blocks!(ctx, next, entry, none_left, get_next);
+
+            build.position_at_end(entry);
+            let curr_pos = iter.llvm_pos(ctx, &build, iter_ptr);
+            let curr_len = iter.llvm_len(ctx, &build, iter_ptr);
+            let have_more = build
+                .build_int_compare(IntPredicate::ULT, curr_pos, curr_len, "have_enough")
+                .unwrap();
+            build
+                .build_conditional_branch(have_more, get_next, none_left)
+                .unwrap();
+
+            build.position_at_end(none_left);
+            build
+                .build_return(Some(&bool_type.const_int(0, false)))
+                .unwrap();
+
+            build.position_at_end(get_next);
+            let out = build_variable_list_value(ctx, &build, iter, iter_ptr, curr_pos);
+            build.build_store(out_ptr, out).unwrap();
+            iter.llvm_increment_pos(ctx, &build, iter_ptr, i64_type.const_int(1, false));
+            build
+                .build_return(Some(&bool_type.const_int(1, false)))
+                .unwrap();
+
+            Some(next)
+        }
         IteratorHolder::ScalarPrimitive(s) => {
+            let ptype = PrimitiveType::for_arrow_type(dt);
             assert_eq!(ptype.width(), s.width as usize);
             declare_blocks!(ctx, next, entry);
             build.position_at_end(entry);
@@ -2000,8 +2214,7 @@ pub fn generate_random_access<'a>(
     ih: &IteratorHolder,
 ) -> Option<FunctionValue<'a>> {
     let build = ctx.create_builder();
-    let ptype = PrimitiveType::for_arrow_type(dt);
-    let llvm_type = ptype.llvm_type(ctx);
+    let llvm_type = iterator_value_llvm_type(ctx, dt, ih)?;
     let ptr_type = ctx.ptr_type(AddressSpace::default());
     let i64_type = ctx.i64_type();
 
@@ -2021,6 +2234,7 @@ pub fn generate_random_access<'a>(
 
     match ih {
         IteratorHolder::Primitive(primitive_iter) => {
+            let ptype = PrimitiveType::for_arrow_type(dt);
             declare_blocks!(ctx, access_f, entry);
 
             build.position_at_end(entry);
@@ -2037,6 +2251,15 @@ pub fn generate_random_access<'a>(
             build.position_at_end(entry);
             let out =
                 build_fixed_size_list_value(ctx, llvm_mod, &build, label, dt, iter, iter_ptr, idx)?;
+            build.build_return(Some(&out)).unwrap();
+
+            Some(access_f)
+        }
+        IteratorHolder::List(iter) => {
+            declare_blocks!(ctx, access_f, entry);
+
+            build.position_at_end(entry);
+            let out = build_variable_list_value(ctx, &build, iter, iter_ptr, idx);
             build.build_return(Some(&out)).unwrap();
 
             Some(access_f)
@@ -2215,6 +2438,7 @@ pub fn generate_random_access<'a>(
             Some(access_f)
         }
         IteratorHolder::Bitmap(bitmap_iterator) => {
+            let ptype = PrimitiveType::for_arrow_type(dt);
             declare_blocks!(ctx, access_f, entry);
 
             build.position_at_end(entry);
@@ -2387,12 +2611,13 @@ pub fn get_iterator_length<'a>(
         IteratorHolder::View(iter) => Some(iter.llvm_len(ctx, builder, iter_ptr)),
         IteratorHolder::Bitmap(iter) => Some(iter.llvm_len(ctx, builder, iter_ptr)),
         IteratorHolder::SetBit(..) => None,
-        IteratorHolder::Dictionary { arr, values, .. } => {
-            let values_ptr = arr.llvm_val_iter_ptr(ctx, builder, iter_ptr);
-            get_iterator_length(ctx, builder, values, values_ptr)
+        IteratorHolder::Dictionary { arr, keys, .. } => {
+            let keys_ptr = arr.llvm_key_iter_ptr(ctx, builder, iter_ptr);
+            get_iterator_length(ctx, builder, keys, keys_ptr)
         }
         IteratorHolder::RunEnd { .. } => None,
         IteratorHolder::FixedSizeList(iter) => Some(iter.llvm_len(ctx, builder, iter_ptr)),
+        IteratorHolder::List(iter) => Some(iter.llvm_len(ctx, builder, iter_ptr)),
         IteratorHolder::ScalarPrimitive(..) => None,
         IteratorHolder::ScalarBoolean(..) => None,
         IteratorHolder::ScalarString(..) => None,

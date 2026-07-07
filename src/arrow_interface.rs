@@ -684,14 +684,22 @@ pub mod compute {
 
     use crate::{
         compiled_kernels::{
-            HashFunction, HashKernel, KernelCache, ReductionKernel, ReductionKernelType,
+            HashFunction, HashKernel, KernelCache, ListLenKernel, ReductionKernel,
+            ReductionKernelType,
         },
         ArrowKernelError,
     };
 
     static HASH_PROGRAM_CACHE: LazyLock<KernelCache<HashKernel>> = LazyLock::new(KernelCache::new);
+    static LIST_LEN_PROGRAM_CACHE: LazyLock<KernelCache<ListLenKernel>> =
+        LazyLock::new(KernelCache::new);
     static REDUCTION_PROGRAM_CACHE: LazyLock<KernelCache<ReductionKernel>> =
         LazyLock::new(KernelCache::new);
+
+    /// Return the per-row length of a list-like array.
+    pub fn len(data: &dyn Array) -> Result<UInt64Array, ArrowKernelError> {
+        LIST_LEN_PROGRAM_CACHE.get(data, ())
+    }
 
     /// Return the minimum non-null value as a one-element array.
     ///

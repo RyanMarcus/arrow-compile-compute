@@ -89,6 +89,7 @@ fn dsl_type_to_llvm_type<'a>(ctx: &'a Context, v: &DSLType) -> BasicTypeEnum<'a>
                 _ => PrimitiveType::for_arrow_type(dt).llvm_type(ctx),
             }
         }
+        DSLType::VarList(_) => v.llvm_type(ctx).unwrap(),
         DSLType::Buffer(..)
         | DSLType::Scalar(..)
         | DSLType::SetBits(..)
@@ -1687,6 +1688,35 @@ fn compile_expr<'ctx, 'a>(
                 )),
             }
         }
+        DSLExpr::ListLen(v) => match v.get_type() {
+            DSLType::VarList(_) => {
+                let row = compile_expr(ctx, v)?.into_struct_value();
+                let start = ctx
+                    .b
+                    .build_extract_value(row, 1, "list_start")
+                    .unwrap()
+                    .into_int_value();
+                let end = ctx
+                    .b
+                    .build_extract_value(row, 2, "list_end")
+                    .unwrap()
+                    .into_int_value();
+                Ok(ctx
+                    .b
+                    .build_int_sub(end, start, "list_len")
+                    .unwrap()
+                    .as_basic_value_enum())
+            }
+            DSLType::Primitive(PrimitiveType::List(_, size)) => Ok(ctx
+                .ctx
+                .i64_type()
+                .const_int(size as u64, false)
+                .as_basic_value_enum()),
+            _ => Err(ArrowKernelError::DSLInvalidType(
+                "list_len requires a list row value",
+                v.get_type(),
+            )),
+        },
         DSLExpr::Splat(v, size) => {
             let pt = v.get_type().as_primitive().unwrap();
             let vec_ty = pt.llvm_vec_type(ctx.ctx, *size as u32).ok_or_else(|| {
