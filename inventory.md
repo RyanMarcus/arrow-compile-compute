@@ -1,131 +1,148 @@
 # Kernel Inventory
 
-Comparison against [arrow::compute](https://docs.rs/arrow/latest/arrow/compute/index.html) (arrow-rs 55.2.0).
+Comparison against [`arrow::compute`](https://docs.rs/arrow/59.1.0/arrow/compute/index.html) — **arrow-rs 59.1.0**.
+
+`arrow::compute` is a re-export facade: it does not implement kernels itself but
+re-exports them from `arrow-arith`, `arrow-ord`, `arrow-select`, `arrow-string`,
+and `arrow-cast`. Rows below are derived from those crate sources at 59.1.0,
+**scoped to what is actually re-exported under `arrow::compute`** (so `arrow-cast`
+display / pretty-printing / base64 / string-parsing helpers, which live under
+`arrow::util` rather than `arrow::compute`, are excluded), cross-checked against
+the `arrow::compute` module docs and this repo's public surface
+(`src/arrow_interface.rs` plus the kernels exported from `src/compiled_kernels/`).
+Nothing here is inferred from what a compute engine "usually" has.
+
+> Note: the repo currently pins arrow-rs **55.2** in `Cargo.toml`. The compute
+> surface between 55.2 and 59.1 is nearly identical — 59.1 adds `product`,
+> `merge`/`merge_n`, `union_extract_by_id`/`by_type`, `eq_ignore_ascii_case`,
+> `num_cast`, `rescale_decimal`, and the `Decimal32`/`Decimal64` types; the
+> functions that appear "removed" (standalone temporal accessors,
+> `regexp_is_match_utf8*`, `build_compare`, `build_filter`) were consolidated,
+> not dropped. None of the differences change the rows below.
 
 ---
 
-## Supported — kernels in this repo that cover Arrow compute operations
+## Supported — `arrow::compute` operations covered by a JIT kernel
 
-| Operation | Kernel | Notes |
+| Arrow operation | Kernel in this repo | Notes |
 |---|---|---|
-| **Arithmetic** | `BinOpKernel` | add, sub, mul, div, rem — array vs array or scalar, all numeric types |
-| **Comparison** | `ComparisonKernel` | eq, ne, lt, lte, gt, gte — numeric + string |
-| **Cast** | `CastKernel` | numeric↔numeric, binary↔utf8, boolean↔numeric, primitive→dict, dict→primitive, dict→StringView, REE value cast, FixedSizeList element cast |
-| **Filter** | `FilterKernel` | all Arrow array types |
-| **Take** | `TakeKernel` | all Arrow array types, all integer index types |
-| **Concat** | `concat_all` | all Arrow array types |
-| **Interleave** | `InterleaveKernel` | all Arrow array types |
-| **Partition** | `PartitionKernel` | group consecutive equal rows, all Arrow array types |
-| **Sort** | `sort_col`, `sort_multi_col` | single-column and multi-column sort, returns index array |
-| **Top-K** | `top_k` | partial sort returning the K smallest/largest elements |
-| **Reduce** | `ReductionKernel` | min, max, argmin, argmax — ungrouped |
-| **String predicates** | `compile_string_like`, `string_contains`, `StringStartEndKernel` | like (GLOB-style), ilike, contains, starts_with, ends_with |
+| `add`, `sub`/`sub_wrapping`, `mul`/`mul_wrapping`, `div`, `rem` | `BinOpKernel` | array-vs-array or array-vs-scalar, all numeric types |
+| `eq`, `neq`, `lt`, `lt_eq`, `gt`, `gt_eq` | `ComparisonKernel` | numeric + string |
+| `cast`, `cast_with_options` | `CastKernel` | numeric↔numeric, binary↔utf8, boolean↔numeric, primitive↔dict, dict→StringView, REE value cast, FixedSizeList element cast |
+| `filter`, `filter_record_batch` | `FilterKernel` | all array types |
+| `take`, `take_arrays`, `take_record_batch` | `TakeKernel` | all array types, all integer index types |
+| `concat`, `concat_batches` | `concat_all` | all array types |
+| `interleave`, `interleave_record_batch` | `InterleaveKernel` | all array types |
+| `partition` | `PartitionKernel` | groups consecutive equal rows |
+| `sort_to_indices` | `sort_col` | single-column sort → index array |
+| `lexsort_to_indices` | `sort_multi_col` | multi-column sort → index array |
+| `sort_limit` / `partial_sort` | `top_k` | K smallest/largest as indices |
+| `min`, `max` | `ReductionKernel`, `MinMaxAggKernel` | ungrouped and grouped |
+| `sum` | `ReductionKernel`, `SumAggregator` | ungrouped and grouped |
+| `like` | `compile_string_like` | GLOB-style matching with escape char (case-sensitive only) |
+| `contains` | `string_contains` | substring search |
+| `starts_with`, `ends_with` | `StringStartEndKernel` | prefix / suffix match |
 
 ---
 
-## Extensions — kernels in this repo with no Arrow compute equivalent
-
-These operations don't exist in Arrow compute at all; they are additional capabilities this repo provides.
+## Extensions — kernels in this repo with no `arrow::compute` equivalent
 
 | Operation | Kernel | Description |
 |---|---|---|
-| **Bounds check** | `BoundsKernel` | Tests whether each value falls in \[lo, hi\] — a single fused kernel vs two comparisons |
-| **Lower bound** | `lower_bound` | Binary search (bisect) on a sorted column |
-| **Grouped aggregation** | `CountAggregator`, `SumAggregator`, `MinAggregator`, `MaxAggregator`, `MostRecentAggregator` | Hash-table grouped aggregation (SQL-style GROUP BY) |
-| **Hash / grouping** | `HashKernel` | Murmur and unchained CRC32 hashing into a ticket table for dictionary building |
-| **Sort normalization** | `normalize_columns` | Maps raw sort keys to a canonical ordinal representation |
-| **Vector — dot product** | `DotKernel` | Dot product of two fixed-size list columns |
-| **Vector — norm** | `NormVecKernel` | L2 norm of a fixed-size list column |
-| **Vector — nearest neighbor** | `NearestNeighborKernel` | Nearest-neighbor search over a fixed-size list column |
+| Between / bounds check | `BetweenKernel`, `BoundsKernel` | fused `lo <= x <= hi` in one pass (Arrow has no `between`) |
+| Argmin / argmax | `ReductionKernel` (`argmin`, `argmax`) | index of the min/max — Arrow has no argmin/argmax |
+| Grouped aggregation | `CountAggregator`, `SumAggregator`, `MinMaxAggKernel`, `MostRecentAggregator` (+ their `*MergeKernel`s) | SQL-style GROUP BY with mergeable partial states for parallel aggregation — Arrow has no group-by |
+| Hash / grouping | `HashKernel` | Murmur and unchained CRC32 hashing into a ticket table |
+| Sort key normalization | `normalize_columns` | maps raw sort keys to a canonical ordinal encoding |
+| Binary search | `lower_bound` | bisect on a sorted column |
+| Run-length estimate | `approx_max_run_length` | estimates the largest run for REE planning |
+| Vector — dot product | `DotKernel` | dot product of two fixed-size-list columns |
+| Vector — L2 norm | `NormVecKernel` | norm of a fixed-size-list column |
+| Vector — nearest neighbor | `NearestNeighborKernel` | nearest-neighbor search over a fixed-size-list column |
 
 ---
 
-## Not yet supported — Arrow compute operations not covered by this repo
+## Not yet supported — `arrow::compute` 59.1 operations with no JIT kernel
 
-### Logical / Boolean
-| Arrow function | Description |
+### Logical / boolean (`arrow-arith::boolean`)
+| Function | Description |
 |---|---|
-| `and`, `and_kleene` | Element-wise boolean AND (with Kleene null logic) |
-| `or`, `or_kleene` | Element-wise boolean OR (with Kleene null logic) |
-| `not` | Element-wise boolean NOT |
-| `and_not` | Element-wise AND NOT |
-
-### Unary arithmetic (arrow-arith)
-| Arrow function | Description |
-|---|---|
-| `negate` | Arithmetic negation |
-| `abs` | Absolute value |
-| `pow` | Element-wise power |
-| `sqrt`, `exp`, `ln`, `log2`, `log10` | Exponential / logarithm |
-| `sin`, `cos`, `tan`, `asin`, `acos`, `atan`, `atan2`, `sinh`, `cosh`, `tanh` | Trigonometric functions |
-| `floor`, `ceil`, `round`, `trunc` | Rounding |
-| `signum` | Sign of value |
-
-### Bitwise aggregation
-| Arrow function | Description |
-|---|---|
-| `bit_and`, `bit_or`, `bit_xor` | Reduce an array to a single value via bitwise AND/OR/XOR |
-
-### Boolean aggregation
-| Arrow function | Description |
-|---|---|
-| `bool_and` | True if all non-null inputs are true |
-| `bool_or` | True if any non-null input is true |
-
-### String operations (arrow-string)
-| Arrow function | Description |
-|---|---|
-| `length` / `bit_length` | Character / byte length of each string |
-| `upper`, `lower` | Case conversion |
-| `ltrim`, `rtrim`, `trim` | Whitespace trimming |
-| `pad_left`, `pad_right` | String padding |
-| `substr` / `substring` | Substring extraction |
-| `repeat` | Repeat a string N times |
-| `replace` | Find-and-replace within strings |
-| `reverse` | Reverse string characters |
-| `regexp_is_match`, `regexp_match` | Regular-expression matching and capture group extraction |
+| `and`, `and_kleene` | element-wise AND (with Kleene null logic) |
+| `or`, `or_kleene` | element-wise OR (with Kleene null logic) |
+| `not` | element-wise NOT |
+| `and_not` | element-wise AND NOT |
 
 ### Null handling
-| Arrow function | Description |
+| Function | Description |
 |---|---|
-| `is_null`, `is_not_null` | Returns boolean array marking null / non-null positions |
-| `nullif` | Sets entries to null where a condition holds |
+| `is_null`, `is_not_null` | boolean mask of null / non-null positions |
+| `nullif` | null out entries where a condition holds |
 
-### Sorting
-| Arrow function | Description |
+### Unary arithmetic (`arrow-arith::numeric`)
+| Function | Description |
 |---|---|
-| `rank` | Assigns a rank to each element based on sort order |
+| `neg`, `neg_wrapping` | arithmetic negation — the only unary math kernels Arrow ships |
 
-### Array manipulation
-| Arrow function | Description |
+### Bitwise, element-wise (`arrow-arith::bitwise`)
+| Function | Description |
 |---|---|
-| `shift` | Shifts array elements left or right, filling with null |
+| `bitwise_and`, `bitwise_or`, `bitwise_xor`, `bitwise_not`, `bitwise_and_not` | element-wise bit ops (+ `_scalar` variants) |
+| `bitwise_shift_left`, `bitwise_shift_right` | element-wise shifts (+ `_scalar` variants) |
 
-### Date / time
-| Arrow function | Description |
+### Aggregation (`arrow-arith::aggregate`)
+| Function | Description |
 |---|---|
-| `date_part` | Extracts a component (year, month, day, hour, …) from a timestamp or date |
+| `product`, `product_checked` | multiply all elements to one scalar |
+| `sum_checked`, `sum_array`, `sum_array_checked` | overflow-checked / list-element sums |
+| `bit_and`, `bit_or`, `bit_xor` | reduce an array via bitwise AND/OR/XOR |
+| `bool_and`, `bool_or` | all-true / any-true reductions |
 
-### Decimal arithmetic
-| Arrow function | Description |
+### Comparison / set membership / rank (`arrow-ord`)
+| Function | Description |
 |---|---|
-| `multiply_fixed_point`, `rescale_decimal` | Decimal-specific multiplication and precision rescaling |
+| `distinct`, `not_distinct` | null-aware equality |
+| `in_list`, `in_list_utf8` | membership test against a value set |
+| `rank` | assign a rank to each element by sort order |
 
-### Union arrays
-| Arrow function | Description |
+### Array manipulation (`arrow-select`)
+| Function | Description |
 |---|---|
-| `union_extract` | Extracts the value at a named field from a union array |
+| `shift` | shift elements left/right, filling with null |
+| `zip` | select from one array or another per a boolean mask |
+| `merge`, `merge_n` | merge pre-sorted runs into one sorted output |
+| `union_extract`, `union_extract_by_id`, `union_extract_by_type` | extract a child from a union array |
+
+### String / binary (`arrow-string`)
+| Function | Description |
+|---|---|
+| `length`, `bit_length` | character / byte length |
+| `substring`, `substring_by_char` | substring extraction |
+| `concat_elements_*` | element-wise string/binary concatenation |
+| `ilike`, `nlike`, `nilike` | case-insensitive LIKE, negated LIKE, negated case-insensitive LIKE |
+| `eq_ignore_ascii_case` | case-insensitive ASCII equality |
+| `regexp_is_match`, `regexp_is_match_scalar`, `regexp_match` | regex match / capture |
+
+### Temporal (`arrow-arith::temporal`)
+| Function | Description |
+|---|---|
+| `date_part` | extract year/month/day/hour/… from a temporal array |
+
+### Cast / decimal (`arrow-cast`, re-exported into `arrow::compute`)
+| Function | Description |
+|---|---|
+| `num_cast`, `cast_num_to_bool` | scalar / numeric-to-bool conversions |
+| `multiply_fixed_point`, `rescale_decimal` | decimal-specific arithmetic and rescaling |
 
 ---
 
-## Not supported, but unnecessary — Arrow compute functions that don't benefit from JIT kernels
+## Not supported, but unnecessary — functions that don't benefit from JIT
 
-| Function | Reason |
+| Function / family | Reason |
 |---|---|
-| Schema / metadata operations | Pure Rust struct manipulation, no data computation |
-| Array construction / builders | Allocation-bound, not compute-bound |
-| `can_cast_types` | Type-level check with no data touched |
-| `concat_batches`, `filter_record_batch` | Thin wrappers that call column-by-column; the per-column kernels are what matters |
-| `unary`, `binary`, `try_unary`, `try_binary` | Low-level building blocks for writing kernels, not end-user operations |
-| `prep_null_mask_filter` | Trivial bitwise fixup |
-| `partition_validity` | Separates null/non-null index sets; memory-bound, not compute-bound |
+| `unary`, `binary`, `try_unary`, `try_binary` (+ `_mut`) | low-level building blocks for writing kernels, not end-user ops |
+| `can_cast_types` | type-level check, touches no data |
+| `filter_record_batch`, `take_record_batch`, `concat_batches`, `interleave_record_batch`, `take_arrays` | thin per-column wrappers; the column kernels are what matter |
+| `prep_null_mask_filter`, `partition_validity` | trivial bitmask fixups |
+| `FilterBuilder` / `optimize`, `BatchCoalescer`, `garbage_collect_dictionary` | internal optimization / allocation machinery, not compute |
+| `make_comparator` | builds a comparator closure; the sort kernels JIT this inline |
+| Schema / metadata / builder APIs | struct manipulation and allocation, not compute-bound |
