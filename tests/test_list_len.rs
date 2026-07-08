@@ -2,7 +2,7 @@ use arrow_array::{
     builder::{Int32Builder, ListBuilder},
     Array,
 };
-use arrow_compile_compute::compute;
+use arrow_compile_compute::list;
 use proptest::prelude::*;
 
 fn build_list_array(rows: &[Option<Vec<i32>>]) -> arrow_array::ListArray {
@@ -26,7 +26,7 @@ proptest! {
         0..128
     )) {
         let arr = build_list_array(&rows);
-        let result = compute::len(&arr).unwrap();
+        let result = list::len(&arr).unwrap();
         let actual = result.iter().collect::<Vec<_>>();
         let expected = rows
             .iter()

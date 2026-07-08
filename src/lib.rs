@@ -34,6 +34,7 @@ pub use arrow_interface::cast;
 pub use arrow_interface::cmp;
 pub use arrow_interface::compute;
 pub use arrow_interface::iter;
+pub use arrow_interface::list;
 pub use arrow_interface::select;
 pub use arrow_interface::sort;
 pub use arrow_interface::vec;

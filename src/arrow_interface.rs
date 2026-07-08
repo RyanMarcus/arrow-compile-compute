@@ -675,6 +675,41 @@ pub mod select {
     }
 }
 
+/// Kernels for list-like Arrow arrays.
+pub mod list {
+    use std::sync::LazyLock;
+
+    use arrow_array::{Array, UInt64Array};
+
+    use crate::{
+        compiled_kernels::{KernelCache, ListLenKernel},
+        ArrowKernelError,
+    };
+
+    static LIST_LEN_PROGRAM_CACHE: LazyLock<KernelCache<ListLenKernel>> =
+        LazyLock::new(KernelCache::new);
+
+    /// Return the per-row length of a list-like array.
+    ///
+    /// ```
+    /// use arrow_array::builder::{Int32Builder, ListBuilder};
+    /// use arrow_compile_compute::list;
+    ///
+    /// let mut builder = ListBuilder::new(Int32Builder::new());
+    /// builder.values().append_slice(&[1, 2, 3]);
+    /// builder.append(true);
+    /// builder.append(true);
+    /// builder.append(false);
+    /// let values = builder.finish();
+    ///
+    /// let lengths = list::len(&values).unwrap();
+    /// assert_eq!(lengths.iter().collect::<Vec<_>>(), vec![Some(3), Some(0), None]);
+    /// ```
+    pub fn len(data: &dyn Array) -> Result<UInt64Array, ArrowKernelError> {
+        LIST_LEN_PROGRAM_CACHE.get(data, ())
+    }
+}
+
 /// Computations (like hashing) over Arrow arrays.
 pub mod compute {
     use std::sync::LazyLock;
@@ -684,22 +719,14 @@ pub mod compute {
 
     use crate::{
         compiled_kernels::{
-            HashFunction, HashKernel, KernelCache, ListLenKernel, ReductionKernel,
-            ReductionKernelType,
+            HashFunction, HashKernel, KernelCache, ReductionKernel, ReductionKernelType,
         },
         ArrowKernelError,
     };
 
     static HASH_PROGRAM_CACHE: LazyLock<KernelCache<HashKernel>> = LazyLock::new(KernelCache::new);
-    static LIST_LEN_PROGRAM_CACHE: LazyLock<KernelCache<ListLenKernel>> =
-        LazyLock::new(KernelCache::new);
     static REDUCTION_PROGRAM_CACHE: LazyLock<KernelCache<ReductionKernel>> =
         LazyLock::new(KernelCache::new);
-
-    /// Return the per-row length of a list-like array.
-    pub fn len(data: &dyn Array) -> Result<UInt64Array, ArrowKernelError> {
-        LIST_LEN_PROGRAM_CACHE.get(data, ())
-    }
 
     /// Return the minimum non-null value as a one-element array.
     ///
