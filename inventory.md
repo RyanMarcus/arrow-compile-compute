@@ -27,6 +27,7 @@ Nothing here is inferred from what a compute engine "usually" has.
 | Arrow operation | Kernel in this repo | Notes |
 |---|---|---|
 | `add`, `sub`/`sub_wrapping`, `mul`/`mul_wrapping`, `div`, `rem` | `BinOpKernel` | array-vs-array or array-vs-scalar, all numeric types |
+| `neg`, `neg_wrapping` | `UnaryOpKernel` | arithmetic negation, all numeric types; wrapping semantics (both names map to the wrapping kernel) |
 | `eq`, `neq`, `lt`, `lt_eq`, `gt`, `gt_eq` | `ComparisonKernel` | numeric + string |
 | `cast`, `cast_with_options` | `CastKernel` | numeric↔numeric, binary↔utf8, boolean↔numeric, primitive↔dict, dict→StringView, REE value cast, FixedSizeList element cast |
 | `filter`, `filter_record_batch` | `FilterKernel` | all array types |
@@ -77,11 +78,6 @@ Nothing here is inferred from what a compute engine "usually" has.
 |---|---|
 | `is_null`, `is_not_null` | boolean mask of null / non-null positions |
 | `nullif` | null out entries where a condition holds |
-
-### Unary arithmetic (`arrow-arith::numeric`)
-| Function | Description |
-|---|---|
-| `neg`, `neg_wrapping` | arithmetic negation — the only unary math kernels Arrow ships |
 
 ### Bitwise, element-wise (`arrow-arith::bitwise`)
 | Function | Description |

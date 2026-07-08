@@ -956,12 +956,31 @@ pub mod arith {
     use arrow_array::{ArrayRef, Datum};
 
     use crate::{
-        compiled_kernels::{BinOpKernel, DSLArithBinOp, KernelCache},
+        compiled_kernels::{BinOpKernel, DSLArithBinOp, DSLUnaryOp, KernelCache, UnaryOpKernel},
         ArrowKernelError,
     };
 
     static BINOP_PROGRAM_CACHE: LazyLock<KernelCache<BinOpKernel>> =
         LazyLock::new(KernelCache::new);
+
+    static UNARYOP_PROGRAM_CACHE: LazyLock<KernelCache<UnaryOpKernel>> =
+        LazyLock::new(KernelCache::new);
+
+    /// Compute the arithmetic negation (`-x`) of each element.
+    ///
+    /// Unlike `arrow`'s checked `neg` (which errors on overflow, e.g.
+    /// `-i32::MIN`), this crate negates with wrapping semantics. It is
+    /// therefore identical to [`neg_wrapping`]; both are provided for API
+    /// parity with `arrow`.
+    pub fn neg(value: &dyn Datum) -> Result<ArrayRef, ArrowKernelError> {
+        UNARYOP_PROGRAM_CACHE.get(value, DSLUnaryOp::Neg)
+    }
+
+    /// Compute the wrapping arithmetic negation of each element (`-i32::MIN`
+    /// wraps to `i32::MIN`). Identical to [`neg`] in this crate.
+    pub fn neg_wrapping(value: &dyn Datum) -> Result<ArrayRef, ArrowKernelError> {
+        UNARYOP_PROGRAM_CACHE.get(value, DSLUnaryOp::Neg)
+    }
 
     pub fn add(left: &dyn Datum, right: &dyn Datum) -> Result<ArrayRef, ArrowKernelError> {
         BINOP_PROGRAM_CACHE.get((left, right), DSLArithBinOp::Add)

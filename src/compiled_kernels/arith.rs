@@ -5,7 +5,7 @@ use crate::{
     compiled_kernels::{
         dsl2::{
             compile, DSLArgument, DSLArithBinOp, DSLContext, DSLFunction, DSLStmt, DSLType,
-            RunnableDSLFunction, WriterSpec,
+            DSLUnaryOp, RunnableDSLFunction, WriterSpec,
         },
         null_utils::intersect_and_copy_nulls,
     },
@@ -79,17 +79,75 @@ impl Kernel for BinOpKernel {
     }
 }
 
+pub struct UnaryOpKernel(RunnableDSLFunction);
+unsafe impl Sync for UnaryOpKernel {}
+unsafe impl Send for UnaryOpKernel {}
+
+impl Kernel for UnaryOpKernel {
+    type Key = (DataType, bool, DSLUnaryOp);
+
+    type Input<'a>
+        = &'a dyn Datum
+    where
+        Self: 'a;
+
+    type Params = DSLUnaryOp;
+
+    type Output = ArrayRef;
+
+    fn call(&self, inp: Self::Input<'_>) -> Result<Self::Output, ArrowKernelError> {
+        let res = self
+            .0
+            .run(&[DSLArgument::Datum(inp)])
+            .map(|x| x[0].clone())?;
+
+        intersect_and_copy_nulls(&[inp], res)
+    }
+
+    fn compile(arr: &Self::Input<'_>, params: Self::Params) -> Result<Self, ArrowKernelError> {
+        let pt = PrimitiveType::for_arrow_type(arr.get().0.data_type());
+
+        let mut ctx = DSLContext::new();
+        let mut func = DSLFunction::new("arith_unaryop");
+        let arg = func.add_arg(&mut ctx, DSLType::array_like(*arr, "n"));
+        func.add_ret(WriterSpec::Primitive(pt), "n");
+
+        func.add_body(
+            DSLStmt::for_each(&mut ctx, &[arg], |loop_vars| {
+                let el = match params {
+                    DSLUnaryOp::Neg => loop_vars[0].expr().neg()?,
+                };
+                DSLStmt::emit(0, el)
+            })
+            .unwrap(),
+        );
+        let func = compile(func, [DSLArgument::Datum(*arr)]).unwrap();
+        Ok(UnaryOpKernel(func))
+    }
+
+    fn get_key_for_input(
+        i: &Self::Input<'_>,
+        p: &Self::Params,
+    ) -> Result<Self::Key, ArrowKernelError> {
+        let (arr, is_scalar) = i.get();
+        Ok((arr.data_type().clone(), is_scalar, *p))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use arrow_array::{
         cast::AsArray,
         types::{Float32Type, Float64Type, Int32Type, UInt32Type},
-        Float32Array, Float64Array, Int32Array, UInt32Array, UInt64Array,
+        Datum, Float32Array, Float64Array, Int32Array, UInt32Array, UInt64Array,
     };
     use strum::IntoEnumIterator;
 
     use crate::{
-        compiled_kernels::{arith::BinOpKernel, dsl2::DSLArithBinOp},
+        compiled_kernels::{
+            arith::{BinOpKernel, UnaryOpKernel},
+            dsl2::{DSLArithBinOp, DSLUnaryOp},
+        },
         Kernel,
     };
 
@@ -103,6 +161,48 @@ mod tests {
             let res = res.as_primitive::<Int32Type>();
 
             let arrow_res = op.arrow_compute(&arr1, &arr2);
+            let arrow_res = arrow_res.as_primitive::<Int32Type>();
+            assert_eq!(res, arrow_res, "failed for op {:?}", op);
+        }
+    }
+
+    #[test]
+    fn test_neg_i32() {
+        let arr = Int32Array::from(vec![1, 0, 2, -4, -10, 20, i32::MIN, i32::MAX]);
+        for op in DSLUnaryOp::iter() {
+            let k = UnaryOpKernel::compile(&(&arr as &dyn Datum), op).unwrap();
+            let res = k.call(&arr).unwrap();
+            let res = res.as_primitive::<Int32Type>();
+
+            let arrow_res = op.arrow_compute(&arr);
+            let arrow_res = arrow_res.as_primitive::<Int32Type>();
+            assert_eq!(res, arrow_res, "failed for op {:?}", op);
+        }
+    }
+
+    #[test]
+    fn test_neg_f32() {
+        let arr = Float32Array::from(vec![1.0, 0.0, -2.0, 4.0, -10.0, 20.0]);
+        for op in DSLUnaryOp::iter() {
+            let k = UnaryOpKernel::compile(&(&arr as &dyn Datum), op).unwrap();
+            let res = k.call(&arr).unwrap();
+            let res = res.as_primitive::<Float32Type>();
+
+            let arrow_res = op.arrow_compute(&arr);
+            let arrow_res = arrow_res.as_primitive::<Float32Type>();
+            assert_eq!(res, arrow_res, "failed for op {:?}", op);
+        }
+    }
+
+    #[test]
+    fn test_neg_scalar_i32_nulls() {
+        let arr = Int32Array::from(vec![Some(1), None, Some(-2), Some(4)]);
+        for op in DSLUnaryOp::iter() {
+            let k = UnaryOpKernel::compile(&(&arr as &dyn Datum), op).unwrap();
+            let res = k.call(&arr).unwrap();
+            let res = res.as_primitive::<Int32Type>();
+
+            let arrow_res = op.arrow_compute(&arr);
             let arrow_res = arrow_res.as_primitive::<Int32Type>();
             assert_eq!(res, arrow_res, "failed for op {:?}", op);
         }

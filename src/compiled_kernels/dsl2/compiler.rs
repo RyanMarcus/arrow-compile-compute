@@ -1953,6 +1953,42 @@ fn compile_expr<'ctx, 'a>(
                 )),
             }
         }
+
+        DSLExpr::Neg(v) => {
+            let value = compile_expr(ctx, v)?;
+            match v.get_type() {
+                DSLType::Primitive(pt) if pt.is_int() => Ok(ctx
+                    .b
+                    .build_int_neg(value.into_int_value(), "neg")
+                    .unwrap()
+                    .as_basic_value_enum()),
+                DSLType::Primitive(pt) if pt.is_float() => Ok(ctx
+                    .b
+                    .build_float_neg(value.into_float_value(), "neg")
+                    .unwrap()
+                    .as_basic_value_enum()),
+                DSLType::Primitive(PrimitiveType::List(item, _)) => {
+                    if PrimitiveType::from(item).is_float() {
+                        Ok(ctx
+                            .b
+                            .build_float_neg(value.into_vector_value(), "neg")
+                            .unwrap()
+                            .as_basic_value_enum())
+                    } else {
+                        Ok(ctx
+                            .b
+                            .build_int_neg(value.into_vector_value(), "neg")
+                            .unwrap()
+                            .as_basic_value_enum())
+                    }
+                }
+                _ => Err(ArrowKernelError::DSLInvalidType(
+                    "invalid type for neg",
+                    v.get_type(),
+                )),
+            }
+        }
+
         DSLExpr::Select(cond, v1, v2) => {
             let cond_v = compile_expr(ctx, cond)?.into_int_value();
             let v1_v = compile_expr(ctx, v1)?;
