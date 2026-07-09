@@ -27,7 +27,7 @@ Nothing here is inferred from what a compute engine "usually" has.
 | Arrow operation | Kernel in this repo | Notes |
 |---|---|---|
 | `add`, `sub`/`sub_wrapping`, `mul`/`mul_wrapping`, `div`, `rem` | `BinOpKernel` | array-vs-array or array-vs-scalar, all numeric types |
-| `neg`, `neg_wrapping` | `UnaryOpKernel` | arithmetic negation, all numeric types; wrapping semantics (both names map to the wrapping kernel) |
+| `neg_wrapping` | `UnaryOpKernel` | arithmetic negation, all numeric types; wrapping semantics only (no checked `neg`) |
 | `eq`, `neq`, `lt`, `lt_eq`, `gt`, `gt_eq` | `ComparisonKernel` | numeric + string |
 | `cast`, `cast_with_options` | `CastKernel` | numeric↔numeric, binary↔utf8, boolean↔numeric, primitive↔dict, dict→StringView, REE value cast, FixedSizeList element cast |
 | `filter`, `filter_record_batch` | `FilterKernel` | all array types |
