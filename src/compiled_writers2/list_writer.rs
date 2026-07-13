@@ -10,6 +10,7 @@ use arrow_schema::{DataType, Field};
 use inkwell::{
     builder::Builder,
     context::Context,
+    module::Module,
     values::{BasicValue, BasicValueEnum, PointerValue},
     AddressSpace,
 };
@@ -100,6 +101,7 @@ impl Writer for ListWriter {
     fn llvm_write<'ctx, 'borrow, F>(
         &'borrow self,
         ctx: &'ctx Context,
+        module: &'borrow Module<'ctx>,
         b: &'borrow Builder<'ctx>,
         runtime_ptr: PointerValue<'ctx>,
         f: F,
@@ -119,6 +121,7 @@ impl Writer for ListWriter {
             run_counter_ptr: curr_count_ptr,
             value_ptr: self.get_value_ptr(ctx, b, runtime_ptr),
             value_writer: self.inner.as_ref(),
+            module,
         }
         .into();
 
@@ -231,6 +234,7 @@ impl WriterRuntime for ListWriterRuntime {
 }
 
 pub struct ListWriterEmitter<'ctx, 'borrow> {
+    module: &'borrow Module<'ctx>,
     ctx: &'ctx Context,
     b: &'borrow Builder<'ctx>,
     run_counter_ptr: PointerValue<'ctx>,
@@ -241,7 +245,9 @@ impl<'ctx, 'borrow> WriterEmitter<'ctx, 'borrow> for ListWriterEmitter<'ctx, 'bo
     fn emit(&mut self, val: BasicValueEnum<'ctx>) -> Result<(), crate::ArrowKernelError> {
         let i64_type = self.ctx.i64_type();
         self.value_writer
-            .llvm_write(self.ctx, self.b, self.value_ptr, |e| e.emit(val))?;
+            .llvm_write(self.ctx, self.module, self.b, self.value_ptr, |e| {
+                e.emit(val)
+            })?;
 
         let curr_run_count = self
             .b
@@ -302,16 +308,16 @@ mod tests {
 
         writer.llvm_init(&ctx, &build, dest);
         writer
-            .llvm_write(&ctx, &build, dest, |emitter| {
+            .llvm_write(&ctx, &llvm_mod, &build, dest, |emitter| {
                 emitter.emit(ctx.i32_type().const_int(10, true).as_basic_value_enum())?;
                 emitter.emit(ctx.i32_type().const_int(11, true).as_basic_value_enum())
             })
             .unwrap();
         writer
-            .llvm_write(&ctx, &build, dest, |_emitter| Ok(()))
+            .llvm_write(&ctx, &llvm_mod, &build, dest, |_emitter| Ok(()))
             .unwrap();
         writer
-            .llvm_write(&ctx, &build, dest, |emitter| {
+            .llvm_write(&ctx, &llvm_mod, &build, dest, |emitter| {
                 emitter.emit(ctx.i32_type().const_int(12, true).as_basic_value_enum())?;
                 emitter.emit(ctx.i32_type().const_int(13, true).as_basic_value_enum())?;
                 emitter.emit(ctx.i32_type().const_int(14, true).as_basic_value_enum())
@@ -373,16 +379,16 @@ mod tests {
 
         writer.llvm_init(&ctx, &build, dest);
         writer
-            .llvm_write(&ctx, &build, dest, |emitter| {
+            .llvm_write(&ctx, &llvm_mod, &build, dest, |emitter| {
                 emitter.emit(ctx.i32_type().const_int(10, true).as_basic_value_enum())?;
                 emitter.emit(ctx.i32_type().const_int(11, true).as_basic_value_enum())
             })
             .unwrap();
         writer
-            .llvm_write(&ctx, &build, dest, |_emitter| Ok(()))
+            .llvm_write(&ctx, &llvm_mod, &build, dest, |_emitter| Ok(()))
             .unwrap();
         writer
-            .llvm_write(&ctx, &build, dest, |emitter| {
+            .llvm_write(&ctx, &llvm_mod, &build, dest, |emitter| {
                 emitter.emit(ctx.i32_type().const_int(12, true).as_basic_value_enum())?;
                 emitter.emit(ctx.i32_type().const_int(13, true).as_basic_value_enum())?;
                 emitter.emit(ctx.i32_type().const_int(14, true).as_basic_value_enum())

@@ -4,6 +4,7 @@ use arrow_data::ArrayDataBuilder;
 use inkwell::{
     builder::Builder,
     context::Context,
+    module::Module,
     values::{BasicValue, BasicValueEnum, PointerValue},
     AddressSpace,
 };
@@ -154,6 +155,7 @@ impl WriterTrait for PrimitiveWriter {
     fn llvm_write<'ctx, 'borrow, F>(
         &'borrow self,
         ctx: &'ctx Context,
+        _module: &'borrow Module<'ctx>,
         build: &'borrow Builder<'ctx>,
         runtime_ptr: PointerValue<'ctx>,
         f: F,

@@ -1,9 +1,7 @@
 use std::{ffi::c_void, sync::Arc};
 
 use arrow_array::{
-    cast::AsArray,
     make_array,
-    types::{Int32Type, Int64Type},
     ArrayRef,
 };
 use arrow_buffer::Buffer;
@@ -12,24 +10,19 @@ use arrow_schema::DataType;
 use inkwell::{
     builder::Builder,
     context::Context,
-    types::FunctionType,
-    values::{BasicValue, BasicValueEnum, PointerValue},
-    AddressSpace,
+    module::Module,
+    values::{BasicValue, BasicValueEnum, FunctionValue, PointerValue},
 };
 use repr_offset::ReprOffset;
 
 use crate::{
+    compiled_kernels::llvm_add_str_writer_append_bytes,
     compiled_writers2::{
         AnyRuntime, AnyWriterEmitter, PrimitiveWriter, PrimitiveWriterRuntime, Writer,
         WriterEmitter, WriterRuntime,
     },
     increment_pointer, pointer_diff, ArrowKernelError, PrimitiveType,
 };
-
-#[allow(dead_code)]
-unsafe extern "C" {
-    fn str_writer_append_bytes(ptr: *const u8, len: u64, vec: *mut c_void);
-}
 
 pub struct StringWriter {
     offset_writer: PrimitiveWriter,
@@ -70,6 +63,7 @@ impl Writer for StringWriter {
     fn llvm_write<'ctx, 'borrow, F>(
         &'borrow self,
         ctx: &'ctx Context,
+        module: &'borrow Module<'ctx>,
         build: &'borrow Builder<'ctx>,
         runtime_ptr: PointerValue<'ctx>,
         f: F,
@@ -77,15 +71,7 @@ impl Writer for StringWriter {
     where
         F: Fn(&mut AnyWriterEmitter<'ctx, 'borrow>) -> Result<(), ArrowKernelError>,
     {
-        let ptr_type = ctx.ptr_type(AddressSpace::default());
-        let i64_type = ctx.i64_type();
-        let extend_type = ctx
-            .void_type()
-            .fn_type(&[ptr_type.into(), i64_type.into(), ptr_type.into()], false);
-        let extend = ctx
-            .i64_type()
-            .const_int(str_writer_append_bytes as *const () as usize as u64, false)
-            .const_to_pointer(ptr_type);
+        let extend = llvm_add_str_writer_append_bytes(ctx, module);
 
         let mut emitter = AnyWriterEmitter::StringWriterEmitter(StringWriterEmitter {
             ctx,
@@ -104,7 +90,6 @@ impl Writer for StringWriter {
                 StringWriterRuntime::OFFSET_CURR_OFFSET
             ),
             vec_ptr: increment_pointer!(ctx, build, runtime_ptr, StringWriterRuntime::OFFSET_BYTES),
-            extend_type,
             extend,
         });
 
@@ -201,8 +186,7 @@ pub struct StringWriterEmitter<'ctx, 'borrow> {
 
     offset_counter_ptr: PointerValue<'ctx>,
     vec_ptr: PointerValue<'ctx>,
-    extend_type: FunctionType<'ctx>,
-    extend: PointerValue<'ctx>,
+    extend: FunctionValue<'ctx>,
 }
 impl<'ctx, 'borrow> WriterEmitter<'ctx, 'borrow> for StringWriterEmitter<'ctx, 'borrow> {
     fn emit(&mut self, val: BasicValueEnum<'ctx>) -> Result<(), ArrowKernelError> {
@@ -219,8 +203,7 @@ impl<'ctx, 'borrow> WriterEmitter<'ctx, 'borrow> for StringWriterEmitter<'ctx, '
             .into_pointer_value();
         let len = pointer_diff!(self.ctx, self.builder, ptr1, ptr2);
         self.builder
-            .build_indirect_call(
-                self.extend_type,
+            .build_call(
                 self.extend,
                 &[ptr1.into(), len.into(), self.vec_ptr.into()],
                 "extend",
@@ -263,7 +246,7 @@ impl<'ctx, 'borrow> WriterEmitter<'ctx, 'borrow> for StringWriterEmitter<'ctx, '
 mod tests {
     use std::ffi::c_void;
 
-    use arrow_array::{BinaryArray, StringArray};
+    use arrow_array::BinaryArray;
     use inkwell::{context::Context, values::BasicValue, AddressSpace, OptimizationLevel};
 
     use super::StringWriter;
@@ -308,7 +291,7 @@ mod tests {
                     .into(),
             ]);
             writer
-                .llvm_write(&ctx, &build, dest, |emitter| {
+                .llvm_write(&ctx, &llvm_mod, &build, dest, |emitter| {
                     emitter.emit(value.as_basic_value_enum())
                 })
                 .unwrap();
@@ -320,6 +303,7 @@ mod tests {
         let ee = llvm_mod
             .create_jit_execution_engine(OptimizationLevel::None)
             .unwrap();
+        crate::compiled_kernels::link_req_helpers(&llvm_mod, &ee).unwrap();
         let f = unsafe {
             ee.get_function::<unsafe extern "C" fn(*mut c_void)>(func.get_name().to_str().unwrap())
                 .unwrap()

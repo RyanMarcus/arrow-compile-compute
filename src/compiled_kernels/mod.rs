@@ -37,6 +37,7 @@ pub use ht::{HashFunction, HashKernel};
 use inkwell::execution_engine::ExecutionEngine;
 pub use interleave::InterleaveKernel;
 pub use list_len::ListLenKernel;
+pub(crate) use llvm_utils::llvm_add_str_writer_append_bytes;
 use llvm_utils::str_writer_append_bytes;
 pub use null_utils::intersect_and_copy_nulls;
 pub use partition::PartitionKernel;

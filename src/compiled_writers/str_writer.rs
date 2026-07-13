@@ -2,7 +2,10 @@ use std::ffi::c_void;
 use std::marker::PhantomData;
 use std::sync::Arc;
 
-use crate::{declare_blocks, increment_pointer, pointer_diff, PrimitiveType};
+use crate::{
+    compiled_kernels::llvm_add_str_writer_append_bytes, declare_blocks, increment_pointer,
+    pointer_diff, PrimitiveType,
+};
 
 use arrow_array::{ArrayRef, GenericBinaryArray, GenericByteArray, OffsetSizeTrait};
 use arrow_buffer::{Buffer, OffsetBuffer, ScalarBuffer};
@@ -126,23 +129,13 @@ impl<'a, T: OffsetSizeTrait> LeafWriter<'a> for StringArrayWriter<'a, T> {
     ) -> Self {
         assert_eq!(ty, PrimitiveType::P64x2, "string writer type must be P64x2");
         let ptr_type = ctx.ptr_type(AddressSpace::default());
-        let i64_type = ctx.i64_type();
         let offset_element_type = if T::IS_LARGE {
             ctx.i64_type()
         } else {
             ctx.i32_type()
         };
 
-        let extend_f = llvm_mod
-            .get_function("str_writer_append_bytes")
-            .unwrap_or_else(|| {
-                llvm_mod.add_function(
-                    "str_writer_append_bytes",
-                    ctx.void_type()
-                        .fn_type(&[ptr_type.into(), i64_type.into(), ptr_type.into()], false),
-                    Some(Linkage::External),
-                )
-            });
+        let extend_f = llvm_add_str_writer_append_bytes(ctx, llvm_mod);
 
         // Create or retrieve the ingest function:
         let func_name = format!("ingest_str_{}b", T::get_byte_width());

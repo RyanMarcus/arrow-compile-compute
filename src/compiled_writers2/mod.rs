@@ -10,6 +10,7 @@ use enum_dispatch::enum_dispatch;
 use inkwell::{
     builder::Builder,
     context::Context,
+    module::Module,
     values::{BasicValueEnum, PointerValue},
 };
 
@@ -53,6 +54,7 @@ pub trait Writer {
     fn llvm_write<'ctx, 'borrow, F>(
         &'borrow self,
         ctx: &'ctx Context,
+        module: &'borrow Module<'ctx>,
         build: &'borrow Builder<'ctx>,
         runtime_ptr: PointerValue<'ctx>,
         f: F,
