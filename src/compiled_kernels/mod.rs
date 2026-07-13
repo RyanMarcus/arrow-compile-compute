@@ -152,6 +152,9 @@ pub enum ArrowKernelError {
 
     #[error("dsl error")]
     DSLError(#[from] DSLError),
+
+    #[error("internal error: {0}")]
+    InternalError(String),
 }
 
 pub trait Kernel: Sized {

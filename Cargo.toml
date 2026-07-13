@@ -13,6 +13,7 @@ arrow-array = "55.2"
 ouroboros = "0.18"
 half = { version = "2.4", features = ["bytemuck"] }
 enum-as-inner = "0.6.1"
+enum_dispatch = "0.3.13"
 repr_offset = { version = "0.2.2", features = ["derive"] }
 itertools = "0.13.0"
 bytemuck = { version = "1.23", features = ["extern_crate_alloc"] }
