@@ -60,8 +60,16 @@ impl WriterRuntime for PrimitiveWriterRuntime {
     }
 
     fn to_array(self, len: usize) -> Result<ArrayRef, ArrowKernelError> {
-        let buf = Buffer::from(self.alloc);
-        let buf = buf.slice_with_length(0, len * self.pt.width());
+        let mut buf = Buffer::from(self.alloc);
+        let sliced = buf.slice_with_length(0, len * self.pt.width());
+        if buf.len() > len * self.pt.width() * 2 {
+            // over 2x over allocated, trim to exact size
+            let vec = sliced.to_vec();
+            buf = Buffer::from(vec);
+        } else {
+            buf = sliced;
+        }
+
         let ad = unsafe {
             ArrayDataBuilder::new(self.pt.as_arrow_type())
                 .add_buffer(buf)

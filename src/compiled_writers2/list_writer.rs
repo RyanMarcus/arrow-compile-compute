@@ -3,7 +3,7 @@ use std::{ffi::c_void, sync::Arc};
 use arrow_array::{
     cast::AsArray,
     types::{Int32Type, Int64Type},
-    LargeListArray, ListArray,
+    ListArray,
 };
 use arrow_data::ArrayDataBuilder;
 use arrow_schema::{DataType, Field};
@@ -340,6 +340,80 @@ mod tests {
         assert_eq!(list.offsets().as_ref(), &[0, 2, 2, 5]);
         assert_eq!(
             list.values().as_primitive::<Int32Type>().values(),
+            &[10, 11, 12, 13, 14]
+        );
+    }
+
+    #[test]
+    fn list_writer_writes_nested_list() {
+        let ctx = Context::create();
+        let llvm_mod = ctx.create_module("compiled_writers2_nested_list_writer");
+        let build = ctx.create_builder();
+        let ptr_type = ctx.ptr_type(AddressSpace::default());
+
+        let func = llvm_mod.add_function(
+            "test",
+            ctx.void_type().fn_type(&[ptr_type.into()], false),
+            None,
+        );
+
+        declare_blocks!(ctx, func, entry);
+        build.position_at_end(entry);
+
+        let dest = func.get_nth_param(0).unwrap().into_pointer_value();
+        let writer = ListWriter {
+            offsets: PrimitiveWriter::compile(PrimitiveType::I32).unwrap(),
+            inner: Box::new(AnyWriter::ListWriter(ListWriter {
+                offsets: PrimitiveWriter::compile(PrimitiveType::I32).unwrap(),
+                inner: Box::new(AnyWriter::PrimitiveWriter(
+                    PrimitiveWriter::compile(PrimitiveType::I32).unwrap(),
+                )),
+            })),
+        };
+
+        writer.llvm_init(&ctx, &build, dest);
+        writer
+            .llvm_write(&ctx, &build, dest, |emitter| {
+                emitter.emit(ctx.i32_type().const_int(10, true).as_basic_value_enum())?;
+                emitter.emit(ctx.i32_type().const_int(11, true).as_basic_value_enum())
+            })
+            .unwrap();
+        writer
+            .llvm_write(&ctx, &build, dest, |_emitter| Ok(()))
+            .unwrap();
+        writer
+            .llvm_write(&ctx, &build, dest, |emitter| {
+                emitter.emit(ctx.i32_type().const_int(12, true).as_basic_value_enum())?;
+                emitter.emit(ctx.i32_type().const_int(13, true).as_basic_value_enum())?;
+                emitter.emit(ctx.i32_type().const_int(14, true).as_basic_value_enum())
+            })
+            .unwrap();
+        writer.llvm_flush(&ctx, &build, dest);
+
+        build.build_return(None).unwrap();
+        llvm_mod.verify().unwrap();
+
+        let ee = llvm_mod
+            .create_jit_execution_engine(OptimizationLevel::None)
+            .unwrap();
+        let f = unsafe {
+            ee.get_function::<unsafe extern "C" fn(*mut c_void)>(func.get_name().to_str().unwrap())
+                .unwrap()
+        };
+
+        let mut runtime = writer.allocate(5);
+        unsafe {
+            f.call(runtime.as_ptr());
+        }
+
+        let array = runtime.to_array(3).unwrap();
+        let outer = array.as_list::<i32>();
+        assert_eq!(outer.offsets().as_ref(), &[0, 2, 2, 5]);
+
+        let inner = outer.values().as_list::<i32>();
+        assert_eq!(inner.offsets().as_ref(), &[0, 1, 2, 3, 4, 5]);
+        assert_eq!(
+            inner.values().as_primitive::<Int32Type>().values(),
             &[10, 11, 12, 13, 14]
         );
     }

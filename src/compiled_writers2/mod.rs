@@ -1,5 +1,6 @@
 mod list_writer;
 mod primitive_writer;
+mod string_writer;
 
 use std::ffi::c_void;
 
@@ -16,6 +17,7 @@ use list_writer::{ListWriter, ListWriterEmitter, ListWriterRuntime};
 
 use crate::{
     compiled_writers::{DictionaryKeyType, RunEndType},
+    compiled_writers2::string_writer::{StringWriter, StringWriterEmitter, StringWriterRuntime},
     ArrowKernelError, PrimitiveType,
 };
 
@@ -65,18 +67,21 @@ pub trait Writer {
 pub enum AnyWriter {
     PrimitiveWriter,
     ListWriter,
+    StringWriter,
 }
 
 #[enum_dispatch(WriterEmitter)]
 pub enum AnyWriterEmitter<'ctx, 'borrow> {
     PrimitiveWriterEmitter(PrimitiveWriterEmitter<'ctx>),
     ListWriterEmitter(ListWriterEmitter<'ctx, 'borrow>),
+    StringWriterEmitter(StringWriterEmitter<'ctx, 'borrow>),
 }
 
 #[enum_dispatch(WriterRuntime)]
 pub enum AnyRuntime {
     PrimitiveWriterRuntime,
     ListWriterRuntime,
+    StringWriterRuntime,
 }
 
 pub enum WriterPlan {
@@ -163,7 +168,9 @@ impl WriterPlan {
             WriterPlan::RunEnd(run_end_type, writer_plan) => todo!(),
             WriterPlan::FixedSizeList(_, writer_plan) => todo!(),
             WriterPlan::VariableSizeList(writer_plan) => todo!(),
-            WriterPlan::String => todo!(),
+            WriterPlan::String => Ok(AnyWriter::StringWriter(StringWriter::compile(
+                PrimitiveType::I32,
+            )?)),
             WriterPlan::StringView => todo!(),
         }
     }
