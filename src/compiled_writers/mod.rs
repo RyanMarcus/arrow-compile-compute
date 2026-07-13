@@ -1,79 +1,43 @@
-//! LLVM-backed Arrow array writers.
+//! Composable LLVM-backed writers for building Arrow arrays.
 //!
-//! This module is the bridge between the Rust objects that own output buffers
-//! and the LLVM IR that appends values into those buffers. There are four
-//! related concepts:
+//! Most callers work with [`WriterSpec`], a recursive description of an output
+//! column. Create a spec directly or with [`WriterSpec::for_data_type`], call
+//! [`WriterSpec::allocate`] to obtain a [`WriterAllocation`], and pass its
+//! opaque pointer to the JIT function. During IR generation,
+//! [`WriterSpec::llvm_init`] binds the compiled writer to that pointer and
+//! returns a [`BoundWriter`], whose ingest methods emit writes. After execution,
+//! consume the allocation with [`WriterAllocation::into_array_ref`] to finalize
+//! any remaining metadata and produce the Arrow array.
 //!
-//! 1. [`WriterSpec`] describes the logical output type. It is cheap, cloneable
-//!    metadata such as "primitive i32", "string", or "dictionary with i32
-//!    values".
-//! 2. [`WriterAllocation`] owns the Rust-side allocation for one output column.
-//!    The allocation is created before the JIT function runs, passed to LLVM as
-//!    an opaque pointer, and converted into an Arrow array after the JIT
-//!    function returns.
-//! 3. [`Writer`] owns the generated writer logic for a spec. It may contain
-//!    LLVM helper functions and nested child writers, but it is deliberately not
-//!    the public append API because it is not tied to a particular allocation
-//!    pointer.
-//! 4. [`BoundWriter`] is a writer bound to the allocation pointer that is valid
-//!    in the current LLVM IR context. It is the public IR-generation API for
-//!    appending values and flushing buffered state.
+//! The lower-level pieces used to implement a writer are:
 //!
-//! The distinction between [`Writer`] and [`BoundWriter`] is important. An LLVM
-//! [`PointerValue`] is an SSA value: a pointer computed in one function, helper,
-//! or block is not automatically valid in another. Earlier versions of this
-//! module hid the current allocation pointer in a thread-local LLVM global, but
-//! that was fragile for JIT linking on macOS and also made the active allocation
-//! implicit. The current design passes allocation pointers explicitly and makes
-//! Rust code bind writer logic to the pointer that is valid at the place where
-//! IR is being emitted.
+//! - [`Writer`], which allocates runtime state and emits the LLVM operations for
+//!   a logical write;
+//! - [`WriterEmitter`], the per-write interface through which scalar or
+//!   composite values are supplied;
+//! - [`WriterRuntime`], which owns the Rust buffers, supports reservation, and
+//!   materializes the finished array;
+//! - [`AnyWriter`], [`AnyWriterEmitter`], and [`AnyRuntime`], which provide
+//!   enum-based dispatch so writers can recursively compose child writers.
 //!
-//! A typical consumer follows this lifecycle:
-//!
-//! ```ignore
-//! use arrow_compile_compute::{compiled_writers::WriterSpec, PrimitiveType};
-//!
-//! let spec = WriterSpec::Primitive(PrimitiveType::I32);
-//! let mut allocation = spec.allocate(expected_rows);
-//!
-//! // Pass this pointer to the compiled function as an opaque output pointer.
-//! let output_ptr = allocation.get_ptr();
-//!
-//! // After the compiled function has run, consume the allocation as an Arrow
-//! // array. The length normally comes from the kernel's output-length logic.
-//! let array = allocation.into_array_ref_with_len(output_len, None);
-//! ```
-//!
-//! During IR generation, the opaque output pointer is materialized as an LLVM
-//! [`PointerValue`] and bound to the writer:
-//!
-//! ```ignore
-//! let writer = spec.llvm_init(ctx, llvm_mod, build, output_alloc_ptr);
-//!
-//! writer.llvm_ingest(ctx, build, value);
-//! writer.llvm_flush(ctx, build);
-//! ```
-//!
-//! Composite writers use the same rule recursively. If a dictionary or
-//! run-end-encoded helper derives a child allocation pointer from the parent
-//! allocation, it calls [`BoundWriter::with_alloc`] and emits child writes
-//! through that rebound writer:
-//!
-//! ```ignore
-//! child_writer.with_alloc(child_alloc_ptr).llvm_ingest(ctx, build, child_value);
-//! ```
-//!
-//! The author of IR-generation code is responsible for ensuring that a
-//! [`BoundWriter`] is used only where its allocation pointer is valid LLVM IR.
-//! Misuse should be caught by LLVM verification or compilation; the Rust object
-//! itself does not extend the lifetime or dominance of the underlying SSA value.
+//! Finalization happens in Rust when the runtime becomes an array; generated
+//! code therefore does not need a separate flush step.
+
+mod boolean_writer;
+mod dictionary_writer;
+mod fixed_size_list_writer;
+mod list_writer;
+mod primitive_writer;
+mod run_end_writer;
+mod string_writer;
+mod view_writer;
 
 use std::ffi::c_void;
-use std::sync::Arc;
 
-use arrow_array::{Array, ArrayRef, Datum};
+use arrow_array::{make_array, ArrayRef, Datum};
 use arrow_buffer::NullBuffer;
 use arrow_schema::DataType;
+use enum_dispatch::enum_dispatch;
 use inkwell::{
     builder::Builder,
     context::Context,
@@ -81,60 +45,22 @@ use inkwell::{
     values::{BasicValueEnum, PointerValue, VectorValue},
 };
 
-mod array_writer;
-mod bool_writer;
-mod dict_writer;
-mod fixed_size_list_writer;
-mod ree_writer;
-mod str_writer;
-mod view_writer;
+use dictionary_writer::{DictionaryWriter, DictionaryWriterEmitter, DictionaryWriterRuntime};
+use fixed_size_list_writer::{
+    FixedSizeListWriter, FixedSizeListWriterEmitter, FixedSizeListWriterRuntime,
+};
+use list_writer::{ListWriter, ListWriterEmitter, ListWriterRuntime};
+use run_end_writer::{RunEndWriter, RunEndWriterEmitter, RunEndWriterRuntime};
+use view_writer::{StringViewWriter, StringViewWriterEmitter, StringViewWriterRuntime};
 
-pub use array_writer::ArrayOutput;
-pub use array_writer::PrimitiveArrayWriter;
-pub use bool_writer::BooleanAllocation;
-pub use bool_writer::BooleanWriter;
-pub use dict_writer::DictAllocation;
-pub use dict_writer::DictWriter;
-pub use fixed_size_list_writer::FixedSizeListWriter;
-pub use fixed_size_list_writer::FixedSizeListWriterAlloc;
-pub use ree_writer::REEAllocation;
-pub use ree_writer::REEWriter;
-pub use str_writer::StringAllocation;
-pub use str_writer::StringArrayWriter;
-pub use view_writer::StringViewAllocation;
-pub use view_writer::StringViewWriter;
+use crate::{
+    compiled_writers::string_writer::{StringWriter, StringWriterEmitter, StringWriterRuntime},
+    normalized_base_type, ArrowKernelError, ListItemType, PrimitiveType,
+};
+
+pub use boolean_writer::{BooleanWriter, BooleanWriterEmitter, BooleanWriterRuntime};
+pub use primitive_writer::{PrimitiveWriter, PrimitiveWriterEmitter, PrimitiveWriterRuntime};
 pub use view_writer::ViewBufferWriter;
-
-use crate::{normalized_base_type, ListItemType, PrimitiveType};
-
-pub trait LeafWriter<'a> {
-    type Allocation: LeafWriterAllocation;
-
-    fn allocate(expected_count: usize, ty: PrimitiveType) -> Self::Allocation;
-
-    fn llvm_init(
-        ctx: &'a Context,
-        llvm_mod: &Module<'a>,
-        build: &Builder<'a>,
-        ty: PrimitiveType,
-        alloc_ptr: PointerValue<'a>,
-    ) -> Self;
-}
-
-pub trait LeafWriterAllocation {
-    type Output: Array;
-
-    fn get_ptr(&mut self) -> *mut c_void;
-    fn reserve_for_additional(&mut self, count: usize);
-
-    fn rewind_one(&mut self) {
-        panic!("rewind_one unsupported for this writer allocation");
-    }
-
-    fn len(&self) -> usize;
-    fn to_array(self, len: usize, nulls: Option<NullBuffer>) -> Self::Output;
-    fn to_array_ref(self, nulls: Option<NullBuffer>) -> ArrayRef;
-}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum DictionaryKeyType {
@@ -211,16 +137,144 @@ impl RunEndType {
     }
 }
 
-/// Logical description of an output writer.
-///
-/// A `WriterSpec` is schema-like metadata. Use it to allocate the Rust-side
-/// output storage with [`WriterSpec::allocate`] and to create LLVM writer logic
-/// with [`WriterSpec::llvm_init`].
-///
-/// ```ignore
-/// let spec = WriterSpec::for_data_type(&arrow_schema::DataType::Int32);
-/// let mut allocation = spec.allocate(expected_rows);
-/// ```
+#[enum_dispatch]
+pub trait WriterRuntime {
+    fn as_ptr(&mut self) -> *mut c_void;
+
+    /// Reserves space for future writes and refreshes any child runtime pointers.
+    fn reserve_for_additional(&mut self, count: usize) -> Result<(), ArrowKernelError>;
+    fn len(&self) -> usize;
+
+    /// Finalizes the runtime state and materializes an Arrow array.
+    fn to_array(self, len: usize) -> Result<ArrayRef, ArrowKernelError>;
+
+    fn to_array_ref(self) -> Result<ArrayRef, ArrowKernelError>
+    where
+        Self: Sized,
+    {
+        let len = self.len();
+        self.to_array(len)
+    }
+}
+
+#[enum_dispatch]
+pub trait WriterEmitter<'ctx, 'borrow> {
+    fn emit(&mut self, val: BasicValueEnum<'ctx>) -> Result<(), ArrowKernelError>;
+}
+
+#[derive(Clone, Copy)]
+pub struct WriterCodegen<'ctx, 'borrow> {
+    pub ctx: &'ctx Context,
+    pub module: &'borrow Module<'ctx>,
+    pub builder: &'borrow Builder<'ctx>,
+}
+
+#[enum_dispatch]
+pub trait Writer {
+    /// Allocates the runtime state used by generated code.
+    ///
+    /// `size` will be the maximum number of items that can be written. Writing
+    /// more items will cause invalid writes / segfaults / UB.
+    fn allocate(&self, size: usize) -> AnyRuntime;
+
+    /// Emits initialization code for this writer and its composed children.
+    ///
+    /// `runtime_ptr` must point to runtime state returned by [`Writer::allocate`].
+    fn llvm_init<'ctx, 'borrow>(
+        &self,
+        codegen: WriterCodegen<'ctx, 'borrow>,
+        runtime_ptr: PointerValue<'ctx>,
+    );
+
+    /// Emits code for one logical write operation.
+    ///
+    /// The callback describes the value through a writer-specific emitter.
+    /// Scalar emitters generally accept one call to [`WriterEmitter::emit`],
+    /// while composite emitters may accept multiple calls to describe the
+    /// contents of one logical value.
+    fn llvm_write<'ctx, 'borrow, F>(
+        &'borrow self,
+        codegen: WriterCodegen<'ctx, 'borrow>,
+        runtime_ptr: PointerValue<'ctx>,
+        f: F,
+    ) -> Result<(), ArrowKernelError>
+    where
+        F: Fn(&mut AnyWriterEmitter<'ctx, 'borrow>) -> Result<(), ArrowKernelError>;
+
+    /// Writes each lane of `values` as a separate logical value.
+    ///
+    /// Writers may override this to ingest a vector more efficiently. The
+    /// default preserves the single-value emitter contract by creating a new
+    /// emitter for every lane.
+    fn llvm_write_multiple<'ctx, 'borrow>(
+        &'borrow self,
+        codegen: WriterCodegen<'ctx, 'borrow>,
+        runtime_ptr: PointerValue<'ctx>,
+        values: VectorValue<'ctx>,
+    ) -> Result<(), ArrowKernelError> {
+        for idx in 0..values.get_type().get_size() {
+            let value = codegen
+                .builder
+                .build_extract_element(
+                    values,
+                    codegen.ctx.i64_type().const_int(idx as u64, false),
+                    "writer_multiple_value",
+                )
+                .unwrap();
+            self.llvm_write(codegen, runtime_ptr, |emitter| emitter.emit(value))?;
+        }
+        Ok(())
+    }
+}
+
+#[enum_dispatch(Writer)]
+pub enum AnyWriter {
+    Boolean(BooleanWriter),
+    Dictionary(DictionaryWriter),
+    FixedSizeList(FixedSizeListWriter),
+    Primitive(PrimitiveWriter),
+    List(ListWriter),
+    RunEnd(RunEndWriter),
+    String(StringWriter),
+    StringView(StringViewWriter),
+}
+
+#[enum_dispatch(WriterEmitter)]
+pub enum AnyWriterEmitter<'ctx, 'borrow> {
+    Boolean(BooleanWriterEmitter<'ctx, 'borrow>),
+    Dictionary(DictionaryWriterEmitter<'ctx, 'borrow>),
+    FixedSizeList(FixedSizeListWriterEmitter<'ctx, 'borrow>),
+    Primitive(PrimitiveWriterEmitter<'ctx, 'borrow>),
+    List(ListWriterEmitter<'ctx, 'borrow>),
+    RunEnd(RunEndWriterEmitter<'ctx, 'borrow>),
+    String(StringWriterEmitter<'ctx, 'borrow>),
+    StringView(StringViewWriterEmitter<'ctx, 'borrow>),
+}
+
+#[enum_dispatch(WriterRuntime)]
+pub enum AnyRuntime {
+    Boolean(BooleanWriterRuntime),
+    Dictionary(DictionaryWriterRuntime),
+    FixedSizeList(FixedSizeListWriterRuntime),
+    Primitive(PrimitiveWriterRuntime),
+    List(ListWriterRuntime),
+    RunEnd(RunEndWriterRuntime),
+    String(StringWriterRuntime),
+    StringView(StringViewWriterRuntime),
+}
+
+impl AnyRuntime {
+    fn append_integer(&mut self, value: u64) -> Result<(), ArrowKernelError> {
+        match self {
+            Self::Primitive(runtime) => runtime.append_integer(value),
+            _ => Err(ArrowKernelError::InternalError(
+                "integer metadata must use a primitive writer runtime".into(),
+            )),
+        }
+    }
+}
+
+/// A recursive description of an output writer and its composed child writers.
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub enum WriterSpec {
     Primitive(PrimitiveType),
@@ -228,148 +282,115 @@ pub enum WriterSpec {
     String,
     LargeString,
     StringView,
-    FixedSizeList(ListItemType, usize),
+    List(Box<WriterSpec>),
+    LargeList(Box<WriterSpec>),
+    FixedSizeList(Box<WriterSpec>, usize),
     Dictionary(DictionaryKeyType, Box<WriterSpec>),
     RunEndEncoded(RunEndType, Box<WriterSpec>),
 }
 
 impl WriterSpec {
+    /// Returns the value type accepted by the generated writer code.
     pub fn storage_type(&self) -> PrimitiveType {
         match self {
-            Self::Primitive(pt) => {
-                assert!(
-                    !matches!(pt, PrimitiveType::P64x2 | PrimitiveType::List(_, _)),
-                    "use a dedicated writer spec for strings and fixed-size lists",
-                );
-                *pt
-            }
+            Self::Primitive(pt) => *pt,
             Self::Boolean => PrimitiveType::U8,
             Self::String | Self::LargeString | Self::StringView => PrimitiveType::P64x2,
-            Self::FixedSizeList(item, size) => PrimitiveType::List(*item, *size),
+            Self::List(_) | Self::LargeList(_) => {
+                unreachable!("variable-size lists do not have a scalar storage type")
+            }
+            Self::FixedSizeList(values, size) => {
+                let item_type = match values.as_ref() {
+                    Self::Boolean => ListItemType::Boolean,
+                    _ => values
+                        .storage_type()
+                        .try_into()
+                        .expect("fixed-size list item type must be scalar"),
+                };
+                PrimitiveType::List(item_type, *size)
+            }
             Self::Dictionary(_, values) | Self::RunEndEncoded(_, values) => values.storage_type(),
         }
     }
 
-    /// Allocate Rust-side output storage for this writer spec.
-    ///
-    /// The returned allocation owns the buffers that the compiled function will
-    /// mutate. Pass [`WriterAllocation::get_ptr`] to the JIT function, then
-    /// consume the allocation with [`WriterAllocation::into_array_ref`] or
-    /// [`WriterAllocation::into_array_ref_with_len`].
-    pub fn allocate(&self, expected_count: usize) -> WriterAllocation {
-        match self {
-            Self::Primitive(pt) => {
-                WriterAllocation::Primitive(PrimitiveArrayWriter::allocate(expected_count, *pt))
-            }
-            Self::Boolean => WriterAllocation::Boolean(BooleanWriter::allocate(
-                expected_count,
-                self.storage_type(),
-            )),
-            Self::String => WriterAllocation::String(StringArrayWriter::allocate(
-                expected_count,
-                self.storage_type(),
-            )),
-            Self::LargeString => WriterAllocation::LargeString(StringArrayWriter::allocate(
-                expected_count,
-                self.storage_type(),
-            )),
-            Self::StringView => WriterAllocation::StringView(StringViewWriter::allocate(
-                expected_count,
-                self.storage_type(),
-            )),
-            Self::FixedSizeList(item, size) => WriterAllocation::FixedSizeList(
-                FixedSizeListWriter::allocate(expected_count, PrimitiveType::List(*item, *size)),
+    pub fn for_primitive_type(primitive_type: PrimitiveType) -> Self {
+        match primitive_type {
+            PrimitiveType::P64x2 => Self::String,
+            PrimitiveType::List(item_type, size) => Self::FixedSizeList(
+                Box::new(match item_type {
+                    ListItemType::Boolean => Self::Boolean,
+                    _ => Self::for_primitive_type(PrimitiveType::from(item_type)),
+                }),
+                size,
             ),
-            Self::Dictionary(key, values) => WriterAllocation::Dictionary(Box::new(
-                DictAllocation::allocate(expected_count, *key, values),
-            )),
-            Self::RunEndEncoded(run_end, values) => WriterAllocation::RunEndEncoded(Box::new(
-                REEAllocation::allocate(expected_count, *run_end, values),
-            )),
+            primitive_type => Self::Primitive(primitive_type),
         }
     }
 
-    /// Create the unbound LLVM writer logic for this spec.
-    ///
-    /// This is crate-private because callers should normally use
-    /// [`WriterSpec::llvm_init`], which binds the writer to the allocation
-    /// pointer immediately. Composite writers use this lower-level form to
-    /// create child writer logic once and later bind it to child allocation
-    /// pointers derived inside helper functions.
-    pub(crate) fn llvm_writer<'a>(
-        &self,
-        ctx: &'a Context,
-        llvm_mod: &Module<'a>,
-        build: &Builder<'a>,
-        alloc_ptr: PointerValue<'a>,
-    ) -> Writer<'a> {
-        let storage_type = self.storage_type();
+    pub fn compile(&self) -> Result<AnyWriter, ArrowKernelError> {
         match self {
-            Self::Primitive(_) => Writer::Primitive(PrimitiveArrayWriter::llvm_init(
-                ctx,
-                llvm_mod,
-                build,
-                storage_type,
-                alloc_ptr,
+            Self::Boolean => Ok(AnyWriter::Boolean(BooleanWriter::compile())),
+            Self::Primitive(primitive_type) => Ok(AnyWriter::Primitive(PrimitiveWriter::compile(
+                *primitive_type,
+            )?)),
+            Self::Dictionary(dictionary_key_type, values) => {
+                Ok(AnyWriter::Dictionary(DictionaryWriter::compile(
+                    *dictionary_key_type,
+                    values.storage_type(),
+                    values.compile()?,
+                )?))
+            }
+            Self::RunEndEncoded(run_end_type, values) => Ok(AnyWriter::RunEnd(
+                RunEndWriter::compile(*run_end_type, values.storage_type(), values.compile()?)?,
             )),
-            Self::Boolean => Writer::Boolean(BooleanWriter::llvm_init(
-                ctx,
-                llvm_mod,
-                build,
-                storage_type,
-                alloc_ptr,
+            Self::FixedSizeList(values, _) => Ok(AnyWriter::FixedSizeList(
+                FixedSizeListWriter::compile(self.storage_type(), values.compile()?)?,
             )),
-            Self::String => Writer::String(StringArrayWriter::llvm_init(
-                ctx,
-                llvm_mod,
-                build,
-                storage_type,
-                alloc_ptr,
-            )),
-            Self::LargeString => Writer::LargeString(StringArrayWriter::llvm_init(
-                ctx,
-                llvm_mod,
-                build,
-                storage_type,
-                alloc_ptr,
-            )),
-            Self::StringView => Writer::StringView(StringViewWriter::llvm_init(
-                ctx,
-                llvm_mod,
-                build,
-                storage_type,
-                alloc_ptr,
-            )),
-            Self::FixedSizeList(_, _) => Writer::FixedSizeList(FixedSizeListWriter::llvm_init(
-                ctx,
-                llvm_mod,
-                build,
-                storage_type,
-                alloc_ptr,
-            )),
-            Self::Dictionary(key, values) => Writer::Dictionary(Box::new(DictWriter::llvm_init(
-                ctx, llvm_mod, build, *key, values, alloc_ptr,
-            ))),
-            Self::RunEndEncoded(run_end, values) => Writer::RunEndEncoded(Box::new(
-                REEWriter::llvm_init(ctx, llvm_mod, build, *run_end, values, alloc_ptr),
-            )),
+            Self::List(values) => Ok(AnyWriter::List(ListWriter::compile(
+                PrimitiveType::I32,
+                values.compile()?,
+            )?)),
+            Self::LargeList(values) => Ok(AnyWriter::List(ListWriter::compile(
+                PrimitiveType::I64,
+                values.compile()?,
+            )?)),
+            Self::String => Ok(AnyWriter::String(StringWriter::compile(
+                PrimitiveType::I32,
+            )?)),
+            Self::LargeString => Ok(AnyWriter::String(StringWriter::compile(
+                PrimitiveType::I64,
+            )?)),
+            Self::StringView => Ok(AnyWriter::StringView(StringViewWriter::compile())),
         }
     }
 
-    /// Create a [`BoundWriter`] for this spec and allocation pointer.
-    ///
-    /// The `alloc_ptr` must be valid in the LLVM function or helper where
-    /// subsequent [`BoundWriter::llvm_ingest`] and [`BoundWriter::llvm_flush`]
-    /// calls are emitted.
-    pub fn llvm_init<'a>(
+    pub fn allocate(&self, expected_count: usize) -> WriterAllocation {
+        let writer = self.compile().unwrap();
+        WriterAllocation {
+            runtime: writer.allocate(expected_count),
+        }
+    }
+
+    pub fn llvm_init<'ctx, 'borrow>(
         &self,
-        ctx: &'a Context,
-        llvm_mod: &Module<'a>,
-        build: &Builder<'a>,
-        alloc_ptr: PointerValue<'a>,
-    ) -> BoundWriter<'a, 'a> {
-        self.llvm_writer(ctx, llvm_mod, build, alloc_ptr)
-            .bind(alloc_ptr)
+        ctx: &'ctx Context,
+        module: &'borrow Module<'ctx>,
+        builder: &'borrow Builder<'ctx>,
+        runtime_ptr: PointerValue<'ctx>,
+    ) -> BoundWriter<'ctx> {
+        let writer = self.compile().unwrap();
+        writer.llvm_init(
+            WriterCodegen {
+                ctx,
+                module,
+                builder,
+            },
+            runtime_ptr,
+        );
+        BoundWriter {
+            writer,
+            runtime_ptr,
+        }
     }
 
     pub fn for_base_type_of_datum(datum: &dyn Datum) -> Self {
@@ -383,16 +404,19 @@ impl WriterSpec {
             | DataType::LargeUtf8
             | DataType::Utf8View => Self::String,
             DataType::FixedSizeList(field, len) => Self::FixedSizeList(
-                ListItemType::for_arrow_type(field.data_type()),
+                Box::new(Self::for_data_type(field.data_type())),
                 len as usize,
             ),
-            dt => Self::Primitive(PrimitiveType::for_arrow_type(&dt)),
+            DataType::List(field) => Self::List(Box::new(Self::for_data_type(field.data_type()))),
+            DataType::LargeList(field) => {
+                Self::LargeList(Box::new(Self::for_data_type(field.data_type())))
+            }
+            dt => Self::for_primitive_type(PrimitiveType::for_arrow_type(&dt)),
         }
     }
 
     pub fn for_data_type(dt: &DataType) -> Self {
         match dt {
-            DataType::Null => todo!(),
             DataType::Boolean => Self::Boolean,
             DataType::Int8
             | DataType::Int16
@@ -411,23 +435,21 @@ impl WriterSpec {
             | DataType::Time32(_)
             | DataType::Time64(_)
             | DataType::Duration(_)
-            | DataType::Interval(_) => Self::Primitive(PrimitiveType::for_arrow_type(dt)),
+            | DataType::Interval(_) => Self::for_primitive_type(PrimitiveType::for_arrow_type(dt)),
             DataType::Binary | DataType::FixedSizeBinary(_) | DataType::Utf8 => Self::String,
             DataType::LargeBinary | DataType::LargeUtf8 => Self::LargeString,
             DataType::BinaryView | DataType::Utf8View => Self::StringView,
-            DataType::List(_) => todo!(),
-            DataType::ListView(_) => todo!(),
             DataType::FixedSizeList(field, len) => Self::FixedSizeList(
-                ListItemType::for_arrow_type(field.data_type()),
+                Box::new(Self::for_data_type(field.data_type())),
                 *len as usize,
             ),
-            DataType::LargeList(_) => todo!(),
-            DataType::LargeListView(_) => todo!(),
-            DataType::Struct(_) => todo!(),
-            DataType::Union(_, _) => todo!(),
+            DataType::List(field) => Self::List(Box::new(Self::for_data_type(field.data_type()))),
+            DataType::LargeList(field) => {
+                Self::LargeList(Box::new(Self::for_data_type(field.data_type())))
+            }
             DataType::Dictionary(key, values) => Self::Dictionary(
-                DictionaryKeyType::for_data_type(key.as_ref()),
-                Box::new(Self::for_data_type(values.as_ref())),
+                DictionaryKeyType::for_data_type(key),
+                Box::new(Self::for_data_type(values)),
             ),
             DataType::Decimal32(_, _) => todo!(),
             DataType::Decimal64(_, _) => todo!(),
@@ -438,293 +460,86 @@ impl WriterSpec {
                 RunEndType::for_data_type(run_end.data_type()),
                 Box::new(Self::for_data_type(values.data_type())),
             ),
+            _ => todo!("unsupported writer data type {dt}"),
         }
     }
 }
 
-/// Rust-side storage owned by an output writer.
-///
-/// `WriterAllocation` values live outside the generated LLVM function. The JIT
-/// receives [`WriterAllocation::get_ptr`] as an opaque pointer, writes into it,
-/// and the Rust caller later consumes the allocation as an Arrow array.
-///
-/// ```ignore
-/// let mut allocation = spec.allocate(expected_rows);
-/// let raw_ptr = allocation.get_ptr();
-///
-/// run_compiled_kernel(raw_ptr);
-///
-/// let array = allocation.into_array_ref_with_len(output_len, nulls);
-/// ```
-pub enum WriterAllocation {
-    Primitive(ArrayOutput),
-    Boolean(BooleanAllocation),
-    String(StringAllocation<i32>),
-    LargeString(StringAllocation<i64>),
-    StringView(StringViewAllocation),
-    FixedSizeList(FixedSizeListWriterAlloc),
-    Dictionary(Box<DictAllocation>),
-    RunEndEncoded(Box<REEAllocation>),
+pub struct WriterAllocation {
+    runtime: AnyRuntime,
 }
 
 impl WriterAllocation {
     pub fn get_ptr(&mut self) -> *mut c_void {
-        match self {
-            Self::Primitive(alloc) => alloc.get_ptr(),
-            Self::Boolean(alloc) => alloc.get_ptr(),
-            Self::String(alloc) => alloc.get_ptr(),
-            Self::LargeString(alloc) => alloc.get_ptr(),
-            Self::StringView(alloc) => alloc.get_ptr(),
-            Self::FixedSizeList(alloc) => alloc.get_ptr(),
-            Self::Dictionary(alloc) => alloc.get_ptr(),
-            Self::RunEndEncoded(alloc) => alloc.get_ptr(),
-        }
+        self.runtime.as_ptr()
     }
 
     pub fn reserve_for_additional(&mut self, count: usize) {
-        match self {
-            Self::Primitive(alloc) => alloc.reserve_for_additional(count),
-            Self::Boolean(alloc) => alloc.reserve_for_additional(count),
-            Self::String(alloc) => alloc.reserve_for_additional(count),
-            Self::LargeString(alloc) => alloc.reserve_for_additional(count),
-            Self::StringView(alloc) => alloc.reserve_for_additional(count),
-            Self::FixedSizeList(alloc) => alloc.reserve_for_additional(count),
-            Self::Dictionary(alloc) => alloc.reserve_for_additional(count),
-            Self::RunEndEncoded(alloc) => alloc.reserve_for_additional(count),
-        }
-    }
-
-    pub fn rewind_one(&mut self) {
-        match self {
-            Self::Primitive(alloc) => alloc.rewind_one(),
-            Self::Boolean(alloc) => alloc.rewind_one(),
-            Self::String(alloc) => alloc.rewind_one(),
-            Self::LargeString(alloc) => alloc.rewind_one(),
-            Self::StringView(alloc) => alloc.rewind_one(),
-            Self::FixedSizeList(alloc) => alloc.rewind_one(),
-            Self::Dictionary(_) => {
-                panic!("rewind_one unsupported for dictionary writer allocation")
-            }
-            Self::RunEndEncoded(_) => {
-                panic!("rewind_one unsupported for run-end writer allocation")
-            }
-        }
+        self.runtime.reserve_for_additional(count).unwrap();
     }
 
     pub fn len(&self) -> usize {
-        match self {
-            Self::Primitive(alloc) => alloc.len(),
-            Self::Boolean(alloc) => alloc.len(),
-            Self::String(alloc) => alloc.len(),
-            Self::LargeString(alloc) => alloc.len(),
-            Self::StringView(alloc) => alloc.len(),
-            Self::FixedSizeList(alloc) => alloc.len(),
-            Self::Dictionary(alloc) => alloc.len(),
-            Self::RunEndEncoded(alloc) => alloc.len(),
-        }
+        self.runtime.len()
     }
 
     pub fn into_array_ref_with_len(self, len: usize, nulls: Option<NullBuffer>) -> ArrayRef {
-        match self {
-            Self::Primitive(alloc) => alloc.to_array(len, nulls),
-            Self::Boolean(alloc) => Arc::new(alloc.to_array(len, nulls)),
-            Self::String(alloc) => Arc::new(alloc.to_array(len, nulls)),
-            Self::LargeString(alloc) => Arc::new(alloc.to_array(len, nulls)),
-            Self::StringView(alloc) => Arc::new(alloc.to_array(len, nulls)),
-            Self::FixedSizeList(alloc) => Arc::new(alloc.to_array(len, nulls)),
-            Self::Dictionary(alloc) => alloc.into_array_ref_with_len(len, nulls),
-            Self::RunEndEncoded(alloc) => alloc.into_array_ref_with_len(len, nulls),
+        let array = self.runtime.to_array(len).unwrap();
+        if nulls.is_none() {
+            return array;
         }
+        let data = array.to_data().into_builder().nulls(nulls);
+        make_array(unsafe { data.build_unchecked() })
     }
 
     pub fn into_array_ref(self, nulls: Option<NullBuffer>) -> ArrayRef {
-        match self {
-            Self::Primitive(alloc) => alloc.to_array_ref(nulls),
-            Self::Boolean(alloc) => alloc.to_array_ref(nulls),
-            Self::String(alloc) => alloc.to_array_ref(nulls),
-            Self::LargeString(alloc) => alloc.to_array_ref(nulls),
-            Self::StringView(alloc) => alloc.to_array_ref(nulls),
-            Self::FixedSizeList(alloc) => alloc.to_array_ref(nulls),
-            Self::Dictionary(alloc) => alloc.into_array_ref(nulls),
-            Self::RunEndEncoded(alloc) => alloc.into_array_ref(nulls),
-        }
+        let len = self.len();
+        self.into_array_ref_with_len(len, nulls)
     }
 }
 
-/// Generated writer logic that is not bound to an allocation pointer.
-///
-/// This type owns LLVM helper functions and nested writer state, but it does
-/// not expose public ingest or flush methods. Bind it to a valid LLVM allocation
-/// pointer with [`Writer::bind`] before emitting writes.
-///
-/// Most callers should use [`WriterSpec::llvm_init`], which creates a
-/// [`Writer`] and immediately returns a [`BoundWriter`].
-pub enum Writer<'a> {
-    Primitive(PrimitiveArrayWriter<'a>),
-    Boolean(BooleanWriter<'a>),
-    String(StringArrayWriter<'a, i32>),
-    LargeString(StringArrayWriter<'a, i64>),
-    StringView(StringViewWriter<'a>),
-    FixedSizeList(FixedSizeListWriter<'a>),
-    Dictionary(Box<DictWriter<'a>>),
-    RunEndEncoded(Box<REEWriter<'a>>),
+pub struct BoundWriter<'ctx> {
+    writer: AnyWriter,
+    runtime_ptr: PointerValue<'ctx>,
 }
 
-impl<'a> Writer<'a> {
-    /// Attach this writer logic to the allocation pointer currently valid in
-    /// the emitted LLVM IR.
-    pub fn bind(self, alloc_ptr: PointerValue<'a>) -> BoundWriter<'a, 'a> {
-        BoundWriter {
-            writer: BoundWriterTarget::Owned(self),
-            alloc_ptr,
-        }
-    }
-
-    fn emit_ingest(
-        &self,
-        ctx: &'a Context,
-        build: &Builder<'a>,
-        alloc_ptr: PointerValue<'a>,
-        val: BasicValueEnum<'a>,
+impl<'ctx> BoundWriter<'ctx> {
+    pub fn llvm_ingest<'call>(
+        &'call self,
+        ctx: &'ctx Context,
+        module: &'call Module<'ctx>,
+        builder: &'call Builder<'ctx>,
+        value: BasicValueEnum<'ctx>,
     ) {
-        match self {
-            Self::Primitive(writer) => writer.emit_ingest(build, alloc_ptr, val),
-            Self::Boolean(writer) => writer.emit_ingest(ctx, build, alloc_ptr, val),
-            Self::String(writer) => writer.emit_ingest(build, alloc_ptr, val),
-            Self::LargeString(writer) => writer.emit_ingest(build, alloc_ptr, val),
-            Self::StringView(writer) => writer.emit_ingest(build, alloc_ptr, val),
-            Self::FixedSizeList(writer) => writer.emit_ingest(ctx, build, alloc_ptr, val),
-            Self::Dictionary(writer) => writer.emit_ingest(ctx, build, alloc_ptr, val),
-            Self::RunEndEncoded(writer) => writer.emit_ingest(ctx, build, alloc_ptr, val),
-        }
+        self.writer
+            .llvm_write(
+                WriterCodegen {
+                    ctx,
+                    module,
+                    builder,
+                },
+                self.runtime_ptr,
+                |emitter| emitter.emit(value),
+            )
+            .unwrap();
     }
 
-    fn emit_ingest_block(
-        &self,
-        ctx: &'a Context,
-        build: &Builder<'a>,
-        alloc_ptr: PointerValue<'a>,
-        vals: VectorValue<'a>,
+    pub fn llvm_ingest_block<'call>(
+        &'call self,
+        ctx: &'ctx Context,
+        module: &'call Module<'ctx>,
+        builder: &'call Builder<'ctx>,
+        values: VectorValue<'ctx>,
     ) {
-        match self {
-            Self::Primitive(writer) => writer.emit_ingest_block(build, alloc_ptr, vals),
-            Self::Boolean(writer) => writer.emit_ingest_block(ctx, build, alloc_ptr, vals),
-            Self::String(_)
-            | Self::LargeString(_)
-            | Self::StringView(_)
-            | Self::FixedSizeList(_) => {
-                let i64_type = ctx.i64_type();
-                for idx in 0..vals.get_type().get_size() {
-                    let val = build
-                        .build_extract_element(
-                            vals,
-                            i64_type.const_int(idx as u64, false),
-                            &format!("val{}", idx),
-                        )
-                        .unwrap();
-                    self.emit_ingest(ctx, build, alloc_ptr, val);
-                }
-            }
-            Self::Dictionary(writer) => {
-                let i64_type = ctx.i64_type();
-                for idx in 0..vals.get_type().get_size() {
-                    let val = build
-                        .build_extract_element(
-                            vals,
-                            i64_type.const_int(idx as u64, false),
-                            &format!("val{}", idx),
-                        )
-                        .unwrap();
-                    writer.emit_ingest(ctx, build, alloc_ptr, val);
-                }
-            }
-            Self::RunEndEncoded(writer) => {
-                let i64_type = ctx.i64_type();
-                for idx in 0..vals.get_type().get_size() {
-                    let val = build
-                        .build_extract_element(
-                            vals,
-                            i64_type.const_int(idx as u64, false),
-                            &format!("val{}", idx),
-                        )
-                        .unwrap();
-                    writer.emit_ingest(ctx, build, alloc_ptr, val);
-                }
-            }
-        }
-    }
-
-    fn emit_flush(&self, ctx: &'a Context, build: &Builder<'a>, alloc_ptr: PointerValue<'a>) {
-        match self {
-            Self::Primitive(writer) => writer.emit_flush(ctx, build, alloc_ptr),
-            Self::Boolean(writer) => writer.emit_flush(ctx, build, alloc_ptr),
-            Self::String(writer) => writer.emit_flush(build, alloc_ptr),
-            Self::LargeString(writer) => writer.emit_flush(build, alloc_ptr),
-            Self::StringView(writer) => writer.emit_flush(build, alloc_ptr),
-            Self::FixedSizeList(writer) => writer.emit_flush(ctx, build, alloc_ptr),
-            Self::Dictionary(writer) => writer.emit_flush(ctx, build, alloc_ptr),
-            Self::RunEndEncoded(writer) => writer.emit_flush(ctx, build, alloc_ptr),
-        }
-    }
-}
-
-enum BoundWriterTarget<'a, 'w> {
-    Owned(Writer<'a>),
-    Borrowed(&'w Writer<'a>),
-}
-
-/// Writer logic attached to a specific LLVM allocation pointer.
-///
-/// `BoundWriter` is the public API for appending to an output allocation during
-/// IR generation. The allocation pointer must be valid at the point where the
-/// emitted call is inserted.
-///
-/// ```ignore
-/// let writer = spec.llvm_init(ctx, llvm_mod, build, output_alloc_ptr);
-/// writer.llvm_ingest(ctx, build, value);
-/// writer.llvm_flush(ctx, build);
-/// ```
-pub struct BoundWriter<'a, 'w> {
-    writer: BoundWriterTarget<'a, 'w>,
-    alloc_ptr: PointerValue<'a>,
-}
-
-impl<'a, 'w> BoundWriter<'a, 'w> {
-    fn writer(&self) -> &Writer<'a> {
-        match &self.writer {
-            BoundWriterTarget::Owned(writer) => writer,
-            BoundWriterTarget::Borrowed(writer) => writer,
-        }
-    }
-
-    /// Reuse this writer logic with another allocation pointer.
-    ///
-    /// This is primarily for composite writers. For example, a dictionary
-    /// writer can derive the keys and values allocation pointers from its
-    /// parent allocation and temporarily bind child writer logic to those
-    /// derived pointers before emitting child appends.
-    pub fn with_alloc<'b>(&'b self, alloc_ptr: PointerValue<'a>) -> BoundWriter<'a, 'b> {
-        BoundWriter {
-            writer: BoundWriterTarget::Borrowed(self.writer()),
-            alloc_ptr,
-        }
-    }
-
-    /// Emit IR that appends one value into this bound allocation.
-    pub fn llvm_ingest(&self, ctx: &'a Context, build: &Builder<'a>, val: BasicValueEnum<'a>) {
-        self.writer().emit_ingest(ctx, build, self.alloc_ptr, val);
-    }
-
-    /// Emit IR that appends each lane of a vector value into this bound
-    /// allocation.
-    pub fn llvm_ingest_block(&self, ctx: &'a Context, build: &Builder<'a>, vals: VectorValue<'a>) {
-        self.writer()
-            .emit_ingest_block(ctx, build, self.alloc_ptr, vals);
-    }
-
-    /// Emit IR that flushes any buffered writer state into this bound
-    /// allocation.
-    pub fn llvm_flush(&self, ctx: &'a Context, build: &Builder<'a>) {
-        self.writer().emit_flush(ctx, build, self.alloc_ptr);
+        self.writer
+            .llvm_write_multiple(
+                WriterCodegen {
+                    ctx,
+                    module,
+                    builder,
+                },
+                self.runtime_ptr,
+                values,
+            )
+            .unwrap();
     }
 }

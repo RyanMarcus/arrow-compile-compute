@@ -52,7 +52,7 @@ impl StringIterator {
     pub fn llvm_get_offset_ptr<'a>(
         &self,
         ctx: &'a Context,
-        build: &'a Builder,
+        build: &Builder<'a>,
         ptr: PointerValue<'a>,
     ) -> PointerValue<'a> {
         let offset_ptr_ptr = increment_pointer!(ctx, build, ptr, StringIterator::OFFSET_OFFSETS);
@@ -74,7 +74,7 @@ impl StringIterator {
     pub fn llvm_get_data_ptr<'a>(
         &self,
         ctx: &'a Context,
-        build: &'a Builder,
+        build: &Builder<'a>,
         ptr: PointerValue<'a>,
     ) -> PointerValue<'a> {
         let data_ptr_ptr = increment_pointer!(ctx, build, ptr, StringIterator::OFFSET_DATA);
@@ -109,7 +109,7 @@ impl StringIterator {
     pub fn llvm_len<'a>(
         &self,
         ctx: &'a Context,
-        build: &'a Builder,
+        build: &Builder<'a>,
         ptr: PointerValue<'a>,
     ) -> IntValue<'a> {
         let len_ptr = increment_pointer!(ctx, build, ptr, StringIterator::OFFSET_LEN);
@@ -212,7 +212,7 @@ impl LargeStringIterator {
     pub fn llvm_len<'a>(
         &self,
         ctx: &'a Context,
-        build: &'a Builder,
+        build: &Builder<'a>,
         ptr: PointerValue<'a>,
     ) -> IntValue<'a> {
         let len_ptr = increment_pointer!(ctx, build, ptr, LargeStringIterator::OFFSET_LEN);

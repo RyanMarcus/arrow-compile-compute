@@ -17,6 +17,25 @@ pub extern "C" fn str_writer_append_bytes(ptr: *const u8, len: u64, vec: *mut c_
     vec.extend_from_slice(bytes);
 }
 
+pub fn llvm_add_str_writer_append_bytes<'ctx>(
+    ctx: &'ctx Context,
+    module: &Module<'ctx>,
+) -> FunctionValue<'ctx> {
+    let ptr_type = ctx.ptr_type(AddressSpace::default());
+    module
+        .get_function("str_writer_append_bytes")
+        .unwrap_or_else(|| {
+            module.add_function(
+                "str_writer_append_bytes",
+                ctx.void_type().fn_type(
+                    &[ptr_type.into(), ctx.i64_type().into(), ptr_type.into()],
+                    false,
+                ),
+                Some(Linkage::External),
+            )
+        })
+}
+
 #[no_mangle]
 pub extern "C" fn str_view_writer_append_bytes(
     str_ptr: *const u8,

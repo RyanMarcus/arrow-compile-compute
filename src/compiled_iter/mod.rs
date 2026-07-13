@@ -22,7 +22,6 @@ use arrow_array::{
     Array, BooleanArray, Datum, GenericStringArray, Int16RunArray, Int32RunArray, Int64RunArray,
 };
 
-use arrow_buffer::bit_util;
 use arrow_schema::DataType;
 use bitmap::BitmapIterator;
 use dictionary::DictionaryIterator;
@@ -51,130 +50,6 @@ use crate::{
     declare_blocks, increment_pointer, mark_load_invariant, set_noalias_params, ArrowKernelError,
     ListItemType, PrimitiveType,
 };
-
-// Load up to 64 Arrow-packed boolean values into the low bits of a u64.
-pub(crate) unsafe extern "C" fn load_packed_bool_chunk(
-    data: *const u8,
-    start_bit: u64,
-    len: u64,
-) -> u64 {
-    debug_assert!(len <= 64);
-    let mut out = 0_u64;
-    for bit in 0..len {
-        if unsafe { bit_util::get_bit_raw(data, (start_bit + bit) as usize) } {
-            out |= 1_u64 << bit;
-        }
-    }
-    out
-}
-
-pub(crate) fn add_load_packed_bool_chunk<'a>(
-    ctx: &'a Context,
-    module: &Module<'a>,
-) -> FunctionValue<'a> {
-    module
-        .get_function("load_packed_bool_chunk_ir")
-        .unwrap_or_else(|| {
-            let ptr_type = ctx.ptr_type(AddressSpace::default());
-            let i64_type = ctx.i64_type();
-            let i8_type = ctx.i8_type();
-            let func = module.add_function(
-                "load_packed_bool_chunk_ir",
-                i64_type.fn_type(&[ptr_type.into(), i64_type.into(), i64_type.into()], false),
-                Some(Linkage::Private),
-            );
-            let build = ctx.create_builder();
-            declare_blocks!(ctx, func, entry, loop_cond, loop_body, done);
-
-            build.position_at_end(entry);
-            let data_ptr = func.get_nth_param(0).unwrap().into_pointer_value();
-            let start_bit = func.get_nth_param(1).unwrap().into_int_value();
-            let len = func.get_nth_param(2).unwrap().into_int_value();
-            let out_ptr = build.build_alloca(i64_type, "packed_out").unwrap();
-            let bit_ptr = build.build_alloca(i64_type, "packed_bit").unwrap();
-            build.build_store(out_ptr, i64_type.const_zero()).unwrap();
-            build.build_store(bit_ptr, i64_type.const_zero()).unwrap();
-            build.build_unconditional_branch(loop_cond).unwrap();
-
-            build.position_at_end(loop_cond);
-            let bit = build
-                .build_load(i64_type, bit_ptr, "packed_bit")
-                .unwrap()
-                .into_int_value();
-            let keep_going = build
-                .build_int_compare(IntPredicate::ULT, bit, len, "packed_keep_going")
-                .unwrap();
-            build
-                .build_conditional_branch(keep_going, loop_body, done)
-                .unwrap();
-
-            build.position_at_end(loop_body);
-            let absolute_bit = build
-                .build_int_add(start_bit, bit, "packed_absolute_bit")
-                .unwrap();
-            let byte_idx = build
-                .build_right_shift(
-                    absolute_bit,
-                    i64_type.const_int(3, false),
-                    false,
-                    "packed_byte_idx",
-                )
-                .unwrap();
-            let bit_in_byte = build
-                .build_and(
-                    absolute_bit,
-                    i64_type.const_int(7, false),
-                    "packed_bit_in_byte",
-                )
-                .unwrap();
-            let byte_ptr = increment_pointer!(ctx, build, data_ptr, 1, byte_idx);
-            let byte = build
-                .build_load(i8_type, byte_ptr, "packed_byte")
-                .unwrap()
-                .into_int_value();
-            let bit_in_byte_i8 = build
-                .build_int_truncate(bit_in_byte, i8_type, "packed_bit_in_byte_i8")
-                .unwrap();
-            let shifted_byte = build
-                .build_right_shift(byte, bit_in_byte_i8, false, "packed_shifted_byte")
-                .unwrap();
-            let loaded_bit = build
-                .build_and(
-                    shifted_byte,
-                    i8_type.const_int(1, false),
-                    "packed_loaded_bit",
-                )
-                .unwrap();
-            let loaded_bit_i64 = build
-                .build_int_z_extend(loaded_bit, i64_type, "packed_loaded_bit_i64")
-                .unwrap();
-            let shifted_out_bit = build
-                .build_left_shift(loaded_bit_i64, bit, "packed_shifted_out_bit")
-                .unwrap();
-            let old_out = build
-                .build_load(i64_type, out_ptr, "packed_old_out")
-                .unwrap()
-                .into_int_value();
-            let new_out = build
-                .build_or(old_out, shifted_out_bit, "packed_new_out")
-                .unwrap();
-            build.build_store(out_ptr, new_out).unwrap();
-            let next_bit = build
-                .build_int_add(bit, i64_type.const_int(1, false), "packed_next_bit")
-                .unwrap();
-            build.build_store(bit_ptr, next_bit).unwrap();
-            build.build_unconditional_branch(loop_cond).unwrap();
-
-            build.position_at_end(done);
-            let out = build
-                .build_load(i64_type, out_ptr, "packed_out")
-                .unwrap()
-                .into_int_value();
-            build.build_return(Some(&out)).unwrap();
-
-            func
-        })
-}
 
 fn build_fixed_size_list_value<'a>(
     ctx: &'a Context,
@@ -208,42 +83,36 @@ fn build_fixed_size_list_value<'a>(
 
     match ptype {
         PrimitiveType::List(ListItemType::Boolean, size) => {
-            let IteratorHolder::Bitmap(child_iter) = iter.child() else {
-                unreachable!("fixed-size-list boolean child must use a bitmap iterator");
-            };
-            let data_ptr = child_iter.llvm_get_data_ptr(ctx, build, child_iter_ptr);
-            let slice_offset = child_iter.llvm_slice_offset(ctx, build, child_iter_ptr);
-            let start_bit = build
-                .build_int_add(slice_offset, base_idx, "fsl_bool_start_bit")
-                .unwrap();
-            let load_chunk = add_load_packed_bool_chunk(ctx, llvm_mod);
-            let mut out = llvm_type.into_array_type().const_zero();
-            for chunk in 0..size.div_ceil(64) {
-                let chunk_start = build
+            let mut out = llvm_type.into_vector_type().const_zero();
+            for lane in 0..size as u64 {
+                let child_idx = build
                     .build_int_add(
-                        start_bit,
-                        i64_type.const_int((chunk * 64) as u64, false),
-                        "fsl_bool_chunk_start",
+                        base_idx,
+                        i64_type.const_int(lane, false),
+                        "fsl_bool_child_idx",
                     )
                     .unwrap();
-                let chunk_len = (size - chunk * 64).min(64);
                 let value = build
                     .build_call(
-                        load_chunk,
-                        &[
-                            data_ptr.into(),
-                            chunk_start.into(),
-                            i64_type.const_int(chunk_len as u64, false).into(),
-                        ],
-                        "fsl_bool_chunk",
+                        child_access,
+                        &[child_iter_ptr.into(), child_idx.into()],
+                        "fsl_bool_value",
                     )
                     .unwrap()
                     .try_as_basic_value()
-                    .unwrap_basic();
+                    .unwrap_basic()
+                    .into_int_value();
+                let value = build
+                    .build_int_truncate(value, ctx.bool_type(), "fsl_bool_value_i1")
+                    .unwrap();
                 out = build
-                    .build_insert_value(out, value, chunk as u32, "fsl_bool_insert_chunk")
-                    .unwrap()
-                    .into_array_value();
+                    .build_insert_element(
+                        out,
+                        value,
+                        i64_type.const_int(lane, false),
+                        "fsl_bool_insert",
+                    )
+                    .unwrap();
             }
             Some(out.as_basic_value_enum())
         }
@@ -2602,7 +2471,7 @@ pub fn generate_random_access<'a>(
 /// `@llvm.assume` when two iterators have equal length.
 pub fn get_iterator_length<'a>(
     ctx: &'a Context,
-    builder: &'a Builder,
+    builder: &Builder<'a>,
     ih: &IteratorHolder,
     iter_ptr: PointerValue<'a>,
 ) -> Option<IntValue<'a>> {
