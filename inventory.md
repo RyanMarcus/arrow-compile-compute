@@ -28,6 +28,7 @@ Nothing here is inferred from what a compute engine "usually" has.
 |---|---|---|
 | `add`, `sub`/`sub_wrapping`, `mul`/`mul_wrapping`, `div`, `rem` | `BinOpKernel` | array-vs-array or array-vs-scalar, all numeric types |
 | `neg_wrapping` | `UnaryOpKernel` | arithmetic negation, all numeric types; wrapping semantics only (no checked `neg`) |
+| `abs` | `UnaryOpKernel` | absolute value; value semantics match pyarrow's C++ `AbsoluteValue` on shared types — signed-int overflow wraps (`abs(i32::MIN) == i32::MIN`), unsigned is identity, floats use IEEE `fabs`; wrapping only (no checked `abs`). Type-domain differs from pyarrow: **no** decimal128/256 or duration (currently panics via `for_arrow_type`), and **does** accept float16 (pyarrow does not register `abs` for it). |
 | `eq`, `neq`, `lt`, `lt_eq`, `gt`, `gt_eq` | `ComparisonKernel` | numeric + string |
 | `cast`, `cast_with_options` | `CastKernel` | numeric↔numeric, binary↔utf8, boolean↔numeric, primitive↔dict, dict→StringView, REE value cast, FixedSizeList element cast |
 | `filter`, `filter_record_batch` | `FilterKernel` | all array types |

@@ -116,6 +116,7 @@ impl Kernel for UnaryOpKernel {
             DSLStmt::for_each(&mut ctx, &[arg], |loop_vars| {
                 let el = match params {
                     DSLUnaryOp::Neg => loop_vars[0].expr().neg()?,
+                    DSLUnaryOp::Abs => loop_vars[0].expr().abs()?,
                 };
                 DSLStmt::emit(0, el)
             })
@@ -166,46 +167,127 @@ mod tests {
         }
     }
 
+    // These test `Neg` directly rather than iterating `DSLUnaryOp::iter()`:
+    // not every unary op has an arrow oracle (`abs` has none, so its
+    // `arrow_compute` arm is `unreachable!`), so a shared-oracle loop can't
+    // cover all variants. `abs` is verified by the dedicated `test_abs_*` tests.
     #[test]
     fn test_neg_i32() {
         let arr = Int32Array::from(vec![1, 0, 2, -4, -10, 20, i32::MIN, i32::MAX]);
-        for op in DSLUnaryOp::iter() {
-            let k = UnaryOpKernel::compile(&(&arr as &dyn Datum), op).unwrap();
-            let res = k.call(&arr).unwrap();
-            let res = res.as_primitive::<Int32Type>();
+        let k = UnaryOpKernel::compile(&(&arr as &dyn Datum), DSLUnaryOp::Neg).unwrap();
+        let res = k.call(&arr).unwrap();
+        let res = res.as_primitive::<Int32Type>();
 
-            let arrow_res = op.arrow_compute(&arr);
-            let arrow_res = arrow_res.as_primitive::<Int32Type>();
-            assert_eq!(res, arrow_res, "failed for op {:?}", op);
-        }
+        let arrow_res = DSLUnaryOp::Neg.arrow_compute(&arr);
+        let arrow_res = arrow_res.as_primitive::<Int32Type>();
+        assert_eq!(res, arrow_res);
     }
 
     #[test]
     fn test_neg_f32() {
         let arr = Float32Array::from(vec![1.0, 0.0, -2.0, 4.0, -10.0, 20.0]);
-        for op in DSLUnaryOp::iter() {
-            let k = UnaryOpKernel::compile(&(&arr as &dyn Datum), op).unwrap();
-            let res = k.call(&arr).unwrap();
-            let res = res.as_primitive::<Float32Type>();
+        let k = UnaryOpKernel::compile(&(&arr as &dyn Datum), DSLUnaryOp::Neg).unwrap();
+        let res = k.call(&arr).unwrap();
+        let res = res.as_primitive::<Float32Type>();
 
-            let arrow_res = op.arrow_compute(&arr);
-            let arrow_res = arrow_res.as_primitive::<Float32Type>();
-            assert_eq!(res, arrow_res, "failed for op {:?}", op);
-        }
+        let arrow_res = DSLUnaryOp::Neg.arrow_compute(&arr);
+        let arrow_res = arrow_res.as_primitive::<Float32Type>();
+        assert_eq!(res, arrow_res);
     }
 
     #[test]
     fn test_neg_scalar_i32_nulls() {
         let arr = Int32Array::from(vec![Some(1), None, Some(-2), Some(4)]);
-        for op in DSLUnaryOp::iter() {
-            let k = UnaryOpKernel::compile(&(&arr as &dyn Datum), op).unwrap();
-            let res = k.call(&arr).unwrap();
-            let res = res.as_primitive::<Int32Type>();
+        let k = UnaryOpKernel::compile(&(&arr as &dyn Datum), DSLUnaryOp::Neg).unwrap();
+        let res = k.call(&arr).unwrap();
+        let res = res.as_primitive::<Int32Type>();
 
-            let arrow_res = op.arrow_compute(&arr);
-            let arrow_res = arrow_res.as_primitive::<Int32Type>();
-            assert_eq!(res, arrow_res, "failed for op {:?}", op);
+        let arrow_res = DSLUnaryOp::Neg.arrow_compute(&arr);
+        let arrow_res = arrow_res.as_primitive::<Int32Type>();
+        assert_eq!(res, arrow_res);
+    }
+
+    #[test]
+    fn test_abs_i32() {
+        // hard-coded edge inputs: MIN wraps to itself, MAX, 0, negatives
+        let arr = Int32Array::from(vec![0, 1, -1, 4, -10, i32::MAX, i32::MIN, -(i32::MAX)]);
+        let k = UnaryOpKernel::compile(&(&arr as &dyn Datum), DSLUnaryOp::Abs).unwrap();
+        let res = k.call(&arr).unwrap();
+        let res = res.as_primitive::<Int32Type>();
+
+        let expected = Int32Array::from(
+            (0..arr.len())
+                .map(|i| arr.value(i).wrapping_abs())
+                .collect::<Vec<_>>(),
+        );
+        assert_eq!(res, &expected);
+    }
+
+    #[test]
+    fn test_abs_u32_identity() {
+        // unsigned abs is the identity
+        let arr = UInt32Array::from(vec![0, 1, 5, u32::MAX, 900000]);
+        let k = UnaryOpKernel::compile(&(&arr as &dyn Datum), DSLUnaryOp::Abs).unwrap();
+        let res = k.call(&arr).unwrap();
+        let res = res.as_primitive::<UInt32Type>();
+
+        let expected = UInt32Array::from(
+            (0..arr.len()).map(|i| arr.value(i)).collect::<Vec<_>>(),
+        );
+        assert_eq!(res, &expected);
+    }
+
+    #[test]
+    fn test_abs_f64() {
+        // hard-coded float edge inputs: NaN, +/-inf, -0.0, 0.0, negatives
+        let arr = Float64Array::from(vec![
+            0.0,
+            -0.0,
+            1.0,
+            -2.5,
+            f64::INFINITY,
+            f64::NEG_INFINITY,
+            f64::NAN,
+            -f64::NAN,
+        ]);
+        let k = UnaryOpKernel::compile(&(&arr as &dyn Datum), DSLUnaryOp::Abs).unwrap();
+        let res = k.call(&arr).unwrap();
+        let res = res.as_primitive::<Float64Type>();
+
+        for i in 0..arr.len() {
+            let expected = arr.value(i).abs();
+            let got = res.value(i);
+            if expected.is_nan() {
+                assert!(got.is_nan(), "expected NaN at {i}, got {got}");
+            } else {
+                // compare bit patterns so -0.0 vs 0.0 is distinguished
+                assert_eq!(
+                    got.to_bits(),
+                    expected.to_bits(),
+                    "mismatch at {i}: got {got}, expected {expected}"
+                );
+            }
         }
+    }
+
+    #[test]
+    fn test_abs_i32_nulls() {
+        let arr = Int32Array::from(vec![Some(1), None, Some(-2), Some(i32::MIN)]);
+        let k = UnaryOpKernel::compile(&(&arr as &dyn Datum), DSLUnaryOp::Abs).unwrap();
+        let res = k.call(&arr).unwrap();
+        let res = res.as_primitive::<Int32Type>();
+
+        let expected = Int32Array::from(vec![Some(1), None, Some(2), Some(i32::MIN)]);
+        assert_eq!(res, &expected);
+    }
+
+    #[test]
+    fn test_abs_empty() {
+        let arr = Int32Array::from(Vec::<i32>::new());
+        let k = UnaryOpKernel::compile(&(&arr as &dyn Datum), DSLUnaryOp::Abs).unwrap();
+        let res = k.call(&arr).unwrap();
+        let res = res.as_primitive::<Int32Type>();
+        assert_eq!(res.len(), 0);
     }
 
     #[test]

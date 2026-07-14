@@ -1989,6 +1989,65 @@ fn compile_expr<'ctx, 'a>(
             }
         }
 
+        DSLExpr::Abs(v) => {
+            let value = compile_expr(ctx, v)?;
+            // `false` for the intrinsic's `is_int_min_poison` operand keeps the
+            // wrapping semantics: abs(iN::MIN) == iN::MIN.
+            let no_poison = ctx.ctx.bool_type().const_zero();
+            match v.get_type() {
+                // unsigned integers are already non-negative, so abs is identity
+                DSLType::Primitive(pt) if pt.is_int() && !pt.is_signed() => Ok(value),
+                DSLType::Primitive(pt) if pt.is_int() => {
+                    let abs = Intrinsic::find("llvm.abs").unwrap();
+                    let abs = abs.get_declaration(ctx.module, &[value.get_type()]).unwrap();
+                    Ok(ctx
+                        .b
+                        .build_call(abs, &[value.into(), no_poison.into()], "abs")
+                        .unwrap()
+                        .try_as_basic_value()
+                        .unwrap_basic())
+                }
+                DSLType::Primitive(pt) if pt.is_float() => {
+                    let fabs = Intrinsic::find("llvm.fabs").unwrap();
+                    let fabs = fabs.get_declaration(ctx.module, &[value.get_type()]).unwrap();
+                    Ok(ctx
+                        .b
+                        .build_call(fabs, &[value.into()], "abs")
+                        .unwrap()
+                        .try_as_basic_value()
+                        .unwrap_basic())
+                }
+                DSLType::Primitive(PrimitiveType::List(item, _)) => {
+                    let inner = PrimitiveType::from(item);
+                    if inner.is_float() {
+                        let fabs = Intrinsic::find("llvm.fabs").unwrap();
+                        let fabs = fabs.get_declaration(ctx.module, &[value.get_type()]).unwrap();
+                        Ok(ctx
+                            .b
+                            .build_call(fabs, &[value.into()], "abs")
+                            .unwrap()
+                            .try_as_basic_value()
+                            .unwrap_basic())
+                    } else if inner.is_signed() {
+                        let abs = Intrinsic::find("llvm.abs").unwrap();
+                        let abs = abs.get_declaration(ctx.module, &[value.get_type()]).unwrap();
+                        Ok(ctx
+                            .b
+                            .build_call(abs, &[value.into(), no_poison.into()], "abs")
+                            .unwrap()
+                            .try_as_basic_value()
+                            .unwrap_basic())
+                    } else {
+                        Ok(value)
+                    }
+                }
+                _ => Err(ArrowKernelError::DSLInvalidType(
+                    "invalid type for abs",
+                    v.get_type(),
+                )),
+            }
+        }
+
         DSLExpr::Select(cond, v1, v2) => {
             let cond_v = compile_expr(ctx, cond)?.into_int_value();
             let v1_v = compile_expr(ctx, v1)?;

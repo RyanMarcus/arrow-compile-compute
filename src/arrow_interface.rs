@@ -976,6 +976,17 @@ pub mod arith {
         UNARYOP_PROGRAM_CACHE.get(value, DSLUnaryOp::Neg)
     }
 
+    /// Compute the absolute value of each element.
+    ///
+    /// Signed integer overflow wraps (`abs(i32::MIN) == i32::MIN`); this matches
+    /// `pyarrow.compute.abs` (whose docs state results wrap on integer overflow)
+    /// and, like the rest of this crate, provides no checked variant. Unsigned
+    /// integers are returned unchanged, and floats follow IEEE `fabs`
+    /// (`abs(NaN)` is `NaN`, `abs(-0.0)` is `0.0`).
+    pub fn abs(value: &dyn Datum) -> Result<ArrayRef, ArrowKernelError> {
+        UNARYOP_PROGRAM_CACHE.get(value, DSLUnaryOp::Abs)
+    }
+
     pub fn add(left: &dyn Datum, right: &dyn Datum) -> Result<ArrayRef, ArrowKernelError> {
         BINOP_PROGRAM_CACHE.get((left, right), DSLArithBinOp::Add)
     }
