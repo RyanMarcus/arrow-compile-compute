@@ -43,7 +43,7 @@ impl DictionaryIterator {
     pub fn llvm_key_iter_ptr<'a>(
         &self,
         ctx: &'a Context,
-        builder: &'a Builder,
+        builder: &Builder<'a>,
         ptr: PointerValue<'a>,
     ) -> PointerValue<'a> {
         let ptr_ptr = increment_pointer!(ctx, builder, ptr, DictionaryIterator::OFFSET_KEY_ITER);

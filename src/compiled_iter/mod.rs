@@ -2469,7 +2469,7 @@ pub fn generate_random_access<'a>(
 /// `@llvm.assume` when two iterators have equal length.
 pub fn get_iterator_length<'a>(
     ctx: &'a Context,
-    builder: &'a Builder,
+    builder: &Builder<'a>,
     ih: &IteratorHolder,
     iter_ptr: PointerValue<'a>,
 ) -> Option<IntValue<'a>> {

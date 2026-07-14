@@ -59,7 +59,7 @@ impl ViewIterator {
     pub fn llvm_pos<'a>(
         &self,
         ctx: &'a Context,
-        build: &'a Builder,
+        build: &Builder<'a>,
         ptr: PointerValue<'a>,
     ) -> IntValue<'a> {
         let pos_ptr = increment_pointer!(ctx, build, ptr, ViewIterator::OFFSET_POS);
@@ -72,7 +72,7 @@ impl ViewIterator {
     pub fn llvm_len<'a>(
         &self,
         ctx: &'a Context,
-        build: &'a Builder,
+        build: &Builder<'a>,
         ptr: PointerValue<'a>,
     ) -> IntValue<'a> {
         let len_ptr = increment_pointer!(ctx, build, ptr, ViewIterator::OFFSET_LEN);

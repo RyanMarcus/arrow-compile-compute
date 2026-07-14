@@ -45,7 +45,7 @@ impl PrimitiveIterator {
     pub fn llvm_len<'a>(
         &self,
         ctx: &'a Context,
-        builder: &'a Builder,
+        builder: &Builder<'a>,
         ptr: PointerValue<'a>,
     ) -> IntValue<'a> {
         let len_ptr = increment_pointer!(ctx, builder, ptr, PrimitiveIterator::OFFSET_LEN);
