@@ -2,16 +2,15 @@ use arrow_array::{make_array, ArrayRef};
 use arrow_buffer::Buffer;
 use arrow_data::ArrayDataBuilder;
 use inkwell::{
-    builder::Builder,
-    context::Context,
-    module::Module,
     values::{BasicValue, BasicValueEnum, PointerValue},
     AddressSpace,
 };
 use repr_offset::ReprOffset;
 
 use crate::{
-    compiled_writers2::{AnyRuntime, AnyWriterEmitter, Writer, WriterEmitter, WriterRuntime},
+    compiled_writers2::{
+        AnyRuntime, AnyWriterEmitter, Writer, WriterCodegen, WriterEmitter, WriterRuntime,
+    },
     increment_pointer, ArrowKernelError, PrimitiveType,
 };
 
@@ -109,19 +108,16 @@ impl Writer for PrimitiveWriter {
         pwr.into()
     }
 
-    fn llvm_init<'a>(
+    fn llvm_init<'ctx, 'borrow>(
         &self,
-        _ctx: &'a Context,
-        _build: &Builder<'a>,
-        _runtime_ptr: PointerValue<'a>,
+        _codegen: WriterCodegen<'ctx, 'borrow>,
+        _runtime_ptr: PointerValue<'ctx>,
     ) {
     }
 
     fn llvm_write<'ctx, 'borrow, F>(
         &'borrow self,
-        ctx: &'ctx Context,
-        _module: &'borrow Module<'ctx>,
-        b: &'borrow Builder<'ctx>,
+        codegen: WriterCodegen<'ctx, 'borrow>,
         runtime_ptr: PointerValue<'ctx>,
         f: F,
     ) -> Result<(), ArrowKernelError>
@@ -129,8 +125,7 @@ impl Writer for PrimitiveWriter {
         F: Fn(&mut AnyWriterEmitter<'ctx, 'borrow>) -> Result<(), ArrowKernelError>,
     {
         let mut emitter = PrimitiveWriterEmitter {
-            ctx,
-            b,
+            codegen,
             runtime_ptr,
             pt: self.pt,
             used: false,
@@ -141,8 +136,7 @@ impl Writer for PrimitiveWriter {
 }
 
 pub struct PrimitiveWriterEmitter<'ctx, 'borrow> {
-    ctx: &'ctx Context,
-    b: &'borrow Builder<'ctx>,
+    codegen: WriterCodegen<'ctx, 'borrow>,
     runtime_ptr: PointerValue<'ctx>,
     pt: PrimitiveType,
     used: bool,
@@ -157,23 +151,33 @@ impl<'ctx, 'borrow> WriterEmitter<'ctx, 'borrow> for PrimitiveWriterEmitter<'ctx
         }
         self.used = true;
 
-        let ptr_type = self.ctx.ptr_type(AddressSpace::default());
+        let ptr_type = self.codegen.ctx.ptr_type(AddressSpace::default());
         let curr_alloc_ptr_ptr = increment_pointer!(
-            self.ctx,
-            self.b,
+            self.codegen.ctx,
+            self.codegen.builder,
             self.runtime_ptr,
             PrimitiveWriterRuntime::OFFSET_ALLOC_PTR
         );
         let curr_alloc_ptr = self
-            .b
+            .codegen
+            .builder
             .build_load(ptr_type, curr_alloc_ptr_ptr, "curr_alloc_ptr")
             .unwrap()
             .as_basic_value_enum()
             .into_pointer_value();
-        self.b.build_store(curr_alloc_ptr, val).unwrap();
+        self.codegen
+            .builder
+            .build_store(curr_alloc_ptr, val)
+            .unwrap();
 
-        let new_alloc_ptr = increment_pointer!(self.ctx, self.b, curr_alloc_ptr, self.pt.width());
-        self.b
+        let new_alloc_ptr = increment_pointer!(
+            self.codegen.ctx,
+            self.codegen.builder,
+            curr_alloc_ptr,
+            self.pt.width()
+        );
+        self.codegen
+            .builder
             .build_store(curr_alloc_ptr_ptr, new_alloc_ptr)
             .unwrap();
 
@@ -190,7 +194,7 @@ mod tests {
 
     use super::PrimitiveWriter;
     use crate::{
-        compiled_writers2::{Writer, WriterEmitter, WriterRuntime},
+        compiled_writers2::{Writer, WriterCodegen, WriterEmitter, WriterRuntime},
         declare_blocks, PrimitiveType,
     };
 
@@ -212,11 +216,16 @@ mod tests {
 
         let dest = func.get_nth_param(0).unwrap().into_pointer_value();
         let writer = PrimitiveWriter::compile(PrimitiveType::I32).unwrap();
+        let codegen = WriterCodegen {
+            ctx: &ctx,
+            module: &llvm_mod,
+            builder: &build,
+        };
 
-        writer.llvm_init(&ctx, &build, dest);
+        writer.llvm_init(codegen, dest);
         for value in [17_i32, -4, 99] {
             writer
-                .llvm_write(&ctx, &llvm_mod, &build, dest, |emitter| {
+                .llvm_write(codegen, dest, |emitter| {
                     emitter.emit(
                         ctx.i32_type()
                             .const_int(value as u64, true)
@@ -225,7 +234,7 @@ mod tests {
                 })
                 .unwrap();
         }
-        writer.llvm_flush(&ctx, &llvm_mod, &build, dest);
+        writer.llvm_flush(codegen, dest);
 
         build.build_return(None).unwrap();
         llvm_mod.verify().unwrap();

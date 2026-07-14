@@ -46,17 +46,26 @@ pub trait WriterEmitter<'ctx, 'borrow> {
     fn emit(&mut self, val: BasicValueEnum<'ctx>) -> Result<(), ArrowKernelError>;
 }
 
+#[derive(Clone, Copy)]
+pub struct WriterCodegen<'ctx, 'borrow> {
+    pub ctx: &'ctx Context,
+    pub module: &'borrow Module<'ctx>,
+    pub builder: &'borrow Builder<'ctx>,
+}
+
 #[enum_dispatch]
 pub trait Writer {
     fn allocate(&self, size: usize) -> AnyRuntime;
 
-    fn llvm_init<'a>(&self, ctx: &'a Context, build: &Builder<'a>, runtime_ptr: PointerValue<'a>);
+    fn llvm_init<'ctx, 'borrow>(
+        &self,
+        codegen: WriterCodegen<'ctx, 'borrow>,
+        runtime_ptr: PointerValue<'ctx>,
+    );
 
     fn llvm_write<'ctx, 'borrow, F>(
         &'borrow self,
-        ctx: &'ctx Context,
-        module: &'borrow Module<'ctx>,
-        build: &'borrow Builder<'ctx>,
+        codegen: WriterCodegen<'ctx, 'borrow>,
         runtime_ptr: PointerValue<'ctx>,
         f: F,
     ) -> Result<(), ArrowKernelError>
@@ -65,10 +74,8 @@ pub trait Writer {
 
     fn llvm_flush<'ctx, 'borrow>(
         &'borrow self,
-        ctx: &'ctx Context,
-        module: &'borrow Module<'ctx>,
-        build: &'borrow Builder<'ctx>,
-        runtime_ptr: PointerValue<'ctx>,
+        _codegen: WriterCodegen<'ctx, 'borrow>,
+        _runtime_ptr: PointerValue<'ctx>,
     ) {
     }
 }

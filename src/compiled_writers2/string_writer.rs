@@ -4,19 +4,14 @@ use arrow_array::{make_array, ArrayRef};
 use arrow_buffer::Buffer;
 use arrow_data::ArrayDataBuilder;
 use arrow_schema::DataType;
-use inkwell::{
-    builder::Builder,
-    context::Context,
-    module::Module,
-    values::{BasicValue, BasicValueEnum, FunctionValue, PointerValue},
-};
+use inkwell::values::{BasicValue, BasicValueEnum, FunctionValue, PointerValue};
 use repr_offset::ReprOffset;
 
 use crate::{
     compiled_kernels::llvm_add_str_writer_append_bytes,
     compiled_writers2::{
-        AnyRuntime, AnyWriterEmitter, PrimitiveWriter, PrimitiveWriterRuntime, Writer,
-        WriterEmitter, WriterRuntime,
+        AnyRuntime, AnyWriterEmitter, PrimitiveWriter, Writer, WriterCodegen, WriterEmitter,
+        WriterRuntime,
     },
     increment_pointer, pointer_diff, ArrowKernelError, PrimitiveType,
 };
@@ -40,19 +35,19 @@ impl StringWriter {
 
     fn get_offset_ptr<'a>(
         &self,
-        ctx: &'a Context,
-        build: &Builder<'a>,
+        codegen: WriterCodegen<'a, '_>,
         runtime_ptr: PointerValue<'a>,
     ) -> PointerValue<'a> {
         let offset_ptr_ptr = increment_pointer!(
-            ctx,
-            build,
+            codegen.ctx,
+            codegen.builder,
             runtime_ptr,
             StringWriterRuntime::OFFSET_OFFSET_RUNTIME_PTR
         );
-        build
+        codegen
+            .builder
             .build_load(
-                ctx.ptr_type(inkwell::AddressSpace::default()),
+                codegen.ctx.ptr_type(inkwell::AddressSpace::default()),
                 offset_ptr_ptr,
                 "offset_runtime_ptr",
             )
@@ -73,37 +68,42 @@ impl Writer for StringWriter {
         runtime.into()
     }
 
-    fn llvm_init<'a>(&self, ctx: &'a Context, b: &Builder<'a>, runtime_ptr: PointerValue<'a>) {
+    fn llvm_init<'ctx, 'borrow>(
+        &self,
+        codegen: WriterCodegen<'ctx, 'borrow>,
+        runtime_ptr: PointerValue<'ctx>,
+    ) {
         self.offset_writer
-            .llvm_init(ctx, b, self.get_offset_ptr(ctx, b, runtime_ptr));
+            .llvm_init(codegen, self.get_offset_ptr(codegen, runtime_ptr));
     }
 
     fn llvm_write<'ctx, 'borrow, F>(
         &'borrow self,
-        ctx: &'ctx Context,
-        module: &'borrow Module<'ctx>,
-        build: &'borrow Builder<'ctx>,
+        codegen: WriterCodegen<'ctx, 'borrow>,
         runtime_ptr: PointerValue<'ctx>,
         f: F,
     ) -> Result<(), ArrowKernelError>
     where
         F: Fn(&mut AnyWriterEmitter<'ctx, 'borrow>) -> Result<(), ArrowKernelError>,
     {
-        let extend = llvm_add_str_writer_append_bytes(ctx, module);
+        let extend = llvm_add_str_writer_append_bytes(codegen.ctx, codegen.module);
 
         let mut emitter = AnyWriterEmitter::StringWriterEmitter(StringWriterEmitter {
-            ctx,
-            builder: build,
-            module,
+            codegen,
             offset_writer: &self.offset_writer,
-            offset_writer_ptr: self.get_offset_ptr(ctx, build, runtime_ptr),
+            offset_writer_ptr: self.get_offset_ptr(codegen, runtime_ptr),
             offset_counter_ptr: increment_pointer!(
-                ctx,
-                build,
+                codegen.ctx,
+                codegen.builder,
                 runtime_ptr,
                 StringWriterRuntime::OFFSET_CURR_OFFSET
             ),
-            vec_ptr: increment_pointer!(ctx, build, runtime_ptr, StringWriterRuntime::OFFSET_BYTES),
+            vec_ptr: increment_pointer!(
+                codegen.ctx,
+                codegen.builder,
+                runtime_ptr,
+                StringWriterRuntime::OFFSET_BYTES
+            ),
             extend,
         });
 
@@ -112,28 +112,36 @@ impl Writer for StringWriter {
 
     fn llvm_flush<'ctx, 'borrow>(
         &'borrow self,
-        ctx: &'ctx Context,
-        module: &'borrow Module<'ctx>,
-        build: &'borrow Builder<'ctx>,
+        codegen: WriterCodegen<'ctx, 'borrow>,
         runtime_ptr: PointerValue<'ctx>,
     ) {
         let curr_offset_ptr = increment_pointer!(
-            ctx,
-            build,
+            codegen.ctx,
+            codegen.builder,
             runtime_ptr,
             StringWriterRuntime::OFFSET_CURR_OFFSET
         );
-        let curr_offset = build
-            .build_load(ctx.i64_type(), curr_offset_ptr, "final_string_offset")
+        let curr_offset = codegen
+            .builder
+            .build_load(
+                codegen.ctx.i64_type(),
+                curr_offset_ptr,
+                "final_string_offset",
+            )
             .unwrap()
             .into_int_value();
-        let offset_writer_ptr = self.get_offset_ptr(ctx, build, runtime_ptr);
+        let offset_writer_ptr = self.get_offset_ptr(codegen, runtime_ptr);
 
         self.offset_writer
-            .llvm_write(ctx, module, build, offset_writer_ptr, |e| {
+            .llvm_write(codegen, offset_writer_ptr, |e| {
                 let offset = match self.offset_writer.primitive_type() {
-                    PrimitiveType::I32 => build
-                        .build_int_truncate(curr_offset, ctx.i32_type(), "final_string_offset_i32")
+                    PrimitiveType::I32 => codegen
+                        .builder
+                        .build_int_truncate(
+                            curr_offset,
+                            codegen.ctx.i32_type(),
+                            "final_string_offset_i32",
+                        )
                         .unwrap()
                         .as_basic_value_enum(),
                     PrimitiveType::I64 => curr_offset.as_basic_value_enum(),
@@ -146,8 +154,7 @@ impl Writer for StringWriter {
                 e.emit(offset)
             })
             .unwrap();
-        self.offset_writer
-            .llvm_flush(ctx, module, build, offset_writer_ptr);
+        self.offset_writer.llvm_flush(codegen, offset_writer_ptr);
     }
 }
 
@@ -201,9 +208,7 @@ impl WriterRuntime for StringWriterRuntime {
 }
 
 pub struct StringWriterEmitter<'ctx, 'borrow> {
-    ctx: &'ctx Context,
-    module: &'borrow Module<'ctx>,
-    builder: &'borrow Builder<'ctx>,
+    codegen: WriterCodegen<'ctx, 'borrow>,
 
     offset_writer: &'borrow PrimitiveWriter,
     offset_writer_ptr: PointerValue<'ctx>,
@@ -214,19 +219,23 @@ pub struct StringWriterEmitter<'ctx, 'borrow> {
 }
 impl<'ctx, 'borrow> WriterEmitter<'ctx, 'borrow> for StringWriterEmitter<'ctx, 'borrow> {
     fn emit(&mut self, val: BasicValueEnum<'ctx>) -> Result<(), ArrowKernelError> {
+        let codegen = self.codegen;
         let val = val.into_struct_value();
         let ptr1 = self
+            .codegen
             .builder
             .build_extract_value(val, 0, "ptr1")
             .unwrap()
             .into_pointer_value();
         let ptr2 = self
+            .codegen
             .builder
             .build_extract_value(val, 1, "ptr2")
             .unwrap()
             .into_pointer_value();
-        let len = pointer_diff!(self.ctx, self.builder, ptr1, ptr2);
-        self.builder
+        let len = pointer_diff!(codegen.ctx, codegen.builder, ptr1, ptr2);
+        codegen
+            .builder
             .build_call(
                 self.extend,
                 &[ptr1.into(), len.into(), self.vec_ptr.into()],
@@ -235,35 +244,40 @@ impl<'ctx, 'borrow> WriterEmitter<'ctx, 'borrow> for StringWriterEmitter<'ctx, '
             .unwrap();
 
         let curr_offset = self
+            .codegen
             .builder
-            .build_load(self.ctx.i64_type(), self.offset_counter_ptr, "curr_offset")
+            .build_load(
+                codegen.ctx.i64_type(),
+                self.offset_counter_ptr,
+                "curr_offset",
+            )
             .unwrap()
             .into_int_value();
 
-        self.offset_writer.llvm_write(
-            self.ctx,
-            self.module,
-            self.builder,
-            self.offset_writer_ptr,
-            |e| {
+        self.offset_writer
+            .llvm_write(codegen, self.offset_writer_ptr, |e| {
                 let offset = match self.offset_writer.primitive_type() {
-                    PrimitiveType::I32 => self
+                    PrimitiveType::I32 => codegen
                         .builder
-                        .build_int_truncate(curr_offset, self.ctx.i32_type(), "string_offset_i32")
+                        .build_int_truncate(
+                            curr_offset,
+                            codegen.ctx.i32_type(),
+                            "string_offset_i32",
+                        )
                         .unwrap()
                         .as_basic_value_enum(),
                     PrimitiveType::I64 => curr_offset.as_basic_value_enum(),
                     _ => unreachable!("invalid string offset type"),
                 };
                 e.emit(offset)
-            },
-        )?;
+            })?;
 
-        let new_offset = self
+        let new_offset = codegen
             .builder
             .build_int_add(curr_offset, len, "new_offset")
             .unwrap();
-        self.builder
+        codegen
+            .builder
             .build_store(self.offset_counter_ptr, new_offset)
             .unwrap();
 
@@ -280,7 +294,7 @@ mod tests {
 
     use super::StringWriter;
     use crate::{
-        compiled_writers2::{Writer, WriterEmitter, WriterRuntime},
+        compiled_writers2::{Writer, WriterCodegen, WriterEmitter, WriterRuntime},
         declare_blocks, PrimitiveType,
     };
 
@@ -304,8 +318,13 @@ mod tests {
         let writer = StringWriter::compile(PrimitiveType::I32).unwrap();
         let string_type = PrimitiveType::P64x2.llvm_type(&ctx).into_struct_type();
         let strings = ["alpha", "", "beta", "gamma"];
+        let codegen = WriterCodegen {
+            ctx: &ctx,
+            module: &llvm_mod,
+            builder: &build,
+        };
 
-        writer.llvm_init(&ctx, &build, dest);
+        writer.llvm_init(codegen, dest);
         for s in strings {
             let start = s.as_ptr();
             let end = start.wrapping_add(s.len());
@@ -320,12 +339,12 @@ mod tests {
                     .into(),
             ]);
             writer
-                .llvm_write(&ctx, &llvm_mod, &build, dest, |emitter| {
+                .llvm_write(codegen, dest, |emitter| {
                     emitter.emit(value.as_basic_value_enum())
                 })
                 .unwrap();
         }
-        writer.llvm_flush(&ctx, &llvm_mod, &build, dest);
+        writer.llvm_flush(codegen, dest);
         build.build_return(None).unwrap();
 
         llvm_mod.verify().unwrap();
