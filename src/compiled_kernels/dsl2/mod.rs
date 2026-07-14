@@ -534,6 +534,7 @@ impl DSLArithBinOp {
 pub enum DSLUnaryOp {
     Neg,
     Abs,
+    Sqrt,
 }
 
 #[cfg(test)]
@@ -544,6 +545,9 @@ impl DSLUnaryOp {
             // arrow-rs ships no abs kernel, so there is no differential oracle
             // here; abs is verified directly by the `test_abs_*` tests.
             Self::Abs => unreachable!("abs has no arrow-rs oracle; see test_abs_* tests"),
+            // arrow-rs ships no sqrt kernel either; sqrt is verified directly by
+            // the `test_sqrt_*` tests against Rust std `f64::sqrt`/`f32::sqrt`.
+            Self::Sqrt => unreachable!("sqrt has no arrow-rs oracle; see test_sqrt_* tests"),
         }
     }
 }
