@@ -5,7 +5,7 @@ use crate::{
     compiled_kernels::{
         dsl2::{
             compile, DSLArgument, DSLArithBinOp, DSLContext, DSLFunction, DSLStmt, DSLType,
-            RunnableDSLFunction, WriterSpec,
+            DSLUnaryOp, RunnableDSLFunction, WriterSpec,
         },
         null_utils::intersect_and_copy_nulls,
     },
@@ -79,17 +79,88 @@ impl Kernel for BinOpKernel {
     }
 }
 
+pub struct UnaryOpKernel(RunnableDSLFunction);
+unsafe impl Sync for UnaryOpKernel {}
+unsafe impl Send for UnaryOpKernel {}
+
+impl Kernel for UnaryOpKernel {
+    type Key = (DataType, bool, DSLUnaryOp);
+
+    type Input<'a>
+        = &'a dyn Datum
+    where
+        Self: 'a;
+
+    type Params = DSLUnaryOp;
+
+    type Output = ArrayRef;
+
+    fn call(&self, inp: Self::Input<'_>) -> Result<Self::Output, ArrowKernelError> {
+        let res = self
+            .0
+            .run(&[DSLArgument::Datum(inp)])
+            .map(|x| x[0].clone())?;
+
+        intersect_and_copy_nulls(&[inp], res)
+    }
+
+    fn compile(arr: &Self::Input<'_>, params: Self::Params) -> Result<Self, ArrowKernelError> {
+        let pt = PrimitiveType::for_arrow_type(arr.get().0.data_type());
+
+        // `Neg`/`Abs` preserve the input type, but `sqrt` always returns a float
+        // and promotes integer inputs to `f64` (matching pyarrow), so the output
+        // type is op-aware.
+        let out_pt = match params {
+            DSLUnaryOp::Neg | DSLUnaryOp::Abs => pt,
+            DSLUnaryOp::Sqrt if pt.is_float() => pt,
+            DSLUnaryOp::Sqrt => PrimitiveType::F64,
+        };
+
+        let mut ctx = DSLContext::new();
+        let mut func = DSLFunction::new("arith_unaryop");
+        let arg = func.add_arg(&mut ctx, DSLType::array_like(*arr, "n"));
+        func.add_ret(WriterSpec::Primitive(out_pt), "n");
+
+        func.add_body(
+            DSLStmt::for_each(&mut ctx, &[arg], |loop_vars| {
+                let el = match params {
+                    DSLUnaryOp::Neg => loop_vars[0].expr().neg()?,
+                    DSLUnaryOp::Abs => loop_vars[0].expr().abs()?,
+                    // `.sqrt()` is float-only; `primitive_cast` is a no-op when the
+                    // input is already `out_pt` and casts integers to `f64`.
+                    DSLUnaryOp::Sqrt => loop_vars[0].expr().primitive_cast(out_pt)?.sqrt()?,
+                };
+                DSLStmt::emit(0, el)
+            })
+            .unwrap(),
+        );
+        let func = compile(func, [DSLArgument::Datum(*arr)]).unwrap();
+        Ok(UnaryOpKernel(func))
+    }
+
+    fn get_key_for_input(
+        i: &Self::Input<'_>,
+        p: &Self::Params,
+    ) -> Result<Self::Key, ArrowKernelError> {
+        let (arr, is_scalar) = i.get();
+        Ok((arr.data_type().clone(), is_scalar, *p))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use arrow_array::{
         cast::AsArray,
         types::{Float32Type, Float64Type, Int32Type, UInt32Type},
-        Float32Array, Float64Array, Int32Array, UInt32Array, UInt64Array,
+        Datum, Float32Array, Float64Array, Int32Array, UInt32Array, UInt64Array,
     };
     use strum::IntoEnumIterator;
 
     use crate::{
-        compiled_kernels::{arith::BinOpKernel, dsl2::DSLArithBinOp},
+        compiled_kernels::{
+            arith::{BinOpKernel, UnaryOpKernel},
+            dsl2::{DSLArithBinOp, DSLUnaryOp},
+        },
         Kernel,
     };
 
@@ -106,6 +177,215 @@ mod tests {
             let arrow_res = arrow_res.as_primitive::<Int32Type>();
             assert_eq!(res, arrow_res, "failed for op {:?}", op);
         }
+    }
+
+    // These test `Neg` directly rather than iterating `DSLUnaryOp::iter()`:
+    // not every unary op has an arrow oracle (`abs` and `sqrt` have none, so
+    // their `arrow_compute` arms are `unreachable!`), so a shared-oracle loop
+    // can't cover all variants. `abs`/`sqrt` are verified by their dedicated
+    // `test_abs_*` / `test_sqrt_*` tests.
+    #[test]
+    fn test_neg_i32() {
+        let arr = Int32Array::from(vec![1, 0, 2, -4, -10, 20, i32::MIN, i32::MAX]);
+        let k = UnaryOpKernel::compile(&(&arr as &dyn Datum), DSLUnaryOp::Neg).unwrap();
+        let res = k.call(&arr).unwrap();
+        let res = res.as_primitive::<Int32Type>();
+
+        let arrow_res = DSLUnaryOp::Neg.arrow_compute(&arr);
+        let arrow_res = arrow_res.as_primitive::<Int32Type>();
+        assert_eq!(res, arrow_res);
+    }
+
+    #[test]
+    fn test_neg_f32() {
+        let arr = Float32Array::from(vec![1.0, 0.0, -2.0, 4.0, -10.0, 20.0]);
+        let k = UnaryOpKernel::compile(&(&arr as &dyn Datum), DSLUnaryOp::Neg).unwrap();
+        let res = k.call(&arr).unwrap();
+        let res = res.as_primitive::<Float32Type>();
+
+        let arrow_res = DSLUnaryOp::Neg.arrow_compute(&arr);
+        let arrow_res = arrow_res.as_primitive::<Float32Type>();
+        assert_eq!(res, arrow_res);
+    }
+
+    #[test]
+    fn test_neg_scalar_i32_nulls() {
+        let arr = Int32Array::from(vec![Some(1), None, Some(-2), Some(4)]);
+        let k = UnaryOpKernel::compile(&(&arr as &dyn Datum), DSLUnaryOp::Neg).unwrap();
+        let res = k.call(&arr).unwrap();
+        let res = res.as_primitive::<Int32Type>();
+
+        let arrow_res = DSLUnaryOp::Neg.arrow_compute(&arr);
+        let arrow_res = arrow_res.as_primitive::<Int32Type>();
+        assert_eq!(res, arrow_res);
+    }
+
+    #[test]
+    fn test_abs_i32() {
+        // hard-coded edge inputs: MIN wraps to itself, MAX, 0, negatives
+        let arr = Int32Array::from(vec![0, 1, -1, 4, -10, i32::MAX, i32::MIN, -(i32::MAX)]);
+        let k = UnaryOpKernel::compile(&(&arr as &dyn Datum), DSLUnaryOp::Abs).unwrap();
+        let res = k.call(&arr).unwrap();
+        let res = res.as_primitive::<Int32Type>();
+
+        let expected = Int32Array::from(
+            (0..arr.len())
+                .map(|i| arr.value(i).wrapping_abs())
+                .collect::<Vec<_>>(),
+        );
+        assert_eq!(res, &expected);
+    }
+
+    #[test]
+    fn test_abs_u32_identity() {
+        // unsigned abs is the identity
+        let arr = UInt32Array::from(vec![0, 1, 5, u32::MAX, 900000]);
+        let k = UnaryOpKernel::compile(&(&arr as &dyn Datum), DSLUnaryOp::Abs).unwrap();
+        let res = k.call(&arr).unwrap();
+        let res = res.as_primitive::<UInt32Type>();
+
+        let expected = UInt32Array::from(
+            (0..arr.len()).map(|i| arr.value(i)).collect::<Vec<_>>(),
+        );
+        assert_eq!(res, &expected);
+    }
+
+    #[test]
+    fn test_abs_f64() {
+        // hard-coded float edge inputs: NaN, +/-inf, -0.0, 0.0, negatives
+        let arr = Float64Array::from(vec![
+            0.0,
+            -0.0,
+            1.0,
+            -2.5,
+            f64::INFINITY,
+            f64::NEG_INFINITY,
+            f64::NAN,
+            -f64::NAN,
+        ]);
+        let k = UnaryOpKernel::compile(&(&arr as &dyn Datum), DSLUnaryOp::Abs).unwrap();
+        let res = k.call(&arr).unwrap();
+        let res = res.as_primitive::<Float64Type>();
+
+        for i in 0..arr.len() {
+            let expected = arr.value(i).abs();
+            let got = res.value(i);
+            if expected.is_nan() {
+                assert!(got.is_nan(), "expected NaN at {i}, got {got}");
+            } else {
+                // compare bit patterns so -0.0 vs 0.0 is distinguished
+                assert_eq!(
+                    got.to_bits(),
+                    expected.to_bits(),
+                    "mismatch at {i}: got {got}, expected {expected}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn test_abs_i32_nulls() {
+        let arr = Int32Array::from(vec![Some(1), None, Some(-2), Some(i32::MIN)]);
+        let k = UnaryOpKernel::compile(&(&arr as &dyn Datum), DSLUnaryOp::Abs).unwrap();
+        let res = k.call(&arr).unwrap();
+        let res = res.as_primitive::<Int32Type>();
+
+        let expected = Int32Array::from(vec![Some(1), None, Some(2), Some(i32::MIN)]);
+        assert_eq!(res, &expected);
+    }
+
+    #[test]
+    fn test_abs_empty() {
+        let arr = Int32Array::from(Vec::<i32>::new());
+        let k = UnaryOpKernel::compile(&(&arr as &dyn Datum), DSLUnaryOp::Abs).unwrap();
+        let res = k.call(&arr).unwrap();
+        let res = res.as_primitive::<Int32Type>();
+        assert_eq!(res.len(), 0);
+    }
+
+    // arrow-rs ships no sqrt kernel, so these tests use Rust std
+    // (`f64::sqrt`/`f32::sqrt`) as the oracle rather than a differential kernel.
+    #[test]
+    fn test_sqrt_f64() {
+        // exact perfect squares plus float edge inputs
+        let arr = Float64Array::from(vec![
+            0.0,
+            4.0,
+            2.0,
+            9.0,
+            -1.0,
+            f64::INFINITY,
+            f64::NAN,
+            -0.0,
+        ]);
+        let k = UnaryOpKernel::compile(&(&arr as &dyn Datum), DSLUnaryOp::Sqrt).unwrap();
+        let res = k.call(&arr).unwrap();
+        let res = res.as_primitive::<Float64Type>();
+
+        for i in 0..arr.len() {
+            let expected = arr.value(i).sqrt();
+            let got = res.value(i);
+            if expected.is_nan() {
+                assert!(got.is_nan(), "expected NaN at {i}, got {got}");
+            } else {
+                // compare bit patterns so -0.0 vs 0.0 is distinguished
+                assert_eq!(
+                    got.to_bits(),
+                    expected.to_bits(),
+                    "mismatch at {i}: got {got}, expected {expected}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn test_sqrt_f32() {
+        let arr = Float32Array::from(vec![0.0, 4.0, 2.0, 9.0, f32::INFINITY]);
+        let k = UnaryOpKernel::compile(&(&arr as &dyn Datum), DSLUnaryOp::Sqrt).unwrap();
+        let res = k.call(&arr).unwrap();
+        let res = res.as_primitive::<Float32Type>();
+
+        for i in 0..arr.len() {
+            let expected = arr.value(i).sqrt();
+            let got = res.value(i);
+            assert_eq!(
+                got.to_bits(),
+                expected.to_bits(),
+                "mismatch at {i}: got {got}, expected {expected}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_sqrt_i32_promotes_to_f64() {
+        // integer input is promoted to Float64 (matching pyarrow)
+        let arr = Int32Array::from(vec![0, 1, 4, 9]);
+        let k = UnaryOpKernel::compile(&(&arr as &dyn Datum), DSLUnaryOp::Sqrt).unwrap();
+        let res = k.call(&arr).unwrap();
+        let res = res.as_primitive::<Float64Type>();
+
+        let expected = Float64Array::from(vec![0.0, 1.0, 2.0, 3.0]);
+        assert_eq!(res, &expected);
+    }
+
+    #[test]
+    fn test_sqrt_f64_nulls() {
+        let arr = Float64Array::from(vec![Some(4.0), None, Some(9.0), Some(0.0)]);
+        let k = UnaryOpKernel::compile(&(&arr as &dyn Datum), DSLUnaryOp::Sqrt).unwrap();
+        let res = k.call(&arr).unwrap();
+        let res = res.as_primitive::<Float64Type>();
+
+        let expected = Float64Array::from(vec![Some(2.0), None, Some(3.0), Some(0.0)]);
+        assert_eq!(res, &expected);
+    }
+
+    #[test]
+    fn test_sqrt_empty() {
+        let arr = Float64Array::from(Vec::<f64>::new());
+        let k = UnaryOpKernel::compile(&(&arr as &dyn Datum), DSLUnaryOp::Sqrt).unwrap();
+        let res = k.call(&arr).unwrap();
+        let res = res.as_primitive::<Float64Type>();
+        assert_eq!(res.len(), 0);
     }
 
     #[test]

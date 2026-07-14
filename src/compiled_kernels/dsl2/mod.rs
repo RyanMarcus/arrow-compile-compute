@@ -574,6 +574,28 @@ impl DSLArithBinOp {
 }
 
 #[derive(Debug, Copy, Clone, Hash, PartialEq, Eq, EnumIter)]
+pub enum DSLUnaryOp {
+    Neg,
+    Abs,
+    Sqrt,
+}
+
+#[cfg(test)]
+impl DSLUnaryOp {
+    pub fn arrow_compute(&self, arr: &dyn arrow_array::Array) -> ArrayRef {
+        match self {
+            Self::Neg => arrow_arith::numeric::neg_wrapping(arr).unwrap(),
+            // arrow-rs ships no abs kernel, so there is no differential oracle
+            // here; abs is verified directly by the `test_abs_*` tests.
+            Self::Abs => unreachable!("abs has no arrow-rs oracle; see test_abs_* tests"),
+            // arrow-rs ships no sqrt kernel either; sqrt is verified directly by
+            // the `test_sqrt_*` tests against Rust std `f64::sqrt`/`f32::sqrt`.
+            Self::Sqrt => unreachable!("sqrt has no arrow-rs oracle; see test_sqrt_* tests"),
+        }
+    }
+}
+
+#[derive(Debug, Copy, Clone, Hash, PartialEq, Eq, EnumIter)]
 pub enum DSLBitwiseBinOp {
     And,
     Or,
@@ -1177,6 +1199,8 @@ pub enum DSLExpr {
     Splat(Box<DSLExpr>, usize),
     Len(Box<DSLValue>),
     Select(Box<DSLExpr>, Box<DSLExpr>, Box<DSLExpr>),
+    Neg(Box<DSLExpr>),
+    Abs(Box<DSLExpr>),
 }
 
 impl DSLExpr {
@@ -1410,6 +1434,36 @@ impl DSLExpr {
         }
     }
 
+    pub fn neg(&self) -> Result<DSLExpr, ArrowKernelError> {
+        match self.get_type() {
+            DSLType::Primitive(pt) if pt.as_numeric_primitive_type().is_some() => {
+                Ok(DSLExpr::Neg(Box::new(self.clone())))
+            }
+            DSLType::Primitive(PrimitiveType::List(item, _)) if item.is_numeric() => {
+                Ok(DSLExpr::Neg(Box::new(self.clone())))
+            }
+            _ => Err(ArrowKernelError::DSLInvalidType(
+                "neg requies a numeric primitive or numeric fixed-size-list",
+                self.get_type(),
+            )),
+        }
+    }
+
+    pub fn abs(&self) -> Result<DSLExpr, ArrowKernelError> {
+        match self.get_type() {
+            DSLType::Primitive(pt) if pt.as_numeric_primitive_type().is_some() => {
+                Ok(DSLExpr::Abs(Box::new(self.clone())))
+            }
+            DSLType::Primitive(PrimitiveType::List(item, _)) if item.is_numeric() => {
+                Ok(DSLExpr::Abs(Box::new(self.clone())))
+            }
+            _ => Err(ArrowKernelError::DSLInvalidType(
+                "abs requires a numeric primitive or numeric fixed-size-list value",
+                self.get_type(),
+            )),
+        }
+    }
+
     pub fn sqrt(&self) -> Result<DSLExpr, ArrowKernelError> {
         match self.get_type() {
             DSLType::Primitive(pt) if pt.is_float() => Ok(DSLExpr::Sqrt(Box::new(self.clone()))),
@@ -1497,7 +1551,12 @@ impl DSLExpr {
             DSLExpr::FloatToTotalOrderSInt(v) => DSLType::Primitive(PrimitiveType::int_with_width(
                 v.get_type().as_primitive().unwrap().width(),
             )),
-            DSLExpr::Bswap(v) | DSLExpr::BitNot(v) | DSLExpr::Sqrt(v) => v.get_type(),
+            DSLExpr::Bswap(v)
+            | DSLExpr::BitNot(v)
+            | DSLExpr::Sqrt(v)
+            | DSLExpr::Neg(v)
+            | DSLExpr::Abs(v) => v.get_type(),
+
             DSLExpr::VecSum(v) => {
                 DSLType::Primitive(v.get_type().as_primitive().unwrap().list_type_into_inner())
             }
@@ -1536,6 +1595,8 @@ impl DSLExpr {
             | DSLExpr::BitCast(val, _)
             | DSLExpr::CastToBool(val)
             | DSLExpr::Bswap(val)
+            | DSLExpr::Neg(val)
+            | DSLExpr::Abs(val)
             | DSLExpr::BitNot(val)
             | DSLExpr::FloatToTotalOrderSInt(val)
             | DSLExpr::Sqrt(val)

@@ -991,12 +991,48 @@ pub mod arith {
     use arrow_array::{ArrayRef, Datum};
 
     use crate::{
-        compiled_kernels::{BinOpKernel, DSLArithBinOp, KernelCache},
+        compiled_kernels::{BinOpKernel, DSLArithBinOp, DSLUnaryOp, KernelCache, UnaryOpKernel},
         ArrowKernelError,
     };
 
     static BINOP_PROGRAM_CACHE: LazyLock<KernelCache<BinOpKernel>> =
         LazyLock::new(KernelCache::new);
+
+    static UNARYOP_PROGRAM_CACHE: LazyLock<KernelCache<UnaryOpKernel>> =
+        LazyLock::new(KernelCache::new);
+
+    /// Compute the wrapping arithmetic negation (`-x`) of each element
+    /// (`-i32::MIN` wraps to `i32::MIN`).
+    ///
+    /// This crate has no checked-arithmetic path, so unlike `arrow`'s checked
+    /// `neg` (which errors on overflow) only the wrapping variant is provided,
+    /// matching `arrow`'s `neg_wrapping`.
+    pub fn neg_wrapping(value: &dyn Datum) -> Result<ArrayRef, ArrowKernelError> {
+        UNARYOP_PROGRAM_CACHE.get(value, DSLUnaryOp::Neg)
+    }
+
+    /// Compute the absolute value of each element.
+    ///
+    /// Signed integer overflow wraps (`abs(i32::MIN) == i32::MIN`); this matches
+    /// `pyarrow.compute.abs` (whose docs state results wrap on integer overflow)
+    /// and, like the rest of this crate, provides no checked variant. Unsigned
+    /// integers are returned unchanged, and floats follow IEEE `fabs`
+    /// (`abs(NaN)` is `NaN`, `abs(-0.0)` is `0.0`).
+    pub fn abs(value: &dyn Datum) -> Result<ArrayRef, ArrowKernelError> {
+        UNARYOP_PROGRAM_CACHE.get(value, DSLUnaryOp::Abs)
+    }
+
+    /// Compute the square root of each element.
+    ///
+    /// This is the non-checked variant (like the rest of this crate): a negative
+    /// argument yields `NaN` rather than an error, matching `pyarrow.compute.sqrt`
+    /// (no `sqrt_checked` equivalent is provided). Float inputs preserve their
+    /// type (`f32 -> f32`, `f64 -> f64`) and integer inputs are promoted to
+    /// `f64`, also matching pyarrow. IEEE special cases follow `llvm.sqrt`
+    /// (`sqrt(inf)` is `inf`, `sqrt(NaN)` is `NaN`, `sqrt(-0.0)` is `-0.0`).
+    pub fn sqrt(value: &dyn Datum) -> Result<ArrayRef, ArrowKernelError> {
+        UNARYOP_PROGRAM_CACHE.get(value, DSLUnaryOp::Sqrt)
+    }
 
     pub fn add(left: &dyn Datum, right: &dyn Datum) -> Result<ArrayRef, ArrowKernelError> {
         BINOP_PROGRAM_CACHE.get((left, right), DSLArithBinOp::Add)

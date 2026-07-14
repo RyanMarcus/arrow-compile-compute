@@ -25,13 +25,13 @@ use std::{collections::HashMap, sync::RwLock};
 pub use aggregate2::{
     Aggregator, CountAggregator, MaxAggregator, MinAggregator, MostRecentAggregator, SumAggregator,
 };
-pub use arith::BinOpKernel;
+pub use arith::{BinOpKernel, UnaryOpKernel};
 use arrow_schema::DataType;
 pub use bounds::BoundsKernel;
 pub use cast::CastKernel;
 pub use cmp::ComparisonKernel;
 pub use concat::concat_all;
-pub use dsl2::DSLArithBinOp;
+pub use dsl2::{DSLArithBinOp, DSLUnaryOp};
 pub use filter::FilterKernel;
 pub use ht::{HashFunction, HashKernel};
 use inkwell::execution_engine::ExecutionEngine;
