@@ -1,6 +1,8 @@
 mod boolean_writer;
+mod dictionary_writer;
 mod list_writer;
 mod primitive_writer;
+mod run_end_writer;
 mod string_writer;
 
 use std::ffi::c_void;
@@ -15,7 +17,9 @@ use inkwell::{
     values::{BasicValueEnum, PointerValue},
 };
 
+use dictionary_writer::{DictionaryWriter, DictionaryWriterEmitter, DictionaryWriterRuntime};
 use list_writer::{ListWriter, ListWriterEmitter, ListWriterRuntime};
+use run_end_writer::{RunEndWriter, RunEndWriterEmitter, RunEndWriterRuntime};
 
 use crate::{
     compiled_writers::{DictionaryKeyType, RunEndType},
@@ -29,6 +33,12 @@ pub use primitive_writer::{PrimitiveWriter, PrimitiveWriterEmitter, PrimitiveWri
 #[enum_dispatch]
 pub trait WriterRuntime {
     fn as_ptr(&mut self) -> *mut c_void;
+
+    /// Reserves space for future writes and refreshes any child runtime pointers.
+    ///
+    /// This may only be called before [`Writer::llvm_flush`] has executed for
+    /// this runtime. A flushed runtime is finalized and may only be converted
+    /// into an array.
     fn reserve_for_additional(&mut self, count: usize) -> Result<(), ArrowKernelError>;
     fn len(&self) -> usize;
     fn to_array(self, len: usize) -> Result<ArrayRef, ArrowKernelError>;
@@ -73,6 +83,11 @@ pub trait Writer {
     where
         F: Fn(&mut AnyWriterEmitter<'ctx, 'borrow>) -> Result<(), ArrowKernelError>;
 
+    /// Finalizes this writer and all composed child writers.
+    ///
+    /// This must be emitted exactly once, after all writes and runtime
+    /// reservations are complete. The runtime cannot be written to or resized
+    /// after the generated flush code has executed.
     fn llvm_flush<'ctx, 'borrow>(
         &'borrow self,
         _codegen: WriterCodegen<'ctx, 'borrow>,
@@ -84,24 +99,30 @@ pub trait Writer {
 #[enum_dispatch(Writer)]
 pub enum AnyWriter {
     BooleanWriter,
+    DictionaryWriter,
     PrimitiveWriter,
     ListWriter,
+    RunEndWriter,
     StringWriter,
 }
 
 #[enum_dispatch(WriterEmitter)]
 pub enum AnyWriterEmitter<'ctx, 'borrow> {
     BooleanWriterEmitter(BooleanWriterEmitter<'ctx, 'borrow>),
+    DictionaryWriterEmitter(DictionaryWriterEmitter<'ctx, 'borrow>),
     PrimitiveWriterEmitter(PrimitiveWriterEmitter<'ctx, 'borrow>),
     ListWriterEmitter(ListWriterEmitter<'ctx, 'borrow>),
+    RunEndWriterEmitter(RunEndWriterEmitter<'ctx, 'borrow>),
     StringWriterEmitter(StringWriterEmitter<'ctx, 'borrow>),
 }
 
 #[enum_dispatch(WriterRuntime)]
 pub enum AnyRuntime {
     BooleanWriterRuntime,
+    DictionaryWriterRuntime,
     PrimitiveWriterRuntime,
     ListWriterRuntime,
+    RunEndWriterRuntime,
     StringWriterRuntime,
 }
 
@@ -117,6 +138,27 @@ pub enum WriterPlan {
 }
 
 impl WriterPlan {
+    /// The logical type being stored. Used by dictionary and REE writers to
+    /// know what kind of equality test to use.
+    fn storage_type(&self) -> PrimitiveType {
+        match self {
+            Self::Boolean => PrimitiveType::U8,
+            Self::Primitive(pt) => *pt,
+            Self::Dictionary(_, values) | Self::RunEnd(_, values) => values.storage_type(),
+            Self::FixedSizeList(size, values) => PrimitiveType::List(
+                values
+                    .storage_type()
+                    .try_into()
+                    .expect("fixed-size list item type must be scalar"),
+                *size,
+            ),
+            Self::VariableSizeList(_) => {
+                unreachable!("variable-size lists do not have a scalar storage type")
+            }
+            Self::String | Self::StringView => PrimitiveType::P64x2,
+        }
+    }
+
     pub fn for_primitive_type(pt: PrimitiveType) -> Self {
         match pt {
             PrimitiveType::I8
@@ -185,10 +227,22 @@ impl WriterPlan {
             WriterPlan::Primitive(primitive_type) => Ok(AnyWriter::PrimitiveWriter(
                 PrimitiveWriter::compile(*primitive_type)?,
             )),
-            WriterPlan::Dictionary(dictionary_key_type, writer_plan) => todo!(),
-            WriterPlan::RunEnd(run_end_type, writer_plan) => todo!(),
-            WriterPlan::FixedSizeList(_, writer_plan) => todo!(),
-            WriterPlan::VariableSizeList(writer_plan) => todo!(),
+            WriterPlan::Dictionary(dictionary_key_type, writer_plan) => {
+                Ok(AnyWriter::DictionaryWriter(DictionaryWriter::compile(
+                    *dictionary_key_type,
+                    writer_plan.storage_type(),
+                    writer_plan.compile()?,
+                )?))
+            }
+            WriterPlan::RunEnd(run_end_type, writer_plan) => {
+                Ok(AnyWriter::RunEndWriter(RunEndWriter::compile(
+                    *run_end_type,
+                    writer_plan.storage_type(),
+                    writer_plan.compile()?,
+                )?))
+            }
+            WriterPlan::FixedSizeList(_, _) => todo!(),
+            WriterPlan::VariableSizeList(_) => todo!(),
             WriterPlan::String => Ok(AnyWriter::StringWriter(StringWriter::compile(
                 PrimitiveType::I32,
             )?)),

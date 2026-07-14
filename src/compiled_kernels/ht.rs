@@ -157,6 +157,15 @@ pub fn generate_lookup_or_insert<'a>(
     module: &Module<'a>,
     ht: &TicketTable,
 ) -> FunctionValue<'a> {
+    generate_lookup_or_insert_named(ctx, module, ht, "lookup_or_insert")
+}
+
+pub fn generate_lookup_or_insert_named<'a>(
+    ctx: &'a Context,
+    module: &Module<'a>,
+    ht: &TicketTable,
+    name: &str,
+) -> FunctionValue<'a> {
     let key_prim_type = PrimitiveType::for_arrow_type(&ht.key_type);
     let ticket_prim_type = PrimitiveType::for_arrow_type(&ht.ticket_type);
 
@@ -167,7 +176,7 @@ pub fn generate_lookup_or_insert<'a>(
     let ticket_type = ticket_prim_type.llvm_type(ctx).into_int_type();
 
     let func = module.add_function(
-        "lookup_or_insert",
+        name,
         ticket_type.fn_type(
             &[
                 ptr_type.into(), // pointer to the hash table
@@ -376,11 +385,20 @@ pub fn generate_hash_func<'a>(
     llvm_mod: &Module<'a>,
     pt: PrimitiveType,
 ) -> FunctionValue<'a> {
+    generate_hash_func_named(ctx, llvm_mod, pt, "hash")
+}
+
+pub fn generate_hash_func_named<'a>(
+    ctx: &'a Context,
+    llvm_mod: &Module<'a>,
+    pt: PrimitiveType,
+    name: &str,
+) -> FunctionValue<'a> {
     let i64_type = ctx.i64_type();
     let inp_type = pt.llvm_type(ctx);
     let ptr_type = ctx.ptr_type(AddressSpace::default());
 
-    let func = llvm_mod.add_function("hash", i64_type.fn_type(&[inp_type.into()], false), None);
+    let func = llvm_mod.add_function(name, i64_type.fn_type(&[inp_type.into()], false), None);
 
     let memcpy = Intrinsic::find("llvm.memcpy").unwrap();
     let memcpy_f = memcpy
