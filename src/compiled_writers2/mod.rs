@@ -5,6 +5,7 @@ mod list_writer;
 mod primitive_writer;
 mod run_end_writer;
 mod string_writer;
+mod view_writer;
 
 use std::ffi::c_void;
 
@@ -24,6 +25,7 @@ use fixed_size_list_writer::{
 };
 use list_writer::{ListWriter, ListWriterEmitter, ListWriterRuntime};
 use run_end_writer::{RunEndWriter, RunEndWriterEmitter, RunEndWriterRuntime};
+use view_writer::{StringViewWriter, StringViewWriterEmitter, StringViewWriterRuntime};
 
 use crate::{
     compiled_writers::{DictionaryKeyType, RunEndType},
@@ -147,6 +149,7 @@ pub enum AnyWriter {
     ListWriter,
     RunEndWriter,
     StringWriter,
+    StringViewWriter,
 }
 
 #[enum_dispatch(WriterEmitter)]
@@ -158,6 +161,7 @@ pub enum AnyWriterEmitter<'ctx, 'borrow> {
     ListWriterEmitter(ListWriterEmitter<'ctx, 'borrow>),
     RunEndWriterEmitter(RunEndWriterEmitter<'ctx, 'borrow>),
     StringWriterEmitter(StringWriterEmitter<'ctx, 'borrow>),
+    StringViewWriterEmitter(StringViewWriterEmitter<'ctx, 'borrow>),
 }
 
 #[enum_dispatch(WriterRuntime)]
@@ -169,6 +173,7 @@ pub enum AnyRuntime {
     ListWriterRuntime,
     RunEndWriterRuntime,
     StringWriterRuntime,
+    StringViewWriterRuntime,
 }
 
 pub enum WriterPlan {
@@ -299,7 +304,7 @@ impl WriterPlan {
             WriterPlan::String => Ok(AnyWriter::StringWriter(StringWriter::compile(
                 PrimitiveType::I32,
             )?)),
-            WriterPlan::StringView => todo!(),
+            WriterPlan::StringView => Ok(AnyWriter::StringViewWriter(StringViewWriter::compile())),
         }
     }
 }
