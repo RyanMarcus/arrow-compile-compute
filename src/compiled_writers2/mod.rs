@@ -1,4 +1,4 @@
-//mod boolean_writer;
+mod boolean_writer;
 mod list_writer;
 mod primitive_writer;
 mod string_writer;
@@ -23,6 +23,7 @@ use crate::{
     ArrowKernelError, PrimitiveType,
 };
 
+pub use boolean_writer::{BooleanWriter, BooleanWriterEmitter, BooleanWriterRuntime};
 pub use primitive_writer::{PrimitiveWriter, PrimitiveWriterEmitter, PrimitiveWriterRuntime};
 
 #[enum_dispatch]
@@ -82,6 +83,7 @@ pub trait Writer {
 
 #[enum_dispatch(Writer)]
 pub enum AnyWriter {
+    BooleanWriter,
     PrimitiveWriter,
     ListWriter,
     StringWriter,
@@ -89,6 +91,7 @@ pub enum AnyWriter {
 
 #[enum_dispatch(WriterEmitter)]
 pub enum AnyWriterEmitter<'ctx, 'borrow> {
+    BooleanWriterEmitter(BooleanWriterEmitter<'ctx, 'borrow>),
     PrimitiveWriterEmitter(PrimitiveWriterEmitter<'ctx, 'borrow>),
     ListWriterEmitter(ListWriterEmitter<'ctx, 'borrow>),
     StringWriterEmitter(StringWriterEmitter<'ctx, 'borrow>),
@@ -96,6 +99,7 @@ pub enum AnyWriterEmitter<'ctx, 'borrow> {
 
 #[enum_dispatch(WriterRuntime)]
 pub enum AnyRuntime {
+    BooleanWriterRuntime,
     PrimitiveWriterRuntime,
     ListWriterRuntime,
     StringWriterRuntime,
@@ -137,8 +141,8 @@ impl WriterPlan {
     pub fn for_data_type(dt: &DataType) -> Result<Self, ArrowKernelError> {
         match dt {
             DataType::Null => todo!(),
-            DataType::Boolean
-            | DataType::Int8
+            DataType::Boolean => Ok(Self::Boolean),
+            DataType::Int8
             | DataType::Int16
             | DataType::Int32
             | DataType::Int64
@@ -177,7 +181,7 @@ impl WriterPlan {
 
     pub fn compile(&self) -> Result<AnyWriter, ArrowKernelError> {
         match self {
-            WriterPlan::Boolean => todo!(),
+            WriterPlan::Boolean => Ok(AnyWriter::BooleanWriter(BooleanWriter::compile())),
             WriterPlan::Primitive(primitive_type) => Ok(AnyWriter::PrimitiveWriter(
                 PrimitiveWriter::compile(*primitive_type)?,
             )),
