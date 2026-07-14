@@ -37,24 +37,45 @@ impl StringWriter {
             offset_writer: PrimitiveWriter::compile(offset_type)?,
         })
     }
+
+    fn get_offset_ptr<'a>(
+        &self,
+        ctx: &'a Context,
+        build: &Builder<'a>,
+        runtime_ptr: PointerValue<'a>,
+    ) -> PointerValue<'a> {
+        let offset_ptr_ptr = increment_pointer!(
+            ctx,
+            build,
+            runtime_ptr,
+            StringWriterRuntime::OFFSET_OFFSET_RUNTIME_PTR
+        );
+        build
+            .build_load(
+                ctx.ptr_type(inkwell::AddressSpace::default()),
+                offset_ptr_ptr,
+                "offset_runtime_ptr",
+            )
+            .unwrap()
+            .into_pointer_value()
+    }
 }
 
 impl Writer for StringWriter {
     fn allocate(&self, size: usize) -> AnyRuntime {
-        StringWriterRuntime {
+        let mut runtime = StringWriterRuntime {
+            offset_runtime_ptr: std::ptr::null_mut(),
             offsets: Box::new(self.offset_writer.allocate(size + 1)),
             bytes: Vec::with_capacity(4096),
             curr_offset: 0,
-        }
-        .into()
+        };
+        runtime.offset_runtime_ptr = runtime.offsets.as_ptr();
+        runtime.into()
     }
 
     fn llvm_init<'a>(&self, ctx: &'a Context, b: &Builder<'a>, runtime_ptr: PointerValue<'a>) {
-        self.offset_writer.llvm_init(
-            ctx,
-            b,
-            increment_pointer!(ctx, b, runtime_ptr, StringWriterRuntime::OFFSET_OFFSETS),
-        );
+        self.offset_writer
+            .llvm_init(ctx, b, self.get_offset_ptr(ctx, b, runtime_ptr));
     }
 
     fn llvm_write<'ctx, 'borrow, F>(
@@ -75,12 +96,7 @@ impl Writer for StringWriter {
             builder: build,
             module,
             offset_writer: &self.offset_writer,
-            offset_writer_ptr: increment_pointer!(
-                ctx,
-                build,
-                runtime_ptr,
-                StringWriterRuntime::OFFSET_OFFSETS
-            ),
+            offset_writer_ptr: self.get_offset_ptr(ctx, build, runtime_ptr),
             offset_counter_ptr: increment_pointer!(
                 ctx,
                 build,
@@ -111,8 +127,7 @@ impl Writer for StringWriter {
             .build_load(ctx.i64_type(), curr_offset_ptr, "final_string_offset")
             .unwrap()
             .into_int_value();
-        let offset_writer_ptr =
-            increment_pointer!(ctx, build, runtime_ptr, StringWriterRuntime::OFFSET_OFFSETS);
+        let offset_writer_ptr = self.get_offset_ptr(ctx, build, runtime_ptr);
 
         self.offset_writer
             .llvm_write(ctx, module, build, offset_writer_ptr, |e| {
@@ -140,6 +155,7 @@ impl Writer for StringWriter {
 #[derive(ReprOffset)]
 #[roff(usize_offsets)]
 pub struct StringWriterRuntime {
+    offset_runtime_ptr: *mut c_void,
     offsets: Box<AnyRuntime>,
     bytes: Vec<u8>,
     curr_offset: u64,
@@ -151,7 +167,9 @@ impl WriterRuntime for StringWriterRuntime {
     }
 
     fn reserve_for_additional(&mut self, count: usize) -> Result<(), ArrowKernelError> {
-        self.offsets.reserve_for_additional(count)
+        self.offsets.reserve_for_additional(count)?;
+        self.offset_runtime_ptr = self.offsets.as_ptr();
+        Ok(())
     }
 
     fn len(&self) -> usize {
