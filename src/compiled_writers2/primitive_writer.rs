@@ -11,9 +11,7 @@ use inkwell::{
 use repr_offset::ReprOffset;
 
 use crate::{
-    compiled_writers2::{
-        AnyRuntime, AnyWriterEmitter, Writer as WriterTrait, WriterEmitter, WriterRuntime,
-    },
+    compiled_writers2::{AnyRuntime, AnyWriterEmitter, Writer, WriterEmitter, WriterRuntime},
     increment_pointer, ArrowKernelError, PrimitiveType,
 };
 
@@ -95,8 +93,10 @@ impl PrimitiveWriter {
 
         Ok(PrimitiveWriter { pt })
     }
+}
 
-    pub fn allocate(&self, size: usize) -> PrimitiveWriterRuntime {
+impl Writer for PrimitiveWriter {
+    fn allocate(&self, size: usize) -> AnyRuntime {
         let mut pwr = PrimitiveWriterRuntime {
             alloc: Vec::new(),
             alloc_ptr: std::ptr::null_mut(),
@@ -106,105 +106,77 @@ impl PrimitiveWriter {
 
         pwr.alloc.resize((self.pt.width() * size).div_ceil(16), 0);
         pwr.alloc_ptr = pwr.alloc.as_mut_ptr() as *mut u8;
-        pwr
+        pwr.into()
     }
 
-    pub fn llvm_init(&self, _ctx: &Context, _b: &Builder, _ptr: PointerValue) {}
-    pub fn llvm_write<
-        'a,
-        F: Fn(&mut PrimitiveWriterEmitter<'a>) -> Result<(), ArrowKernelError>,
-    >(
+    fn llvm_init<'a>(
         &self,
-        ctx: &'a Context,
-        b: &Builder<'a>,
-        ptr: PointerValue,
-        f: F,
-    ) -> Result<(), ArrowKernelError> {
-        let mut emitter = PrimitiveWriterEmitter::default();
-        f(&mut emitter)?;
-
-        if let Some(val) = emitter.val {
-            let ptr_type = ctx.ptr_type(AddressSpace::default());
-            let curr_alloc_ptr_ptr =
-                increment_pointer!(ctx, b, ptr, PrimitiveWriterRuntime::OFFSET_ALLOC_PTR);
-            let curr_alloc_ptr = b
-                .build_load(ptr_type, curr_alloc_ptr_ptr, "curr_alloc_ptr")
-                .unwrap()
-                .as_basic_value_enum()
-                .into_pointer_value();
-            b.build_store(curr_alloc_ptr, val).unwrap();
-
-            let new_alloc_ptr = increment_pointer!(ctx, b, curr_alloc_ptr, self.pt.width());
-            b.build_store(curr_alloc_ptr_ptr, new_alloc_ptr).unwrap();
-        }
-
-        Ok(())
-    }
-    pub fn llvm_flush(&self, _ctx: &Context, _b: &Builder, _ptr: PointerValue) {}
-}
-
-impl WriterTrait for PrimitiveWriter {
-    fn allocate(&self, size: usize) -> AnyRuntime {
-        AnyRuntime::PrimitiveWriterRuntime(PrimitiveWriter::allocate(self, size))
-    }
-
-    fn llvm_init<'a>(&self, ctx: &'a Context, build: &Builder<'a>, runtime_ptr: PointerValue<'a>) {
-        PrimitiveWriter::llvm_init(self, ctx, build, runtime_ptr);
+        _ctx: &'a Context,
+        _build: &Builder<'a>,
+        _runtime_ptr: PointerValue<'a>,
+    ) {
     }
 
     fn llvm_write<'ctx, 'borrow, F>(
         &'borrow self,
         ctx: &'ctx Context,
         _module: &'borrow Module<'ctx>,
-        build: &'borrow Builder<'ctx>,
+        b: &'borrow Builder<'ctx>,
         runtime_ptr: PointerValue<'ctx>,
         f: F,
     ) -> Result<(), ArrowKernelError>
     where
         F: Fn(&mut AnyWriterEmitter<'ctx, 'borrow>) -> Result<(), ArrowKernelError>,
     {
-        let mut emitter =
-            AnyWriterEmitter::PrimitiveWriterEmitter(PrimitiveWriterEmitter::default());
-        f(&mut emitter)?;
-
-        let AnyWriterEmitter::PrimitiveWriterEmitter(emitter) = emitter else {
-            return Err(ArrowKernelError::InternalError(
-                "primitive writer received non-primitive emitter".into(),
-            ));
-        };
-
-        PrimitiveWriter::llvm_write(self, ctx, build, runtime_ptr, |inner| {
-            if let Some(val) = emitter.val {
-                inner.emit(val)?;
-            }
-            Ok(())
-        })
-    }
-
-    fn llvm_flush<'a>(&self, ctx: &'a Context, build: &Builder<'a>, runtime_ptr: PointerValue<'a>) {
-        PrimitiveWriter::llvm_flush(self, ctx, build, runtime_ptr);
+        let mut emitter = PrimitiveWriterEmitter {
+            ctx,
+            b,
+            runtime_ptr,
+            pt: self.pt,
+            used: false,
+        }
+        .into();
+        f(&mut emitter)
     }
 }
 
-#[derive(Default)]
-pub struct PrimitiveWriterEmitter<'a> {
-    val: Option<BasicValueEnum<'a>>,
+pub struct PrimitiveWriterEmitter<'ctx, 'borrow> {
+    ctx: &'ctx Context,
+    b: &'borrow Builder<'ctx>,
+    runtime_ptr: PointerValue<'ctx>,
+    pt: PrimitiveType,
+    used: bool,
 }
 
-impl<'ctx, 'borrow> WriterEmitter<'ctx, 'borrow> for PrimitiveWriterEmitter<'ctx> {
+impl<'ctx, 'borrow> WriterEmitter<'ctx, 'borrow> for PrimitiveWriterEmitter<'ctx, 'borrow> {
     fn emit(&mut self, val: BasicValueEnum<'ctx>) -> Result<(), ArrowKernelError> {
-        PrimitiveWriterEmitter::emit(self, val)
-    }
-}
-
-impl<'a> PrimitiveWriterEmitter<'a> {
-    pub fn emit(&mut self, val: BasicValueEnum<'a>) -> Result<(), ArrowKernelError> {
-        if self.val.is_some() {
+        if self.used {
             return Err(ArrowKernelError::InternalError(
                 "emit called on non-empty primitive emitter".into(),
             ));
         }
-        self.val = Some(val);
+        self.used = true;
+
+        let ptr_type = self.ctx.ptr_type(AddressSpace::default());
+        let curr_alloc_ptr_ptr = increment_pointer!(
+            self.ctx,
+            self.b,
+            self.runtime_ptr,
+            PrimitiveWriterRuntime::OFFSET_ALLOC_PTR
+        );
+        let curr_alloc_ptr = self
+            .b
+            .build_load(ptr_type, curr_alloc_ptr_ptr, "curr_alloc_ptr")
+            .unwrap()
+            .as_basic_value_enum()
+            .into_pointer_value();
+        self.b.build_store(curr_alloc_ptr, val).unwrap();
+
+        let new_alloc_ptr = increment_pointer!(self.ctx, self.b, curr_alloc_ptr, self.pt.width());
+        self.b
+            .build_store(curr_alloc_ptr_ptr, new_alloc_ptr)
+            .unwrap();
+
         Ok(())
     }
 }
@@ -217,7 +189,10 @@ mod tests {
     use inkwell::{context::Context, values::BasicValue, AddressSpace, OptimizationLevel};
 
     use super::PrimitiveWriter;
-    use crate::{compiled_writers2::WriterRuntime, declare_blocks, PrimitiveType};
+    use crate::{
+        compiled_writers2::{Writer, WriterEmitter, WriterRuntime},
+        declare_blocks, PrimitiveType,
+    };
 
     #[test]
     fn primitive_writer_jit_writes_values_to_array() {
@@ -241,7 +216,7 @@ mod tests {
         writer.llvm_init(&ctx, &build, dest);
         for value in [17_i32, -4, 99] {
             writer
-                .llvm_write(&ctx, &build, dest, |emitter| {
+                .llvm_write(&ctx, &llvm_mod, &build, dest, |emitter| {
                     emitter.emit(
                         ctx.i32_type()
                             .const_int(value as u64, true)
@@ -250,7 +225,7 @@ mod tests {
                 })
                 .unwrap();
         }
-        writer.llvm_flush(&ctx, &build, dest);
+        writer.llvm_flush(&ctx, &llvm_mod, &build, dest);
 
         build.build_return(None).unwrap();
         llvm_mod.verify().unwrap();

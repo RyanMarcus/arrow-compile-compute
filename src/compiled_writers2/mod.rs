@@ -1,3 +1,4 @@
+//mod boolean_writer;
 mod list_writer;
 mod primitive_writer;
 mod string_writer;
@@ -62,7 +63,14 @@ pub trait Writer {
     where
         F: Fn(&mut AnyWriterEmitter<'ctx, 'borrow>) -> Result<(), ArrowKernelError>;
 
-    fn llvm_flush<'a>(&self, ctx: &'a Context, build: &Builder<'a>, runtime_ptr: PointerValue<'a>);
+    fn llvm_flush<'ctx, 'borrow>(
+        &'borrow self,
+        ctx: &'ctx Context,
+        module: &'borrow Module<'ctx>,
+        build: &'borrow Builder<'ctx>,
+        runtime_ptr: PointerValue<'ctx>,
+    ) {
+    }
 }
 
 #[enum_dispatch(Writer)]
@@ -74,7 +82,7 @@ pub enum AnyWriter {
 
 #[enum_dispatch(WriterEmitter)]
 pub enum AnyWriterEmitter<'ctx, 'borrow> {
-    PrimitiveWriterEmitter(PrimitiveWriterEmitter<'ctx>),
+    PrimitiveWriterEmitter(PrimitiveWriterEmitter<'ctx, 'borrow>),
     ListWriterEmitter(ListWriterEmitter<'ctx, 'borrow>),
     StringWriterEmitter(StringWriterEmitter<'ctx, 'borrow>),
 }

@@ -1,9 +1,6 @@
 use std::{ffi::c_void, sync::Arc};
 
-use arrow_array::{
-    make_array,
-    ArrayRef,
-};
+use arrow_array::{make_array, ArrayRef};
 use arrow_buffer::Buffer;
 use arrow_data::ArrayDataBuilder;
 use arrow_schema::DataType;
@@ -45,7 +42,7 @@ impl StringWriter {
 impl Writer for StringWriter {
     fn allocate(&self, size: usize) -> AnyRuntime {
         StringWriterRuntime {
-            offsets: self.offset_writer.allocate(size + 1),
+            offsets: Box::new(self.offset_writer.allocate(size + 1)),
             bytes: Vec::with_capacity(4096),
             curr_offset: 0,
         }
@@ -76,6 +73,7 @@ impl Writer for StringWriter {
         let mut emitter = AnyWriterEmitter::StringWriterEmitter(StringWriterEmitter {
             ctx,
             builder: build,
+            module,
             offset_writer: &self.offset_writer,
             offset_writer_ptr: increment_pointer!(
                 ctx,
@@ -96,7 +94,13 @@ impl Writer for StringWriter {
         f(&mut emitter)
     }
 
-    fn llvm_flush<'a>(&self, ctx: &'a Context, build: &Builder<'a>, runtime_ptr: PointerValue<'a>) {
+    fn llvm_flush<'ctx, 'borrow>(
+        &'borrow self,
+        ctx: &'ctx Context,
+        module: &'borrow Module<'ctx>,
+        build: &'borrow Builder<'ctx>,
+        runtime_ptr: PointerValue<'ctx>,
+    ) {
         let curr_offset_ptr = increment_pointer!(
             ctx,
             build,
@@ -111,7 +115,7 @@ impl Writer for StringWriter {
             increment_pointer!(ctx, build, runtime_ptr, StringWriterRuntime::OFFSET_OFFSETS);
 
         self.offset_writer
-            .llvm_write(ctx, build, offset_writer_ptr, |e| {
+            .llvm_write(ctx, module, build, offset_writer_ptr, |e| {
                 let offset = match self.offset_writer.primitive_type() {
                     PrimitiveType::I32 => build
                         .build_int_truncate(curr_offset, ctx.i32_type(), "final_string_offset_i32")
@@ -127,15 +131,16 @@ impl Writer for StringWriter {
                 e.emit(offset)
             })
             .unwrap();
-        self.offset_writer.llvm_flush(ctx, build, offset_writer_ptr);
+        self.offset_writer
+            .llvm_flush(ctx, module, build, offset_writer_ptr);
     }
 }
 
 #[repr(C)]
-#[derive(ReprOffset, Debug)]
+#[derive(ReprOffset)]
 #[roff(usize_offsets)]
 pub struct StringWriterRuntime {
-    offsets: PrimitiveWriterRuntime,
+    offsets: Box<AnyRuntime>,
     bytes: Vec<u8>,
     curr_offset: u64,
 }
@@ -179,6 +184,7 @@ impl WriterRuntime for StringWriterRuntime {
 
 pub struct StringWriterEmitter<'ctx, 'borrow> {
     ctx: &'ctx Context,
+    module: &'borrow Module<'ctx>,
     builder: &'borrow Builder<'ctx>,
 
     offset_writer: &'borrow PrimitiveWriter,
@@ -216,8 +222,12 @@ impl<'ctx, 'borrow> WriterEmitter<'ctx, 'borrow> for StringWriterEmitter<'ctx, '
             .unwrap()
             .into_int_value();
 
-        self.offset_writer
-            .llvm_write(self.ctx, self.builder, self.offset_writer_ptr, |e| {
+        self.offset_writer.llvm_write(
+            self.ctx,
+            self.module,
+            self.builder,
+            self.offset_writer_ptr,
+            |e| {
                 let offset = match self.offset_writer.primitive_type() {
                     PrimitiveType::I32 => self
                         .builder
@@ -228,7 +238,8 @@ impl<'ctx, 'borrow> WriterEmitter<'ctx, 'borrow> for StringWriterEmitter<'ctx, '
                     _ => unreachable!("invalid string offset type"),
                 };
                 e.emit(offset)
-            })?;
+            },
+        )?;
 
         let new_offset = self
             .builder
@@ -296,7 +307,7 @@ mod tests {
                 })
                 .unwrap();
         }
-        writer.llvm_flush(&ctx, &build, dest);
+        writer.llvm_flush(&ctx, &llvm_mod, &build, dest);
         build.build_return(None).unwrap();
 
         llvm_mod.verify().unwrap();

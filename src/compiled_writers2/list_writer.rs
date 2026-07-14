@@ -83,7 +83,7 @@ impl Writer for ListWriter {
             offset_runtime_ptr: std::ptr::null_mut(),
             value_runtime_ptr: std::ptr::null_mut(),
             curr_count: 0,
-            offset_runtime: self.offsets.allocate(size),
+            offset_runtime: Box::new(self.offsets.allocate(size)),
             value_runtime: Box::new(self.inner.allocate(size)),
         };
         runtime.offset_runtime_ptr = runtime.offset_runtime.as_ptr();
@@ -127,19 +127,23 @@ impl Writer for ListWriter {
 
         f(&mut emitter)?;
 
-        self.offsets
-            .llvm_write(ctx, b, self.get_offset_ptr(ctx, b, runtime_ptr), |e| {
-                e.emit(curr_count)
-            })?;
+        self.offsets.llvm_write(
+            ctx,
+            module,
+            b,
+            self.get_offset_ptr(ctx, b, runtime_ptr),
+            |e| e.emit(curr_count),
+        )?;
 
         Ok(())
     }
 
-    fn llvm_flush<'a>(
-        &self,
-        ctx: &'a inkwell::context::Context,
-        build: &inkwell::builder::Builder<'a>,
-        runtime_ptr: inkwell::values::PointerValue<'a>,
+    fn llvm_flush<'ctx, 'borrow>(
+        &'borrow self,
+        ctx: &'ctx Context,
+        module: &'borrow Module<'ctx>,
+        build: &'borrow Builder<'ctx>,
+        runtime_ptr: PointerValue<'ctx>,
     ) {
         let curr_count_ptr = increment_pointer!(
             ctx,
@@ -154,6 +158,7 @@ impl Writer for ListWriter {
         self.offsets
             .llvm_write(
                 ctx,
+                module,
                 build,
                 self.get_offset_ptr(ctx, build, runtime_ptr),
                 |e| {
@@ -169,10 +174,18 @@ impl Writer for ListWriter {
             )
             .unwrap();
 
-        self.offsets
-            .llvm_flush(ctx, build, self.get_offset_ptr(ctx, build, runtime_ptr));
-        self.inner
-            .llvm_flush(ctx, build, self.get_value_ptr(ctx, build, runtime_ptr));
+        self.offsets.llvm_flush(
+            ctx,
+            module,
+            build,
+            self.get_offset_ptr(ctx, build, runtime_ptr),
+        );
+        self.inner.llvm_flush(
+            ctx,
+            module,
+            build,
+            self.get_value_ptr(ctx, build, runtime_ptr),
+        );
     }
 }
 
@@ -183,7 +196,7 @@ pub struct ListWriterRuntime {
     offset_runtime_ptr: *mut c_void,
     value_runtime_ptr: *mut c_void,
     curr_count: u64,
-    offset_runtime: PrimitiveWriterRuntime,
+    offset_runtime: Box<AnyRuntime>,
     value_runtime: Box<AnyRuntime>,
 }
 
@@ -323,7 +336,7 @@ mod tests {
                 emitter.emit(ctx.i32_type().const_int(14, true).as_basic_value_enum())
             })
             .unwrap();
-        writer.llvm_flush(&ctx, &build, dest);
+        writer.llvm_flush(&ctx, &llvm_mod, &build, dest);
 
         build.build_return(None).unwrap();
         llvm_mod.verify().unwrap();
@@ -394,7 +407,7 @@ mod tests {
                 emitter.emit(ctx.i32_type().const_int(14, true).as_basic_value_enum())
             })
             .unwrap();
-        writer.llvm_flush(&ctx, &build, dest);
+        writer.llvm_flush(&ctx, &llvm_mod, &build, dest);
 
         build.build_return(None).unwrap();
         llvm_mod.verify().unwrap();
