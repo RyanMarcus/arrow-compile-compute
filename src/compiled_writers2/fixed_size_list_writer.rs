@@ -87,16 +87,15 @@ impl Writer for FixedSizeListWriter {
     where
         F: Fn(&mut AnyWriterEmitter<'ctx, 'borrow>) -> Result<(), ArrowKernelError>,
     {
-        let mut emitter =
-            AnyWriterEmitter::FixedSizeListWriterEmitter(FixedSizeListWriterEmitter {
-                codegen,
-                value_runtime_ptr: Self::get_value_ptr(codegen, runtime_ptr),
-                values: self.values.as_ref(),
-                list_type: self.list_type,
-                used: false,
-            });
+        let mut emitter = AnyWriterEmitter::FixedSizeList(FixedSizeListWriterEmitter {
+            codegen,
+            value_runtime_ptr: Self::get_value_ptr(codegen, runtime_ptr),
+            values: self.values.as_ref(),
+            list_type: self.list_type,
+            used: false,
+        });
         f(&mut emitter)?;
-        let AnyWriterEmitter::FixedSizeListWriterEmitter(emitter) = emitter else {
+        let AnyWriterEmitter::FixedSizeList(emitter) = emitter else {
             unreachable!()
         };
         if !emitter.used {

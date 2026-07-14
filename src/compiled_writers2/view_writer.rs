@@ -325,10 +325,7 @@ mod tests {
             arrow_schema::DataType::BinaryView,
         ] {
             let plan = WriterPlan::for_data_type(&data_type).unwrap();
-            assert!(matches!(
-                plan.compile().unwrap(),
-                AnyWriter::StringView(_)
-            ));
+            assert!(matches!(plan.compile().unwrap(), AnyWriter::StringView(_)));
         }
     }
 

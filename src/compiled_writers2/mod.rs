@@ -142,38 +142,38 @@ pub trait Writer {
 
 #[enum_dispatch(Writer)]
 pub enum AnyWriter {
-    BooleanWriter,
-    DictionaryWriter,
-    FixedSizeListWriter,
-    PrimitiveWriter,
-    ListWriter,
-    RunEndWriter,
-    StringWriter,
-    StringViewWriter,
+    Boolean(BooleanWriter),
+    Dictionary(DictionaryWriter),
+    FixedSizeList(FixedSizeListWriter),
+    Primitive(PrimitiveWriter),
+    List(ListWriter),
+    RunEnd(RunEndWriter),
+    String(StringWriter),
+    StringView(StringViewWriter),
 }
 
 #[enum_dispatch(WriterEmitter)]
 pub enum AnyWriterEmitter<'ctx, 'borrow> {
-    BooleanWriterEmitter(BooleanWriterEmitter<'ctx, 'borrow>),
-    DictionaryWriterEmitter(DictionaryWriterEmitter<'ctx, 'borrow>),
-    FixedSizeListWriterEmitter(FixedSizeListWriterEmitter<'ctx, 'borrow>),
-    PrimitiveWriterEmitter(PrimitiveWriterEmitter<'ctx, 'borrow>),
-    ListWriterEmitter(ListWriterEmitter<'ctx, 'borrow>),
-    RunEndWriterEmitter(RunEndWriterEmitter<'ctx, 'borrow>),
-    StringWriterEmitter(StringWriterEmitter<'ctx, 'borrow>),
-    StringViewWriterEmitter(StringViewWriterEmitter<'ctx, 'borrow>),
+    Boolean(BooleanWriterEmitter<'ctx, 'borrow>),
+    Dictionary(DictionaryWriterEmitter<'ctx, 'borrow>),
+    FixedSizeList(FixedSizeListWriterEmitter<'ctx, 'borrow>),
+    Primitive(PrimitiveWriterEmitter<'ctx, 'borrow>),
+    List(ListWriterEmitter<'ctx, 'borrow>),
+    RunEnd(RunEndWriterEmitter<'ctx, 'borrow>),
+    String(StringWriterEmitter<'ctx, 'borrow>),
+    StringView(StringViewWriterEmitter<'ctx, 'borrow>),
 }
 
 #[enum_dispatch(WriterRuntime)]
 pub enum AnyRuntime {
-    BooleanWriterRuntime,
-    DictionaryWriterRuntime,
-    FixedSizeListWriterRuntime,
-    PrimitiveWriterRuntime,
-    ListWriterRuntime,
-    RunEndWriterRuntime,
-    StringWriterRuntime,
-    StringViewWriterRuntime,
+    Boolean(BooleanWriterRuntime),
+    Dictionary(DictionaryWriterRuntime),
+    FixedSizeList(FixedSizeListWriterRuntime),
+    Primitive(PrimitiveWriterRuntime),
+    List(ListWriterRuntime),
+    RunEnd(RunEndWriterRuntime),
+    String(StringWriterRuntime),
+    StringView(StringViewWriterRuntime),
 }
 
 pub enum WriterPlan {
@@ -279,32 +279,32 @@ impl WriterPlan {
 
     pub fn compile(&self) -> Result<AnyWriter, ArrowKernelError> {
         match self {
-            WriterPlan::Boolean => Ok(AnyWriter::BooleanWriter(BooleanWriter::compile())),
-            WriterPlan::Primitive(primitive_type) => Ok(AnyWriter::PrimitiveWriter(
+            WriterPlan::Boolean => Ok(AnyWriter::Boolean(BooleanWriter::compile())),
+            WriterPlan::Primitive(primitive_type) => Ok(AnyWriter::Primitive(
                 PrimitiveWriter::compile(*primitive_type)?,
             )),
             WriterPlan::Dictionary(dictionary_key_type, writer_plan) => {
-                Ok(AnyWriter::DictionaryWriter(DictionaryWriter::compile(
+                Ok(AnyWriter::Dictionary(DictionaryWriter::compile(
                     *dictionary_key_type,
                     writer_plan.storage_type(),
                     writer_plan.compile()?,
                 )?))
             }
             WriterPlan::RunEnd(run_end_type, writer_plan) => {
-                Ok(AnyWriter::RunEndWriter(RunEndWriter::compile(
+                Ok(AnyWriter::RunEnd(RunEndWriter::compile(
                     *run_end_type,
                     writer_plan.storage_type(),
                     writer_plan.compile()?,
                 )?))
             }
-            WriterPlan::FixedSizeList(_, writer_plan) => Ok(AnyWriter::FixedSizeListWriter(
+            WriterPlan::FixedSizeList(_, writer_plan) => Ok(AnyWriter::FixedSizeList(
                 FixedSizeListWriter::compile(self.storage_type(), writer_plan.compile()?)?,
             )),
             WriterPlan::VariableSizeList(_) => todo!(),
-            WriterPlan::String => Ok(AnyWriter::StringWriter(StringWriter::compile(
+            WriterPlan::String => Ok(AnyWriter::String(StringWriter::compile(
                 PrimitiveType::I32,
             )?)),
-            WriterPlan::StringView => Ok(AnyWriter::StringViewWriter(StringViewWriter::compile())),
+            WriterPlan::StringView => Ok(AnyWriter::StringView(StringViewWriter::compile())),
         }
     }
 }

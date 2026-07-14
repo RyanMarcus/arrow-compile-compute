@@ -300,7 +300,7 @@ mod tests {
         let dest = func.get_nth_param(0).unwrap().into_pointer_value();
         let writer = ListWriter {
             offsets: PrimitiveWriter::compile(PrimitiveType::I32).unwrap(),
-            inner: Box::new(AnyWriter::PrimitiveWriter(
+            inner: Box::new(AnyWriter::Primitive(
                 PrimitiveWriter::compile(PrimitiveType::I32).unwrap(),
             )),
         };
@@ -371,9 +371,9 @@ mod tests {
         let dest = func.get_nth_param(0).unwrap().into_pointer_value();
         let writer = ListWriter {
             offsets: PrimitiveWriter::compile(PrimitiveType::I32).unwrap(),
-            inner: Box::new(AnyWriter::ListWriter(ListWriter {
+            inner: Box::new(AnyWriter::List(ListWriter {
                 offsets: PrimitiveWriter::compile(PrimitiveType::I32).unwrap(),
-                inner: Box::new(AnyWriter::PrimitiveWriter(
+                inner: Box::new(AnyWriter::Primitive(
                     PrimitiveWriter::compile(PrimitiveType::I32).unwrap(),
                 )),
             })),

@@ -303,10 +303,7 @@ mod tests {
     #[test]
     fn boolean_writer_plan_compiles_boolean_writer() {
         let plan = WriterPlan::for_data_type(&arrow_schema::DataType::Boolean).unwrap();
-        assert!(matches!(
-            plan.compile().unwrap(),
-            AnyWriter::BooleanWriter(_)
-        ));
+        assert!(matches!(plan.compile().unwrap(), AnyWriter::Boolean(_)));
     }
 
     fn compile_write_function<'ctx>(

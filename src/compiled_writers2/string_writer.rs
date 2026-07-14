@@ -88,7 +88,7 @@ impl Writer for StringWriter {
     {
         let extend = llvm_add_str_writer_append_bytes(codegen.ctx, codegen.module);
 
-        let mut emitter = AnyWriterEmitter::StringWriterEmitter(StringWriterEmitter {
+        let mut emitter = AnyWriterEmitter::String(StringWriterEmitter {
             codegen,
             offset_writer: &self.offset_writer,
             offset_writer_ptr: self.get_offset_ptr(codegen, runtime_ptr),
