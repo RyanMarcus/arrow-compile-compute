@@ -190,7 +190,9 @@ mod tests {
     use std::ffi::c_void;
 
     use arrow_array::{cast::AsArray, types::Int32Type};
-    use inkwell::{context::Context, values::BasicValue, AddressSpace, OptimizationLevel};
+    use inkwell::{
+        context::Context, types::VectorType, values::BasicValue, AddressSpace, OptimizationLevel,
+    };
 
     use super::PrimitiveWriter;
     use crate::{
@@ -234,6 +236,10 @@ mod tests {
                 })
                 .unwrap();
         }
+        let values = [8_i32, 9, 10].map(|value| ctx.i32_type().const_int(value as u64, true));
+        writer
+            .llvm_write_multiple(codegen, dest, VectorType::const_vector(&values))
+            .unwrap();
         writer.llvm_flush(codegen, dest);
 
         build.build_return(None).unwrap();
@@ -247,13 +253,13 @@ mod tests {
                 .unwrap()
         };
 
-        let mut runtime = writer.allocate(3);
+        let mut runtime = writer.allocate(6);
         unsafe {
             f.call(runtime.as_ptr());
         }
 
-        let array = runtime.to_array(3).unwrap();
+        let array = runtime.to_array(6).unwrap();
         let values = array.as_primitive::<Int32Type>().values();
-        assert_eq!(values, &[17, -4, 99]);
+        assert_eq!(values, &[17, -4, 99, 8, 9, 10]);
     }
 }

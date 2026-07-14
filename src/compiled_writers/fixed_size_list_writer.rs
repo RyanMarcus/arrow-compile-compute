@@ -267,36 +267,17 @@ impl<'a> FixedSizeListWriter<'a> {
                     .unwrap();
             }
             FixedSizeListWriter::Boolean { writer, list_size } => {
-                let val = val.into_array_value();
-                let full_chunks = list_size / 64;
-                for chunk_idx in 0..full_chunks {
-                    let chunk = build
-                        .build_extract_value(val, chunk_idx as u32, "bool_chunk")
-                        .unwrap();
-                    writer.emit_ingest_64_bools(ctx, build, alloc_ptr, chunk);
-                }
-
-                let tail = list_size % 64;
-                if tail > 0 {
-                    let chunk = build
-                        .build_extract_value(val, full_chunks as u32, "bool_tail_chunk")
+                let val = val.into_vector_value();
+                for idx in 0..*list_size {
+                    let bool_val = build
+                        .build_extract_element(
+                            val,
+                            ctx.i64_type().const_int(idx as u64, false),
+                            "bool_value",
+                        )
                         .unwrap()
-                        .into_int_value();
-                    for idx in 0..tail {
-                        let shifted = build
-                            .build_right_shift(
-                                chunk,
-                                ctx.i64_type().const_int(idx as u64, false),
-                                false,
-                                "bool_tail_shifted",
-                            )
-                            .unwrap();
-                        let bool_val = build
-                            .build_int_truncate(shifted, ctx.bool_type(), "bool_tail_bit")
-                            .unwrap()
-                            .as_basic_value_enum();
-                        writer.emit_ingest(ctx, build, alloc_ptr, bool_val);
-                    }
+                        .as_basic_value_enum();
+                    writer.emit_ingest(ctx, build, alloc_ptr, bool_val);
                 }
             }
         }
@@ -428,12 +409,12 @@ mod tests {
     }
 
     #[test]
-    fn test_fsl_writer_boolean_uses_packed_values() {
+    fn test_fsl_writer_boolean_uses_vector_values() {
         let ctx = Context::create();
 
         let list_type = PrimitiveType::List(ListItemType::Boolean, 3)
             .llvm_type(&ctx)
-            .into_array_type();
+            .into_vector_type();
 
         let llvm_mod = ctx.create_module("test_fsl_bool_writer");
         let build = ctx.create_builder();
@@ -467,19 +448,16 @@ mod tests {
 
         for row in rows {
             let mut to_write = list_type.const_zero();
-            let packed = row
-                .into_iter()
-                .enumerate()
-                .fold(0_u64, |acc, (idx, value)| acc | ((value as u64) << idx));
-            to_write = build
-                .build_insert_value(
-                    to_write,
-                    ctx.i64_type().const_int(packed, false),
-                    0,
-                    "insert_bool_chunk",
-                )
-                .unwrap()
-                .into_array_value();
+            for (idx, value) in row.into_iter().enumerate() {
+                to_write = build
+                    .build_insert_element(
+                        to_write,
+                        ctx.bool_type().const_int(u64::from(value), false),
+                        ctx.i64_type().const_int(idx as u64, false),
+                        "insert_bool_value",
+                    )
+                    .unwrap();
+            }
             writer.llvm_ingest(&ctx, &build, to_write.as_basic_value_enum());
         }
 

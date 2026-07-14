@@ -1,5 +1,6 @@
 mod boolean_writer;
 mod dictionary_writer;
+mod fixed_size_list_writer;
 mod list_writer;
 mod primitive_writer;
 mod run_end_writer;
@@ -14,10 +15,13 @@ use inkwell::{
     builder::Builder,
     context::Context,
     module::Module,
-    values::{BasicValueEnum, PointerValue},
+    values::{BasicValueEnum, PointerValue, VectorValue},
 };
 
 use dictionary_writer::{DictionaryWriter, DictionaryWriterEmitter, DictionaryWriterRuntime};
+use fixed_size_list_writer::{
+    FixedSizeListWriter, FixedSizeListWriterEmitter, FixedSizeListWriterRuntime,
+};
 use list_writer::{ListWriter, ListWriterEmitter, ListWriterRuntime};
 use run_end_writer::{RunEndWriter, RunEndWriterEmitter, RunEndWriterRuntime};
 
@@ -66,14 +70,27 @@ pub struct WriterCodegen<'ctx, 'borrow> {
 
 #[enum_dispatch]
 pub trait Writer {
+    /// Allocates the runtime state used by generated code.
+    ///
+    /// `size` will be the maximum number of items that can be written. Writing
+    /// more items will cause invalid writes / segfaults / UB.
     fn allocate(&self, size: usize) -> AnyRuntime;
 
+    /// Emits initialization code for this writer and its composed children.
+    ///
+    /// `runtime_ptr` must point to runtime state returned by [`Writer::allocate`].
     fn llvm_init<'ctx, 'borrow>(
         &self,
         codegen: WriterCodegen<'ctx, 'borrow>,
         runtime_ptr: PointerValue<'ctx>,
     );
 
+    /// Emits code for one logical write operation.
+    ///
+    /// The callback describes the value through a writer-specific emitter.
+    /// Scalar emitters generally accept one call to [`WriterEmitter::emit`],
+    /// while composite emitters may accept multiple calls to describe the
+    /// contents of one logical value.
     fn llvm_write<'ctx, 'borrow, F>(
         &'borrow self,
         codegen: WriterCodegen<'ctx, 'borrow>,
@@ -82,6 +99,31 @@ pub trait Writer {
     ) -> Result<(), ArrowKernelError>
     where
         F: Fn(&mut AnyWriterEmitter<'ctx, 'borrow>) -> Result<(), ArrowKernelError>;
+
+    /// Writes each lane of `values` as a separate logical value.
+    ///
+    /// Writers may override this to ingest a vector more efficiently. The
+    /// default preserves the single-value emitter contract by creating a new
+    /// emitter for every lane.
+    fn llvm_write_multiple<'ctx, 'borrow>(
+        &'borrow self,
+        codegen: WriterCodegen<'ctx, 'borrow>,
+        runtime_ptr: PointerValue<'ctx>,
+        values: VectorValue<'ctx>,
+    ) -> Result<(), ArrowKernelError> {
+        for idx in 0..values.get_type().get_size() {
+            let value = codegen
+                .builder
+                .build_extract_element(
+                    values,
+                    codegen.ctx.i64_type().const_int(idx as u64, false),
+                    "writer_multiple_value",
+                )
+                .unwrap();
+            self.llvm_write(codegen, runtime_ptr, |emitter| emitter.emit(value))?;
+        }
+        Ok(())
+    }
 
     /// Finalizes this writer and all composed child writers.
     ///
@@ -100,6 +142,7 @@ pub trait Writer {
 pub enum AnyWriter {
     BooleanWriter,
     DictionaryWriter,
+    FixedSizeListWriter,
     PrimitiveWriter,
     ListWriter,
     RunEndWriter,
@@ -110,6 +153,7 @@ pub enum AnyWriter {
 pub enum AnyWriterEmitter<'ctx, 'borrow> {
     BooleanWriterEmitter(BooleanWriterEmitter<'ctx, 'borrow>),
     DictionaryWriterEmitter(DictionaryWriterEmitter<'ctx, 'borrow>),
+    FixedSizeListWriterEmitter(FixedSizeListWriterEmitter<'ctx, 'borrow>),
     PrimitiveWriterEmitter(PrimitiveWriterEmitter<'ctx, 'borrow>),
     ListWriterEmitter(ListWriterEmitter<'ctx, 'borrow>),
     RunEndWriterEmitter(RunEndWriterEmitter<'ctx, 'borrow>),
@@ -120,6 +164,7 @@ pub enum AnyWriterEmitter<'ctx, 'borrow> {
 pub enum AnyRuntime {
     BooleanWriterRuntime,
     DictionaryWriterRuntime,
+    FixedSizeListWriterRuntime,
     PrimitiveWriterRuntime,
     ListWriterRuntime,
     RunEndWriterRuntime,
@@ -145,13 +190,16 @@ impl WriterPlan {
             Self::Boolean => PrimitiveType::U8,
             Self::Primitive(pt) => *pt,
             Self::Dictionary(_, values) | Self::RunEnd(_, values) => values.storage_type(),
-            Self::FixedSizeList(size, values) => PrimitiveType::List(
-                values
-                    .storage_type()
-                    .try_into()
-                    .expect("fixed-size list item type must be scalar"),
-                *size,
-            ),
+            Self::FixedSizeList(size, values) => {
+                let item_type = match values.as_ref() {
+                    Self::Boolean => crate::ListItemType::Boolean,
+                    _ => values
+                        .storage_type()
+                        .try_into()
+                        .expect("fixed-size list item type must be scalar"),
+                };
+                PrimitiveType::List(item_type, *size)
+            }
             Self::VariableSizeList(_) => {
                 unreachable!("variable-size lists do not have a scalar storage type")
             }
@@ -175,7 +223,10 @@ impl WriterPlan {
             PrimitiveType::P64x2 => WriterPlan::String,
             PrimitiveType::List(lit, s) => WriterPlan::FixedSizeList(
                 s,
-                Box::new(WriterPlan::for_primitive_type(PrimitiveType::from(lit))),
+                Box::new(match lit {
+                    crate::ListItemType::Boolean => WriterPlan::Boolean,
+                    _ => WriterPlan::for_primitive_type(PrimitiveType::from(lit)),
+                }),
             ),
         }
     }
@@ -241,7 +292,9 @@ impl WriterPlan {
                     writer_plan.compile()?,
                 )?))
             }
-            WriterPlan::FixedSizeList(_, _) => todo!(),
+            WriterPlan::FixedSizeList(_, writer_plan) => Ok(AnyWriter::FixedSizeListWriter(
+                FixedSizeListWriter::compile(self.storage_type(), writer_plan.compile()?)?,
+            )),
             WriterPlan::VariableSizeList(_) => todo!(),
             WriterPlan::String => Ok(AnyWriter::StringWriter(StringWriter::compile(
                 PrimitiveType::I32,

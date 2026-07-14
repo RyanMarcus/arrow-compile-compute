@@ -64,7 +64,6 @@ use inkwell::{
 };
 use thiserror::Error;
 
-use crate::compiled_iter::load_packed_bool_chunk;
 use crate::compiled_kernels::llvm_utils::save_ptrs_to_string_saver;
 use crate::compiled_kernels::llvm_utils::str_view_writer_append_bytes;
 use crate::llvm_debug::debug_i64;
@@ -228,10 +227,6 @@ pub(crate) fn link_req_helpers(
 
     if let Some(func) = module.get_function("save_ptrs_to_string_saver") {
         ee.add_global_mapping(&func, save_ptrs_to_string_saver as *const () as usize);
-    }
-
-    if let Some(func) = module.get_function("load_packed_bool_chunk") {
-        ee.add_global_mapping(&func, load_packed_bool_chunk as *const () as usize);
     }
 
     if let Some(func) = module.get_function("debug_i64") {

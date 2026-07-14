@@ -320,34 +320,32 @@ impl ScalarVectorIterator {
 
         match self.ptype {
             ListItemType::Boolean => {
-                let mut out = self.ptype().llvm_type(ctx).into_array_type().const_zero();
-                for chunk in 0..self.l.div_ceil(64) {
-                    let remaining_bits = self.l - chunk * 64;
-                    let bytes_in_chunk = remaining_bits.min(64).div_ceil(8);
-                    let mut chunk_value = ctx.i64_type().const_zero();
-                    for byte_idx in 0..bytes_in_chunk {
-                        let byte_ptr =
-                            increment_pointer!(ctx, builder, val_ptr, chunk * 8 + byte_idx);
-                        let byte = builder
-                            .build_load(ctx.i8_type(), byte_ptr, "bool_byte")
-                            .unwrap()
-                            .into_int_value();
-                        let byte = builder
-                            .build_int_z_extend(byte, ctx.i64_type(), "bool_byte_i64")
-                            .unwrap();
-                        let byte = builder
-                            .build_left_shift(
-                                byte,
-                                ctx.i64_type().const_int((byte_idx * 8) as u64, false),
-                                "bool_byte_shifted",
-                            )
-                            .unwrap();
-                        chunk_value = builder.build_or(chunk_value, byte, "bool_chunk").unwrap();
-                    }
-                    out = builder
-                        .build_insert_value(out, chunk_value, chunk as u32, "bool_insert")
+                let mut out = self.ptype().llvm_type(ctx).into_vector_type().const_zero();
+                for idx in 0..self.l {
+                    let byte_ptr = increment_pointer!(ctx, builder, val_ptr, idx / 8);
+                    let byte = builder
+                        .build_load(ctx.i8_type(), byte_ptr, "bool_byte")
                         .unwrap()
-                        .into_array_value();
+                        .into_int_value();
+                    let shifted = builder
+                        .build_right_shift(
+                            byte,
+                            ctx.i8_type().const_int((idx % 8) as u64, false),
+                            false,
+                            "bool_shifted",
+                        )
+                        .unwrap();
+                    let value = builder
+                        .build_int_truncate(shifted, ctx.bool_type(), "bool_value")
+                        .unwrap();
+                    out = builder
+                        .build_insert_element(
+                            out,
+                            value,
+                            ctx.i64_type().const_int(idx as u64, false),
+                            "bool_insert",
+                        )
+                        .unwrap();
                 }
                 out.as_basic_value_enum()
             }
