@@ -954,7 +954,7 @@ pub mod aggregate {
 
     pub use crate::compiled_kernels::{
         Aggregator, CountAggregator, MaxAggregator, MinAggregator, MostRecentAggregator,
-        SumAggregator,
+        ProductAggregator, SumAggregator,
     };
     use crate::ArrowKernelError;
 
@@ -962,6 +962,13 @@ pub mod aggregate {
     /// inputs (e.g., `f32` is summed to `f64`).
     pub fn sum(ty: &DataType) -> Result<Box<SumAggregator>, ArrowKernelError> {
         SumAggregator::create(&[ty])
+    }
+
+    /// Creates a new product aggregator. Final results match the input type and
+    /// wrap on overflow (no checked variant); empty/all-null groups produce no
+    /// value.
+    pub fn product(ty: &DataType) -> Result<Box<ProductAggregator>, ArrowKernelError> {
+        ProductAggregator::create(&[ty])
     }
 
     /// Creates a new min aggregator. Final results will match the input type.
