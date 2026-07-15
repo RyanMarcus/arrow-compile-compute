@@ -357,19 +357,19 @@ mod tests {
 
     use crate::{
         compiled_writers::{
-            AnyWriter, Writer, WriterCodegen, WriterEmitter, WriterPlan, WriterRuntime,
+            AnyWriter, Writer, WriterCodegen, WriterEmitter, WriterRuntime, WriterSpec,
         },
         declare_blocks, PrimitiveType,
     };
 
     #[test]
-    fn string_view_writer_plan_compiles_view_writer() {
+    fn string_view_writer_spec_compiles_view_writer() {
         for data_type in [
             arrow_schema::DataType::Utf8View,
             arrow_schema::DataType::BinaryView,
         ] {
-            let plan = WriterPlan::for_data_type(&data_type).unwrap();
-            assert!(matches!(plan.compile().unwrap(), AnyWriter::StringView(_)));
+            let spec = WriterSpec::for_data_type(&data_type);
+            assert!(matches!(spec.compile().unwrap(), AnyWriter::StringView(_)));
         }
     }
 
@@ -397,7 +397,7 @@ mod tests {
         build.position_at_end(entry);
 
         let runtime_ptr = func.get_nth_param(0).unwrap().into_pointer_value();
-        let writer = WriterPlan::StringView.compile().unwrap();
+        let writer = WriterSpec::StringView.compile().unwrap();
         let codegen = WriterCodegen {
             ctx: &ctx,
             module: &llvm_mod,

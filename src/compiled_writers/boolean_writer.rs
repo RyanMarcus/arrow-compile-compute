@@ -295,15 +295,15 @@ mod tests {
     use super::BooleanWriter;
     use crate::{
         compiled_writers::{
-            AnyWriter, Writer, WriterCodegen, WriterEmitter, WriterPlan, WriterRuntime,
+            AnyWriter, Writer, WriterCodegen, WriterEmitter, WriterRuntime, WriterSpec,
         },
         declare_blocks,
     };
 
     #[test]
-    fn boolean_writer_plan_compiles_boolean_writer() {
-        let plan = WriterPlan::for_data_type(&arrow_schema::DataType::Boolean).unwrap();
-        assert!(matches!(plan.compile().unwrap(), AnyWriter::Boolean(_)));
+    fn boolean_writer_spec_compiles_boolean_writer() {
+        let spec = WriterSpec::for_data_type(&arrow_schema::DataType::Boolean);
+        assert!(matches!(spec.compile().unwrap(), AnyWriter::Boolean(_)));
     }
 
     fn compile_write_function<'ctx>(

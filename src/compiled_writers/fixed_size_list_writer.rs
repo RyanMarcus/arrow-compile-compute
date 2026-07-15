@@ -239,7 +239,7 @@ mod tests {
     };
 
     use crate::{
-        compiled_writers::{Writer, WriterCodegen, WriterEmitter, WriterPlan, WriterRuntime},
+        compiled_writers::{Writer, WriterCodegen, WriterEmitter, WriterRuntime, WriterSpec},
         declare_blocks, ListItemType, PrimitiveType,
     };
 
@@ -259,7 +259,7 @@ mod tests {
 
         let runtime_ptr = func.get_nth_param(0).unwrap().into_pointer_value();
         let writer =
-            WriterPlan::FixedSizeList(3, Box::new(WriterPlan::Primitive(PrimitiveType::I32)))
+            WriterSpec::FixedSizeList(Box::new(WriterSpec::Primitive(PrimitiveType::I32)), 3)
                 .compile()
                 .unwrap();
         let codegen = WriterCodegen {
@@ -317,7 +317,7 @@ mod tests {
         build.position_at_end(entry);
 
         let runtime_ptr = func.get_nth_param(0).unwrap().into_pointer_value();
-        let writer = WriterPlan::for_primitive_type(PrimitiveType::List(ListItemType::Boolean, 3))
+        let writer = WriterSpec::for_primitive_type(PrimitiveType::List(ListItemType::Boolean, 3))
             .compile()
             .unwrap();
         let codegen = WriterCodegen {
@@ -378,7 +378,7 @@ mod tests {
         build.position_at_end(entry);
 
         let runtime_ptr = func.get_nth_param(0).unwrap().into_pointer_value();
-        let writer = WriterPlan::FixedSizeList(2, Box::new(WriterPlan::String))
+        let writer = WriterSpec::FixedSizeList(Box::new(WriterSpec::String), 2)
             .compile()
             .unwrap();
         let codegen = WriterCodegen {

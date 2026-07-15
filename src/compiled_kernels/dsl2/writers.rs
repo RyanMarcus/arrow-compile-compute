@@ -86,9 +86,10 @@ pub fn accepted_type(spec: &WriterSpec) -> DSLType {
         WriterSpec::String | WriterSpec::LargeString | WriterSpec::StringView => {
             DSLType::Primitive(PrimitiveType::P64x2)
         }
-        WriterSpec::FixedSizeList(item, size) => {
-            DSLType::Primitive(PrimitiveType::List(*item, *size))
+        WriterSpec::List(values) | WriterSpec::LargeList(values) => {
+            DSLType::VarList(Box::new(accepted_type(values)))
         }
+        WriterSpec::FixedSizeList(_, _) => DSLType::Primitive(spec.storage_type()),
         WriterSpec::Dictionary(_, values) | WriterSpec::RunEndEncoded(_, values) => {
             accepted_type(values)
         }
@@ -97,12 +98,15 @@ pub fn accepted_type(spec: &WriterSpec) -> DSLType {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::Arc;
+
+    use arrow_schema::{DataType, Field};
     use inkwell::{context::Context, values::BasicValue, AddressSpace};
 
     use super::{accepted_type, OutputSpec, WriterSpec};
     use crate::{
         compiled_writers::{AnyWriter, DictionaryKeyType},
-        declare_blocks, ListItemType,
+        declare_blocks,
     };
 
     #[test]
@@ -119,17 +123,74 @@ mod tests {
         let string = WriterSpec::String;
         assert!(matches!(string.compile().unwrap(), AnyWriter::String(_)));
 
-        let list = WriterSpec::FixedSizeList(ListItemType::I32, 4);
+        let list = WriterSpec::FixedSizeList(
+            Box::new(WriterSpec::Primitive(crate::PrimitiveType::I32)),
+            4,
+        );
         assert!(matches!(
             list.compile().unwrap(),
             AnyWriter::FixedSizeList(_)
         ));
+
+        let list = WriterSpec::List(Box::new(WriterSpec::Primitive(crate::PrimitiveType::I32)));
+        assert!(matches!(list.compile().unwrap(), AnyWriter::List(_)));
+
+        let large_list = WriterSpec::LargeList(Box::new(WriterSpec::StringView));
+        assert!(matches!(large_list.compile().unwrap(), AnyWriter::List(_)));
 
         let dict = WriterSpec::Dictionary(
             DictionaryKeyType::Int8,
             Box::new(WriterSpec::Primitive(crate::PrimitiveType::I32)),
         );
         assert!(matches!(dict.compile().unwrap(), AnyWriter::Dictionary(_)));
+    }
+
+    #[test]
+    fn writer_spec_preserves_composed_fixed_size_list_writer() {
+        let data_type = DataType::FixedSizeList(
+            Arc::new(Field::new_list_field(DataType::LargeUtf8, false)),
+            2,
+        );
+        assert_eq!(
+            WriterSpec::for_data_type(&data_type),
+            WriterSpec::FixedSizeList(Box::new(WriterSpec::LargeString), 2)
+        );
+
+        let list = WriterSpec::FixedSizeList(
+            Box::new(WriterSpec::Dictionary(
+                DictionaryKeyType::Int8,
+                Box::new(WriterSpec::StringView),
+            )),
+            2,
+        );
+        assert!(matches!(
+            list.compile().unwrap(),
+            AnyWriter::FixedSizeList(_)
+        ));
+    }
+
+    #[test]
+    fn writer_spec_preserves_variable_list_offset_width_and_children() {
+        let list = DataType::List(Arc::new(Field::new_list_field(DataType::Utf8View, false)));
+        assert_eq!(
+            WriterSpec::for_data_type(&list),
+            WriterSpec::List(Box::new(WriterSpec::StringView))
+        );
+
+        let large_list = DataType::LargeList(Arc::new(Field::new_list_field(
+            DataType::List(Arc::new(Field::new_list_field(DataType::Boolean, false))),
+            false,
+        )));
+        let spec = WriterSpec::LargeList(Box::new(WriterSpec::List(Box::new(WriterSpec::Boolean))));
+        assert_eq!(WriterSpec::for_data_type(&large_list), spec);
+        assert_eq!(
+            accepted_type(&spec),
+            crate::compiled_kernels::dsl2::DSLType::VarList(Box::new(
+                crate::compiled_kernels::dsl2::DSLType::VarList(Box::new(
+                    crate::compiled_kernels::dsl2::DSLType::Boolean,
+                )),
+            ))
+        );
     }
 
     #[test]

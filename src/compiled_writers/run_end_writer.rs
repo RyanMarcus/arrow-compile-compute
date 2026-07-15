@@ -467,7 +467,7 @@ mod tests {
 
     use crate::{
         compiled_writers::{
-            RunEndType, Writer, WriterCodegen, WriterEmitter, WriterPlan, WriterRuntime,
+            RunEndType, Writer, WriterCodegen, WriterEmitter, WriterRuntime, WriterSpec,
         },
         declare_blocks, PrimitiveType,
     };
@@ -486,9 +486,9 @@ mod tests {
         declare_blocks!(ctx, append_func, entry);
         build.position_at_end(entry);
 
-        let writer = WriterPlan::RunEnd(
+        let writer = WriterSpec::RunEndEncoded(
             RunEndType::Int32,
-            Box::new(WriterPlan::Primitive(PrimitiveType::I32)),
+            Box::new(WriterSpec::Primitive(PrimitiveType::I32)),
         )
         .compile()
         .unwrap();

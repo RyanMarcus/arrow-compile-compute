@@ -448,7 +448,7 @@ mod tests {
     use crate::{
         compiled_kernels::link_req_helpers,
         compiled_writers::{
-            DictionaryKeyType, Writer, WriterCodegen, WriterEmitter, WriterPlan, WriterRuntime,
+            DictionaryKeyType, Writer, WriterCodegen, WriterEmitter, WriterRuntime, WriterSpec,
         },
         declare_blocks, PrimitiveType,
     };
@@ -467,7 +467,7 @@ mod tests {
         declare_blocks!(ctx, append_func, entry);
         build.position_at_end(entry);
 
-        let writer = WriterPlan::Dictionary(DictionaryKeyType::Int8, Box::new(WriterPlan::String))
+        let writer = WriterSpec::Dictionary(DictionaryKeyType::Int8, Box::new(WriterSpec::String))
             .compile()
             .unwrap();
         let runtime_ptr = append_func.get_nth_param(0).unwrap().into_pointer_value();

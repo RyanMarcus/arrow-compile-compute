@@ -2,13 +2,13 @@ use std::{ffi::c_void, sync::Arc};
 
 use arrow_array::{
     cast::AsArray,
+    make_array,
     types::{Int32Type, Int64Type},
-    ListArray,
 };
 use arrow_data::ArrayDataBuilder;
 use arrow_schema::{DataType, Field};
 use inkwell::{
-    values::{BasicValueEnum, PointerValue},
+    values::{BasicValue, BasicValueEnum, PointerValue},
     AddressSpace,
 };
 use repr_offset::ReprOffset;
@@ -18,7 +18,7 @@ use crate::{
         AnyRuntime, AnyWriter, AnyWriterEmitter, PrimitiveWriter, Writer, WriterCodegen,
         WriterEmitter, WriterRuntime,
     },
-    increment_pointer, ArrowKernelError,
+    increment_pointer, ArrowKernelError, PrimitiveType,
 };
 
 pub struct ListWriter {
@@ -27,6 +27,18 @@ pub struct ListWriter {
 }
 
 impl ListWriter {
+    pub fn compile(offset_type: PrimitiveType, inner: AnyWriter) -> Result<Self, ArrowKernelError> {
+        if !matches!(offset_type, PrimitiveType::I32 | PrimitiveType::I64) {
+            return Err(ArrowKernelError::InternalError(format!(
+                "list offsets must be I32 or I64, got {offset_type}"
+            )));
+        }
+        Ok(Self {
+            offsets: PrimitiveWriter::compile(offset_type)?,
+            inner: Box::new(inner),
+        })
+    }
+
     fn get_offset_ptr<'a>(
         &self,
         codegen: WriterCodegen<'a, '_>,
@@ -129,9 +141,22 @@ impl Writer for ListWriter {
 
         f(&mut emitter)?;
 
+        let curr_offset = match self.offsets.primitive_type() {
+            PrimitiveType::I32 => codegen
+                .builder
+                .build_int_truncate(
+                    curr_count.into_int_value(),
+                    codegen.ctx.i32_type(),
+                    "list_offset_i32",
+                )
+                .unwrap()
+                .as_basic_value_enum(),
+            PrimitiveType::I64 => curr_count,
+            _ => unreachable!(),
+        };
         self.offsets
             .llvm_write(codegen, self.get_offset_ptr(codegen, runtime_ptr), |e| {
-                e.emit(curr_count)
+                e.emit(curr_offset)
             })?;
 
         Ok(())
@@ -178,19 +203,28 @@ impl WriterRuntime for ListWriterRuntime {
         }
         let offsets = self.offset_runtime.to_array(len + 1)?;
 
-        let value_len = match offsets.data_type() {
-            DataType::Int32 => offsets.as_primitive::<Int32Type>().value(len) as usize,
-            DataType::Int64 => offsets.as_primitive::<Int64Type>().value(len) as usize,
+        let (is_large, value_len) = match offsets.data_type() {
+            DataType::Int32 => (
+                false,
+                offsets.as_primitive::<Int32Type>().value(len) as usize,
+            ),
+            DataType::Int64 => (
+                true,
+                offsets.as_primitive::<Int64Type>().value(len) as usize,
+            ),
             dt => {
                 return Err(ArrowKernelError::InternalError(format!(
                     "list offsets must be Int32 or Int64, got {dt}"
                 )))
             }
         };
-
         let values = self.value_runtime.to_array(value_len)?;
-        let field = Field::new("item", values.data_type().clone(), false);
-        let data_type = DataType::List(Arc::new(field));
+        let field = Arc::new(Field::new("item", values.data_type().clone(), false));
+        let data_type = if is_large {
+            DataType::LargeList(field)
+        } else {
+            DataType::List(field)
+        };
         let offsets = offsets.to_data();
         let data = unsafe {
             ArrayDataBuilder::new(data_type)
@@ -200,7 +234,7 @@ impl WriterRuntime for ListWriterRuntime {
                 .build_unchecked()
         };
 
-        Ok(Arc::new(ListArray::from(data)))
+        Ok(make_array(data))
     }
 }
 
@@ -246,16 +280,13 @@ mod tests {
     use arrow_array::{cast::AsArray, types::Int32Type};
     use inkwell::{context::Context, values::BasicValue, AddressSpace, OptimizationLevel};
 
-    use super::ListWriter;
     use crate::{
-        compiled_writers::{
-            AnyWriter, PrimitiveWriter, Writer, WriterCodegen, WriterEmitter, WriterRuntime,
-        },
+        compiled_writers::{Writer, WriterCodegen, WriterEmitter, WriterRuntime, WriterSpec},
         declare_blocks, PrimitiveType,
     };
 
     #[test]
-    fn list_writer_runtime_to_array_appends_final_offset() {
+    fn large_list_writer_runtime_to_array_appends_final_offset() {
         let ctx = Context::create();
         let llvm_mod = ctx.create_module("compiled_writers_list_writer");
         let build = ctx.create_builder();
@@ -271,12 +302,9 @@ mod tests {
         build.position_at_end(entry);
 
         let dest = func.get_nth_param(0).unwrap().into_pointer_value();
-        let writer = ListWriter {
-            offsets: PrimitiveWriter::compile(PrimitiveType::I32).unwrap(),
-            inner: Box::new(AnyWriter::Primitive(
-                PrimitiveWriter::compile(PrimitiveType::I32).unwrap(),
-            )),
-        };
+        let writer = WriterSpec::LargeList(Box::new(WriterSpec::Primitive(PrimitiveType::I32)))
+            .compile()
+            .unwrap();
         let codegen = WriterCodegen {
             ctx: &ctx,
             module: &llvm_mod,
@@ -315,7 +343,7 @@ mod tests {
         }
 
         let array = runtime.to_array(3).unwrap();
-        let list = array.as_list::<i32>();
+        let list = array.as_list::<i64>();
         assert_eq!(list.offsets().as_ref(), &[0, 2, 2, 5]);
         assert_eq!(
             list.values().as_primitive::<Int32Type>().values(),
@@ -340,15 +368,11 @@ mod tests {
         build.position_at_end(entry);
 
         let dest = func.get_nth_param(0).unwrap().into_pointer_value();
-        let writer = ListWriter {
-            offsets: PrimitiveWriter::compile(PrimitiveType::I32).unwrap(),
-            inner: Box::new(AnyWriter::List(ListWriter {
-                offsets: PrimitiveWriter::compile(PrimitiveType::I32).unwrap(),
-                inner: Box::new(AnyWriter::Primitive(
-                    PrimitiveWriter::compile(PrimitiveType::I32).unwrap(),
-                )),
-            })),
-        };
+        let writer = WriterSpec::List(Box::new(WriterSpec::List(Box::new(WriterSpec::Primitive(
+            PrimitiveType::I32,
+        )))))
+        .compile()
+        .unwrap();
         let codegen = WriterCodegen {
             ctx: &ctx,
             module: &llvm_mod,

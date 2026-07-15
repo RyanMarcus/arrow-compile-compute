@@ -1586,7 +1586,7 @@ mod tests {
             },
         },
         compiled_writers::RunEndType,
-        ArrowKernelError, ListItemType, PrimitiveType,
+        ArrowKernelError, PrimitiveType,
     };
 
     #[test]
@@ -2547,7 +2547,10 @@ mod tests {
             })
             .unwrap(),
         );
-        func.add_ret(WriterSpec::FixedSizeList(ListItemType::F32, 2), "n");
+        func.add_ret(
+            WriterSpec::FixedSizeList(Box::new(WriterSpec::Primitive(PrimitiveType::F32)), 2),
+            "n",
+        );
 
         let func = compile(func, dsl_args![input]).unwrap();
         let result = func.run(&dsl_args![input]).unwrap();

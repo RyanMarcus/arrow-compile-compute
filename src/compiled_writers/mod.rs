@@ -1,3 +1,28 @@
+//! Composable LLVM-backed writers for building Arrow arrays.
+//!
+//! Most callers work with [`WriterSpec`], a recursive description of an output
+//! column. Create a spec directly or with [`WriterSpec::for_data_type`], call
+//! [`WriterSpec::allocate`] to obtain a [`WriterAllocation`], and pass its
+//! opaque pointer to the JIT function. During IR generation,
+//! [`WriterSpec::llvm_init`] binds the compiled writer to that pointer and
+//! returns a [`BoundWriter`], whose ingest methods emit writes. After execution,
+//! consume the allocation with [`WriterAllocation::into_array_ref`] to finalize
+//! any remaining metadata and produce the Arrow array.
+//!
+//! The lower-level pieces used to implement a writer are:
+//!
+//! - [`Writer`], which allocates runtime state and emits the LLVM operations for
+//!   a logical write;
+//! - [`WriterEmitter`], the per-write interface through which scalar or
+//!   composite values are supplied;
+//! - [`WriterRuntime`], which owns the Rust buffers, supports reservation, and
+//!   materializes the finished array;
+//! - [`AnyWriter`], [`AnyWriterEmitter`], and [`AnyRuntime`], which provide
+//!   enum-based dispatch so writers can recursively compose child writers.
+//!
+//! Finalization happens in Rust when the runtime becomes an array; generated
+//! code therefore does not need a separate flush step.
+
 mod boolean_writer;
 mod dictionary_writer;
 mod fixed_size_list_writer;
@@ -249,141 +274,7 @@ impl AnyRuntime {
     }
 }
 
-pub enum WriterPlan {
-    Boolean,
-    Primitive(PrimitiveType),
-    Dictionary(DictionaryKeyType, Box<WriterPlan>),
-    RunEnd(RunEndType, Box<WriterPlan>),
-    FixedSizeList(usize, Box<WriterPlan>),
-    VariableSizeList(Box<WriterPlan>),
-    String,
-    LargeString,
-    StringView,
-}
-
-impl WriterPlan {
-    /// The logical type being stored. Used by dictionary and REE writers to
-    /// know what kind of equality test to use.
-    fn storage_type(&self) -> PrimitiveType {
-        match self {
-            Self::Boolean => PrimitiveType::U8,
-            Self::Primitive(pt) => *pt,
-            Self::Dictionary(_, values) | Self::RunEnd(_, values) => values.storage_type(),
-            Self::FixedSizeList(size, values) => {
-                let item_type = match values.as_ref() {
-                    Self::Boolean => crate::ListItemType::Boolean,
-                    _ => values
-                        .storage_type()
-                        .try_into()
-                        .expect("fixed-size list item type must be scalar"),
-                };
-                PrimitiveType::List(item_type, *size)
-            }
-            Self::VariableSizeList(_) => {
-                unreachable!("variable-size lists do not have a scalar storage type")
-            }
-            Self::String | Self::LargeString | Self::StringView => PrimitiveType::P64x2,
-        }
-    }
-
-    pub fn for_primitive_type(pt: PrimitiveType) -> Self {
-        match pt {
-            PrimitiveType::I8
-            | PrimitiveType::I16
-            | PrimitiveType::I32
-            | PrimitiveType::I64
-            | PrimitiveType::U8
-            | PrimitiveType::U16
-            | PrimitiveType::U32
-            | PrimitiveType::U64
-            | PrimitiveType::F16
-            | PrimitiveType::F32
-            | PrimitiveType::F64 => WriterPlan::Primitive(pt),
-            PrimitiveType::P64x2 => WriterPlan::String,
-            PrimitiveType::List(lit, s) => WriterPlan::FixedSizeList(
-                s,
-                Box::new(match lit {
-                    crate::ListItemType::Boolean => WriterPlan::Boolean,
-                    _ => WriterPlan::for_primitive_type(PrimitiveType::from(lit)),
-                }),
-            ),
-        }
-    }
-
-    pub fn for_data_type(dt: &DataType) -> Result<Self, ArrowKernelError> {
-        match dt {
-            DataType::Null => todo!(),
-            DataType::Boolean => Ok(Self::Boolean),
-            DataType::Int8
-            | DataType::Int16
-            | DataType::Int32
-            | DataType::Int64
-            | DataType::UInt8
-            | DataType::UInt16
-            | DataType::UInt32
-            | DataType::UInt64
-            | DataType::Float16
-            | DataType::Float32
-            | DataType::Float64
-            | DataType::Binary
-            | DataType::Utf8 => Ok(Self::for_primitive_type(PrimitiveType::for_arrow_type(dt))),
-            DataType::LargeBinary | DataType::LargeUtf8 => Ok(Self::LargeString),
-            DataType::Utf8View | DataType::BinaryView => Ok(Self::StringView),
-            DataType::LargeList(field) | DataType::List(field) => Ok(WriterPlan::VariableSizeList(
-                Box::new(Self::for_data_type(field.data_type())?),
-            )),
-            DataType::FixedSizeList(field, s) => Ok(WriterPlan::FixedSizeList(
-                *s as usize,
-                Box::new(Self::for_data_type(field.data_type())?),
-            )),
-            DataType::Dictionary(k, v) => Ok(WriterPlan::Dictionary(
-                DictionaryKeyType::for_data_type(k),
-                Box::new(Self::for_data_type(v)?),
-            )),
-            DataType::RunEndEncoded(re, v) => Ok(WriterPlan::RunEnd(
-                RunEndType::for_data_type(re.data_type()),
-                Box::new(Self::for_data_type(v.data_type())?),
-            )),
-            _ => todo!(),
-        }
-    }
-
-    pub fn compile(&self) -> Result<AnyWriter, ArrowKernelError> {
-        match self {
-            WriterPlan::Boolean => Ok(AnyWriter::Boolean(BooleanWriter::compile())),
-            WriterPlan::Primitive(primitive_type) => Ok(AnyWriter::Primitive(
-                PrimitiveWriter::compile(*primitive_type)?,
-            )),
-            WriterPlan::Dictionary(dictionary_key_type, writer_plan) => {
-                Ok(AnyWriter::Dictionary(DictionaryWriter::compile(
-                    *dictionary_key_type,
-                    writer_plan.storage_type(),
-                    writer_plan.compile()?,
-                )?))
-            }
-            WriterPlan::RunEnd(run_end_type, writer_plan) => {
-                Ok(AnyWriter::RunEnd(RunEndWriter::compile(
-                    *run_end_type,
-                    writer_plan.storage_type(),
-                    writer_plan.compile()?,
-                )?))
-            }
-            WriterPlan::FixedSizeList(_, writer_plan) => Ok(AnyWriter::FixedSizeList(
-                FixedSizeListWriter::compile(self.storage_type(), writer_plan.compile()?)?,
-            )),
-            WriterPlan::VariableSizeList(_) => todo!(),
-            WriterPlan::String => Ok(AnyWriter::String(StringWriter::compile(
-                PrimitiveType::I32,
-            )?)),
-            WriterPlan::LargeString => Ok(AnyWriter::String(StringWriter::compile(
-                PrimitiveType::I64,
-            )?)),
-            WriterPlan::StringView => Ok(AnyWriter::StringView(StringViewWriter::compile())),
-        }
-    }
-}
-
-/// Schema-level description of a compiled output writer.
+/// A recursive description of an output writer and its composed child writers.
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub enum WriterSpec {
     Primitive(PrimitiveType),
@@ -391,48 +282,86 @@ pub enum WriterSpec {
     String,
     LargeString,
     StringView,
-    FixedSizeList(ListItemType, usize),
+    List(Box<WriterSpec>),
+    LargeList(Box<WriterSpec>),
+    FixedSizeList(Box<WriterSpec>, usize),
     Dictionary(DictionaryKeyType, Box<WriterSpec>),
     RunEndEncoded(RunEndType, Box<WriterSpec>),
 }
 
 impl WriterSpec {
+    /// Returns the value type accepted by the generated writer code.
     pub fn storage_type(&self) -> PrimitiveType {
         match self {
             Self::Primitive(pt) => *pt,
             Self::Boolean => PrimitiveType::U8,
             Self::String | Self::LargeString | Self::StringView => PrimitiveType::P64x2,
-            Self::FixedSizeList(item, size) => PrimitiveType::List(*item, *size),
+            Self::List(_) | Self::LargeList(_) => {
+                unreachable!("variable-size lists do not have a scalar storage type")
+            }
+            Self::FixedSizeList(values, size) => {
+                let item_type = match values.as_ref() {
+                    Self::Boolean => ListItemType::Boolean,
+                    _ => values
+                        .storage_type()
+                        .try_into()
+                        .expect("fixed-size list item type must be scalar"),
+                };
+                PrimitiveType::List(item_type, *size)
+            }
             Self::Dictionary(_, values) | Self::RunEndEncoded(_, values) => values.storage_type(),
         }
     }
 
-    fn writer_plan(&self) -> WriterPlan {
-        match self {
-            Self::Primitive(pt) => WriterPlan::Primitive(*pt),
-            Self::Boolean => WriterPlan::Boolean,
-            Self::String => WriterPlan::String,
-            Self::LargeString => WriterPlan::LargeString,
-            Self::StringView => WriterPlan::StringView,
-            Self::FixedSizeList(item, size) => WriterPlan::FixedSizeList(
-                *size,
-                Box::new(match item {
-                    ListItemType::Boolean => WriterPlan::Boolean,
-                    ListItemType::P64x2 => WriterPlan::String,
-                    _ => WriterPlan::Primitive(PrimitiveType::from(*item)),
+    pub fn for_primitive_type(primitive_type: PrimitiveType) -> Self {
+        match primitive_type {
+            PrimitiveType::P64x2 => Self::String,
+            PrimitiveType::List(item_type, size) => Self::FixedSizeList(
+                Box::new(match item_type {
+                    ListItemType::Boolean => Self::Boolean,
+                    _ => Self::for_primitive_type(PrimitiveType::from(item_type)),
                 }),
+                size,
             ),
-            Self::Dictionary(key, values) => {
-                WriterPlan::Dictionary(*key, Box::new(values.writer_plan()))
-            }
-            Self::RunEndEncoded(run_end, values) => {
-                WriterPlan::RunEnd(*run_end, Box::new(values.writer_plan()))
-            }
+            primitive_type => Self::Primitive(primitive_type),
         }
     }
 
     pub fn compile(&self) -> Result<AnyWriter, ArrowKernelError> {
-        self.writer_plan().compile()
+        match self {
+            Self::Boolean => Ok(AnyWriter::Boolean(BooleanWriter::compile())),
+            Self::Primitive(primitive_type) => Ok(AnyWriter::Primitive(PrimitiveWriter::compile(
+                *primitive_type,
+            )?)),
+            Self::Dictionary(dictionary_key_type, values) => {
+                Ok(AnyWriter::Dictionary(DictionaryWriter::compile(
+                    *dictionary_key_type,
+                    values.storage_type(),
+                    values.compile()?,
+                )?))
+            }
+            Self::RunEndEncoded(run_end_type, values) => Ok(AnyWriter::RunEnd(
+                RunEndWriter::compile(*run_end_type, values.storage_type(), values.compile()?)?,
+            )),
+            Self::FixedSizeList(values, _) => Ok(AnyWriter::FixedSizeList(
+                FixedSizeListWriter::compile(self.storage_type(), values.compile()?)?,
+            )),
+            Self::List(values) => Ok(AnyWriter::List(ListWriter::compile(
+                PrimitiveType::I32,
+                values.compile()?,
+            )?)),
+            Self::LargeList(values) => Ok(AnyWriter::List(ListWriter::compile(
+                PrimitiveType::I64,
+                values.compile()?,
+            )?)),
+            Self::String => Ok(AnyWriter::String(StringWriter::compile(
+                PrimitiveType::I32,
+            )?)),
+            Self::LargeString => Ok(AnyWriter::String(StringWriter::compile(
+                PrimitiveType::I64,
+            )?)),
+            Self::StringView => Ok(AnyWriter::StringView(StringViewWriter::compile())),
+        }
     }
 
     pub fn allocate(&self, expected_count: usize) -> WriterAllocation {
@@ -475,10 +404,14 @@ impl WriterSpec {
             | DataType::LargeUtf8
             | DataType::Utf8View => Self::String,
             DataType::FixedSizeList(field, len) => Self::FixedSizeList(
-                ListItemType::for_arrow_type(field.data_type()),
+                Box::new(Self::for_data_type(field.data_type())),
                 len as usize,
             ),
-            dt => Self::Primitive(PrimitiveType::for_arrow_type(&dt)),
+            DataType::List(field) => Self::List(Box::new(Self::for_data_type(field.data_type()))),
+            DataType::LargeList(field) => {
+                Self::LargeList(Box::new(Self::for_data_type(field.data_type())))
+            }
+            dt => Self::for_primitive_type(PrimitiveType::for_arrow_type(&dt)),
         }
     }
 
@@ -502,14 +435,18 @@ impl WriterSpec {
             | DataType::Time32(_)
             | DataType::Time64(_)
             | DataType::Duration(_)
-            | DataType::Interval(_) => Self::Primitive(PrimitiveType::for_arrow_type(dt)),
+            | DataType::Interval(_) => Self::for_primitive_type(PrimitiveType::for_arrow_type(dt)),
             DataType::Binary | DataType::FixedSizeBinary(_) | DataType::Utf8 => Self::String,
             DataType::LargeBinary | DataType::LargeUtf8 => Self::LargeString,
             DataType::BinaryView | DataType::Utf8View => Self::StringView,
             DataType::FixedSizeList(field, len) => Self::FixedSizeList(
-                ListItemType::for_arrow_type(field.data_type()),
+                Box::new(Self::for_data_type(field.data_type())),
                 *len as usize,
             ),
+            DataType::List(field) => Self::List(Box::new(Self::for_data_type(field.data_type()))),
+            DataType::LargeList(field) => {
+                Self::LargeList(Box::new(Self::for_data_type(field.data_type())))
+            }
             DataType::Dictionary(key, values) => Self::Dictionary(
                 DictionaryKeyType::for_data_type(key),
                 Box::new(Self::for_data_type(values)),
