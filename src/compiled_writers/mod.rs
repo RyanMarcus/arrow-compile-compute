@@ -429,6 +429,8 @@ impl WriterSpec {
                 DictionaryKeyType::for_data_type(key.as_ref()),
                 Box::new(Self::for_data_type(values.as_ref())),
             ),
+            DataType::Decimal32(_, _) => todo!(),
+            DataType::Decimal64(_, _) => todo!(),
             DataType::Decimal128(_, _) => todo!(),
             DataType::Decimal256(_, _) => todo!(),
             DataType::Map(_, _) => todo!(),

@@ -6,10 +6,10 @@ license = "GPL-3.0"
 
 [dependencies]
 inkwell = { version = "0.8.0", features = ["llvm21-1"] }
-arrow-schema = "55.2"
-arrow-buffer = "55.2"
-arrow-data = "55.2"
-arrow-array = "55.2"
+arrow-schema = "59.1"
+arrow-buffer = "59.1"
+arrow-data = "59.1"
+arrow-array = "59.1"
 ouroboros = "0.18"
 half = { version = "2.4", features = ["bytemuck"] }
 enum-as-inner = "0.6.1"
@@ -27,11 +27,11 @@ lincomdb = { git = "https://github.com/RyanMarcus/lincomdb" }
 [dev-dependencies]
 float-ord = "0.3.2"
 half = "2.4.1"
-arrow-ord = "55.2"
-arrow-cast = "55.2"
-arrow-select = "55.2"
-arrow-string = "55.2"
-arrow-arith = "55.2"
+arrow-ord = "59.1"
+arrow-cast = "59.1"
+arrow-select = "59.1"
+arrow-string = "59.1"
+arrow-arith = "59.1"
 criterion = "0.5"
 fastrand = "2.2.0"
 itertools = "0.13.0"
