@@ -43,7 +43,7 @@ use crate::{
         llvm_utils::llvm_add_save_ptrs_string_saver,
         optimize_module,
     },
-    compiled_writers::BoundWriter,
+    compiled_writers::{BoundWriter, WriterSpec},
     increment_pointer, set_noalias_params, ArrowKernelError, ComparisonType, ListItemType,
     NumericPrimitiveType, PrimitiveType,
 };
@@ -119,15 +119,15 @@ pub struct DSLCompilationContext<'ctx, 'a> {
     pub module: &'a Module<'ctx>,
     pub func: &'a FunctionValue<'ctx>,
     pub b: &'a Builder<'ctx>,
-    pub st: HashMap<usize, BasicValueEnum<'a>>,
-    pub access_funcs: HashMap<usize, FunctionValue<'a>>,
-    pub next_funcs: HashMap<usize, FunctionValue<'a>>,
-    pub next_block_funcs: HashMap<usize, FunctionValue<'a>>,
-    pub writer_funcs: HashMap<usize, FunctionValue<'a>>,
-    pub reset_funcs: HashMap<usize, FunctionValue<'a>>,
-    pub lengths: HashMap<usize, Option<IntValue<'a>>>,
-    pub output_specs: Vec<crate::compiled_writers::WriterSpec>,
-    pub outputs: Vec<BoundWriter<'a, 'a>>,
+    pub st: HashMap<usize, BasicValueEnum<'ctx>>,
+    pub access_funcs: HashMap<usize, FunctionValue<'ctx>>,
+    pub next_funcs: HashMap<usize, FunctionValue<'ctx>>,
+    pub next_block_funcs: HashMap<usize, FunctionValue<'ctx>>,
+    pub writer_funcs: HashMap<usize, FunctionValue<'ctx>>,
+    pub reset_funcs: HashMap<usize, FunctionValue<'ctx>>,
+    pub lengths: HashMap<usize, Option<IntValue<'ctx>>>,
+    pub output_specs: Vec<WriterSpec>,
+    pub outputs: Vec<BoundWriter<'ctx>>,
     pub did_vectorize: &'a mut bool,
 }
 
@@ -468,11 +468,6 @@ pub fn compile_inner<'ctx, 'args>(
         compile_stmt(&mut dsl_ctx, stmt)?;
     }
 
-    // flush all outputs
-    for w in dsl_ctx.outputs.iter() {
-        w.llvm_flush(ctx, &b);
-    }
-
     b.build_return(Some(&ctx.i64_type().const_zero())).unwrap();
 
     // add the wrapper function so we can extract a function with a consistent sig
@@ -546,7 +541,7 @@ fn compile_stmt<'ctx, 'a>(
                     ));
                 }
                 let value = compile_expr(ctx, value)?;
-                ctx.outputs[idx as usize].llvm_ingest(ctx.ctx, ctx.b, value);
+                ctx.outputs[idx as usize].llvm_ingest(ctx.ctx, ctx.module, ctx.b, value);
                 return Ok(());
             } else {
                 for spec in ctx.output_specs.iter() {
@@ -576,7 +571,7 @@ fn compile_stmt<'ctx, 'a>(
                         .append_basic_block(*ctx.func, &format!("emit_block_{}", idx));
                     let b = ctx.ctx.create_builder();
                     b.position_at_end(emit_block);
-                    o.llvm_ingest(ctx.ctx, &b, value);
+                    o.llvm_ingest(ctx.ctx, ctx.module, &b, value);
                     b.build_unconditional_branch(emit_worked).unwrap();
 
                     (ctx.ctx.i32_type().const_int(idx as u64, false), emit_block)
@@ -608,6 +603,7 @@ fn compile_stmt<'ctx, 'a>(
             let value = compile_expr(ctx, value)?;
             ctx.outputs[index as usize].llvm_ingest_block(
                 ctx.ctx,
+                ctx.module,
                 ctx.b,
                 value.into_vector_value(),
             );
@@ -1037,9 +1033,9 @@ pub fn compile_compare_values<'ctx, 'a>(
     ctx: &DSLCompilationContext<'ctx, 'a>,
     op: DSLComparison,
     lhs_type: &DSLType,
-    lhs: BasicValueEnum<'a>,
-    rhs: BasicValueEnum<'a>,
-) -> Result<BasicValueEnum<'a>, ArrowKernelError> {
+    lhs: BasicValueEnum<'ctx>,
+    rhs: BasicValueEnum<'ctx>,
+) -> Result<BasicValueEnum<'ctx>, ArrowKernelError> {
     match lhs_type {
         DSLType::Boolean => Ok(ctx
             .b
@@ -1121,9 +1117,9 @@ fn compare_list_values<'ctx, 'a>(
     ctx: &DSLCompilationContext<'ctx, 'a>,
     op: DSLComparison,
     pt: PrimitiveType,
-    lhs: BasicValueEnum<'a>,
-    rhs: BasicValueEnum<'a>,
-) -> Result<BasicValueEnum<'a>, ArrowKernelError> {
+    lhs: BasicValueEnum<'ctx>,
+    rhs: BasicValueEnum<'ctx>,
+) -> Result<BasicValueEnum<'ctx>, ArrowKernelError> {
     let PrimitiveType::List(item, size) = pt else {
         unreachable!("compare_list_values called with non-list type");
     };
@@ -1225,9 +1221,9 @@ fn extract_list_compare_elements<'ctx, 'a>(
     ctx: &DSLCompilationContext<'ctx, 'a>,
     item: ListItemType,
     idx: usize,
-    lhs: BasicValueEnum<'a>,
-    rhs: BasicValueEnum<'a>,
-) -> (BasicValueEnum<'a>, BasicValueEnum<'a>, DSLType) {
+    lhs: BasicValueEnum<'ctx>,
+    rhs: BasicValueEnum<'ctx>,
+) -> (BasicValueEnum<'ctx>, BasicValueEnum<'ctx>, DSLType) {
     let i = ctx.ctx.i64_type().const_int(idx as u64, false);
     match item {
         ListItemType::Boolean => {
@@ -1273,7 +1269,7 @@ fn extract_list_compare_elements<'ctx, 'a>(
 fn compile_expr<'ctx, 'a>(
     ctx: &DSLCompilationContext<'ctx, 'a>,
     expr: &DSLExpr,
-) -> Result<BasicValueEnum<'a>, ArrowKernelError> {
+) -> Result<BasicValueEnum<'ctx>, ArrowKernelError> {
     match expr {
         DSLExpr::StringPredicate(pred, lhs, rhs) => {
             let lhs = compile_expr(ctx, lhs)?;
@@ -1975,10 +1971,10 @@ fn compile_expr<'ctx, 'a>(
 
 fn cast_numeric<'ctx, 'a>(
     ctx: &DSLCompilationContext<'ctx, 'a>,
-    val: BasicValueEnum<'a>,
+    val: BasicValueEnum<'ctx>,
     orig_pt: NumericPrimitiveType,
     tar_pt: NumericPrimitiveType,
-) -> Result<BasicValueEnum<'a>, ArrowKernelError> {
+) -> Result<BasicValueEnum<'ctx>, ArrowKernelError> {
     let tar_type = PrimitiveType::from(tar_pt).llvm_type(ctx.ctx);
     Ok(match (orig_pt.is_integer(), tar_pt.is_integer()) {
         // int to int
@@ -2042,10 +2038,10 @@ fn cast_numeric<'ctx, 'a>(
 
 fn cast_numeric_vec<'ctx, 'a>(
     ctx: &DSLCompilationContext<'ctx, 'a>,
-    val: VectorValue<'a>,
+    val: VectorValue<'ctx>,
     orig_pt: NumericPrimitiveType,
     tar_pt: NumericPrimitiveType,
-) -> Result<VectorValue<'a>, ArrowKernelError> {
+) -> Result<VectorValue<'ctx>, ArrowKernelError> {
     let tar_type = PrimitiveType::from(tar_pt)
         .llvm_vec_type(ctx.ctx, val.get_type().get_size())
         .unwrap();
@@ -2083,7 +2079,7 @@ fn cast_numeric_vec<'ctx, 'a>(
 fn scalar_to_llvm<'ctx, 'a>(
     ctx: &DSLCompilationContext<'ctx, 'a>,
     val: &dyn Datum,
-) -> Result<BasicValueEnum<'a>, ArrowKernelError> {
+) -> Result<BasicValueEnum<'ctx>, ArrowKernelError> {
     let (arr, is_scalar) = val.get();
     assert!(is_scalar, "scalar_to_llvm called with non-scalar value");
 

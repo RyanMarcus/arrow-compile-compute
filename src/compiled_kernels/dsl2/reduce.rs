@@ -88,10 +88,10 @@ impl DSLReductionType {
         &self,
         ctx: &mut DSLCompilationContext<'ctx, 'a>,
         ty: &DSLType,
-        accum: BasicValueEnum<'a>,
-        next: BasicValueEnum<'a>,
-        include: IntValue<'a>,
-    ) -> Result<BasicValueEnum<'a>, ArrowKernelError> {
+        accum: BasicValueEnum<'ctx>,
+        next: BasicValueEnum<'ctx>,
+        include: IntValue<'ctx>,
+    ) -> Result<BasicValueEnum<'ctx>, ArrowKernelError> {
         match self {
             DSLReductionType::And => {
                 let updated = ctx
@@ -200,8 +200,8 @@ impl DSLReductionType {
     pub(crate) fn output_value<'ctx, 'a>(
         &self,
         ctx: &mut DSLCompilationContext<'ctx, 'a>,
-        accum: BasicValueEnum<'a>,
-    ) -> Result<BasicValueEnum<'a>, ArrowKernelError> {
+        accum: BasicValueEnum<'ctx>,
+    ) -> Result<BasicValueEnum<'ctx>, ArrowKernelError> {
         match self {
             DSLReductionType::And | DSLReductionType::Or => Ok(accum),
             DSLReductionType::Min

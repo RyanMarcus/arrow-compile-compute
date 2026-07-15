@@ -27,8 +27,10 @@ pub fn llvm_add_str_writer_append_bytes<'ctx>(
         .unwrap_or_else(|| {
             module.add_function(
                 "str_writer_append_bytes",
-                ctx.void_type()
-                    .fn_type(&[ptr_type.into(), ctx.i64_type().into(), ptr_type.into()], false),
+                ctx.void_type().fn_type(
+                    &[ptr_type.into(), ctx.i64_type().into(), ptr_type.into()],
+                    false,
+                ),
                 Some(Linkage::External),
             )
         })

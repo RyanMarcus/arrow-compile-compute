@@ -9,7 +9,7 @@ use inkwell::{
 use repr_offset::ReprOffset;
 
 use crate::{
-    compiled_writers2::{
+    compiled_writers::{
         AnyRuntime, AnyWriterEmitter, Writer, WriterCodegen, WriterEmitter, WriterRuntime,
     },
     declare_blocks, increment_pointer, ArrowKernelError,
@@ -294,7 +294,7 @@ mod tests {
 
     use super::BooleanWriter;
     use crate::{
-        compiled_writers2::{
+        compiled_writers::{
             AnyWriter, Writer, WriterCodegen, WriterEmitter, WriterPlan, WriterRuntime,
         },
         declare_blocks,
@@ -314,7 +314,7 @@ mod tests {
         inkwell::values::FunctionValue<'ctx>,
         BooleanWriter,
     ) {
-        let llvm_mod = ctx.create_module("compiled_writers2_boolean_writer");
+        let llvm_mod = ctx.create_module("compiled_writers_boolean_writer");
         let build = ctx.create_builder();
         let ptr_type = ctx.ptr_type(AddressSpace::default());
         let func = llvm_mod.add_function(
@@ -345,7 +345,6 @@ mod tests {
                 })
                 .unwrap();
         }
-        writer.llvm_flush(codegen, dest);
         build.build_return(None).unwrap();
         llvm_mod.verify().unwrap();
 

@@ -10,10 +10,9 @@ use repr_offset::ReprOffset;
 
 use crate::{
     compiled_kernels::cmp::add_memcmp,
-    compiled_writers::RunEndType,
-    compiled_writers2::{
-        AnyRuntime, AnyWriter, AnyWriterEmitter, PrimitiveWriter, Writer, WriterCodegen,
-        WriterEmitter, WriterRuntime,
+    compiled_writers::{
+        AnyRuntime, AnyWriter, AnyWriterEmitter, PrimitiveWriter, RunEndType, Writer,
+        WriterCodegen, WriterEmitter, WriterRuntime,
     },
     declare_blocks, increment_pointer, ArrowKernelError, ComparisonType, PrimitiveType,
 };
@@ -61,18 +60,10 @@ impl RunEndWriter {
             .into_pointer_value()
     }
 
-    /// Materializes the pending run by writing its end and cached value through
-    /// the composed child writers.
-    ///
-    /// The caller supplies the logical end of the run being closed. This may
-    /// differ from `curr_run_end` when a newly ingested value starts the next
-    /// run. This method does not update the logical length or run count.
-    fn emit_pending<'ctx, 'borrow>(
+    fn emit_run_end<'ctx, 'borrow>(
         &'borrow self,
         codegen: WriterCodegen<'ctx, 'borrow>,
-        runtime_ptr: PointerValue<'ctx>,
         run_end_runtime_ptr: PointerValue<'ctx>,
-        value_runtime_ptr: PointerValue<'ctx>,
         run_end: inkwell::values::IntValue<'ctx>,
     ) -> Result<(), ArrowKernelError> {
         let converted = codegen
@@ -88,31 +79,6 @@ impl RunEndWriter {
             .unwrap();
         self.run_ends
             .llvm_write(codegen, run_end_runtime_ptr, |e| e.emit(converted.into()))?;
-
-        let last_value_ptr = codegen
-            .builder
-            .build_load(
-                codegen.ctx.ptr_type(AddressSpace::default()),
-                increment_pointer!(
-                    codegen.ctx,
-                    codegen.builder,
-                    runtime_ptr,
-                    RunEndWriterRuntime::OFFSET_LAST_VALUE_PTR
-                ),
-                "last_run_value_ptr",
-            )
-            .unwrap()
-            .into_pointer_value();
-        let last_value = codegen
-            .builder
-            .build_load(
-                self.value_type.llvm_type(codegen.ctx),
-                last_value_ptr,
-                "last_run_value",
-            )
-            .unwrap();
-        self.values
-            .llvm_write(codegen, value_runtime_ptr, |e| e.emit(last_value))?;
         Ok(())
     }
 }
@@ -127,6 +93,7 @@ impl Writer for RunEndWriter {
             last_value_ptr: last_value.as_mut_ptr().cast(),
             curr_run_end: 0,
             num_runs: 0,
+            has_last_value: 0,
             run_ends: Box::new(self.run_ends.allocate(size)),
             values: Box::new(self.values.allocate(size)),
             last_value,
@@ -192,75 +159,6 @@ impl Writer for RunEndWriter {
         .into();
         f(&mut emitter)
     }
-
-    fn llvm_flush<'ctx, 'borrow>(
-        &'borrow self,
-        codegen: WriterCodegen<'ctx, 'borrow>,
-        runtime_ptr: PointerValue<'ctx>,
-    ) {
-        let run_end_runtime_ptr = Self::get_child_ptr(
-            codegen,
-            runtime_ptr,
-            RunEndWriterRuntime::OFFSET_RUN_END_RUNTIME_PTR,
-            "run_end_runtime",
-        );
-        let value_runtime_ptr = Self::get_child_ptr(
-            codegen,
-            runtime_ptr,
-            RunEndWriterRuntime::OFFSET_VALUE_RUNTIME_PTR,
-            "run_value_runtime",
-        );
-        let curr_run_end = codegen
-            .builder
-            .build_load(
-                codegen.ctx.i64_type(),
-                increment_pointer!(
-                    codegen.ctx,
-                    codegen.builder,
-                    runtime_ptr,
-                    RunEndWriterRuntime::OFFSET_CURR_RUN_END
-                ),
-                "run_end",
-            )
-            .unwrap()
-            .into_int_value();
-        let has_value = codegen
-            .builder
-            .build_int_compare(
-                IntPredicate::NE,
-                curr_run_end,
-                codegen.ctx.i64_type().const_zero(),
-                "run_end_has_value",
-            )
-            .unwrap();
-        let func = codegen
-            .builder
-            .get_insert_block()
-            .unwrap()
-            .get_parent()
-            .unwrap();
-        declare_blocks!(codegen.ctx, func, run_end_flush_value, run_end_flush_exit);
-        codegen
-            .builder
-            .build_conditional_branch(has_value, run_end_flush_value, run_end_flush_exit)
-            .unwrap();
-        codegen.builder.position_at_end(run_end_flush_value);
-        self.emit_pending(
-            codegen,
-            runtime_ptr,
-            run_end_runtime_ptr,
-            value_runtime_ptr,
-            curr_run_end,
-        )
-        .unwrap();
-        codegen
-            .builder
-            .build_unconditional_branch(run_end_flush_exit)
-            .unwrap();
-        codegen.builder.position_at_end(run_end_flush_exit);
-        self.run_ends.llvm_flush(codegen, run_end_runtime_ptr);
-        self.values.llvm_flush(codegen, value_runtime_ptr);
-    }
 }
 
 #[repr(C)]
@@ -272,6 +170,7 @@ pub struct RunEndWriterRuntime {
     last_value_ptr: *mut c_void,
     curr_run_end: u64,
     num_runs: u64,
+    has_last_value: u8,
     run_ends: Box<AnyRuntime>,
     values: Box<AnyRuntime>,
     last_value: Box<[u128]>,
@@ -306,6 +205,10 @@ impl WriterRuntime for RunEndWriterRuntime {
     }
 
     fn reserve_for_additional(&mut self, count: usize) -> Result<(), ArrowKernelError> {
+        if self.has_last_value != 0 {
+            self.run_ends.append_integer(self.curr_run_end)?;
+            self.has_last_value = 0;
+        }
         self.run_ends.reserve_for_additional(count)?;
         self.values.reserve_for_additional(count)?;
         self.run_end_runtime_ptr = self.run_ends.as_ptr();
@@ -318,7 +221,17 @@ impl WriterRuntime for RunEndWriterRuntime {
         self.curr_run_end as usize
     }
 
-    fn to_array(self, len: usize) -> Result<ArrayRef, ArrowKernelError> {
+    fn to_array(mut self, len: usize) -> Result<ArrayRef, ArrowKernelError> {
+        if len != self.curr_run_end as usize {
+            return Err(ArrowKernelError::InternalError(format!(
+                "run-end writer contains {} values but {len} were requested",
+                self.curr_run_end
+            )));
+        }
+        if self.has_last_value != 0 {
+            self.run_ends.append_integer(self.curr_run_end)?;
+            self.has_last_value = 0;
+        }
         match self.run_end_type {
             RunEndType::Int16 => self.into_typed_array::<Int16Type>(len),
             RunEndType::Int32 => self.into_typed_array::<Int32Type>(len),
@@ -394,24 +307,40 @@ impl<'ctx, 'borrow> WriterEmitter<'ctx, 'borrow> for RunEndWriterEmitter<'ctx, '
         declare_blocks!(
             self.codegen.ctx,
             func,
-            run_end_first,
             run_end_compare,
+            run_end_close,
             run_end_new,
             run_end_exit
         );
+        let has_last_value_ptr = increment_pointer!(
+            self.codegen.ctx,
+            self.codegen.builder,
+            self.runtime_ptr,
+            RunEndWriterRuntime::OFFSET_HAS_LAST_VALUE
+        );
+        let has_last_value = self
+            .codegen
+            .builder
+            .build_load(
+                self.codegen.ctx.i8_type(),
+                has_last_value_ptr,
+                "run_end_has_last_value",
+            )
+            .unwrap()
+            .into_int_value();
         let is_first = self
             .codegen
             .builder
             .build_int_compare(
                 IntPredicate::EQ,
-                curr_run_end,
-                i64_type.const_zero(),
+                has_last_value,
+                self.codegen.ctx.i8_type().const_zero(),
                 "run_end_is_first",
             )
             .unwrap();
         self.codegen
             .builder
-            .build_conditional_branch(is_first, run_end_first, run_end_compare)
+            .build_conditional_branch(is_first, run_end_new, run_end_compare)
             .unwrap();
 
         self.codegen.builder.position_at_end(run_end_compare);
@@ -469,20 +398,33 @@ impl<'ctx, 'borrow> WriterEmitter<'ctx, 'borrow> for RunEndWriterEmitter<'ctx, '
         };
         self.codegen
             .builder
-            .build_conditional_branch(matches, run_end_exit, run_end_new)
+            .build_conditional_branch(matches, run_end_exit, run_end_close)
+            .unwrap();
+
+        self.codegen.builder.position_at_end(run_end_close);
+        self.writer
+            .emit_run_end(self.codegen, self.run_end_runtime_ptr, curr_run_end)?;
+        self.codegen
+            .builder
+            .build_unconditional_branch(run_end_new)
             .unwrap();
 
         self.codegen.builder.position_at_end(run_end_new);
-        self.writer.emit_pending(
-            self.codegen,
-            self.runtime_ptr,
-            self.run_end_runtime_ptr,
-            self.value_runtime_ptr,
-            curr_run_end,
-        )?;
+        self.writer
+            .values
+            .llvm_write(self.codegen, self.value_runtime_ptr, |emitter| {
+                emitter.emit(value)
+            })?;
         self.codegen
             .builder
             .build_store(last_value_ptr, value)
+            .unwrap();
+        self.codegen
+            .builder
+            .build_store(
+                has_last_value_ptr,
+                self.codegen.ctx.i8_type().const_int(1, false),
+            )
             .unwrap();
         let num_runs_ptr = increment_pointer!(
             self.codegen.ctx,
@@ -511,26 +453,6 @@ impl<'ctx, 'borrow> WriterEmitter<'ctx, 'borrow> for RunEndWriterEmitter<'ctx, '
             .build_unconditional_branch(run_end_exit)
             .unwrap();
 
-        self.codegen.builder.position_at_end(run_end_first);
-        self.codegen
-            .builder
-            .build_store(last_value_ptr, value)
-            .unwrap();
-        let num_runs_ptr = increment_pointer!(
-            self.codegen.ctx,
-            self.codegen.builder,
-            self.runtime_ptr,
-            RunEndWriterRuntime::OFFSET_NUM_RUNS
-        );
-        self.codegen
-            .builder
-            .build_store(num_runs_ptr, i64_type.const_int(1, false))
-            .unwrap();
-        self.codegen
-            .builder
-            .build_unconditional_branch(run_end_exit)
-            .unwrap();
-
         self.codegen.builder.position_at_end(run_end_exit);
         Ok(())
     }
@@ -544,15 +466,16 @@ mod tests {
     use inkwell::{context::Context, values::BasicValue, AddressSpace, OptimizationLevel};
 
     use crate::{
-        compiled_writers::RunEndType,
-        compiled_writers2::{Writer, WriterCodegen, WriterEmitter, WriterPlan, WriterRuntime},
+        compiled_writers::{
+            RunEndType, Writer, WriterCodegen, WriterEmitter, WriterPlan, WriterRuntime,
+        },
         declare_blocks, PrimitiveType,
     };
 
     #[test]
     fn run_end_writer_emits_runs_through_composed_child_writers() {
         let ctx = Context::create();
-        let llvm_mod = ctx.create_module("compiled_writers2_run_end_writer");
+        let llvm_mod = ctx.create_module("compiled_writers_run_end_writer");
         let build = ctx.create_builder();
         let ptr_type = ctx.ptr_type(AddressSpace::default());
         let append_func = llvm_mod.add_function(
@@ -591,16 +514,6 @@ mod tests {
         }
         build.build_return(None).unwrap();
 
-        let flush_func = llvm_mod.add_function(
-            "flush",
-            ctx.void_type().fn_type(&[ptr_type.into()], false),
-            None,
-        );
-        declare_blocks!(ctx, flush_func, flush_entry);
-        build.position_at_end(flush_entry);
-        let flush_runtime_ptr = flush_func.get_nth_param(0).unwrap().into_pointer_value();
-        writer.llvm_flush(codegen, flush_runtime_ptr);
-        build.build_return(None).unwrap();
         llvm_mod.verify().unwrap();
 
         let ee = llvm_mod
@@ -612,12 +525,6 @@ mod tests {
             )
             .unwrap()
         };
-        let flush = unsafe {
-            ee.get_function::<unsafe extern "C" fn(*mut c_void)>(
-                flush_func.get_name().to_str().unwrap(),
-            )
-            .unwrap()
-        };
         let mut runtime = writer.allocate(input.len());
         unsafe {
             append.call(runtime.as_ptr());
@@ -625,7 +532,6 @@ mod tests {
         runtime.reserve_for_additional(input.len()).unwrap();
         unsafe {
             append.call(runtime.as_ptr());
-            flush.call(runtime.as_ptr());
         }
 
         let array = runtime.to_array_ref().unwrap();

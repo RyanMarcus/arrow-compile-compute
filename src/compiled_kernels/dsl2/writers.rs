@@ -68,13 +68,13 @@ impl OutputSlot {
         self.alloc.len()
     }
 
-    pub fn llvm_init<'a>(
+    pub fn llvm_init<'ctx>(
         &self,
-        ctx: &'a Context,
-        llvm_mod: &Module<'a>,
-        build: &Builder<'a>,
-        alloc_ptr: PointerValue<'a>,
-    ) -> BoundWriter<'a, 'a> {
+        ctx: &'ctx Context,
+        llvm_mod: &Module<'ctx>,
+        build: &Builder<'ctx>,
+        alloc_ptr: PointerValue<'ctx>,
+    ) -> BoundWriter<'ctx> {
         self.spec.llvm_init(ctx, llvm_mod, build, alloc_ptr)
     }
 }
@@ -101,35 +101,35 @@ mod tests {
 
     use super::{accepted_type, OutputSpec, WriterSpec};
     use crate::{
-        compiled_writers::{DictionaryKeyType, WriterAllocation},
+        compiled_writers::{AnyWriter, DictionaryKeyType},
         declare_blocks, ListItemType,
     };
 
     #[test]
     fn writer_spec_allocates_matching_variant() {
-        let primitive =
-            OutputSpec::new(WriterSpec::Primitive(crate::PrimitiveType::I32), "rows").allocate(8);
-        assert!(matches!(primitive.alloc, WriterAllocation::Primitive(_)));
+        let primitive = WriterSpec::Primitive(crate::PrimitiveType::I32);
+        assert!(matches!(
+            primitive.compile().unwrap(),
+            AnyWriter::Primitive(_)
+        ));
 
-        let boolean = OutputSpec::new(WriterSpec::Boolean, "rows").allocate(8);
-        assert!(matches!(boolean.alloc, WriterAllocation::Boolean(_)));
+        let boolean = WriterSpec::Boolean;
+        assert!(matches!(boolean.compile().unwrap(), AnyWriter::Boolean(_)));
 
-        let string = OutputSpec::new(WriterSpec::String, "rows").allocate(8);
-        assert!(matches!(string.alloc, WriterAllocation::String(_)));
+        let string = WriterSpec::String;
+        assert!(matches!(string.compile().unwrap(), AnyWriter::String(_)));
 
-        let list =
-            OutputSpec::new(WriterSpec::FixedSizeList(ListItemType::I32, 4), "rows").allocate(8);
-        assert!(matches!(list.alloc, WriterAllocation::FixedSizeList(_)));
+        let list = WriterSpec::FixedSizeList(ListItemType::I32, 4);
+        assert!(matches!(
+            list.compile().unwrap(),
+            AnyWriter::FixedSizeList(_)
+        ));
 
-        let dict = OutputSpec::new(
-            WriterSpec::Dictionary(
-                DictionaryKeyType::Int8,
-                Box::new(WriterSpec::Primitive(crate::PrimitiveType::I32)),
-            ),
-            "rows",
-        )
-        .allocate(8);
-        assert!(matches!(dict.alloc, WriterAllocation::Dictionary(_)));
+        let dict = WriterSpec::Dictionary(
+            DictionaryKeyType::Int8,
+            Box::new(WriterSpec::Primitive(crate::PrimitiveType::I32)),
+        );
+        assert!(matches!(dict.compile().unwrap(), AnyWriter::Dictionary(_)));
     }
 
     #[test]
@@ -180,11 +180,10 @@ mod tests {
         let writer = slot.llvm_init(&ctx, &llvm_mod, &build, dest);
         writer.llvm_ingest(
             &ctx,
+            &llvm_mod,
             &build,
             ctx.i32_type().const_int(7, true).as_basic_value_enum(),
         );
-        writer.llvm_flush(&ctx, &build);
-
         build.build_return(None).unwrap();
         llvm_mod.verify().unwrap();
     }
@@ -215,18 +214,15 @@ mod tests {
             .into_struct_type();
         let null_ptr = ptr_type.const_null();
         let empty = string_type.const_named_struct(&[null_ptr.into(), null_ptr.into()]);
-        string_writer.llvm_ingest(&ctx, &build, empty.as_basic_value_enum());
-        string_writer.llvm_flush(&ctx, &build);
-
+        string_writer.llvm_ingest(&ctx, &llvm_mod, &build, empty.as_basic_value_enum());
         let bool_slot = OutputSpec::new(WriterSpec::Boolean, "rows").allocate(4);
         let bool_writer = bool_slot.llvm_init(&ctx, &llvm_mod, &build, bool_dest);
         bool_writer.llvm_ingest(
             &ctx,
+            &llvm_mod,
             &build,
             ctx.bool_type().const_int(1, false).as_basic_value_enum(),
         );
-        bool_writer.llvm_flush(&ctx, &build);
-
         build.build_return(None).unwrap();
         llvm_mod.verify().unwrap();
     }

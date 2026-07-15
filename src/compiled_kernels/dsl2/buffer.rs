@@ -126,7 +126,11 @@ impl DSLBuffer {
         self as *mut Self as *mut c_void
     }
 
-    pub fn buffer_len<'a>(ctx: &'a Context, b: &'a Builder, ptr: PointerValue<'a>) -> IntValue<'a> {
+    pub fn buffer_len<'a>(
+        ctx: &'a Context,
+        b: &Builder<'a>,
+        ptr: PointerValue<'a>,
+    ) -> IntValue<'a> {
         let len = b
             .build_load(
                 ctx.i64_type(),

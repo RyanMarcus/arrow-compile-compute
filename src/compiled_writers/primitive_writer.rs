@@ -8,7 +8,7 @@ use inkwell::{
 use repr_offset::ReprOffset;
 
 use crate::{
-    compiled_writers2::{
+    compiled_writers::{
         AnyRuntime, AnyWriterEmitter, Writer, WriterCodegen, WriterEmitter, WriterRuntime,
     },
     increment_pointer, ArrowKernelError, PrimitiveType,
@@ -60,7 +60,7 @@ impl WriterRuntime for PrimitiveWriterRuntime {
     fn to_array(self, len: usize) -> Result<ArrayRef, ArrowKernelError> {
         let mut buf = Buffer::from(self.alloc);
         let sliced = buf.slice_with_length(0, len * self.pt.width());
-        if buf.len() > len * self.pt.width() * 2 {
+        if len > 0 && buf.len() > len * self.pt.width() * 2 {
             // over 2x over allocated, trim to exact size
             let vec = sliced.to_vec();
             buf = Buffer::from(vec);
@@ -75,6 +75,34 @@ impl WriterRuntime for PrimitiveWriterRuntime {
                 .build_unchecked()
         };
         Ok(make_array(ad))
+    }
+}
+
+impl PrimitiveWriterRuntime {
+    /// Appends terminal integer metadata while finalizing a composed array.
+    ///
+    /// This is not a general runtime ingestion path. It exists for metadata
+    /// such as the final string/list offset or run end and should normally be
+    /// called at most once per materialized array.
+    pub(super) fn append_integer(&mut self, value: u64) -> Result<(), ArrowKernelError> {
+        if self.len() == self.max_len {
+            self.reserve_for_additional(1)?;
+        }
+
+        unsafe {
+            match self.pt {
+                PrimitiveType::I16 => self.alloc_ptr.cast::<i16>().write_unaligned(value as i16),
+                PrimitiveType::I32 => self.alloc_ptr.cast::<i32>().write_unaligned(value as i32),
+                PrimitiveType::I64 => self.alloc_ptr.cast::<i64>().write_unaligned(value as i64),
+                pt => {
+                    return Err(ArrowKernelError::InternalError(format!(
+                        "cannot append integer metadata to primitive writer {pt}"
+                    )));
+                }
+            }
+            self.alloc_ptr = self.alloc_ptr.byte_add(self.pt.width());
+        }
+        Ok(())
     }
 }
 
@@ -196,14 +224,23 @@ mod tests {
 
     use super::PrimitiveWriter;
     use crate::{
-        compiled_writers2::{Writer, WriterCodegen, WriterEmitter, WriterRuntime},
+        compiled_writers::{Writer, WriterCodegen, WriterEmitter, WriterRuntime},
         declare_blocks, PrimitiveType,
     };
 
     #[test]
+    fn primitive_writer_materializes_empty_array_with_valid_alignment() {
+        let writer = PrimitiveWriter::compile(PrimitiveType::I32).unwrap();
+        let runtime = writer.allocate(1);
+        let array = runtime.to_array(0).unwrap();
+        assert_eq!(array.len(), 0);
+        assert_eq!(array.data_type(), &arrow_schema::DataType::Int32);
+    }
+
+    #[test]
     fn primitive_writer_jit_writes_values_to_array() {
         let ctx = Context::create();
-        let llvm_mod = ctx.create_module("compiled_writers2_primitive_writer");
+        let llvm_mod = ctx.create_module("compiled_writers_primitive_writer");
         let build = ctx.create_builder();
         let ptr_type = ctx.ptr_type(AddressSpace::default());
 
@@ -240,8 +277,6 @@ mod tests {
         writer
             .llvm_write_multiple(codegen, dest, VectorType::const_vector(&values))
             .unwrap();
-        writer.llvm_flush(codegen, dest);
-
         build.build_return(None).unwrap();
         llvm_mod.verify().unwrap();
 

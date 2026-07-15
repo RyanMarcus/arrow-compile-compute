@@ -8,17 +8,17 @@ use arrow_array::{
 use arrow_data::ArrayDataBuilder;
 use arrow_schema::{DataType, Field};
 use inkwell::{
-    values::{BasicValue, BasicValueEnum, PointerValue},
+    values::{BasicValueEnum, PointerValue},
     AddressSpace,
 };
 use repr_offset::ReprOffset;
 
 use crate::{
-    compiled_writers2::{
+    compiled_writers::{
         AnyRuntime, AnyWriter, AnyWriterEmitter, PrimitiveWriter, Writer, WriterCodegen,
         WriterEmitter, WriterRuntime,
     },
-    increment_pointer, ArrowKernelError, PrimitiveType,
+    increment_pointer, ArrowKernelError,
 };
 
 pub struct ListWriter {
@@ -80,7 +80,7 @@ impl Writer for ListWriter {
             offset_runtime_ptr: std::ptr::null_mut(),
             value_runtime_ptr: std::ptr::null_mut(),
             curr_count: 0,
-            offset_runtime: Box::new(self.offsets.allocate(size)),
+            offset_runtime: Box::new(self.offsets.allocate(size + 1)),
             value_runtime: Box::new(self.inner.allocate(size)),
         };
         runtime.offset_runtime_ptr = runtime.offset_runtime.as_ptr();
@@ -136,42 +136,6 @@ impl Writer for ListWriter {
 
         Ok(())
     }
-
-    fn llvm_flush<'ctx, 'borrow>(
-        &'borrow self,
-        codegen: WriterCodegen<'ctx, 'borrow>,
-        runtime_ptr: PointerValue<'ctx>,
-    ) {
-        let curr_count_ptr = increment_pointer!(
-            codegen.ctx,
-            codegen.builder,
-            runtime_ptr,
-            ListWriterRuntime::OFFSET_CURR_COUNT
-        );
-        let curr_count = codegen
-            .builder
-            .build_load(codegen.ctx.i64_type(), curr_count_ptr, "final_count")
-            .unwrap()
-            .into_int_value();
-        self.offsets
-            .llvm_write(codegen, self.get_offset_ptr(codegen, runtime_ptr), |e| {
-                e.emit(match self.offsets.primitive_type() {
-                    PrimitiveType::I32 => codegen
-                        .builder
-                        .build_int_truncate(curr_count, codegen.ctx.i32_type(), "final_count_i32")
-                        .unwrap()
-                        .as_basic_value_enum(),
-                    PrimitiveType::I64 => curr_count.as_basic_value_enum(),
-                    _ => unreachable!("invalid list offset type"),
-                })
-            })
-            .unwrap();
-
-        self.offsets
-            .llvm_flush(codegen, self.get_offset_ptr(codegen, runtime_ptr));
-        self.inner
-            .llvm_flush(codegen, self.get_value_ptr(codegen, runtime_ptr));
-    }
 }
 
 #[repr(C)]
@@ -191,7 +155,7 @@ impl WriterRuntime for ListWriterRuntime {
     }
 
     fn reserve_for_additional(&mut self, count: usize) -> Result<(), ArrowKernelError> {
-        self.offset_runtime.reserve_for_additional(count)?;
+        self.offset_runtime.reserve_for_additional(count + 1)?;
         self.value_runtime.reserve_for_additional(count)?;
         self.offset_runtime_ptr = self.offset_runtime.as_ptr();
         self.value_runtime_ptr = self.value_runtime.as_ptr();
@@ -199,10 +163,19 @@ impl WriterRuntime for ListWriterRuntime {
     }
 
     fn len(&self) -> usize {
-        self.offset_runtime.len() - 1
+        self.offset_runtime.len()
     }
 
-    fn to_array(self, len: usize) -> Result<arrow_array::ArrayRef, crate::ArrowKernelError> {
+    fn to_array(mut self, len: usize) -> Result<arrow_array::ArrayRef, crate::ArrowKernelError> {
+        let written = self.offset_runtime.len();
+        if len > written {
+            return Err(ArrowKernelError::InternalError(format!(
+                "list writer contains {written} values but {len} were requested"
+            )));
+        }
+        if len == written {
+            self.offset_runtime.append_integer(self.curr_count)?;
+        }
         let offsets = self.offset_runtime.to_array(len + 1)?;
 
         let value_len = match offsets.data_type() {
@@ -275,7 +248,7 @@ mod tests {
 
     use super::ListWriter;
     use crate::{
-        compiled_writers2::{
+        compiled_writers::{
             AnyWriter, PrimitiveWriter, Writer, WriterCodegen, WriterEmitter, WriterRuntime,
         },
         declare_blocks, PrimitiveType,
@@ -284,7 +257,7 @@ mod tests {
     #[test]
     fn list_writer_runtime_to_array_appends_final_offset() {
         let ctx = Context::create();
-        let llvm_mod = ctx.create_module("compiled_writers2_list_writer");
+        let llvm_mod = ctx.create_module("compiled_writers_list_writer");
         let build = ctx.create_builder();
         let ptr_type = ctx.ptr_type(AddressSpace::default());
 
@@ -325,8 +298,6 @@ mod tests {
                 emitter.emit(ctx.i32_type().const_int(14, true).as_basic_value_enum())
             })
             .unwrap();
-        writer.llvm_flush(codegen, dest);
-
         build.build_return(None).unwrap();
         llvm_mod.verify().unwrap();
 
@@ -355,7 +326,7 @@ mod tests {
     #[test]
     fn list_writer_writes_nested_list() {
         let ctx = Context::create();
-        let llvm_mod = ctx.create_module("compiled_writers2_nested_list_writer");
+        let llvm_mod = ctx.create_module("compiled_writers_nested_list_writer");
         let build = ctx.create_builder();
         let ptr_type = ctx.ptr_type(AddressSpace::default());
 
@@ -399,8 +370,6 @@ mod tests {
                 emitter.emit(ctx.i32_type().const_int(14, true).as_basic_value_enum())
             })
             .unwrap();
-        writer.llvm_flush(codegen, dest);
-
         build.build_return(None).unwrap();
         llvm_mod.verify().unwrap();
 

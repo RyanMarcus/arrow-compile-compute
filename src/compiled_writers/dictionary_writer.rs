@@ -21,10 +21,9 @@ use crate::{
     compiled_kernels::ht::{
         generate_hash_func_named, generate_lookup_or_insert_named, TicketTable,
     },
-    compiled_writers::DictionaryKeyType,
-    compiled_writers2::{
-        AnyRuntime, AnyWriter, AnyWriterEmitter, PrimitiveWriter, Writer, WriterCodegen,
-        WriterEmitter, WriterRuntime,
+    compiled_writers::{
+        AnyRuntime, AnyWriter, AnyWriterEmitter, DictionaryKeyType, PrimitiveWriter, Writer,
+        WriterCodegen, WriterEmitter, WriterRuntime,
     },
     declare_blocks, increment_pointer, ArrowKernelError, PrimitiveType,
 };
@@ -177,31 +176,6 @@ impl Writer for DictionaryWriter {
         }
         .into();
         f(&mut emitter)
-    }
-
-    fn llvm_flush<'ctx, 'borrow>(
-        &'borrow self,
-        codegen: WriterCodegen<'ctx, 'borrow>,
-        runtime_ptr: PointerValue<'ctx>,
-    ) {
-        self.keys.llvm_flush(
-            codegen,
-            Self::get_child_ptr(
-                codegen,
-                runtime_ptr,
-                DictionaryWriterRuntime::OFFSET_KEY_RUNTIME_PTR,
-                "dictionary_key_runtime",
-            ),
-        );
-        self.values.llvm_flush(
-            codegen,
-            Self::get_child_ptr(
-                codegen,
-                runtime_ptr,
-                DictionaryWriterRuntime::OFFSET_VALUE_RUNTIME_PTR,
-                "dictionary_value_runtime",
-            ),
-        );
     }
 }
 
@@ -473,15 +447,16 @@ mod tests {
 
     use crate::{
         compiled_kernels::link_req_helpers,
-        compiled_writers::DictionaryKeyType,
-        compiled_writers2::{Writer, WriterCodegen, WriterEmitter, WriterPlan, WriterRuntime},
+        compiled_writers::{
+            DictionaryKeyType, Writer, WriterCodegen, WriterEmitter, WriterPlan, WriterRuntime,
+        },
         declare_blocks, PrimitiveType,
     };
 
     #[test]
     fn dictionary_writer_composes_and_falls_back_when_table_is_full() {
         let ctx = Context::create();
-        let llvm_mod = ctx.create_module("compiled_writers2_dictionary_writer");
+        let llvm_mod = ctx.create_module("compiled_writers_dictionary_writer");
         let build = ctx.create_builder();
         let ptr_type = ctx.ptr_type(AddressSpace::default());
         let append_func = llvm_mod.add_function(
@@ -526,16 +501,6 @@ mod tests {
         }
         build.build_return(None).unwrap();
 
-        let flush_func = llvm_mod.add_function(
-            "flush",
-            ctx.void_type().fn_type(&[ptr_type.into()], false),
-            None,
-        );
-        declare_blocks!(ctx, flush_func, flush_entry);
-        build.position_at_end(flush_entry);
-        let flush_runtime_ptr = flush_func.get_nth_param(0).unwrap().into_pointer_value();
-        writer.llvm_flush(codegen, flush_runtime_ptr);
-        build.build_return(None).unwrap();
         llvm_mod.verify().unwrap();
 
         let ee = llvm_mod
@@ -545,12 +510,6 @@ mod tests {
         let append = unsafe {
             ee.get_function::<unsafe extern "C" fn(*mut c_void)>(
                 append_func.get_name().to_str().unwrap(),
-            )
-            .unwrap()
-        };
-        let flush = unsafe {
-            ee.get_function::<unsafe extern "C" fn(*mut c_void)>(
-                flush_func.get_name().to_str().unwrap(),
             )
             .unwrap()
         };
@@ -565,7 +524,6 @@ mod tests {
         runtime.reserve_for_additional(input.len()).unwrap();
         unsafe {
             append.call(runtime.as_ptr());
-            flush.call(runtime.as_ptr());
         }
 
         let array = runtime.to_array_ref().unwrap();

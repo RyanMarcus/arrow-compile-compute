@@ -1,4 +1,4 @@
-use arrow_array::{Datum, UInt64Array};
+use arrow_array::{cast::AsArray, types::UInt64Type, Datum, UInt64Array};
 use arrow_schema::DataType;
 use inkwell::attributes::{Attribute, AttributeLoc};
 use inkwell::execution_engine::JitFunction;
@@ -18,10 +18,9 @@ use std::ffi::c_void;
 
 use crate::compiled_iter::{datum_to_iter, generate_next};
 use crate::compiled_kernels::{link_req_helpers, optimize_module};
-use crate::compiled_writers::{LeafWriter, LeafWriterAllocation, PrimitiveArrayWriter};
 use crate::{
-    compiled_kernels::cmp::add_memcmp, declare_blocks, increment_pointer, pointer_diff,
-    PrimitiveType,
+    compiled_kernels::cmp::add_memcmp, compiled_writers::WriterSpec, declare_blocks,
+    increment_pointer, pointer_diff, PrimitiveType,
 };
 use crate::{logical_nulls, set_noalias_params};
 
@@ -785,11 +784,12 @@ impl Kernel for HashKernel {
         }
 
         let mut iter = datum_to_iter(inp)?;
-        let mut alloc = PrimitiveArrayWriter::allocate(arr.len(), PrimitiveType::U64);
+        let mut alloc = WriterSpec::Primitive(PrimitiveType::U64).allocate(arr.len());
 
         unsafe { self.borrow_func().call(iter.get_mut_ptr(), alloc.get_ptr()) };
 
-        Ok(alloc.into_primitive_array(arr.len(), logical_nulls(arr)?))
+        let output = alloc.into_array_ref_with_len(arr.len(), logical_nulls(arr)?);
+        Ok(output.as_primitive::<UInt64Type>().clone())
     }
 
     fn compile(inp: &Self::Input<'_>, hf: Self::Params) -> Result<Self, super::ArrowKernelError> {
@@ -823,15 +823,8 @@ impl Kernel for HashKernel {
                 let iter_ptr = func.get_nth_param(0).unwrap().into_pointer_value();
                 let out_ptr = func.get_nth_param(1).unwrap().into_pointer_value();
                 let buf_ptr = b.build_alloca(p_llvm, "buf_ptr").unwrap();
-                let writer =
-                    crate::compiled_writers::Writer::Primitive(PrimitiveArrayWriter::llvm_init(
-                        ctx,
-                        &llvm_mod,
-                        &b,
-                        PrimitiveType::U64,
-                        out_ptr,
-                    ))
-                    .bind(out_ptr);
+                let writer = WriterSpec::Primitive(PrimitiveType::U64)
+                    .llvm_init(ctx, &llvm_mod, &b, out_ptr);
                 b.build_unconditional_branch(loop_cond).unwrap();
 
                 b.position_at_end(loop_cond);
@@ -851,7 +844,7 @@ impl Kernel for HashKernel {
                     .try_as_basic_value()
                     .unwrap_basic()
                     .into_int_value();
-                writer.llvm_ingest(ctx, &b, hashed.into());
+                writer.llvm_ingest(ctx, &llvm_mod, &b, hashed.into());
                 b.build_unconditional_branch(loop_cond).unwrap();
 
                 b.position_at_end(exit);

@@ -1585,6 +1585,7 @@ mod tests {
                 DSLContext, DSLFunction, DSLReductionType, DSLStmt, DSLType, DSLValue, OutputSpec,
             },
         },
+        compiled_writers::RunEndType,
         ArrowKernelError, ListItemType, PrimitiveType,
     };
 
@@ -1666,6 +1667,46 @@ mod tests {
         assert_eq!(
             out.into_iter().map(|x| x.unwrap()).collect_vec(),
             vec![1, 2, 3, 4, 5, 6]
+        );
+    }
+
+    #[test]
+    fn test_dsl2_run_into_run_end_strings_owns_values_between_calls() {
+        let mut ctx = DSLContext::new();
+        let mut func = DSLFunction::new("append_run_end_strings");
+        let arr_input = StringArray::new_null(0);
+
+        let arr = func.add_arg(&mut ctx, DSLType::array_of(PrimitiveType::P64x2, "n"));
+        func.add_body(
+            DSLStmt::for_each(&mut ctx, &[arr], |loop_vars| {
+                DSLStmt::emit(0, loop_vars[0].expr())
+            })
+            .unwrap(),
+        );
+        let spec = WriterSpec::RunEndEncoded(RunEndType::Int32, Box::new(WriterSpec::String));
+        func.add_ret(spec.clone(), "n");
+
+        let func = compile(func, dsl_args![arr_input]).unwrap();
+        let mut output = OutputSpec::new(spec, "n").allocate(5);
+        let arr1 = StringArray::from(vec!["a", "a", "b"]);
+        func.run_into(&dsl_args![arr1], std::slice::from_mut(&mut output))
+            .unwrap();
+        drop(arr1);
+
+        let arr2 = StringArray::from(vec!["b", "c"]);
+        func.run_into(&dsl_args![arr2], std::slice::from_mut(&mut output))
+            .unwrap();
+
+        let out = output.into_array_ref(None);
+        let out = out.as_run::<Int32Type>();
+        assert_eq!(out.run_ends().values(), &[2, 3, 4, 5]);
+        assert_eq!(
+            out.values()
+                .as_binary::<i32>()
+                .iter()
+                .map(|value| std::str::from_utf8(value.unwrap()).unwrap())
+                .collect::<Vec<_>>(),
+            ["a", "b", "b", "c"]
         );
     }
 

@@ -9,7 +9,7 @@ use repr_offset::ReprOffset;
 
 use crate::{
     compiled_kernels::llvm_add_str_writer_append_bytes,
-    compiled_writers2::{
+    compiled_writers::{
         AnyRuntime, AnyWriterEmitter, PrimitiveWriter, Writer, WriterCodegen, WriterEmitter,
         WriterRuntime,
     },
@@ -109,53 +109,6 @@ impl Writer for StringWriter {
 
         f(&mut emitter)
     }
-
-    fn llvm_flush<'ctx, 'borrow>(
-        &'borrow self,
-        codegen: WriterCodegen<'ctx, 'borrow>,
-        runtime_ptr: PointerValue<'ctx>,
-    ) {
-        let curr_offset_ptr = increment_pointer!(
-            codegen.ctx,
-            codegen.builder,
-            runtime_ptr,
-            StringWriterRuntime::OFFSET_CURR_OFFSET
-        );
-        let curr_offset = codegen
-            .builder
-            .build_load(
-                codegen.ctx.i64_type(),
-                curr_offset_ptr,
-                "final_string_offset",
-            )
-            .unwrap()
-            .into_int_value();
-        let offset_writer_ptr = self.get_offset_ptr(codegen, runtime_ptr);
-
-        self.offset_writer
-            .llvm_write(codegen, offset_writer_ptr, |e| {
-                let offset = match self.offset_writer.primitive_type() {
-                    PrimitiveType::I32 => codegen
-                        .builder
-                        .build_int_truncate(
-                            curr_offset,
-                            codegen.ctx.i32_type(),
-                            "final_string_offset_i32",
-                        )
-                        .unwrap()
-                        .as_basic_value_enum(),
-                    PrimitiveType::I64 => curr_offset.as_basic_value_enum(),
-                    pt => {
-                        return Err(ArrowKernelError::InternalError(format!(
-                            "unsupported string offset type {pt}"
-                        )));
-                    }
-                };
-                e.emit(offset)
-            })
-            .unwrap();
-        self.offset_writer.llvm_flush(codegen, offset_writer_ptr);
-    }
 }
 
 #[repr(C)]
@@ -174,16 +127,25 @@ impl WriterRuntime for StringWriterRuntime {
     }
 
     fn reserve_for_additional(&mut self, count: usize) -> Result<(), ArrowKernelError> {
-        self.offsets.reserve_for_additional(count)?;
+        self.offsets.reserve_for_additional(count + 1)?;
         self.offset_runtime_ptr = self.offsets.as_ptr();
         Ok(())
     }
 
     fn len(&self) -> usize {
-        self.offsets.len().saturating_sub(1)
+        self.offsets.len()
     }
 
-    fn to_array(self, len: usize) -> Result<ArrayRef, ArrowKernelError> {
+    fn to_array(mut self, len: usize) -> Result<ArrayRef, ArrowKernelError> {
+        let written = self.offsets.len();
+        if len > written {
+            return Err(ArrowKernelError::InternalError(format!(
+                "string writer contains {written} values but {len} were requested"
+            )));
+        }
+        if len == written {
+            self.offsets.append_integer(self.curr_offset)?;
+        }
         let offsets = self.offsets.to_array(len + 1)?;
         let data = Buffer::from(self.bytes);
 
@@ -294,14 +256,14 @@ mod tests {
 
     use super::StringWriter;
     use crate::{
-        compiled_writers2::{Writer, WriterCodegen, WriterEmitter, WriterRuntime},
+        compiled_writers::{Writer, WriterCodegen, WriterEmitter, WriterRuntime},
         declare_blocks, PrimitiveType,
     };
 
     #[test]
     fn string_writer_jit_writes_utf8_values() {
         let ctx = Context::create();
-        let llvm_mod = ctx.create_module("compiled_writers2_string_writer");
+        let llvm_mod = ctx.create_module("compiled_writers_string_writer");
         let build = ctx.create_builder();
         let ptr_type = ctx.ptr_type(AddressSpace::default());
 
@@ -344,7 +306,6 @@ mod tests {
                 })
                 .unwrap();
         }
-        writer.llvm_flush(codegen, dest);
         build.build_return(None).unwrap();
 
         llvm_mod.verify().unwrap();
@@ -361,14 +322,25 @@ mod tests {
         unsafe {
             f.call(runtime.as_ptr());
         }
+        runtime.reserve_for_additional(strings.len()).unwrap();
+        unsafe {
+            f.call(runtime.as_ptr());
+        }
 
-        let array = runtime.to_array(strings.len()).unwrap();
+        let array = runtime.to_array(strings.len() * 2).unwrap();
         let array = array.as_any().downcast_ref::<BinaryArray>().unwrap();
         let actual: Vec<String> = array
             .iter()
             .map(|s| String::from_utf8(s.unwrap().to_vec()).unwrap())
             .collect();
-        assert_eq!(actual, strings);
-        assert_eq!(array.value_offsets(), &[0, 5, 5, 9, 14]);
+        assert_eq!(
+            actual,
+            strings
+                .into_iter()
+                .chain(strings)
+                .map(str::to_owned)
+                .collect::<Vec<_>>()
+        );
+        assert_eq!(array.value_offsets(), &[0, 5, 5, 9, 14, 19, 19, 23, 28]);
     }
 }
