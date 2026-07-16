@@ -18,7 +18,7 @@ use super::{array_to_iter, IteratorHolder};
 pub struct DictionaryIterator {
     key_iter: *const c_void,
     val_iter: *const c_void,
-    array_ref: Arc<dyn Array>,
+    pub(super) array_ref: Arc<dyn Array>,
 }
 
 impl<K: ArrowDictionaryKeyType> From<&DictionaryArray<K>> for IteratorHolder {

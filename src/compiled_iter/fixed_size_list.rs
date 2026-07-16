@@ -25,7 +25,7 @@ pub struct FixedSizeListIterator {
     list_size: usize,
     list_ptype: ListItemType,
     child: Box<IteratorHolder>,
-    array_ref: Arc<dyn Array>,
+    pub(super) array_ref: Arc<dyn Array>,
 }
 
 impl From<&FixedSizeListArray> for Box<FixedSizeListIterator> {

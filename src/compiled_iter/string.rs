@@ -21,7 +21,7 @@ pub struct StringIterator {
     data: *const u8,
     pos: u64,
     len: u64,
-    array_ref: Arc<dyn Array>,
+    pub(super) array_ref: Arc<dyn Array>,
 }
 
 impl From<&StringArray> for Box<StringIterator> {
@@ -157,7 +157,7 @@ pub struct LargeStringIterator {
     data: *const u8,
     pos: u64,
     len: u64,
-    array_ref: Arc<dyn Array>,
+    pub(super) array_ref: Arc<dyn Array>,
 }
 
 impl LargeStringIterator {
@@ -274,7 +274,9 @@ impl From<&GenericBinaryArray<i64>> for Box<LargeStringIterator> {
 mod tests {
     use std::ffi::c_void;
 
-    use arrow_array::{Datum, LargeBinaryArray, LargeStringArray, Scalar, StringArray};
+    use arrow_array::{
+        Array, BinaryArray, Datum, LargeBinaryArray, LargeStringArray, Scalar, StringArray,
+    };
     use inkwell::{context::Context, OptimizationLevel};
 
     use crate::{
@@ -288,6 +290,21 @@ mod tests {
         let ptr2 = u64::from_le_bytes(b[8..16].try_into().unwrap());
         let len = (ptr2 - ptr1) as usize;
         std::slice::from_raw_parts(ptr1 as *const u8, len).to_vec()
+    }
+
+    #[test]
+    fn data_type_preserves_string_logical_type() {
+        let string = StringArray::from(vec!["hello"]);
+        let binary = BinaryArray::from(vec![b"hello".as_slice()]);
+
+        assert_eq!(
+            datum_to_iter(&string).unwrap().data_type(),
+            string.data_type().clone()
+        );
+        assert_eq!(
+            datum_to_iter(&binary).unwrap().data_type(),
+            binary.data_type().clone()
+        );
     }
 
     #[test]

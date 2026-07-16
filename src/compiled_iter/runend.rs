@@ -48,7 +48,7 @@ pub struct RunEndIterator {
     /// the remaining number of values in the current run
     remaining: u64,
 
-    array_ref: Arc<dyn Array>,
+    pub(super) array_ref: Arc<dyn Array>,
 }
 
 impl<R: RunEndIndexType + ArrowPrimitiveType> From<&RunArray<R>> for IteratorHolder {
