@@ -1,16 +1,13 @@
-use arrow_array::cast::AsArray;
-use arrow_array::{Array, ArrayRef, BooleanArray, UInt64Array};
-use arrow_buffer::NullBuffer;
+use arrow_array::{Array, ArrayRef, UInt64Array};
 use arrow_schema::DataType;
+use itertools::Itertools;
 
 use crate::compiled_kernels::cast::coalesce_type;
 use crate::compiled_kernels::dsl2::{
     self, dsl_args, DSLContext, DSLFunction, DSLStmt, DSLType, WriterSpec,
 };
-use crate::compiled_kernels::null_utils::replace_nulls;
-use crate::{
-    arrow_interface, logical_nulls, normalized_base_type, ArrowKernelError, PrimitiveType,
-};
+use crate::compiled_kernels::null_utils::{copy_selected_nulls, has_any_nulls};
+use crate::{arrow_interface, iter, normalized_base_type, ArrowKernelError, PrimitiveType};
 
 use crate::compiled_kernels::dsl2::RunnableDSLFunction;
 use crate::compiled_kernels::Kernel;
@@ -34,7 +31,7 @@ impl Kernel for TakeKernel {
     fn call(&self, inp: Self::Input<'_>) -> Result<Self::Output, ArrowKernelError> {
         let (arr, idx) = inp;
 
-        if idx.nulls().is_some() {
+        if has_any_nulls(idx) {
             return Err(ArrowKernelError::UnsupportedArguments(
                 "indexes for take must not be nullable".to_string(),
             ));
@@ -52,12 +49,11 @@ impl Kernel for TakeKernel {
 
         let mut res = self.0.run(&dsl_args!(arr, idx))?[0].clone();
         res = coalesce_type(res, &normalized_base_type(arr.data_type()))?;
-
-        if let Some(nulls) = logical_nulls(arr)? {
-            let ba = BooleanArray::new(nulls.into_inner(), None);
-            let nulls = crate::arrow_interface::select::take(&ba, idx)?;
-            let nulls = NullBuffer::new(nulls.as_boolean().clone().into_parts().0);
-            res = replace_nulls(res, Some(nulls));
+        if has_any_nulls(arr) {
+            let indices = iter::iter_nonnull_u64(idx)?
+                .map(|x| x as usize)
+                .collect_vec();
+            res = copy_selected_nulls(arr, res, &indices)?;
         }
 
         Ok(res)
@@ -105,7 +101,7 @@ mod tests {
     use std::sync::Arc;
 
     use arrow_array::{
-        builder::{FixedSizeListBuilder, Float32Builder},
+        builder::{FixedSizeListBuilder, Float32Builder, Int32Builder, ListBuilder},
         cast::AsArray,
         types::{Float32Type, Int32Type, Int64Type},
         BooleanArray, FixedSizeListArray, Int32Array, Int64Array, RunArray, StringArray,
@@ -277,5 +273,51 @@ mod tests {
         let val = res.value(0);
         let val = val.as_primitive::<Float32Type>();
         assert_eq!(val.values(), &[2.0, 3.0]);
+    }
+
+    #[test]
+    fn test_take_list_repeated_nullable_rows_and_values() {
+        let mut data = ListBuilder::new(Int32Builder::new());
+        data.values().append_value(1);
+        data.values().append_null();
+        data.values().append_value(3);
+        data.append(true);
+        data.append(false);
+        data.append(true);
+        data.values().append_null();
+        data.values().append_value(5);
+        data.append(true);
+        let data = data.finish();
+        let indices = UInt32Array::from(vec![3, 0, 0, 1]);
+
+        let kernel = TakeKernel::compile(&(&data, &indices), ()).unwrap();
+        let actual = kernel.call((&data, &indices)).unwrap();
+        let expected = arrow_select::take::take(&data, &indices, None).unwrap();
+
+        assert_eq!(actual.data_type(), expected.data_type());
+        assert_eq!(actual.as_list::<i32>(), expected.as_list::<i32>());
+    }
+
+    #[test]
+    fn test_take_nested_list_nullable_rows_and_values() {
+        let mut data = ListBuilder::new(ListBuilder::new(Int32Builder::new()));
+        data.values().values().append_value(1);
+        data.values().values().append_null();
+        data.values().append(true);
+        data.values().append(false);
+        data.append(true);
+        data.append(true);
+        data.values().values().append_slice(&[3, 4]);
+        data.values().append(true);
+        data.append(true);
+        let data = data.finish();
+        let indices = UInt32Array::from(vec![2, 0, 2]);
+
+        let kernel = TakeKernel::compile(&(&data, &indices), ()).unwrap();
+        let actual = kernel.call((&data, &indices)).unwrap();
+        let expected = arrow_select::take::take(&data, &indices, None).unwrap();
+
+        assert_eq!(actual.data_type(), expected.data_type());
+        assert_eq!(actual.as_list::<i32>(), expected.as_list::<i32>());
     }
 }

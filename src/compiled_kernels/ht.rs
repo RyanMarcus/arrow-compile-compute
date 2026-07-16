@@ -68,12 +68,6 @@ impl TicketTable {
         }
     }
 
-    /// Returns the number of elements in the table (not the maximum size of the
-    /// table)
-    pub fn len(&self) -> usize {
-        self.last_val as usize
-    }
-
     fn llvm_max_size<'a>(
         &self,
         ctx: &'a Context,
@@ -151,14 +145,6 @@ impl TicketTable {
 /// Builds a function that uses a ticket table to assign each value a unique
 /// ticket. The last/output parameter is `0` if an old value was read from the
 /// table, `1` if a new value was inserted, and `2` if the table is full.
-pub fn generate_lookup_or_insert<'a>(
-    ctx: &'a Context,
-    module: &Module<'a>,
-    ht: &TicketTable,
-) -> FunctionValue<'a> {
-    generate_lookup_or_insert_named(ctx, module, ht, "lookup_or_insert")
-}
-
 pub fn generate_lookup_or_insert_named<'a>(
     ctx: &'a Context,
     module: &Module<'a>,
@@ -884,11 +870,14 @@ mod tests {
     use itertools::Itertools;
 
     use crate::{
-        compiled_kernels::{ht::HashFunction, link_req_helpers, Kernel},
+        compiled_kernels::{
+            ht::{generate_lookup_or_insert_named, HashFunction},
+            link_req_helpers, Kernel,
+        },
         PrimitiveType,
     };
 
-    use super::{generate_hash_func, generate_lookup_or_insert, HashKernel, TicketTable};
+    use super::{generate_hash_func, HashKernel, TicketTable};
 
     #[test]
     fn test_ticket_overflow() {
@@ -896,7 +885,7 @@ mod tests {
 
         let ctx = Context::create();
         let module = ctx.create_module("test");
-        let func = generate_lookup_or_insert(&ctx, &module, &tt);
+        let func = generate_lookup_or_insert_named(&ctx, &module, &tt, "test_lookup_or_insert");
 
         module.verify().unwrap();
         let ee = module
@@ -929,7 +918,7 @@ mod tests {
 
         let ctx = Context::create();
         let module = ctx.create_module("test");
-        let func = generate_lookup_or_insert(&ctx, &module, &tt);
+        let func = generate_lookup_or_insert_named(&ctx, &module, &tt, "test_lookup_or_insert");
 
         module.verify().unwrap();
         let ee = module
@@ -985,7 +974,7 @@ mod tests {
 
         let ctx = Context::create();
         let module = ctx.create_module("test");
-        let func = generate_lookup_or_insert(&ctx, &module, &tt);
+        let func = generate_lookup_or_insert_named(&ctx, &module, &tt, "test_lookup_or_insert");
 
         module.verify().unwrap();
         let ee = module
