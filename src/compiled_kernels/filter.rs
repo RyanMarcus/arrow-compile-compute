@@ -1,15 +1,13 @@
-use arrow_array::cast::AsArray;
 use arrow_array::{Array, ArrayRef, BooleanArray};
-use arrow_buffer::NullBuffer;
 use arrow_schema::DataType;
 
 use crate::compiled_kernels::cast::coalesce_type;
 use crate::compiled_kernels::dsl2::{
     compile, dsl_args, DSLArgument, DSLContext, DSLFunction, DSLStmt, DSLType, RunnableDSLFunction,
 };
-use crate::compiled_kernels::null_utils::replace_nulls;
+use crate::compiled_kernels::null_utils::{copy_selected_nulls, has_any_nulls};
 use crate::compiled_writers::WriterSpec;
-use crate::{logical_nulls, normalized_base_type, ArrowKernelError};
+use crate::{normalized_base_type, ArrowKernelError};
 
 use crate::compiled_kernels::Kernel;
 
@@ -35,16 +33,13 @@ impl Kernel for FilterKernel {
         }
 
         let mut res = self.0.run(&dsl_args!(inp.0, inp.1))?[0].clone();
-        if let Some(nulls) = logical_nulls(inp.0)? {
-            let ba = BooleanArray::new(nulls.into_inner(), None);
-            let filtered_nulls = crate::arrow_interface::select::filter(&ba, inp.1)?;
-            let filtered_nulls = filtered_nulls.as_boolean();
-            let filtered_nulls = NullBuffer::new(filtered_nulls.clone().into_parts().0);
-            res = replace_nulls(res, Some(filtered_nulls));
-        }
-
         let base_dt = normalized_base_type(inp.0.data_type());
         res = coalesce_type(res, &base_dt)?;
+
+        if has_any_nulls(inp.0) {
+            let indices = inp.1.values().set_indices().collect::<Vec<_>>();
+            res = copy_selected_nulls(inp.0, res, &indices)?;
+        }
 
         Ok(res)
     }
@@ -96,7 +91,12 @@ impl Kernel for FilterKernel {
 
 #[cfg(test)]
 mod tests {
-    use arrow_array::{cast::AsArray, types::Int32Type, Array, BooleanArray, Int32Array, RunArray};
+    use arrow_array::{
+        builder::{Int32Builder, LargeListBuilder, ListBuilder, StringBuilder},
+        cast::AsArray,
+        types::Int32Type,
+        Array, BooleanArray, Int32Array, RunArray,
+    };
     use arrow_schema::DataType;
     use itertools::Itertools;
 
@@ -229,5 +229,54 @@ mod tests {
 
         assert_eq!(res.len(), 0);
         assert_eq!(res.iter().collect_vec(), Vec::<Option<&str>>::new());
+    }
+
+    #[test]
+    fn test_filter_list_nullable_rows_and_values() {
+        let mut data = ListBuilder::new(Int32Builder::new());
+        data.values().append_value(1);
+        data.values().append_null();
+        data.values().append_value(3);
+        data.append(true);
+        data.append(false);
+        data.append(true);
+        data.values().append_null();
+        data.values().append_value(5);
+        data.append(true);
+        let data = data.finish();
+        let mask = BooleanArray::from(vec![true, true, false, true]);
+
+        let kernel = FilterKernel::compile(&(&data, &mask), ()).unwrap();
+        let actual = kernel.call((&data, &mask)).unwrap();
+        let expected = arrow_select::filter::filter(&data, &mask).unwrap();
+
+        assert_eq!(actual.data_type(), expected.data_type());
+        assert_eq!(actual.as_list::<i32>(), expected.as_list::<i32>());
+    }
+
+    #[test]
+    fn test_filter_sliced_large_list_strings() {
+        let mut data = LargeListBuilder::new(StringBuilder::new());
+        for row in [
+            vec!["outside"],
+            vec!["alpha", "beta"],
+            vec![],
+            vec!["gamma"],
+            vec!["outside"],
+        ] {
+            for value in row {
+                data.values().append_value(value);
+            }
+            data.append(true);
+        }
+        let data = data.finish().slice(1, 3);
+        let mask = BooleanArray::from(vec![true, false, true]);
+
+        let kernel = FilterKernel::compile(&(&data, &mask), ()).unwrap();
+        let actual = kernel.call((&data, &mask)).unwrap();
+        let expected = arrow_select::filter::filter(&data, &mask).unwrap();
+
+        assert_eq!(actual.data_type(), expected.data_type());
+        assert_eq!(actual.as_list::<i64>(), expected.as_list::<i64>());
     }
 }

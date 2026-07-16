@@ -149,6 +149,7 @@ pub trait WriterRuntime {
     /// Finalizes the runtime state and materializes an Arrow array.
     fn to_array(self, len: usize) -> Result<ArrayRef, ArrowKernelError>;
 
+    #[cfg(test)]
     fn to_array_ref(self) -> Result<ArrayRef, ArrowKernelError>
     where
         Self: Sized,
