@@ -364,78 +364,104 @@ pub fn datum_to_iter(val: &dyn Datum) -> Result<IteratorHolder, ArrowKernelError
             DataType::Time64(__time_unit) => todo!(),
             DataType::Duration(_time_unit) => todo!(),
             DataType::Interval(_interval_unit) => todo!(),
-            DataType::Binary => Ok(d
-                .as_binary::<i32>()
-                .value(0)
-                .to_owned()
-                .into_boxed_slice()
-                .into()),
+            DataType::Binary => Ok(IteratorHolder::ScalarBinary(ScalarBinaryIterator::new(
+                d.as_binary::<i32>().value(0).to_owned().into_boxed_slice(),
+                DataType::Binary,
+            ))),
             DataType::FixedSizeBinary(_) => todo!(),
-            DataType::LargeBinary => Ok(d
-                .as_binary::<i64>()
-                .value(0)
-                .to_owned()
-                .into_boxed_slice()
-                .into()),
+            DataType::LargeBinary => Ok(IteratorHolder::ScalarBinary(ScalarBinaryIterator::new(
+                d.as_binary::<i64>().value(0).to_owned().into_boxed_slice(),
+                DataType::LargeBinary,
+            ))),
             DataType::BinaryView => todo!(),
-            DataType::Utf8 => Ok(d
-                .as_string::<i32>()
-                .value(0)
-                .to_owned()
-                .into_boxed_str()
-                .into()),
-            DataType::LargeUtf8 => Ok(d
-                .as_string::<i64>()
-                .value(0)
-                .to_owned()
-                .into_boxed_str()
-                .into()),
-            DataType::Utf8View => Ok(d
-                .as_string_view()
-                .value(0)
-                .to_owned()
-                .into_boxed_str()
-                .into()),
+            DataType::Utf8 => Ok(IteratorHolder::ScalarString(ScalarStringIterator::new(
+                d.as_string::<i32>().value(0).to_owned().into_boxed_str(),
+                DataType::Utf8,
+            ))),
+            DataType::LargeUtf8 => Ok(IteratorHolder::ScalarString(ScalarStringIterator::new(
+                d.as_string::<i64>().value(0).to_owned().into_boxed_str(),
+                DataType::LargeUtf8,
+            ))),
+            DataType::Utf8View => Ok(IteratorHolder::ScalarString(ScalarStringIterator::new(
+                d.as_string_view().value(0).to_owned().into_boxed_str(),
+                DataType::Utf8View,
+            ))),
             DataType::List(_field) => todo!(),
             DataType::ListView(_field) => todo!(),
             DataType::FixedSizeList(_, _) => {
                 let value = d.as_fixed_size_list().value(0);
                 match value.data_type() {
                     DataType::Int8 => Ok(IteratorHolder::ScalarVec(
-                        ScalarVectorIterator::from_primitive(value.as_primitive::<Int8Type>()),
+                        ScalarVectorIterator::from_primitive(
+                            value.as_primitive::<Int8Type>(),
+                            d.data_type().clone(),
+                        ),
                     )),
                     DataType::Int16 => Ok(IteratorHolder::ScalarVec(
-                        ScalarVectorIterator::from_primitive(value.as_primitive::<Int16Type>()),
+                        ScalarVectorIterator::from_primitive(
+                            value.as_primitive::<Int16Type>(),
+                            d.data_type().clone(),
+                        ),
                     )),
                     DataType::Int32 => Ok(IteratorHolder::ScalarVec(
-                        ScalarVectorIterator::from_primitive(value.as_primitive::<Int32Type>()),
+                        ScalarVectorIterator::from_primitive(
+                            value.as_primitive::<Int32Type>(),
+                            d.data_type().clone(),
+                        ),
                     )),
                     DataType::Int64 => Ok(IteratorHolder::ScalarVec(
-                        ScalarVectorIterator::from_primitive(value.as_primitive::<Int64Type>()),
+                        ScalarVectorIterator::from_primitive(
+                            value.as_primitive::<Int64Type>(),
+                            d.data_type().clone(),
+                        ),
                     )),
                     DataType::UInt8 => Ok(IteratorHolder::ScalarVec(
-                        ScalarVectorIterator::from_primitive(value.as_primitive::<UInt8Type>()),
+                        ScalarVectorIterator::from_primitive(
+                            value.as_primitive::<UInt8Type>(),
+                            d.data_type().clone(),
+                        ),
                     )),
                     DataType::UInt16 => Ok(IteratorHolder::ScalarVec(
-                        ScalarVectorIterator::from_primitive(value.as_primitive::<UInt16Type>()),
+                        ScalarVectorIterator::from_primitive(
+                            value.as_primitive::<UInt16Type>(),
+                            d.data_type().clone(),
+                        ),
                     )),
                     DataType::UInt32 => Ok(IteratorHolder::ScalarVec(
-                        ScalarVectorIterator::from_primitive(value.as_primitive::<UInt32Type>()),
+                        ScalarVectorIterator::from_primitive(
+                            value.as_primitive::<UInt32Type>(),
+                            d.data_type().clone(),
+                        ),
                     )),
                     DataType::UInt64 => Ok(IteratorHolder::ScalarVec(
-                        ScalarVectorIterator::from_primitive(value.as_primitive::<UInt64Type>()),
+                        ScalarVectorIterator::from_primitive(
+                            value.as_primitive::<UInt64Type>(),
+                            d.data_type().clone(),
+                        ),
                     )),
                     DataType::Float16 => Ok(IteratorHolder::ScalarVec(
-                        ScalarVectorIterator::from_primitive(value.as_primitive::<Float16Type>()),
+                        ScalarVectorIterator::from_primitive(
+                            value.as_primitive::<Float16Type>(),
+                            d.data_type().clone(),
+                        ),
                     )),
                     DataType::Float32 => Ok(IteratorHolder::ScalarVec(
-                        ScalarVectorIterator::from_primitive(value.as_primitive::<Float32Type>()),
+                        ScalarVectorIterator::from_primitive(
+                            value.as_primitive::<Float32Type>(),
+                            d.data_type().clone(),
+                        ),
                     )),
                     DataType::Float64 => Ok(IteratorHolder::ScalarVec(
-                        ScalarVectorIterator::from_primitive(value.as_primitive::<Float64Type>()),
+                        ScalarVectorIterator::from_primitive(
+                            value.as_primitive::<Float64Type>(),
+                            d.data_type().clone(),
+                        ),
                     )),
                     DataType::Boolean => Ok(IteratorHolder::ScalarVec(
-                        ScalarVectorIterator::from_boolean(value.as_boolean()),
+                        ScalarVectorIterator::from_boolean(
+                            value.as_boolean(),
+                            d.data_type().clone(),
+                        ),
                     )),
                     DataType::Utf8 => {
                         let arr = value.as_string::<i32>();
@@ -452,6 +478,7 @@ pub fn datum_to_iter(val: &dyn Datum) -> Result<IteratorHolder, ArrowKernelError
                                 ListItemType::P64x2,
                                 ptrs,
                                 value.clone(),
+                                d.data_type().clone(),
                             ),
                         ))
                     }
@@ -470,6 +497,7 @@ pub fn datum_to_iter(val: &dyn Datum) -> Result<IteratorHolder, ArrowKernelError
                                 ListItemType::P64x2,
                                 ptrs,
                                 value.clone(),
+                                d.data_type().clone(),
                             ),
                         ))
                     }
@@ -488,6 +516,7 @@ pub fn datum_to_iter(val: &dyn Datum) -> Result<IteratorHolder, ArrowKernelError
                                 ListItemType::P64x2,
                                 ptrs,
                                 value.clone(),
+                                d.data_type().clone(),
                             ),
                         ))
                     }
@@ -536,6 +565,27 @@ pub enum IteratorHolder {
 }
 
 impl IteratorHolder {
+    /// Returns the Arrow data type represented by this iterator.
+    pub fn data_type(&self) -> DataType {
+        match self {
+            IteratorHolder::Primitive(iter) => iter.array_ref.data_type().clone(),
+            IteratorHolder::String(iter) => iter.array_ref.data_type().clone(),
+            IteratorHolder::LargeString(iter) => iter.array_ref.data_type().clone(),
+            IteratorHolder::View(iter) => iter.array_ref.data_type().clone(),
+            IteratorHolder::Bitmap(_) => DataType::Boolean,
+            IteratorHolder::SetBit(_) => DataType::Boolean,
+            IteratorHolder::Dictionary { arr, .. } => arr.array_ref.data_type().clone(),
+            IteratorHolder::RunEnd { arr, .. } => arr.array_ref.data_type().clone(),
+            IteratorHolder::FixedSizeList(iter) => iter.array_ref.data_type().clone(),
+            IteratorHolder::List(iter) => iter.array_ref.data_type().clone(),
+            IteratorHolder::ScalarPrimitive(iter) => iter.ptype.as_arrow_type(),
+            IteratorHolder::ScalarBoolean(_) => DataType::Boolean,
+            IteratorHolder::ScalarString(iter) => iter.data_type.clone(),
+            IteratorHolder::ScalarBinary(iter) => iter.data_type.clone(),
+            IteratorHolder::ScalarVec(iter) => iter.data_type.clone(),
+        }
+    }
+
     /// Gets a mutable pointer to the inner iterator, suitable for passing to
     /// compiled LLVM functions.
     pub fn get_mut_ptr(&mut self) -> *mut c_void {

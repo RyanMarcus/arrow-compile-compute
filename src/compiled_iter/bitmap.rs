@@ -20,7 +20,7 @@ pub struct BitmapIterator {
     slice_offset: u64,
     pos: u64,
     len: u64,
-    array_ref: BooleanArray,
+    pub(super) array_ref: BooleanArray,
 }
 
 impl From<&BooleanArray> for Box<BitmapIterator> {

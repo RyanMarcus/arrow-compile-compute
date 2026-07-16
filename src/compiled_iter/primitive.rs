@@ -27,7 +27,7 @@ pub struct PrimitiveIterator {
     data: *const c_void,
     pos: u64,
     len: u64,
-    array_ref: Arc<dyn Array>,
+    pub(super) array_ref: Arc<dyn Array>,
 }
 
 impl<K: ArrowPrimitiveType> From<&PrimitiveArray<K>> for Box<PrimitiveIterator> {

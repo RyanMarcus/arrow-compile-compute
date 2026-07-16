@@ -107,7 +107,7 @@ pub struct SetBitIterator {
     /// Index of the first aligned 64-bit segment (used to compute absolute offsets).
     segment_start: u64,
     /// Keep the array alive while iterating.
-    array_ref: BooleanArray,
+    pub(super) array_ref: BooleanArray,
 }
 
 impl From<&BooleanArray> for SetBitIterator {

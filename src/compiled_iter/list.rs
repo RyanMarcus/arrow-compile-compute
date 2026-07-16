@@ -24,7 +24,7 @@ pub struct ListIterator {
     len: u64,
     offset_width: usize,
     child: Box<IteratorHolder>,
-    array_ref: Arc<dyn Array>,
+    pub(super) array_ref: Arc<dyn Array>,
 }
 
 impl From<&GenericListArray<i32>> for Box<ListIterator> {

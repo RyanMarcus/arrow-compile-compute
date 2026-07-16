@@ -32,7 +32,7 @@ pub struct ViewIterator {
     pos: u64,
     len: u64,
 
-    array_ref: Arc<dyn Array>,
+    pub(super) array_ref: Arc<dyn Array>,
 }
 
 impl<T: ByteViewType> From<&GenericByteViewArray<T>> for Box<ViewIterator> {
