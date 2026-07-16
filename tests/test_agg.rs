@@ -56,6 +56,56 @@ proptest! {
     }
 
     #[test]
+    fn test_ungrouped_sum_nulls(arr: Vec<Option<i32>>) {
+        // nulls must be skipped; sum widens to i64 (all-null -> 0, additive identity)
+        let sum = arr.iter().flatten().map(|x| *x as i64).sum::<i64>();
+        let arr = Int32Array::from(arr);
+
+        let mut agg = aggregate::sum(arr.data_type()).unwrap();
+        if !arr.is_empty() {
+            agg.ensure_capacity(1);
+        }
+        agg.ingest_ungrouped(&[&arr]).unwrap();
+        let res = agg.finish().unwrap();
+        let res = res.as_primitive::<Int64Type>();
+        if arr.is_empty() {
+            assert_eq!(res.len(), 0);
+        } else {
+            assert_eq!(res.len(), 1);
+            assert_eq!(res.value(0), sum);
+        }
+    }
+
+    #[test]
+    fn test_ungrouped_min_nulls(arr: Vec<Option<i32>>) {
+        // nulls must be skipped, matching arrow's min
+        let arr = Int32Array::from(arr);
+        let expected = arrow_arith::aggregate::min(&arr);
+
+        let mut agg = aggregate::min(arr.data_type()).unwrap();
+        if !arr.is_empty() {
+            agg.ensure_capacity(1);
+        }
+        agg.ingest_ungrouped(&[&arr]).unwrap();
+        let res = agg.finish().unwrap();
+        let res = res.as_primitive::<Int32Type>();
+
+        match expected {
+            Some(v) => {
+                assert_eq!(res.len(), 1);
+                assert_eq!(res.value(0), v);
+            }
+            None => {
+                // empty or all-null: ours returns 0-length only for the empty case
+                // (all-null is the same finish-level gap product has)
+                if arr.is_empty() {
+                    assert_eq!(res.len(), 0);
+                }
+            }
+        }
+    }
+
+    #[test]
     fn test_ungrouped_product(arr: Vec<i32>) {
         // differential vs arrow's product (both wrap on overflow)
         let arr = Int32Array::from(arr);

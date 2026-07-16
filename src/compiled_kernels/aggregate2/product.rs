@@ -48,28 +48,23 @@ impl Kernel for ProductAggKernel {
 
     fn call(&self, inp: Self::Input<'_>) -> Result<Self::Output, ArrowKernelError> {
         let (used, buf, data, tickets) = inp;
+        let validity;
+        let mut args = vec![
+            DSLArgument::buffer(used),
+            DSLArgument::buffer(buf),
+            DSLArgument::Datum(data),
+            DSLArgument::Datum(tickets),
+        ];
         if self.has_nulls {
             let nulls = logical_nulls(data.get().0)?.ok_or_else(|| {
                 ArrowKernelError::UnsupportedArguments(
                     "nullable product kernel called with non-null input".to_string(),
                 )
             })?;
-            let validity = BooleanArray::new(nulls.into_inner(), None);
-            self.k.run(&[
-                DSLArgument::buffer(used),
-                DSLArgument::buffer(buf),
-                DSLArgument::Datum(data),
-                DSLArgument::Datum(tickets),
-                DSLArgument::Datum(&validity),
-            ])?;
-        } else {
-            self.k.run(&[
-                DSLArgument::buffer(used),
-                DSLArgument::buffer(buf),
-                DSLArgument::Datum(data),
-                DSLArgument::Datum(tickets),
-            ])?;
+            validity = BooleanArray::new(nulls.into_inner(), None);
+            args.push(DSLArgument::Datum(&validity));
         }
+        self.k.run(&args)?;
         Ok(())
     }
 

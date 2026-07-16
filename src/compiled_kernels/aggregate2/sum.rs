@@ -1,6 +1,6 @@
 use std::sync::LazyLock;
 
-use arrow_array::{Array, ArrayRef, Datum, UInt64Array};
+use arrow_array::{Array, ArrayRef, BooleanArray, Datum, UInt64Array};
 use arrow_schema::DataType;
 
 use crate::{
@@ -12,7 +12,7 @@ use crate::{
         },
         DSLArithBinOp, KernelCache,
     },
-    ArrowKernelError, Kernel, PrimitiveType,
+    logical_nulls, ArrowKernelError, Kernel, PrimitiveType,
 };
 
 fn sum_primitive_type(pt: PrimitiveType) -> Result<PrimitiveType, ArrowKernelError> {
@@ -32,12 +32,17 @@ fn sum_primitive_type(pt: PrimitiveType) -> Result<PrimitiveType, ArrowKernelErr
     })
 }
 
-pub struct SumAggKernel(RunnableDSLFunction);
+pub struct SumAggKernel {
+    k: RunnableDSLFunction,
+    has_nulls: bool,
+}
 unsafe impl Send for SumAggKernel {}
 unsafe impl Sync for SumAggKernel {}
 
 impl Kernel for SumAggKernel {
-    type Key = DataType;
+    // `has_nulls` is part of the key: nullable inputs compile a validity-aware
+    // kernel that skips null slots, non-nullable ones the faster plain kernel.
+    type Key = (DataType, bool);
 
     type Input<'a> = (&'a mut DSLBuffer, &'a dyn Datum, &'a UInt64Array);
 
@@ -47,12 +52,22 @@ impl Kernel for SumAggKernel {
 
     fn call(&self, inp: Self::Input<'_>) -> Result<Self::Output, super::ArrowKernelError> {
         let (buf, data, tickets) = inp;
-
-        self.0.run(&[
+        let validity;
+        let mut args = vec![
             DSLArgument::buffer(buf),
             DSLArgument::Datum(data),
             DSLArgument::datum(tickets),
-        ])?;
+        ];
+        if self.has_nulls {
+            let nulls = logical_nulls(data.get().0)?.ok_or_else(|| {
+                ArrowKernelError::UnsupportedArguments(
+                    "nullable sum kernel called with non-null input".to_string(),
+                )
+            })?;
+            validity = BooleanArray::new(nulls.into_inner(), None);
+            args.push(DSLArgument::Datum(&validity));
+        }
+        self.k.run(&args)?;
 
         Ok(())
     }
@@ -64,6 +79,7 @@ impl Kernel for SumAggKernel {
         let (buf, data, tickets) = inp;
         let input_pt = PrimitiveType::for_arrow_type(data.get().0.data_type());
         let sum_pt = sum_primitive_type(input_pt)?;
+        let has_nulls = logical_nulls(data.get().0)?.is_some();
 
         let mut ctx = DSLContext::new();
         let mut func = DSLFunction::new("sum");
@@ -71,27 +87,54 @@ impl Kernel for SumAggKernel {
         let dat_arg = func.add_arg(&mut ctx, DSLType::array_like(*data, "n"));
         let tic_arg = func.add_arg(&mut ctx, DSLType::array_like(tickets, "n"));
 
-        func.add_body(
-            DSLStmt::for_each(&mut ctx, &[tic_arg, dat_arg], |loop_vars| {
-                let ticket = loop_vars[0].expr();
-                let value = loop_vars[1].expr().primitive_cast(sum_pt)?;
-                let cur = buf_arg.expr().at(&ticket)?;
+        // an empty placeholder, only used for its (boolean) type at compile time
+        let validity = BooleanArray::from(Vec::<bool>::new());
 
-                DSLStmt::set(&buf_arg, &ticket, &cur.arith(DSLArithBinOp::Add, value)?)
-            })
-            .unwrap(),
-        );
+        if has_nulls {
+            let val_arg = func.add_arg(&mut ctx, DSLType::array_like(&validity, "n"));
+            func.add_body(
+                DSLStmt::for_each(&mut ctx, &[tic_arg, dat_arg, val_arg], |loop_vars| {
+                    let ticket = loop_vars[0].expr();
+                    let value = loop_vars[1].expr().primitive_cast(sum_pt)?;
+                    let valid = loop_vars[2].expr();
+                    let cur = buf_arg.expr().at(&ticket)?;
 
-        let func = compile(
-            func,
-            [
-                DSLArgument::buffer(&mut DSLBuffer::empty_like(buf)),
-                DSLArgument::Datum(*data),
-                DSLArgument::datum(tickets),
-            ],
-        )?;
+                    // only add valid (non-null) slots
+                    DSLStmt::cond(
+                        valid,
+                        DSLStmt::set(&buf_arg, &ticket, &cur.arith(DSLArithBinOp::Add, value)?)?,
+                    )
+                })
+                .unwrap(),
+            );
+        } else {
+            func.add_body(
+                DSLStmt::for_each(&mut ctx, &[tic_arg, dat_arg], |loop_vars| {
+                    let ticket = loop_vars[0].expr();
+                    let value = loop_vars[1].expr().primitive_cast(sum_pt)?;
+                    let cur = buf_arg.expr().at(&ticket)?;
 
-        Ok(Self(func))
+                    DSLStmt::set(&buf_arg, &ticket, &cur.arith(DSLArithBinOp::Add, value)?)
+                })
+                .unwrap(),
+            );
+        }
+
+        let mut empty_buf = DSLBuffer::empty_like(buf);
+        let mut args = vec![
+            DSLArgument::buffer(&mut empty_buf),
+            DSLArgument::Datum(*data),
+            DSLArgument::datum(tickets),
+        ];
+        if has_nulls {
+            args.push(DSLArgument::Datum(&validity));
+        }
+        let func = compile(func, args)?;
+
+        Ok(Self {
+            k: func,
+            has_nulls,
+        })
     }
 
     fn get_key_for_input(
@@ -101,7 +144,8 @@ impl Kernel for SumAggKernel {
         let dt = i.1.get().0.data_type().clone();
         let pt = PrimitiveType::for_arrow_type(&dt);
         sum_primitive_type(pt)?;
-        Ok(dt)
+        let has_nulls = logical_nulls(i.1.get().0)?.is_some();
+        Ok((dt, has_nulls))
     }
 }
 
@@ -411,4 +455,5 @@ mod tests {
 
         assert_eq!(result, vec![2.0, 1.0]);
     }
+
 }

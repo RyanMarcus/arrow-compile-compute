@@ -25,9 +25,9 @@ Comparison against [`arrow::compute`](https://docs.rs/arrow/59.1.0/arrow/compute
 | `sort_to_indices` | `sort_col` | single-column sort → index array |
 | `lexsort_to_indices` | `sort_multi_col` | multi-column sort → index array |
 | `sort_limit` / `partial_sort` | `top_k` | K smallest/largest as indices |
-| `min`, `max` | `ReductionKernel`, `MinMaxAggKernel` | ungrouped and grouped |
-| `sum` | `SumAggregator` | grouped; ungrouped via `Aggregator::ingest_ungrouped` |
-| `product` | `ProductAggregator` | grouped; ungrouped via `Aggregator::ingest_ungrouped`; wrapping semantics only (no `product_checked`) |
+| `min`, `max` | `ReductionKernel`, `MinMaxAggKernel` | ungrouped and grouped; nulls skipped |
+| `sum` | `SumAggregator` | grouped; ungrouped via `Aggregator::ingest_ungrouped`; nulls skipped |
+| `product` | `ProductAggregator` | grouped; ungrouped via `Aggregator::ingest_ungrouped`; nulls skipped; wrapping semantics only (no `product_checked`) |
 | `like` | `compile_string_like` | GLOB-style matching with escape char (case-sensitive only) |
 | `contains` | `string_contains` | substring search |
 | `starts_with`, `ends_with` | `StringStartEndKernel` | prefix / suffix match |

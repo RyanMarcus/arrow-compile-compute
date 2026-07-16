@@ -1,6 +1,6 @@
 use std::{ffi::c_void, ptr::null, sync::LazyLock};
 
-use arrow_array::{Array, ArrayRef, Datum, UInt64Array};
+use arrow_array::{Array, ArrayRef, BooleanArray, Datum, UInt64Array};
 use arrow_schema::DataType;
 
 use crate::{
@@ -13,15 +13,20 @@ use crate::{
         llvm_utils::StringSaver,
         KernelCache,
     },
-    ArrowKernelError, Kernel, PrimitiveType,
+    logical_nulls, ArrowKernelError, Kernel, PrimitiveType,
 };
 
-pub struct MinMaxAggKernel(RunnableDSLFunction);
+pub struct MinMaxAggKernel {
+    k: RunnableDSLFunction,
+    has_nulls: bool,
+}
 unsafe impl Send for MinMaxAggKernel {}
 unsafe impl Sync for MinMaxAggKernel {}
 
 impl Kernel for MinMaxAggKernel {
-    type Key = (DataType, bool);
+    // key: (data type, is_min, has_nulls). Nullable inputs compile a
+    // validity-aware kernel that skips null slots.
+    type Key = (DataType, bool, bool);
 
     type Input<'a> = (
         &'a mut DSLBuffer,
@@ -37,13 +42,24 @@ impl Kernel for MinMaxAggKernel {
 
     fn call(&self, inp: Self::Input<'_>) -> Result<Self::Output, super::ArrowKernelError> {
         let (used, buf, data, tickets, ss) = inp;
-        self.0.run(&[
+        let validity;
+        let mut args = vec![
             DSLArgument::buffer(used),
             DSLArgument::buffer(buf),
             DSLArgument::Datum(data),
             DSLArgument::Datum(tickets),
             DSLArgument::string_saver(ss),
-        ])?;
+        ];
+        if self.has_nulls {
+            let nulls = logical_nulls(data.get().0)?.ok_or_else(|| {
+                ArrowKernelError::UnsupportedArguments(
+                    "nullable minmax kernel called with non-null input".to_string(),
+                )
+            })?;
+            validity = BooleanArray::new(nulls.into_inner(), None);
+            args.push(DSLArgument::Datum(&validity));
+        }
+        self.k.run(&args)?;
         Ok(())
     }
 
@@ -52,6 +68,7 @@ impl Kernel for MinMaxAggKernel {
         is_min: Self::Params,
     ) -> Result<Self, super::ArrowKernelError> {
         let (used, buf, data, tickets, _ss) = inp;
+        let has_nulls = logical_nulls(data.get().0)?.is_some();
 
         let mut ctx = DSLContext::new();
         let mut func = DSLFunction::new("minmax");
@@ -64,58 +81,102 @@ impl Kernel for MinMaxAggKernel {
         let tic_arg = func.add_arg(&mut ctx, DSLType::array_like(tickets, "n"));
         let ss_arg = func.add_arg(&mut ctx, DSLType::StringSaver);
 
-        func.add_body(
-            DSLStmt::for_each(&mut ctx, &[tic_arg, dat_arg], |loop_vars| {
-                let ticket = loop_vars[0].expr();
-                let data = loop_vars[1].expr();
-                let used = use_arg.expr().at(&ticket)?;
-                let cur = buf_arg.expr().at(&ticket)?;
+        // an empty placeholder, only used for its (boolean) type at compile time
+        let validity = BooleanArray::from(Vec::<bool>::new());
 
-                DSLStmt::cond_else(
-                    used.cast_to_bool()?,
+        if has_nulls {
+            let val_arg = func.add_arg(&mut ctx, DSLType::array_like(&validity, "n"));
+            func.add_body(
+                DSLStmt::for_each(&mut ctx, &[tic_arg, dat_arg, val_arg], |loop_vars| {
+                    let ticket = loop_vars[0].expr();
+                    let data = loop_vars[1].expr();
+                    let valid = loop_vars[2].expr();
+                    let used = use_arg.expr().at(&ticket)?;
+                    let cur = buf_arg.expr().at(&ticket)?;
+
+                    // only consider valid (non-null) slots
                     DSLStmt::cond(
-                        data.cmp(
-                            &cur,
-                            if is_min {
-                                DSLComparison::Lt
-                            } else {
-                                DSLComparison::Gt
-                            },
+                        valid,
+                        DSLStmt::cond_else(
+                            used.cast_to_bool()?,
+                            DSLStmt::cond(
+                                data.cmp(
+                                    &cur,
+                                    if is_min { DSLComparison::Lt } else { DSLComparison::Gt },
+                                )?,
+                                DSLStmt::set_with_saver(&buf_arg, &ticket, &data, &ss_arg)?,
+                            )?,
+                            vec![
+                                DSLStmt::set_with_saver(&buf_arg, &ticket, &data, &ss_arg)?,
+                                DSLStmt::set(
+                                    &use_arg,
+                                    &ticket,
+                                    &DSLValue::u8(1).expr().primitive_cast(PrimitiveType::U8)?,
+                                )?,
+                            ],
                         )?,
-                        DSLStmt::set_with_saver(&buf_arg, &ticket, &data, &ss_arg)?,
-                    )?,
-                    vec![
-                        DSLStmt::set_with_saver(&buf_arg, &ticket, &data, &ss_arg)?,
-                        DSLStmt::set(
-                            &use_arg,
-                            &ticket,
-                            &DSLValue::u8(1).expr().primitive_cast(PrimitiveType::U8)?,
+                    )
+                })
+                .unwrap(),
+            );
+        } else {
+            func.add_body(
+                DSLStmt::for_each(&mut ctx, &[tic_arg, dat_arg], |loop_vars| {
+                    let ticket = loop_vars[0].expr();
+                    let data = loop_vars[1].expr();
+                    let used = use_arg.expr().at(&ticket)?;
+                    let cur = buf_arg.expr().at(&ticket)?;
+
+                    DSLStmt::cond_else(
+                        used.cast_to_bool()?,
+                        DSLStmt::cond(
+                            data.cmp(
+                                &cur,
+                                if is_min { DSLComparison::Lt } else { DSLComparison::Gt },
+                            )?,
+                            DSLStmt::set_with_saver(&buf_arg, &ticket, &data, &ss_arg)?,
                         )?,
-                    ],
-                )
-            })
-            .unwrap(),
-        );
+                        vec![
+                            DSLStmt::set_with_saver(&buf_arg, &ticket, &data, &ss_arg)?,
+                            DSLStmt::set(
+                                &use_arg,
+                                &ticket,
+                                &DSLValue::u8(1).expr().primitive_cast(PrimitiveType::U8)?,
+                            )?,
+                        ],
+                    )
+                })
+                .unwrap(),
+            );
+        }
 
-        let func = compile(
-            func,
-            [
-                DSLArgument::buffer(&mut DSLBuffer::empty_like(used)),
-                DSLArgument::buffer(&mut DSLBuffer::empty_like(buf)),
-                DSLArgument::Datum(*data),
-                DSLArgument::Datum(tickets),
-                DSLArgument::StringSaver(null::<StringSaver>() as *mut c_void),
-            ],
-        )?;
+        let mut empty_used = DSLBuffer::empty_like(used);
+        let mut empty_buf = DSLBuffer::empty_like(buf);
+        let mut args = vec![
+            DSLArgument::buffer(&mut empty_used),
+            DSLArgument::buffer(&mut empty_buf),
+            DSLArgument::Datum(*data),
+            DSLArgument::Datum(tickets),
+            DSLArgument::StringSaver(null::<StringSaver>() as *mut c_void),
+        ];
+        if has_nulls {
+            args.push(DSLArgument::Datum(&validity));
+        }
+        let func = compile(func, args)?;
 
-        Ok(Self(func))
+        Ok(Self {
+            k: func,
+            has_nulls,
+        })
     }
 
     fn get_key_for_input(
         i: &Self::Input<'_>,
         p: &Self::Params,
     ) -> Result<Self::Key, super::ArrowKernelError> {
-        Ok((i.2.get().0.data_type().clone(), *p))
+        let dt = i.2.get().0.data_type().clone();
+        let has_nulls = logical_nulls(i.2.get().0)?.is_some();
+        Ok((dt, *p, has_nulls))
     }
 }
 
@@ -530,4 +591,5 @@ mod tests {
             ]
         );
     }
+
 }
