@@ -3,8 +3,6 @@ mod dictionary;
 mod fixed_size_list;
 mod list;
 mod primitive;
-#[cfg(test)]
-mod reset_tests;
 mod runend;
 mod scalar;
 mod setbit;
@@ -55,23 +53,16 @@ fn build_fixed_size_list_value<'a>(
     ctx: &'a Context,
     llvm_mod: &Module<'a>,
     build: &Builder<'a>,
-    label: &str,
     dt: &DataType,
     iter: &FixedSizeListIterator,
     iter_ptr: PointerValue<'a>,
     row_idx: IntValue<'a>,
 ) -> Option<inkwell::values::BasicValueEnum<'a>> {
-    let DataType::FixedSizeList(field, list_size) = dt else {
+    let DataType::FixedSizeList(_, list_size) = dt else {
         unreachable!("fixed-size-list iterator with non-list data type {dt:?}");
     };
 
-    let child_access = generate_random_access(
-        ctx,
-        llvm_mod,
-        &format!("{}_child", label),
-        field.data_type(),
-        iter.child(),
-    )?;
+    let child_access = iter.child().generate_random_access(ctx, llvm_mod)?;
     let child_iter_ptr = iter.llvm_child_iter(ctx, build, iter_ptr);
     let i64_type = ctx.i64_type();
     let list_size_i64 = i64_type.const_int(*list_size as u64, false);
@@ -176,25 +167,37 @@ fn list_value_llvm_type<'a>(ctx: &'a Context) -> inkwell::types::StructType<'a> 
     )
 }
 
-// Most iterators produce values represented by PrimitiveType, including
-// fixed-size lists whose row width is known at compile time. Variable lists are
-// different: each row has a runtime width, so the iterator yields a descriptor
-// { child_iter, start, end } instead of a primitive/fixed-width value.
-fn iterator_value_llvm_type<'a>(
-    ctx: &'a Context,
-    dt: &DataType,
-    ih: &IteratorHolder,
-) -> Option<inkwell::types::BasicTypeEnum<'a>> {
-    match ih {
-        IteratorHolder::List(_) => Some(list_value_llvm_type(ctx).into()),
-        IteratorHolder::Dictionary { values, .. } => match dt {
-            DataType::Dictionary(_, value_type) => {
-                iterator_value_llvm_type(ctx, value_type, values)
-            }
-            _ => None,
-        },
-        _ => Some(PrimitiveType::for_arrow_type(dt).llvm_type(ctx)),
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum IteratorValueType {
+    Primitive(PrimitiveType),
+    VariableList,
+}
+
+impl IteratorValueType {
+    fn llvm_type<'a>(self, ctx: &'a Context) -> inkwell::types::BasicTypeEnum<'a> {
+        match self {
+            IteratorValueType::Primitive(ptype) => ptype.llvm_type(ctx),
+            IteratorValueType::VariableList => list_value_llvm_type(ctx).into(),
+        }
     }
+
+    fn vectorizable_primitive(self) -> Option<PrimitiveType> {
+        match self {
+            IteratorValueType::Primitive(ptype)
+                if !matches!(ptype, PrimitiveType::P64x2 | PrimitiveType::List(_, _)) =>
+            {
+                Some(ptype)
+            }
+            IteratorValueType::Primitive(_) | IteratorValueType::VariableList => None,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct IteratorCodegenInfo {
+    value_type: IteratorValueType,
+    random_access: bool,
+    next_block: bool,
 }
 
 fn build_variable_list_value<'a>(
@@ -652,32 +655,249 @@ impl IteratorHolder {
         }
     }
 
-    fn is_variable_list_like(&self) -> bool {
+    fn codegen_info(&self) -> IteratorCodegenInfo {
         match self {
-            IteratorHolder::List(_) => true,
-            IteratorHolder::Dictionary { values, .. } => values.is_variable_list_like(),
-            _ => false,
+            IteratorHolder::Primitive(_) => {
+                let value_type =
+                    IteratorValueType::Primitive(PrimitiveType::for_arrow_type(&self.data_type()));
+                IteratorCodegenInfo {
+                    value_type,
+                    random_access: true,
+                    next_block: value_type.vectorizable_primitive().is_some(),
+                }
+            }
+            IteratorHolder::String(_)
+            | IteratorHolder::LargeString(_)
+            | IteratorHolder::View(_) => IteratorCodegenInfo {
+                value_type: IteratorValueType::Primitive(PrimitiveType::P64x2),
+                random_access: true,
+                next_block: false,
+            },
+            IteratorHolder::Bitmap(_) => IteratorCodegenInfo {
+                value_type: IteratorValueType::Primitive(PrimitiveType::U8),
+                random_access: true,
+                next_block: false,
+            },
+            IteratorHolder::SetBit(_) => IteratorCodegenInfo {
+                value_type: IteratorValueType::Primitive(PrimitiveType::U64),
+                random_access: false,
+                next_block: false,
+            },
+            IteratorHolder::Dictionary { keys, values, .. } => {
+                let keys = keys.codegen_info();
+                let values = values.codegen_info();
+                IteratorCodegenInfo {
+                    value_type: values.value_type,
+                    random_access: keys.random_access && values.random_access,
+                    next_block: keys.next_block
+                        && values.random_access
+                        && values.value_type.vectorizable_primitive().is_some(),
+                }
+            }
+            IteratorHolder::RunEnd {
+                run_ends, values, ..
+            } => {
+                let run_ends = run_ends.codegen_info();
+                let values = values.codegen_info();
+                IteratorCodegenInfo {
+                    value_type: values.value_type,
+                    random_access: run_ends.random_access && values.random_access,
+                    next_block: run_ends.random_access
+                        && values.random_access
+                        && values.value_type.vectorizable_primitive().is_some(),
+                }
+            }
+            IteratorHolder::FixedSizeList(iter) => IteratorCodegenInfo {
+                value_type: IteratorValueType::Primitive(iter.ptype()),
+                random_access: iter.child().codegen_info().random_access,
+                next_block: false,
+            },
+            IteratorHolder::List(_) => IteratorCodegenInfo {
+                value_type: IteratorValueType::VariableList,
+                random_access: true,
+                next_block: false,
+            },
+            IteratorHolder::ScalarPrimitive(iter) => {
+                let value_type = IteratorValueType::Primitive(iter.ptype);
+                IteratorCodegenInfo {
+                    value_type,
+                    random_access: false,
+                    next_block: value_type.vectorizable_primitive().is_some(),
+                }
+            }
+            IteratorHolder::ScalarBoolean(_) => IteratorCodegenInfo {
+                value_type: IteratorValueType::Primitive(PrimitiveType::U8),
+                random_access: false,
+                next_block: false,
+            },
+            IteratorHolder::ScalarString(_) | IteratorHolder::ScalarBinary(_) => {
+                IteratorCodegenInfo {
+                    value_type: IteratorValueType::Primitive(PrimitiveType::P64x2),
+                    random_access: false,
+                    next_block: false,
+                }
+            }
+            IteratorHolder::ScalarVec(iter) => IteratorCodegenInfo {
+                value_type: IteratorValueType::Primitive(iter.ptype()),
+                random_access: true,
+                next_block: false,
+            },
         }
+    }
+
+    fn primitive_codegen_name(ptype: PrimitiveType) -> String {
+        match ptype {
+            PrimitiveType::List(item_type, size) => {
+                let item_type = match item_type {
+                    ListItemType::Boolean => "boolean",
+                    ListItemType::I8 => "i8",
+                    ListItemType::I16 => "i16",
+                    ListItemType::I32 => "i32",
+                    ListItemType::I64 => "i64",
+                    ListItemType::U8 => "u8",
+                    ListItemType::U16 => "u16",
+                    ListItemType::U32 => "u32",
+                    ListItemType::U64 => "u64",
+                    ListItemType::F16 => "f16",
+                    ListItemType::F32 => "f32",
+                    ListItemType::F64 => "f64",
+                    ListItemType::P64x2 => "p64x2",
+                };
+                format!("list_{item_type}_{size}")
+            }
+            _ => ptype.to_string().to_ascii_lowercase(),
+        }
+    }
+
+    fn codegen_shape_name(&self) -> String {
+        match self {
+            IteratorHolder::Primitive(_) => format!(
+                "primitive_{}",
+                Self::primitive_codegen_name(PrimitiveType::for_arrow_type(&self.data_type()))
+            ),
+            IteratorHolder::String(_) => "string32".to_owned(),
+            IteratorHolder::LargeString(_) => "string64".to_owned(),
+            IteratorHolder::View(_) => "view".to_owned(),
+            IteratorHolder::Bitmap(_) => "bitmap".to_owned(),
+            IteratorHolder::SetBit(_) => "set_bit".to_owned(),
+            IteratorHolder::Dictionary { keys, values, .. } => {
+                let keys = keys.codegen_shape_name();
+                let values = values.codegen_shape_name();
+                format!(
+                    "dictionary_k{}_{}_v{}_{}",
+                    keys.len(),
+                    keys,
+                    values.len(),
+                    values
+                )
+            }
+            IteratorHolder::RunEnd {
+                run_ends, values, ..
+            } => {
+                let run_ends = run_ends.codegen_shape_name();
+                let values = values.codegen_shape_name();
+                format!(
+                    "run_end_r{}_{}_v{}_{}",
+                    run_ends.len(),
+                    run_ends,
+                    values.len(),
+                    values
+                )
+            }
+            IteratorHolder::FixedSizeList(iter) => {
+                let child = iter.child().codegen_shape_name();
+                format!(
+                    "fixed_size_{}_c{}_{}",
+                    Self::primitive_codegen_name(iter.ptype()),
+                    child.len(),
+                    child
+                )
+            }
+            IteratorHolder::List(iter) => {
+                let child = iter.child().codegen_shape_name();
+                format!("list_w{}_c{}_{}", iter.offset_width(), child.len(), child)
+            }
+            IteratorHolder::ScalarPrimitive(iter) => format!(
+                "scalar_primitive_{}",
+                Self::primitive_codegen_name(iter.ptype)
+            ),
+            IteratorHolder::ScalarBoolean(_) => "scalar_boolean".to_owned(),
+            IteratorHolder::ScalarString(_) => "scalar_string".to_owned(),
+            IteratorHolder::ScalarBinary(_) => "scalar_binary".to_owned(),
+            IteratorHolder::ScalarVec(iter) => format!(
+                "scalar_vector_{}",
+                Self::primitive_codegen_name(iter.ptype())
+            ),
+        }
+    }
+
+    fn codegen_label(&self) -> String {
+        format!("iterator_{}", self.codegen_shape_name())
+    }
+
+    /// Adds or reuses the reset function for this iterator's code-generation shape.
+    ///
+    /// The generated function's signature is:
+    ///
+    /// `fn reset(iter: ptr)`
+    pub fn generate_reset<'a>(&self, ctx: &'a Context, llvm_mod: &Module<'a>) -> FunctionValue<'a> {
+        generate_reset_iterator(ctx, llvm_mod, self)
+    }
+
+    /// Adds or reuses the block-next function for this iterator's code-generation shape.
+    ///
+    /// The generated function fetches `N` elements and advances the iterator.
+    /// Its signature is:
+    ///
+    /// `fn next_block(iter: ptr, out: ptr_to_vec_of_size_n) -> bool`
+    pub fn generate_next_block<'a, const N: u32>(
+        &self,
+        ctx: &'a Context,
+        llvm_mod: &Module<'a>,
+    ) -> Option<FunctionValue<'a>> {
+        generate_next_block::<N>(ctx, llvm_mod, self)
+    }
+
+    /// Adds or reuses the scalar-next function for this iterator's code-generation shape.
+    ///
+    /// The generated function fetches the next element and advances the iterator.
+    /// Its signature is:
+    ///
+    /// `fn next(iter: ptr, out: ptr_to_el) -> bool`
+    pub fn generate_next<'a>(&self, ctx: &'a Context, llvm_mod: &Module<'a>) -> FunctionValue<'a> {
+        generate_next(ctx, llvm_mod, self)
+    }
+
+    /// Adds or reuses the random-access function for this iterator's code-generation shape.
+    ///
+    /// The generated function indexes from the base data without advancing the
+    /// iterator. Its signature is:
+    ///
+    /// `fn access(iter: ptr, el: u64) -> T`
+    pub fn generate_random_access<'a>(
+        &self,
+        ctx: &'a Context,
+        llvm_mod: &Module<'a>,
+    ) -> Option<FunctionValue<'a>> {
+        generate_random_access(ctx, llvm_mod, self)
     }
 }
 
-/// Adds a function to the module that resets iterator state back to its
-/// original position. The generated function's signature is:
-///
-/// fn reset(iter: ptr)
-///
-pub fn generate_reset_iterator<'a>(
+fn generate_reset_iterator<'a>(
     ctx: &'a Context,
     llvm_mod: &Module<'a>,
-    label: &str,
     ih: &IteratorHolder,
-) -> Option<FunctionValue<'a>> {
+) -> FunctionValue<'a> {
     let build = ctx.create_builder();
     let ptr_type = ctx.ptr_type(AddressSpace::default());
-    let name = format!("{}_reset", label);
+    let name = format!("{}_reset", ih.codegen_label());
 
     if let Some(existing) = llvm_mod.get_function(&name) {
-        return Some(existing);
+        assert_eq!(
+            existing.get_type(),
+            ctx.void_type().fn_type(&[ptr_type.into()], false)
+        );
+        return existing;
     }
 
     let fn_type = ctx.void_type().fn_type(&[ptr_type.into()], false);
@@ -700,49 +920,46 @@ pub fn generate_reset_iterator<'a>(
             build.position_at_end(entry);
             iter.llvm_reset(ctx, &build, iter_ptr);
             build.build_return(None).unwrap();
-            Some(reset)
+            reset
         }
         IteratorHolder::String(iter) => {
             declare_blocks!(ctx, reset, entry);
             build.position_at_end(entry);
             iter.llvm_reset(ctx, &build, iter_ptr);
             build.build_return(None).unwrap();
-            Some(reset)
+            reset
         }
         IteratorHolder::LargeString(iter) => {
             declare_blocks!(ctx, reset, entry);
             build.position_at_end(entry);
             iter.llvm_reset(ctx, &build, iter_ptr);
             build.build_return(None).unwrap();
-            Some(reset)
+            reset
         }
         IteratorHolder::View(iter) => {
             declare_blocks!(ctx, reset, entry);
             build.position_at_end(entry);
             iter.llvm_reset(ctx, &build, iter_ptr);
             build.build_return(None).unwrap();
-            Some(reset)
+            reset
         }
         IteratorHolder::Bitmap(iter) => {
             declare_blocks!(ctx, reset, entry);
             build.position_at_end(entry);
             iter.llvm_reset(ctx, &build, iter_ptr);
             build.build_return(None).unwrap();
-            Some(reset)
+            reset
         }
         IteratorHolder::SetBit(iter) => {
             declare_blocks!(ctx, reset, entry);
             build.position_at_end(entry);
             iter.llvm_reset(ctx, &build, iter_ptr);
             build.build_return(None).unwrap();
-            Some(reset)
+            reset
         }
         IteratorHolder::Dictionary { arr, keys, values } => {
-            let key_reset =
-                generate_reset_iterator(ctx, llvm_mod, &format!("{}_key", label), keys).unwrap();
-            let value_reset =
-                generate_reset_iterator(ctx, llvm_mod, &format!("{}_value", label), values)
-                    .unwrap();
+            let key_reset = keys.generate_reset(ctx, llvm_mod);
+            let value_reset = values.generate_reset(ctx, llvm_mod);
 
             declare_blocks!(ctx, reset, entry);
             build.position_at_end(entry);
@@ -755,19 +972,15 @@ pub fn generate_reset_iterator<'a>(
                 .build_call(value_reset, &[val_ptr.into()], "reset_value_iter")
                 .unwrap();
             build.build_return(None).unwrap();
-            Some(reset)
+            reset
         }
         IteratorHolder::RunEnd {
             arr,
             run_ends,
             values,
         } => {
-            let re_reset =
-                generate_reset_iterator(ctx, llvm_mod, &format!("{}_run_ends", label), run_ends)
-                    .unwrap();
-            let value_reset =
-                generate_reset_iterator(ctx, llvm_mod, &format!("{}_values", label), values)
-                    .unwrap();
+            let re_reset = run_ends.generate_reset(ctx, llvm_mod);
+            let value_reset = values.generate_reset(ctx, llvm_mod);
 
             declare_blocks!(ctx, reset, entry);
             build.position_at_end(entry);
@@ -781,19 +994,17 @@ pub fn generate_reset_iterator<'a>(
                 .unwrap();
             arr.llvm_reset(ctx, &build, iter_ptr);
             build.build_return(None).unwrap();
-            Some(reset)
+            reset
         }
         IteratorHolder::FixedSizeList(iter) => {
             declare_blocks!(ctx, reset, entry);
             build.position_at_end(entry);
             iter.llvm_reset(ctx, &build, iter_ptr);
             build.build_return(None).unwrap();
-            Some(reset)
+            reset
         }
         IteratorHolder::List(iter) => {
-            let child_reset =
-                generate_reset_iterator(ctx, llvm_mod, &format!("{}_child", label), iter.child())
-                    .unwrap();
+            let child_reset = iter.child().generate_reset(ctx, llvm_mod);
 
             declare_blocks!(ctx, reset, entry);
             build.position_at_end(entry);
@@ -803,7 +1014,7 @@ pub fn generate_reset_iterator<'a>(
                 .unwrap();
             iter.llvm_reset(ctx, &build, iter_ptr);
             build.build_return(None).unwrap();
-            Some(reset)
+            reset
         }
         IteratorHolder::ScalarPrimitive(_)
         | IteratorHolder::ScalarBoolean(_)
@@ -813,30 +1024,29 @@ pub fn generate_reset_iterator<'a>(
             declare_blocks!(ctx, reset, entry);
             build.position_at_end(entry);
             build.build_return(None).unwrap();
-            Some(reset)
+            reset
         }
     }
 }
 
-/// This adds a `next_block` function to the module for the given iterator. When
-/// called, this `next_block` function will fetch `n` elements from the
-/// iterator, advancing the iterator's offset. The generated function's signature is:
-///
-/// fn next_block(iter: ptr, out: ptr_to_vec_of_size_n) -> bool
-///
-pub fn generate_next_block<'a, const N: u32>(
+fn generate_next_block<'a, const N: u32>(
     ctx: &'a Context,
     llvm_mod: &Module<'a>,
-    label: &str,
-    dt: &DataType,
     ih: &IteratorHolder,
 ) -> Option<FunctionValue<'a>> {
     let build = ctx.create_builder();
-    if ih.is_variable_list_like() {
+    let info = ih.codegen_info();
+    if !info.next_block {
         return None;
     }
-    let ptype = PrimitiveType::for_arrow_type(dt);
-    let vec_type = ptype.llvm_vec_type(ctx, N)?;
+    let dt = ih.data_type();
+    let ptype = info
+        .value_type
+        .vectorizable_primitive()
+        .expect("next-block capability requires a vectorizable primitive value");
+    let vec_type = ptype
+        .llvm_vec_type(ctx, N)
+        .expect("vectorizable primitive should have an LLVM vector type");
     let llvm_type = ptype.llvm_type(ctx);
     let bool_type = ctx.bool_type();
     let ptr_type = ctx.ptr_type(AddressSpace::default());
@@ -844,8 +1054,13 @@ pub fn generate_next_block<'a, const N: u32>(
     let llvm_n = i64_type.const_int(N as u64, false);
 
     let fn_type = bool_type.fn_type(&[ptr_type.into(), ptr_type.into()], false);
+    let name = format!("{}_next_block_{}", ih.codegen_label(), N);
+    if let Some(existing) = llvm_mod.get_function(&name) {
+        assert_eq!(existing.get_type(), fn_type);
+        return Some(existing);
+    }
     let next = llvm_mod.add_function(
-        &format!("{}_next_block_{}", label, N),
+        &name,
         fn_type,
         Some(
             #[cfg(test)]
@@ -896,26 +1111,17 @@ pub fn generate_next_block<'a, const N: u32>(
                 .build_return(Some(&bool_type.const_int(1, false)))
                 .unwrap();
 
-            Some(next)
+            next
         }
-        IteratorHolder::String(_) | IteratorHolder::LargeString(_) => None,
-        IteratorHolder::View(_) => None,
-        IteratorHolder::Bitmap(_bitmap_iterator) => None,
-        IteratorHolder::SetBit(_) => None,
-        IteratorHolder::Dictionary { arr, keys, values } => match dt {
-            DataType::Dictionary(k_dt, v_dt) => {
-                let key_block_next =
-                    generate_next_block::<N>(ctx, llvm_mod, &format!("{}_key", label), k_dt, keys)
-                        .unwrap();
+        IteratorHolder::Dictionary { arr, keys, values } => match &dt {
+            DataType::Dictionary(k_dt, _) => {
+                let key_block_next = keys
+                    .generate_next_block::<N>(ctx, llvm_mod)
+                    .expect("dictionary block capability requires block-readable keys");
 
-                let value_access = generate_random_access(
-                    ctx,
-                    llvm_mod,
-                    &format!("{}_value", label),
-                    v_dt,
-                    values,
-                )
-                .unwrap();
+                let value_access = values
+                    .generate_random_access(ctx, llvm_mod)
+                    .expect("dictionary block capability requires random-access values");
 
                 declare_blocks!(ctx, next, entry, none_left, get_next);
 
@@ -977,7 +1183,7 @@ pub fn generate_next_block<'a, const N: u32>(
                     .build_return(Some(&bool_type.const_int(1, false)))
                     .unwrap();
 
-                Some(next)
+                next
             }
             _ => unreachable!("dict iterator but not dict data type ({:?})", dt),
         },
@@ -985,22 +1191,14 @@ pub fn generate_next_block<'a, const N: u32>(
             arr,
             run_ends,
             values,
-        } => match dt {
-            DataType::RunEndEncoded(re, v) => {
-                let access_ends = generate_random_access(
-                    ctx,
-                    llvm_mod,
-                    "ree_block_ends",
-                    re.data_type(),
-                    run_ends,
-                )?;
-                let access_values = generate_random_access(
-                    ctx,
-                    llvm_mod,
-                    "ree_block_values",
-                    v.data_type(),
-                    values,
-                )?;
+        } => match &dt {
+            DataType::RunEndEncoded(_, _) => {
+                let access_ends = run_ends
+                    .generate_random_access(ctx, llvm_mod)
+                    .expect("run-end block capability requires random-access run ends");
+                let access_values = values
+                    .generate_random_access(ctx, llvm_mod)
+                    .expect("run-end block capability requires random-access values");
 
                 let umin = Intrinsic::find("llvm.umin").unwrap();
                 let umin_f = umin.get_declaration(llvm_mod, &[i64_type.into()]).unwrap();
@@ -1246,21 +1444,13 @@ pub fn generate_next_block<'a, const N: u32>(
                     .build_return(Some(&bool_type.const_all_ones()))
                     .unwrap();
 
-                Some(next)
+                next
             }
             _ => unreachable!("run-end iterator but not run-end data type ({:?})", dt),
         },
-        IteratorHolder::FixedSizeList(_) => None,
-        IteratorHolder::List(_) => None,
         IteratorHolder::ScalarPrimitive(s) => {
             assert_eq!(ptype.width(), s.width as usize);
-            let get_next_single = generate_next(
-                ctx,
-                llvm_mod,
-                &format!("scaler_block_single_next_{}", label),
-                dt,
-                ih,
-            )?;
+            let get_next_single = ih.generate_next(ctx, llvm_mod);
             declare_blocks!(ctx, next, entry);
             build.position_at_end(entry);
             let val_buf = build.build_alloca(llvm_type, "val_buf").unwrap();
@@ -1283,44 +1473,46 @@ pub fn generate_next_block<'a, const N: u32>(
             build
                 .build_return(Some(&bool_type.const_int(1, false)))
                 .unwrap();
-            Some(next)
+            next
         }
-        IteratorHolder::ScalarBoolean(_) => None,
-        IteratorHolder::ScalarString(_) => None,
-        IteratorHolder::ScalarBinary(_) => None,
-        IteratorHolder::ScalarVec(_) => None,
+        IteratorHolder::String(_)
+        | IteratorHolder::LargeString(_)
+        | IteratorHolder::View(_)
+        | IteratorHolder::Bitmap(_)
+        | IteratorHolder::SetBit(_)
+        | IteratorHolder::FixedSizeList(_)
+        | IteratorHolder::List(_)
+        | IteratorHolder::ScalarBoolean(_)
+        | IteratorHolder::ScalarString(_)
+        | IteratorHolder::ScalarBinary(_)
+        | IteratorHolder::ScalarVec(_) => {
+            unreachable!("next-block capability disagrees with iterator variant")
+        }
     };
 
-    match res {
-        Some(x) => Some(x),
-        None => unsafe {
-            next.delete(); // safety: next is created and destroyed here
-            None
-        },
-    }
+    Some(res)
 }
 
-/// This adds a `next` function to the module for the given iterator. When
-/// called, this `next` function will fetch the next element from the
-/// iterator, advancing the iterator's offset. The generated function's signature is:
-/// fn next(iter: ptr, out: ptr_to_el) -> bool
-///
-pub fn generate_next<'a>(
+fn generate_next<'a>(
     ctx: &'a Context,
     llvm_mod: &Module<'a>,
-    label: &str,
-    dt: &DataType,
     ih: &IteratorHolder,
-) -> Option<FunctionValue<'a>> {
+) -> FunctionValue<'a> {
     let build = ctx.create_builder();
-    let llvm_type = iterator_value_llvm_type(ctx, dt, ih)?;
+    let dt = ih.data_type();
+    let llvm_type = ih.codegen_info().value_type.llvm_type(ctx);
     let bool_type = ctx.bool_type();
     let ptr_type = ctx.ptr_type(AddressSpace::default());
     let i64_type = ctx.i64_type();
 
     let fn_type = bool_type.fn_type(&[ptr_type.into(), ptr_type.into()], false);
+    let name = format!("{}_next", ih.codegen_label());
+    if let Some(existing) = llvm_mod.get_function(&name) {
+        assert_eq!(existing.get_type(), fn_type);
+        return existing;
+    }
     let next = llvm_mod.add_function(
-        &format!("{}_next", label),
+        &name,
         fn_type,
         Some(
             #[cfg(test)]
@@ -1334,7 +1526,7 @@ pub fn generate_next<'a>(
     set_noalias_params(&next);
     match ih {
         IteratorHolder::Primitive(primitive_iter) => {
-            let ptype = PrimitiveType::for_arrow_type(dt);
+            let ptype = PrimitiveType::for_arrow_type(&dt);
             declare_blocks!(ctx, next, entry, none_left, get_next);
 
             build.position_at_end(entry);
@@ -1363,10 +1555,10 @@ pub fn generate_next<'a>(
                 .build_return(Some(&bool_type.const_int(1, false)))
                 .unwrap();
 
-            Some(next)
+            next
         }
         IteratorHolder::String(iter) => {
-            let access = generate_random_access(ctx, llvm_mod, label, dt, ih).unwrap();
+            let access = ih.generate_random_access(ctx, llvm_mod).unwrap();
             declare_blocks!(ctx, next, entry, none_left, get_next);
 
             build.position_at_end(entry);
@@ -1398,10 +1590,10 @@ pub fn generate_next<'a>(
                 .build_return(Some(&bool_type.const_int(1, false)))
                 .unwrap();
 
-            Some(next)
+            next
         }
         IteratorHolder::LargeString(iter) => {
-            let access = generate_random_access(ctx, llvm_mod, label, dt, ih).unwrap();
+            let access = ih.generate_random_access(ctx, llvm_mod).unwrap();
             declare_blocks!(ctx, next, entry, none_left, get_next);
 
             build.position_at_end(entry);
@@ -1433,10 +1625,10 @@ pub fn generate_next<'a>(
                 .build_return(Some(&bool_type.const_int(1, false)))
                 .unwrap();
 
-            Some(next)
+            next
         }
         IteratorHolder::View(iter) => {
-            let access = generate_random_access(ctx, llvm_mod, label, dt, ih).unwrap();
+            let access = ih.generate_random_access(ctx, llvm_mod).unwrap();
             declare_blocks!(ctx, next, entry, none_left, get_next);
 
             build.position_at_end(entry);
@@ -1468,10 +1660,10 @@ pub fn generate_next<'a>(
                 .build_return(Some(&bool_type.const_int(1, false)))
                 .unwrap();
 
-            Some(next)
+            next
         }
         IteratorHolder::Bitmap(bitmap_iterator) => {
-            let access = generate_random_access(ctx, llvm_mod, label, dt, ih).unwrap();
+            let access = ih.generate_random_access(ctx, llvm_mod).unwrap();
             declare_blocks!(ctx, next, entry, none_left, get_next);
 
             build.position_at_end(entry);
@@ -1501,7 +1693,7 @@ pub fn generate_next<'a>(
                 .build_return(Some(&bool_type.const_int(1, false)))
                 .unwrap();
 
-            Some(next)
+            next
         }
         IteratorHolder::SetBit(it) => {
             declare_blocks!(
@@ -1708,20 +1900,14 @@ pub fn generate_next<'a>(
                 .build_return(Some(&bool_type.const_int(0, false)))
                 .unwrap();
 
-            Some(next)
+            next
         }
-        IteratorHolder::Dictionary { arr, keys, values } => match dt {
-            DataType::Dictionary(k_dt, v_dt) => {
-                let key_next =
-                    generate_next(ctx, llvm_mod, &format!("{}_key", label), k_dt, keys).unwrap();
-                let values_access = generate_random_access(
-                    ctx,
-                    llvm_mod,
-                    &format!("{}_value", label),
-                    v_dt,
-                    values,
-                )
-                .unwrap();
+        IteratorHolder::Dictionary { arr, keys, values } => match &dt {
+            DataType::Dictionary(k_dt, _) => {
+                let key_next = keys.generate_next(ctx, llvm_mod);
+                let values_access = values
+                    .generate_random_access(ctx, llvm_mod)
+                    .expect("dictionary iteration requires random-access values");
                 declare_blocks!(ctx, next, entry, none_left, fetch);
 
                 build.position_at_end(entry);
@@ -1765,7 +1951,7 @@ pub fn generate_next<'a>(
                 build
                     .build_return(Some(&bool_type.const_int(0, false)))
                     .unwrap();
-                Some(next)
+                next
             }
             _ => unreachable!("dict iterator but not dict data type ({:?})", dt),
         },
@@ -1773,24 +1959,14 @@ pub fn generate_next<'a>(
             arr,
             run_ends,
             values,
-        } => match dt {
-            DataType::RunEndEncoded(res, data) => {
-                let re_access = generate_random_access(
-                    ctx,
-                    llvm_mod,
-                    &format!("re_access_{}", label),
-                    res.data_type(),
-                    run_ends,
-                )
-                .unwrap();
-                let val_access = generate_random_access(
-                    ctx,
-                    llvm_mod,
-                    &format!("val_access_{}", label),
-                    data.data_type(),
-                    values,
-                )
-                .unwrap();
+        } => match &dt {
+            DataType::RunEndEncoded(_, _) => {
+                let re_access = run_ends
+                    .generate_random_access(ctx, llvm_mod)
+                    .expect("run-end iteration requires random-access run ends");
+                let val_access = values
+                    .generate_random_access(ctx, llvm_mod)
+                    .expect("run-end iteration requires random-access values");
 
                 declare_blocks!(
                     ctx,
@@ -1893,7 +2069,7 @@ pub fn generate_next<'a>(
                 build.position_at_end(exhausted);
                 build.build_return(Some(&bool_type.const_zero())).unwrap();
 
-                Some(next)
+                next
             }
             _ => unreachable!("run-end iterator but not run-end data type ({:?})", dt),
         },
@@ -1916,16 +2092,16 @@ pub fn generate_next<'a>(
                 .unwrap();
 
             build.position_at_end(get_next);
-            let out = build_fixed_size_list_value(
-                ctx, llvm_mod, &build, label, dt, iter, iter_ptr, curr_pos,
-            )?;
+            let out =
+                build_fixed_size_list_value(ctx, llvm_mod, &build, &dt, iter, iter_ptr, curr_pos)
+                    .expect("fixed-size-list iteration requires a random-access child");
             build.build_store(out_ptr, out).unwrap();
             iter.llvm_increment_pos(ctx, &build, iter_ptr, i64_type.const_int(1, false));
             build
                 .build_return(Some(&bool_type.const_int(1, false)))
                 .unwrap();
 
-            Some(next)
+            next
         }
         IteratorHolder::List(iter) => {
             declare_blocks!(ctx, next, entry, none_left, get_next);
@@ -1953,15 +2129,15 @@ pub fn generate_next<'a>(
                 .build_return(Some(&bool_type.const_int(1, false)))
                 .unwrap();
 
-            Some(next)
+            next
         }
         IteratorHolder::ScalarPrimitive(s) => {
-            let ptype = PrimitiveType::for_arrow_type(dt);
+            let ptype = PrimitiveType::for_arrow_type(&dt);
             assert_eq!(ptype.width(), s.width as usize);
             declare_blocks!(ctx, next, entry);
             build.position_at_end(entry);
             let ptr = s.llvm_val_ptr(ctx, &build, iter_ptr);
-            let constant = match dt {
+            let constant = match &dt {
                 DataType::Int8
                 | DataType::Int16
                 | DataType::Int32
@@ -2011,7 +2187,7 @@ pub fn generate_next<'a>(
             build
                 .build_return(Some(&bool_type.const_int(1, false)))
                 .unwrap();
-            Some(next)
+            next
         }
         IteratorHolder::ScalarBoolean(s) => {
             declare_blocks!(ctx, next, entry);
@@ -2029,7 +2205,7 @@ pub fn generate_next<'a>(
             build
                 .build_return(Some(&bool_type.const_int(1, false)))
                 .unwrap();
-            Some(next)
+            next
         }
         IteratorHolder::ScalarString(s) => {
             let ptr_type = ctx.ptr_type(AddressSpace::default());
@@ -2066,7 +2242,7 @@ pub fn generate_next<'a>(
                 .build_return(Some(&bool_type.const_int(1, false)))
                 .unwrap();
 
-            Some(next)
+            next
         }
         IteratorHolder::ScalarBinary(s) => {
             let ptr_type = ctx.ptr_type(AddressSpace::default());
@@ -2103,7 +2279,7 @@ pub fn generate_next<'a>(
                 .build_return(Some(&bool_type.const_int(1, false)))
                 .unwrap();
 
-            Some(next)
+            next
         }
         IteratorHolder::ScalarVec(iter) => {
             declare_blocks!(ctx, next, entry);
@@ -2114,34 +2290,35 @@ pub fn generate_next<'a>(
                 .build_return(Some(&bool_type.const_int(1, false)))
                 .unwrap();
 
-            Some(next)
+            next
         }
     }
 }
 
-/// This adds an `access` function to the module for the given iterator. When
-/// called, this `access` function will fetch an element from the iterator at
-/// the position given by the 2nd parameter, *without* advancing the iterator's
-/// offset. Indexing is done from the base data, not from the iterator's current
-/// position. The generated function's signature is:
-///
-/// fn access(iter: ptr, el: u64) -> T
-///
-pub fn generate_random_access<'a>(
+fn generate_random_access<'a>(
     ctx: &'a Context,
     llvm_mod: &Module<'a>,
-    label: &str,
-    dt: &DataType,
     ih: &IteratorHolder,
 ) -> Option<FunctionValue<'a>> {
+    let info = ih.codegen_info();
+    if !info.random_access {
+        return None;
+    }
+
     let build = ctx.create_builder();
-    let llvm_type = iterator_value_llvm_type(ctx, dt, ih)?;
+    let dt = ih.data_type();
+    let llvm_type = info.value_type.llvm_type(ctx);
     let ptr_type = ctx.ptr_type(AddressSpace::default());
     let i64_type = ctx.i64_type();
 
     let fn_type = llvm_type.fn_type(&[ptr_type.into(), i64_type.into()], false);
+    let name = format!("{}_access", ih.codegen_label());
+    if let Some(existing) = llvm_mod.get_function(&name) {
+        assert_eq!(existing.get_type(), fn_type);
+        return Some(existing);
+    }
     let access_f = llvm_mod.add_function(
-        &format!("{}_access", label),
+        &name,
         fn_type,
         Some(
             #[cfg(test)]
@@ -2155,7 +2332,7 @@ pub fn generate_random_access<'a>(
 
     match ih {
         IteratorHolder::Primitive(primitive_iter) => {
-            let ptype = PrimitiveType::for_arrow_type(dt);
+            let ptype = PrimitiveType::for_arrow_type(&dt);
             declare_blocks!(ctx, access_f, entry);
 
             build.position_at_end(entry);
@@ -2170,8 +2347,8 @@ pub fn generate_random_access<'a>(
             declare_blocks!(ctx, access_f, entry);
 
             build.position_at_end(entry);
-            let out =
-                build_fixed_size_list_value(ctx, llvm_mod, &build, label, dt, iter, iter_ptr, idx)?;
+            let out = build_fixed_size_list_value(ctx, llvm_mod, &build, &dt, iter, iter_ptr, idx)
+                .expect("fixed-size-list access requires a random-access child");
             build.build_return(Some(&out)).unwrap();
 
             Some(access_f)
@@ -2359,7 +2536,7 @@ pub fn generate_random_access<'a>(
             Some(access_f)
         }
         IteratorHolder::Bitmap(bitmap_iterator) => {
-            let ptype = PrimitiveType::for_arrow_type(dt);
+            let ptype = PrimitiveType::for_arrow_type(&dt);
             declare_blocks!(ctx, access_f, entry);
 
             build.position_at_end(entry);
@@ -2396,23 +2573,14 @@ pub fn generate_random_access<'a>(
 
             Some(access_f)
         }
-        IteratorHolder::SetBit(_) => None,
-        IteratorHolder::Dictionary { arr, keys, values } => match dt {
-            DataType::Dictionary(k_dt, v_dt) => {
-                let keys_access = generate_random_access(
-                    ctx,
-                    llvm_mod,
-                    &format!("{}_key_get", label),
-                    k_dt,
-                    keys,
-                )?;
-                let values_access = generate_random_access(
-                    ctx,
-                    llvm_mod,
-                    &format!("{}_value_get", label),
-                    v_dt,
-                    values,
-                )?;
+        IteratorHolder::Dictionary { arr, keys, values } => match &dt {
+            DataType::Dictionary(_, _) => {
+                let keys_access = keys
+                    .generate_random_access(ctx, llvm_mod)
+                    .expect("dictionary access requires random-access keys");
+                let values_access = values
+                    .generate_random_access(ctx, llvm_mod)
+                    .expect("dictionary access requires random-access values");
 
                 declare_blocks!(ctx, access_f, entry);
 
@@ -2456,18 +2624,14 @@ pub fn generate_random_access<'a>(
             arr,
             run_ends,
             values,
-        } => match dt {
-            DataType::RunEndEncoded(r_dt, v_dt) => {
+        } => match &dt {
+            DataType::RunEndEncoded(r_dt, _) => {
                 let runs_prim_type = PrimitiveType::for_arrow_type(r_dt.data_type());
                 let runs_t = runs_prim_type.llvm_type(ctx).into_int_type();
                 let bsearch = add_bsearch(ctx, llvm_mod, run_ends.as_primitive(), runs_prim_type);
-                let value_access = generate_random_access(
-                    ctx,
-                    llvm_mod,
-                    &format!("{}_val_get", label),
-                    v_dt.data_type(),
-                    values,
-                )?;
+                let value_access = values
+                    .generate_random_access(ctx, llvm_mod)
+                    .expect("run-end access requires random-access values");
 
                 declare_blocks!(ctx, access_f, entry);
                 build.position_at_end(entry);
@@ -2505,14 +2669,17 @@ pub fn generate_random_access<'a>(
             }
             _ => unreachable!("run-end iterator but non-iterator data type ({:?})", dt),
         },
-        IteratorHolder::ScalarPrimitive(_) => None,
-        IteratorHolder::ScalarBoolean(_) => None,
-        IteratorHolder::ScalarString(_) => None,
-        IteratorHolder::ScalarBinary(_) => None,
         IteratorHolder::ScalarVec(iter) => {
             let val = iter.llvm_val(ctx, &build, iter_ptr);
             build.build_return(Some(&val)).unwrap();
             Some(access_f)
+        }
+        IteratorHolder::SetBit(_)
+        | IteratorHolder::ScalarPrimitive(_)
+        | IteratorHolder::ScalarBoolean(_)
+        | IteratorHolder::ScalarString(_)
+        | IteratorHolder::ScalarBinary(_) => {
+            unreachable!("random-access capability disagrees with iterator variant")
         }
     }
 }
@@ -2544,5 +2711,165 @@ pub fn get_iterator_length<'a>(
         IteratorHolder::ScalarString(..) => None,
         IteratorHolder::ScalarBinary(..) => None,
         IteratorHolder::ScalarVec(..) => None,
+    }
+}
+
+#[cfg(test)]
+mod codegen_cache_tests {
+    use std::sync::Arc;
+
+    use arrow_array::{
+        types::{Int16Type, Int32Type, Int8Type},
+        BooleanArray, DictionaryArray, Int16Array, Int32Array, Int8Array, LargeListArray,
+        ListArray, RunArray,
+    };
+    use inkwell::context::Context;
+
+    use super::{array_to_iter, array_to_setbit_iter};
+
+    #[test]
+    fn reuses_generated_functions_for_the_same_iterator_shape() {
+        let first = Int32Array::from(vec![1, 2, 3]);
+        let second = Int32Array::from(vec![4, 5, 6]);
+        let first = array_to_iter(&first);
+        let second = array_to_iter(&second);
+        let ctx = Context::create();
+        let module = ctx.create_module("iterator_codegen_cache");
+
+        let first_access = first.generate_random_access(&ctx, &module).unwrap();
+        let first_next = first.generate_next(&ctx, &module);
+        let first_next_block = first.generate_next_block::<8>(&ctx, &module).unwrap();
+        let first_reset = first.generate_reset(&ctx, &module);
+        let function_count = module.get_functions().count();
+
+        let second_access = second.generate_random_access(&ctx, &module).unwrap();
+        let second_next = second.generate_next(&ctx, &module);
+        let second_next_block = second.generate_next_block::<8>(&ctx, &module).unwrap();
+        let second_reset = second.generate_reset(&ctx, &module);
+
+        assert_eq!(first_access, second_access);
+        assert_eq!(first_next, second_next);
+        assert_eq!(first_next_block, second_next_block);
+        assert_eq!(first_reset, second_reset);
+        assert_eq!(module.get_functions().count(), function_count);
+        module.verify().unwrap();
+    }
+
+    #[test]
+    fn gives_different_iterator_shapes_different_structural_names() {
+        let primitive = Int32Array::from(vec![1, 2, 3]);
+        let bitmap = BooleanArray::from(vec![true, false, true]);
+        let primitive = array_to_iter(&primitive);
+        let bitmap = array_to_iter(&bitmap);
+        let ctx = Context::create();
+        let module = ctx.create_module("iterator_codegen_names");
+
+        let primitive_access = primitive.generate_random_access(&ctx, &module).unwrap();
+        let bitmap_access = bitmap.generate_random_access(&ctx, &module).unwrap();
+        let primitive_name = primitive_access.get_name().to_str().unwrap();
+        let bitmap_name = bitmap_access.get_name().to_str().unwrap();
+
+        assert_eq!(primitive_name, "iterator_primitive_i32_access");
+        assert_eq!(bitmap_name, "iterator_bitmap_access");
+        assert_ne!(primitive_access, bitmap_access);
+        module.verify().unwrap();
+    }
+
+    #[test]
+    fn gives_nested_iterator_shapes_structural_names() {
+        let rows = [Some(vec![Some(1), Some(2)]), Some(vec![Some(3), Some(4)])];
+        let list = ListArray::from_iter_primitive::<Int32Type, _, _>(rows.clone());
+        let large_list = LargeListArray::from_iter_primitive::<Int32Type, _, _>(rows);
+        let dictionary =
+            DictionaryArray::<Int8Type>::new(Int8Array::from(vec![0, 1]), Arc::new(list));
+        let run_ends = Int16Array::from(vec![2, 4]);
+        let run_end = RunArray::<Int16Type>::try_new(&run_ends, dictionary.values()).unwrap();
+
+        let list = array_to_iter(dictionary.values().as_ref());
+        let large_list = array_to_iter(&large_list);
+        let dictionary = array_to_iter(&dictionary);
+        let run_end = array_to_iter(&run_end);
+        let ctx = Context::create();
+        let module = ctx.create_module("nested_iterator_codegen_names");
+
+        let list_access = list.generate_random_access(&ctx, &module).unwrap();
+        let large_list_access = large_list.generate_random_access(&ctx, &module).unwrap();
+        let dictionary_access = dictionary.generate_random_access(&ctx, &module).unwrap();
+        let run_end_access = run_end.generate_random_access(&ctx, &module).unwrap();
+
+        assert!(list_access
+            .get_name()
+            .to_str()
+            .unwrap()
+            .starts_with("iterator_list_w4_"));
+        assert!(large_list_access
+            .get_name()
+            .to_str()
+            .unwrap()
+            .starts_with("iterator_list_w8_"));
+        assert!(dictionary_access
+            .get_name()
+            .to_str()
+            .unwrap()
+            .starts_with("iterator_dictionary_"));
+        assert!(run_end_access
+            .get_name()
+            .to_str()
+            .unwrap()
+            .starts_with("iterator_run_end_"));
+        assert!(dictionary_access
+            .get_type()
+            .get_return_type()
+            .unwrap()
+            .is_struct_type());
+        assert!(run_end_access
+            .get_type()
+            .get_return_type()
+            .unwrap()
+            .is_struct_type());
+        dictionary.generate_next(&ctx, &module);
+        run_end.generate_next(&ctx, &module);
+        module.verify().unwrap();
+    }
+
+    #[test]
+    fn separates_block_functions_by_width() {
+        let values = Int32Array::from(vec![1, 2, 3]);
+        let iter = array_to_iter(&values);
+        let ctx = Context::create();
+        let module = ctx.create_module("iterator_block_widths");
+
+        let block_8 = iter.generate_next_block::<8>(&ctx, &module).unwrap();
+        let block_64 = iter.generate_next_block::<64>(&ctx, &module).unwrap();
+
+        assert_eq!(
+            block_8.get_name().to_str().unwrap(),
+            "iterator_primitive_i32_next_block_8"
+        );
+        assert_eq!(
+            block_64.get_name().to_str().unwrap(),
+            "iterator_primitive_i32_next_block_64"
+        );
+        assert_ne!(block_8, block_64);
+        module.verify().unwrap();
+    }
+
+    #[test]
+    fn unsupported_generators_do_not_add_llvm_functions() {
+        let list = ListArray::from_iter_primitive::<Int32Type, _, _>([Some(vec![Some(1)])]);
+        let run_ends = Int16Array::from(vec![1]);
+        let run_end = RunArray::<Int16Type>::try_new(&run_ends, &list).unwrap();
+        let set_bits = BooleanArray::from(vec![true, false, true]);
+        let list = array_to_iter(&list);
+        let run_end = array_to_iter(&run_end);
+        let set_bits = array_to_setbit_iter(&set_bits).unwrap();
+        let ctx = Context::create();
+        let module = ctx.create_module("unsupported_iterator_codegen");
+
+        assert!(list.generate_next_block::<8>(&ctx, &module).is_none());
+        assert!(run_end.generate_next_block::<8>(&ctx, &module).is_none());
+        assert!(set_bits.generate_random_access(&ctx, &module).is_none());
+        assert_eq!(module.get_functions().count(), 0);
+        module.verify().unwrap();
     }
 }

@@ -17,7 +17,7 @@ pub fn vectorize_for_each(ctx: &DSLCompilationContext, f: &DSLForEach) -> Option
 
     // see if every iterator has a next block function
     for iv in f.iterators.iter() {
-        ctx.next_block_funcs.get(&iv.name)?;
+        ctx.iterator_holders[&iv.name].generate_next_block::<64>(ctx.ctx, ctx.module)?;
     }
 
     // see if all loop vars have a block type

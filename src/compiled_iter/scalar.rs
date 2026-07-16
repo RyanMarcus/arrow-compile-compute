@@ -419,7 +419,7 @@ mod tests {
     use arrow_schema::DataType;
     use inkwell::{context::Context, OptimizationLevel};
 
-    use crate::compiled_iter::{datum_to_iter, generate_next, generate_next_block, IteratorHolder};
+    use crate::compiled_iter::{datum_to_iter, IteratorHolder};
 
     #[test]
     fn data_type_preserves_scalar_string_offset_width() {
@@ -451,11 +451,8 @@ mod tests {
 
         let ctx = Context::create();
         let module = ctx.create_module("test_scalar_prim");
-        let func_block =
-            generate_next_block::<4>(&ctx, &module, "iter_prim_test", &DataType::Int32, &iter)
-                .unwrap();
-        let func_next =
-            generate_next(&ctx, &module, "iter_prim_test", &DataType::Int32, &iter).unwrap();
+        let func_block = iter.generate_next_block::<4>(&ctx, &module).unwrap();
+        let func_next = iter.generate_next(&ctx, &module);
 
         let fname_block = func_block.get_name().to_str().unwrap();
         let fname_next = func_next.get_name().to_str().unwrap();
@@ -506,16 +503,8 @@ mod tests {
 
         let ctx = Context::create();
         let module = ctx.create_module("test_scalar_prim");
-        let func_block = generate_next_block::<4>(
-            &ctx,
-            &module,
-            "iter_block_prim_test",
-            &DataType::Float32,
-            &iter,
-        )
-        .unwrap();
-        let func_next =
-            generate_next(&ctx, &module, "iter_prim_test", &DataType::Float32, &iter).unwrap();
+        let func_block = iter.generate_next_block::<4>(&ctx, &module).unwrap();
+        let func_next = iter.generate_next(&ctx, &module);
 
         let fname_block = func_block.get_name().to_str().unwrap();
         let fname_next = func_next.get_name().to_str().unwrap();
@@ -566,8 +555,7 @@ mod tests {
 
         let ctx = Context::create();
         let module = ctx.create_module("test_scalar_bool");
-        let func_next =
-            generate_next(&ctx, &module, "iter_prim_test", &DataType::Boolean, &iter).unwrap();
+        let func_next = iter.generate_next(&ctx, &module);
 
         let fname_next = func_next.get_name().to_str().unwrap();
 

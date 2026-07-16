@@ -275,14 +275,11 @@ mod tests {
     use std::ffi::c_void;
 
     use arrow_array::{
-        Array, BinaryArray, Datum, LargeBinaryArray, LargeStringArray, Scalar, StringArray,
+        Array, BinaryArray, LargeBinaryArray, LargeStringArray, Scalar, StringArray,
     };
     use inkwell::{context::Context, OptimizationLevel};
 
-    use crate::{
-        compiled_iter::{datum_to_iter, generate_next, generate_random_access},
-        pointers_to_str,
-    };
+    use crate::{compiled_iter::datum_to_iter, pointers_to_str};
 
     unsafe fn pointers_to_bytes(ptrs: u128) -> Vec<u8> {
         let b = ptrs.to_le_bytes();
@@ -314,7 +311,7 @@ mod tests {
 
         let ctx = Context::create();
         let module = ctx.create_module("test_scalar_prim");
-        let func_next = generate_next(&ctx, &module, "next", s.get().0.data_type(), &iter).unwrap();
+        let func_next = iter.generate_next(&ctx, &module);
         let fname_next = func_next.get_name().to_str().unwrap();
 
         module.verify().unwrap();
@@ -349,7 +346,7 @@ mod tests {
 
         let ctx = Context::create();
         let module = ctx.create_module("test_scalar_prim");
-        let func_next = generate_next(&ctx, &module, "next", s.get().0.data_type(), &iter).unwrap();
+        let func_next = iter.generate_next(&ctx, &module);
         let fname_next = func_next.get_name().to_str().unwrap();
 
         module.verify().unwrap();
@@ -385,7 +382,7 @@ mod tests {
 
         let ctx = Context::create();
         let module = ctx.create_module("test_scalar_large_binary");
-        let func_next = generate_next(&ctx, &module, "next", s.get().0.data_type(), &iter).unwrap();
+        let func_next = iter.generate_next(&ctx, &module);
         let fname_next = func_next.get_name().to_str().unwrap();
 
         module.verify().unwrap();
@@ -412,9 +409,7 @@ mod tests {
 
         let ctx = Context::create();
         let module = ctx.create_module("test_string_random_access");
-        let func_access =
-            generate_random_access(&ctx, &module, "access", data.get().0.data_type(), &iter)
-                .unwrap();
+        let func_access = iter.generate_random_access(&ctx, &module).unwrap();
         let fname = func_access.get_name().to_str().unwrap();
 
         module.verify().unwrap();
@@ -444,9 +439,7 @@ mod tests {
 
         let ctx = Context::create();
         let module = ctx.create_module("test_string_random_access");
-        let func_access =
-            generate_random_access(&ctx, &module, "access", data.get().0.data_type(), &iter)
-                .unwrap();
+        let func_access = iter.generate_random_access(&ctx, &module).unwrap();
         let fname = func_access.get_name().to_str().unwrap();
 
         module.verify().unwrap();
@@ -475,8 +468,7 @@ mod tests {
 
         let ctx = Context::create();
         let module = ctx.create_module("test_string_next");
-        let func_access =
-            generate_next(&ctx, &module, "access", data.get().0.data_type(), &iter).unwrap();
+        let func_access = iter.generate_next(&ctx, &module);
         let fname = func_access.get_name().to_str().unwrap();
 
         module.verify().unwrap();
@@ -517,8 +509,7 @@ mod tests {
 
         let ctx = Context::create();
         let module = ctx.create_module("test_string_next");
-        let func_access =
-            generate_next(&ctx, &module, "access", data.get().0.data_type(), &iter).unwrap();
+        let func_access = iter.generate_next(&ctx, &module);
         let fname = func_access.get_name().to_str().unwrap();
 
         module.verify().unwrap();
@@ -556,9 +547,7 @@ mod tests {
 
         let ctx = Context::create();
         let module = ctx.create_module("test_string_random_access");
-        let func_access =
-            generate_random_access(&ctx, &module, "access", data.get().0.data_type(), &iter)
-                .unwrap();
+        let func_access = iter.generate_random_access(&ctx, &module).unwrap();
         let fname = func_access.get_name().to_str().unwrap();
 
         module.verify().unwrap();
@@ -587,8 +576,7 @@ mod tests {
 
         let ctx = Context::create();
         let module = ctx.create_module("test_string_next");
-        let func_access =
-            generate_next(&ctx, &module, "access", data.get().0.data_type(), &iter).unwrap();
+        let func_access = iter.generate_next(&ctx, &module);
         let fname = func_access.get_name().to_str().unwrap();
 
         module.verify().unwrap();
@@ -631,9 +619,7 @@ mod tests {
 
         let ctx = Context::create();
         let module = ctx.create_module("test_large_binary_random_access");
-        let func_access =
-            generate_random_access(&ctx, &module, "access", data.get().0.data_type(), &iter)
-                .unwrap();
+        let func_access = iter.generate_random_access(&ctx, &module).unwrap();
         let fname = func_access.get_name().to_str().unwrap();
 
         module.verify().unwrap();
@@ -667,8 +653,7 @@ mod tests {
 
         let ctx = Context::create();
         let module = ctx.create_module("test_large_binary_next");
-        let func_next =
-            generate_next(&ctx, &module, "next", data.get().0.data_type(), &iter).unwrap();
+        let func_next = iter.generate_next(&ctx, &module);
         let fname = func_next.get_name().to_str().unwrap();
 
         module.verify().unwrap();
@@ -712,14 +697,7 @@ mod tests {
 
         let ctx = Context::create();
         let module = ctx.create_module("test_large_binary_keeps_array_alive");
-        let func_next = generate_next(
-            &ctx,
-            &module,
-            "next",
-            &arrow_schema::DataType::LargeBinary,
-            &iter,
-        )
-        .unwrap();
+        let func_next = iter.generate_next(&ctx, &module);
         let fname = func_next.get_name().to_str().unwrap();
 
         module.verify().unwrap();

@@ -27,10 +27,7 @@ use itertools::Itertools;
 use ouroboros::self_referencing;
 
 use crate::{
-    compiled_iter::{
-        array_to_setbit_iter, datum_to_iter, generate_next, generate_next_block,
-        generate_random_access, generate_reset_iterator, get_iterator_length,
-    },
+    compiled_iter::{array_to_setbit_iter, datum_to_iter, get_iterator_length, IteratorHolder},
     compiled_kernels::{
         cmp::{add_float_to_int, add_float_vec_to_int_vec, add_memcmp},
         dsl2::{
@@ -120,11 +117,10 @@ pub struct DSLCompilationContext<'ctx, 'a> {
     pub func: &'a FunctionValue<'ctx>,
     pub b: &'a Builder<'ctx>,
     pub st: HashMap<usize, BasicValueEnum<'ctx>>,
+    /// Maps iterable argument IDs to the iterator holders that back them.
+    pub iterator_holders: HashMap<usize, IteratorHolder>,
     pub access_funcs: HashMap<usize, FunctionValue<'ctx>>,
-    pub next_funcs: HashMap<usize, FunctionValue<'ctx>>,
-    pub next_block_funcs: HashMap<usize, FunctionValue<'ctx>>,
     pub writer_funcs: HashMap<usize, FunctionValue<'ctx>>,
-    pub reset_funcs: HashMap<usize, FunctionValue<'ctx>>,
     pub lengths: HashMap<usize, Option<IntValue<'ctx>>>,
     pub output_specs: Vec<WriterSpec>,
     pub outputs: Vec<BoundWriter<'ctx>>,
@@ -220,12 +216,9 @@ pub fn compile_inner<'ctx, 'args>(
 
     let mut st = HashMap::new();
     let mut access_funcs = HashMap::new();
-    let mut next_funcs = HashMap::new();
-    let mut next_block_funcs = HashMap::new();
     let mut writer_funcs = HashMap::new();
     let mut ihs = HashMap::new();
     let mut lengths = HashMap::new();
-    let mut reset_funcs = HashMap::new();
 
     // load LLVM function parameters into the symbol table
     for (idx, param) in f.params.iter().enumerate() {
@@ -281,14 +274,7 @@ pub fn compile_inner<'ctx, 'args>(
                     ));
                 }
 
-                let access_func = generate_random_access(
-                    ctx,
-                    &module,
-                    &format!("access_{}", param.name),
-                    &arg.data_type(),
-                    ih,
-                )
-                .unwrap();
+                let access_func = ih.generate_random_access(ctx, &module).unwrap();
                 access_funcs.insert(param.name, access_func);
             }
             DSLType::Buffer(t, _) => {
@@ -314,7 +300,6 @@ pub fn compile_inner<'ctx, 'args>(
     // setup iterators
     for idx in f.iterated_parameters() {
         let param = names_to_params[&idx];
-        let arg = &names_to_args[&idx];
 
         match &param.ty {
             DSLType::Scalar(t) | DSLType::Array(t, ..) => {
@@ -327,63 +312,8 @@ pub fn compile_inner<'ctx, 'args>(
                         detected_dtype,
                     ));
                 }
-
-                let next_func = generate_next(
-                    ctx,
-                    &module,
-                    &format!("next_{}", param.name),
-                    &arg.data_type(),
-                    ih,
-                )
-                .unwrap();
-                next_funcs.insert(param.name, next_func);
-
-                let reset_func =
-                    generate_reset_iterator(ctx, &module, &format!("{}", param.name), ih).unwrap();
-                reset_funcs.insert(param.name, reset_func);
             }
-            DSLType::SetBits(_) => {
-                let ih = &ihs[&idx];
-
-                let next_func = generate_next(
-                    ctx,
-                    &module,
-                    &format!("next_setbit_{}", param.name),
-                    &arg.data_type(),
-                    ih,
-                )
-                .unwrap();
-                next_funcs.insert(param.name, next_func);
-
-                let reset_func =
-                    generate_reset_iterator(ctx, &module, &format!("{}", param.name), ih).unwrap();
-                reset_funcs.insert(param.name, reset_func);
-            }
-            _ => return Err(ArrowKernelError::NonIterableType(param.ty.clone())),
-        };
-    }
-
-    // setup block iterators
-    for idx in f.iterated_parameters() {
-        let param = names_to_params[&idx];
-        let arg = &names_to_args[&idx];
-
-        match &param.ty {
-            DSLType::Scalar(_) | DSLType::Array(..) | DSLType::SetBits(_) => {
-                let ih = &ihs[&idx];
-
-                if let Some(next_func) = generate_next_block::<64>(
-                    ctx,
-                    &module,
-                    &format!("next_block_{}", param.name),
-                    &arg.data_type(),
-                    ih,
-                ) {
-                    next_block_funcs.insert(param.name, next_func);
-                } else {
-                    continue;
-                }
-            }
+            DSLType::SetBits(_) => {}
             _ => return Err(ArrowKernelError::NonIterableType(param.ty.clone())),
         };
     }
@@ -453,11 +383,9 @@ pub fn compile_inner<'ctx, 'args>(
         func: &func,
         b: &b,
         st,
+        iterator_holders: ihs,
         access_funcs,
-        next_funcs,
-        next_block_funcs,
         writer_funcs,
-        reset_funcs,
         output_specs,
         lengths,
         outputs: writers,
@@ -722,7 +650,7 @@ fn compile_stmt<'ctx, 'a>(
 
             let mut last_res = None;
             for (iter, buf_ptr) in floop.iterators.iter().zip(bufs.iter()) {
-                let next_func = ctx.next_funcs[&iter.name];
+                let next_func = ctx.iterator_holders[&iter.name].generate_next(ctx.ctx, ctx.module);
                 let iter_ptr = ctx.st[&iter.name];
                 let had_next = ctx
                     .b
@@ -780,12 +708,9 @@ fn compile_stmt<'ctx, 'a>(
 
             ctx.b.position_at_end(loop_end);
             floop.iterators.iter().for_each(|itr| {
+                let reset = ctx.iterator_holders[&itr.name].generate_reset(ctx.ctx, ctx.module);
                 ctx.b
-                    .build_call(
-                        ctx.reset_funcs[&itr.name],
-                        &[ctx.st[&itr.name].into()],
-                        "reset",
-                    )
+                    .build_call(reset, &[ctx.st[&itr.name].into()], "reset")
                     .unwrap();
             });
         }
@@ -811,7 +736,9 @@ fn compile_stmt<'ctx, 'a>(
 
             let mut last_res = None;
             for (iter, buf_ptr) in bfloop.iterators.iter().zip(bufs.iter()) {
-                let next_func = ctx.next_block_funcs[&iter.name];
+                let next_func = ctx.iterator_holders[&iter.name]
+                    .generate_next_block::<64>(ctx.ctx, ctx.module)
+                    .expect("vectorized loop requires block-readable iterators");
                 let iter_ptr = ctx.st[&iter.name];
                 let had_next = ctx
                     .b
@@ -890,7 +817,7 @@ fn compile_stmt<'ctx, 'a>(
 
             let mut last_res = None;
             for (iter, buf_ptr) in dslred.iterators.iter().zip(bufs.iter()) {
-                let next_func = ctx.next_funcs[&iter.name];
+                let next_func = ctx.iterator_holders[&iter.name].generate_next(ctx.ctx, ctx.module);
                 let iter_ptr = ctx.st[&iter.name];
                 let had_next = ctx
                     .b
@@ -963,12 +890,9 @@ fn compile_stmt<'ctx, 'a>(
             let result = dslred.reduction_type.output_value(ctx, result)?;
             ctx.st.insert(dslred.result.name, result);
             dslred.iterators.iter().for_each(|itr| {
+                let reset = ctx.iterator_holders[&itr.name].generate_reset(ctx.ctx, ctx.module);
                 ctx.b
-                    .build_call(
-                        ctx.reset_funcs[&itr.name],
-                        &[ctx.st[&itr.name].into()],
-                        "reset",
-                    )
+                    .build_call(reset, &[ctx.st[&itr.name].into()], "reset")
                     .unwrap();
             });
         }

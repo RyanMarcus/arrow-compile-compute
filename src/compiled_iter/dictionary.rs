@@ -75,9 +75,7 @@ mod tests {
     use arrow_schema::DataType;
     use inkwell::{context::Context, OptimizationLevel};
 
-    use crate::compiled_iter::{
-        array_to_iter, generate_next, generate_next_block, generate_random_access,
-    };
+    use crate::compiled_iter::array_to_iter;
 
     #[test]
     fn test_dict_iter_block1() {
@@ -92,9 +90,7 @@ mod tests {
 
         let ctx = Context::create();
         let module = ctx.create_module("test_iter");
-        let func =
-            generate_next_block::<8>(&ctx, &module, "dict_iter_block1", data.data_type(), &iter)
-                .unwrap();
+        let func = iter.generate_next_block::<8>(&ctx, &module).unwrap();
         let fname = func.get_name().to_str().unwrap();
 
         module.verify().unwrap();
@@ -130,9 +126,7 @@ mod tests {
 
         let ctx = Context::create();
         let module = ctx.create_module("test_iter");
-        let func =
-            generate_next_block::<2>(&ctx, &module, "dict_iter_block1", data.data_type(), &iter)
-                .unwrap();
+        let func = iter.generate_next_block::<2>(&ctx, &module).unwrap();
         let fname = func.get_name().to_str().unwrap();
 
         module.verify().unwrap();
@@ -176,9 +170,7 @@ mod tests {
 
         let ctx = Context::create();
         let module = ctx.create_module("test_iter");
-        let func =
-            generate_next_block::<2>(&ctx, &module, "dict_iter_block1", data.data_type(), &iter)
-                .unwrap();
+        let func = iter.generate_next_block::<2>(&ctx, &module).unwrap();
         let fname = func.get_name().to_str().unwrap();
 
         module.verify().unwrap();
@@ -217,8 +209,7 @@ mod tests {
 
         let ctx = Context::create();
         let module = ctx.create_module("test_iter");
-        let func = generate_random_access(&ctx, &module, "iter_dict_test", data.data_type(), &iter)
-            .unwrap();
+        let func = iter.generate_random_access(&ctx, &module).unwrap();
         let fname = func.get_name().to_str().unwrap();
 
         module.verify().unwrap();
@@ -259,8 +250,7 @@ mod tests {
 
         let ctx = Context::create();
         let module = ctx.create_module("test_iter");
-        let func = generate_random_access(&ctx, &module, "iter_dict_test", data.data_type(), &iter)
-            .unwrap();
+        let func = iter.generate_random_access(&ctx, &module).unwrap();
         let fname = func.get_name().to_str().unwrap();
 
         module.verify().unwrap();
@@ -296,8 +286,7 @@ mod tests {
 
         let ctx = Context::create();
         let module = ctx.create_module("test_iter");
-        let func = generate_random_access(&ctx, &module, "iter_dict_test", da2.data_type(), &iter)
-            .unwrap();
+        let func = iter.generate_random_access(&ctx, &module).unwrap();
         let fname = func.get_name().to_str().unwrap();
 
         module.verify().unwrap();
@@ -332,8 +321,7 @@ mod tests {
 
         let ctx = Context::create();
         let module = ctx.create_module("test_iter");
-        let func = generate_random_access(&ctx, &module, "iter_dict_test", da2.data_type(), &iter)
-            .unwrap();
+        let func = iter.generate_random_access(&ctx, &module).unwrap();
         let fname = func.get_name().to_str().unwrap();
 
         module.verify().unwrap();
@@ -365,7 +353,7 @@ mod tests {
 
         let ctx = Context::create();
         let module = ctx.create_module("test_iter");
-        let func = generate_next(&ctx, &module, "iter_dict_test", data.data_type(), &iter).unwrap();
+        let func = iter.generate_next(&ctx, &module);
         let fname = func.get_name().to_str().unwrap();
 
         module.verify().unwrap();
@@ -410,7 +398,7 @@ mod tests {
 
         let ctx = Context::create();
         let module = ctx.create_module("test_iter");
-        let func = generate_next(&ctx, &module, "iter_dict_test", data.data_type(), &iter).unwrap();
+        let func = iter.generate_next(&ctx, &module);
         let fname = func.get_name().to_str().unwrap();
 
         module.verify().unwrap();
@@ -450,7 +438,7 @@ mod tests {
 
         let ctx = Context::create();
         let module = ctx.create_module("test_iter");
-        let func = generate_next(&ctx, &module, "iter_dict_test", da2.data_type(), &iter).unwrap();
+        let func = iter.generate_next(&ctx, &module);
         let fname = func.get_name().to_str().unwrap();
 
         module.verify().unwrap();
@@ -491,7 +479,7 @@ mod tests {
 
         let ctx = Context::create();
         let module = ctx.create_module("test_iter");
-        let func = generate_next(&ctx, &module, "iter_dict_test", da2.data_type(), &iter).unwrap();
+        let func = iter.generate_next(&ctx, &module);
         let fname = func.get_name().to_str().unwrap();
 
         module.verify().unwrap();
