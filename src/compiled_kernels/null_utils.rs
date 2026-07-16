@@ -1,4 +1,9 @@
-use arrow_array::{cast::AsArray, make_array, Array, ArrayRef, Datum};
+use arrow_array::{
+    cast::AsArray,
+    make_array,
+    types::{Int16Type, Int32Type, Int64Type, RunEndIndexType},
+    Array, ArrayRef, Datum, RunArray,
+};
 use arrow_buffer::NullBuffer;
 use arrow_schema::DataType;
 
@@ -18,6 +23,12 @@ pub fn has_any_nulls(arr: &dyn Array) -> bool {
         DataType::List(_) => has_any_nulls(arr.as_list::<i32>().values().as_ref()),
         DataType::LargeList(_) => has_any_nulls(arr.as_list::<i64>().values().as_ref()),
         DataType::FixedSizeList(_, _) => has_any_nulls(arr.as_fixed_size_list().values().as_ref()),
+        DataType::RunEndEncoded(run_ends, _) => match run_ends.data_type() {
+            DataType::Int16 => has_any_nulls(arr.as_run::<Int16Type>().values().as_ref()),
+            DataType::Int32 => has_any_nulls(arr.as_run::<Int32Type>().values().as_ref()),
+            DataType::Int64 => has_any_nulls(arr.as_run::<Int64Type>().values().as_ref()),
+            _ => unreachable!("invalid run end type"),
+        },
         _ => false,
     }
 }
@@ -30,6 +41,18 @@ pub fn copy_selected_nulls(
     debug_assert_eq!(result.len(), indices.len());
 
     let result = match (source.data_type(), result.data_type()) {
+        (DataType::RunEndEncoded(run_ends, _), _) => match run_ends.data_type() {
+            DataType::Int16 => {
+                copy_run_end_selected_nulls(source.as_run::<Int16Type>(), result, indices)?
+            }
+            DataType::Int32 => {
+                copy_run_end_selected_nulls(source.as_run::<Int32Type>(), result, indices)?
+            }
+            DataType::Int64 => {
+                copy_run_end_selected_nulls(source.as_run::<Int64Type>(), result, indices)?
+            }
+            _ => unreachable!("invalid run end type"),
+        },
         (DataType::List(_), DataType::List(_)) => {
             let source = source.as_list::<i32>();
             let result_list = result.as_list::<i32>();
@@ -99,6 +122,18 @@ pub fn copy_selected_nulls(
             .collect::<NullBuffer>()
     });
     Ok(replace_nulls(result, nulls))
+}
+
+fn copy_run_end_selected_nulls<R: RunEndIndexType>(
+    source: &RunArray<R>,
+    result: ArrayRef,
+    indices: &[usize],
+) -> Result<ArrayRef, ArrowKernelError> {
+    let physical_indices = indices
+        .iter()
+        .map(|&index| source.get_physical_index(index))
+        .collect::<Vec<_>>();
+    copy_selected_nulls(source.values().as_ref(), result, &physical_indices)
 }
 
 /// Given a list of arrays, intersect their null buffers and set `res`'s null

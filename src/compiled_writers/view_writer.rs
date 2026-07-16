@@ -83,13 +83,6 @@ impl Writer for StringViewWriter {
         .into()
     }
 
-    fn llvm_init<'ctx, 'borrow>(
-        &self,
-        _codegen: WriterCodegen<'ctx, 'borrow>,
-        _runtime_ptr: PointerValue<'ctx>,
-    ) {
-    }
-
     fn llvm_write<'ctx, 'borrow, F>(
         &'borrow self,
         codegen: WriterCodegen<'ctx, 'borrow>,

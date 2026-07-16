@@ -184,9 +184,10 @@ pub trait Writer {
     /// `runtime_ptr` must point to runtime state returned by [`Writer::allocate`].
     fn llvm_init<'ctx, 'borrow>(
         &self,
-        codegen: WriterCodegen<'ctx, 'borrow>,
-        runtime_ptr: PointerValue<'ctx>,
-    );
+        _codegen: WriterCodegen<'ctx, 'borrow>,
+        _runtime_ptr: PointerValue<'ctx>,
+    ) {
+    }
 
     /// Emits code for one logical write operation.
     ///

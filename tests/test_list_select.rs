@@ -1,7 +1,8 @@
 use arrow_array::{
     builder::{Int32Builder, LargeListBuilder, ListBuilder, StringBuilder},
     cast::AsArray,
-    BooleanArray, LargeListArray, ListArray, UInt32Array,
+    types::{Int16Type, Int32Type},
+    BooleanArray, Int16Array, Int32Array, LargeListArray, ListArray, RunArray, UInt32Array,
 };
 use proptest::prelude::*;
 
@@ -90,6 +91,36 @@ fn build_nested_i32_lists(rows: &NestedI32Rows) -> ListArray {
         }
     }
     builder.finish()
+}
+
+#[test]
+fn filter_ree_list_preserves_child_nulls() {
+    let rows = vec![Some(vec![Some(1), None]), Some(vec![Some(3), Some(4)])];
+    let values = build_i32_lists(&rows);
+    let run_ends = Int16Array::from(vec![2, 4]);
+    let data = RunArray::<Int16Type>::try_new(&run_ends, &values).unwrap();
+    let mask = BooleanArray::from(vec![true, false, true, true]);
+
+    let actual = arrow_compile_compute::select::filter(&data, &mask).unwrap();
+    let expected = build_i32_lists(&vec![rows[0].clone(), rows[1].clone(), rows[1].clone()]);
+
+    assert_eq!(actual.as_list::<i32>(), &expected);
+}
+
+#[test]
+fn take_nested_ree_list_preserves_child_nulls() {
+    let rows = vec![Some(vec![Some(1), None])];
+    let lists = build_i32_lists(&rows);
+    let inner_run_ends = Int16Array::from(vec![2]);
+    let inner = RunArray::<Int16Type>::try_new(&inner_run_ends, &lists).unwrap();
+    let outer_run_ends = Int32Array::from(vec![1, 4]);
+    let data = RunArray::<Int32Type>::try_new(&outer_run_ends, &inner).unwrap();
+    let indices = UInt32Array::from(vec![3, 0, 2]);
+
+    let actual = arrow_compile_compute::select::take(&data, &indices).unwrap();
+    let expected = build_i32_lists(&vec![rows[0].clone(), rows[0].clone(), rows[0].clone()]);
+
+    assert_eq!(actual.as_list::<i32>(), &expected);
 }
 
 proptest! {

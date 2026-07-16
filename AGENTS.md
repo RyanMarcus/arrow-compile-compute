@@ -13,7 +13,9 @@ This is a standard Rust project.
 
 ## Large changes
 
-If you are making a large change that might be difficult for a human to review, and `jj` is installed, following the below instructions. If the user specifically asks for `jj`, follow these instructions even for simple changes.
+If you are making a large change that might be difficult for a human to review,
+and the user requested you to use `jj`, following the below instructions. Do not
+use `jj` if the user did not request it.
 
 Use `jj`, not mutating Git commands.
 
@@ -26,6 +28,9 @@ Implement the work as a linear stack of reviewable jj changes:
 5. Keep every change independently buildable and testable.
 6. Do not collapse the stack into one change.
 7. At the end, show each change ID, description, diff summary, and tests run.
+
+Each change should be a reviewable unit of code. The first change does not need
+to fully implement the user's request. 
 
 Use `jj split`, `jj squash`, or `jj edit` when changes need to be
 redistributed. Do not use `git commit`, `git rebase`, `git reset`, or
