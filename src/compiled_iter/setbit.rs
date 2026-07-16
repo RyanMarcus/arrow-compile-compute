@@ -460,11 +460,11 @@ impl SetBitIterator {
 mod tests {
     use std::ffi::c_void;
 
-    use arrow_array::{Array, BooleanArray};
+    use arrow_array::BooleanArray;
     use inkwell::{context::Context, execution_engine::JitFunction, OptimizationLevel};
     use itertools::Itertools;
 
-    use crate::compiled_iter::{array_to_setbit_iter, generate_next, IteratorHolder};
+    use crate::compiled_iter::{array_to_setbit_iter, IteratorHolder};
 
     fn test_iter(
         arr: &BooleanArray,
@@ -496,7 +496,7 @@ mod tests {
 
         let ctx = Context::create();
         let module = ctx.create_module("setbit_test");
-        let func = generate_next(&ctx, &module, "setbit_iter", data.data_type(), &iter).unwrap();
+        let func = iter.generate_next(&ctx, &module);
         let fname = func.get_name().to_str().unwrap();
 
         module.verify().unwrap();
@@ -521,7 +521,7 @@ mod tests {
 
         let ctx = Context::create();
         let module = ctx.create_module("setbit_test");
-        let func = generate_next(&ctx, &module, "setbit_iter", data.data_type(), &iter).unwrap();
+        let func = iter.generate_next(&ctx, &module);
         let fname = func.get_name().to_str().unwrap();
 
         module.verify().unwrap();
@@ -547,7 +547,7 @@ mod tests {
 
         let ctx = Context::create();
         let module = ctx.create_module("setbit_test");
-        let func = generate_next(&ctx, &module, "setbit_iter", data.data_type(), &iter).unwrap();
+        let func = iter.generate_next(&ctx, &module);
         let fname = func.get_name().to_str().unwrap();
 
         module.verify().unwrap();
@@ -573,7 +573,7 @@ mod tests {
 
         let ctx = Context::create();
         let module = ctx.create_module("setbit_test");
-        let func = generate_next(&ctx, &module, "setbit_iter", data.data_type(), &iter).unwrap();
+        let func = iter.generate_next(&ctx, &module);
         let fname = func.get_name().to_str().unwrap();
 
         module.verify().unwrap();

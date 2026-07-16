@@ -16,7 +16,7 @@ use ouroboros::self_referencing;
 use repr_offset::ReprOffset;
 use std::ffi::c_void;
 
-use crate::compiled_iter::{datum_to_iter, generate_next};
+use crate::compiled_iter::datum_to_iter;
 use crate::compiled_kernels::{link_req_helpers, optimize_module};
 use crate::{
     compiled_kernels::cmp::add_memcmp, compiled_writers::WriterSpec, declare_blocks,
@@ -806,9 +806,7 @@ impl Kernel for HashKernel {
                 let p_llvm = p_type.llvm_type(ctx);
 
                 let iter = datum_to_iter(*inp)?;
-                let next_func =
-                    generate_next(ctx, &llvm_mod, "hash_next", inp.get().0.data_type(), &iter)
-                        .unwrap();
+                let next_func = iter.generate_next(ctx, &llvm_mod);
                 let hash_func = hf.generate_hf(ctx, &llvm_mod, p_type)?;
 
                 let func_ty = ctx

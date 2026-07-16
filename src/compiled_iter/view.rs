@@ -169,14 +169,11 @@ impl ViewIterator {
 mod tests {
     use std::ffi::c_void;
 
-    use arrow_array::{builder::GenericByteViewBuilder, Array, StringViewArray};
+    use arrow_array::{builder::GenericByteViewBuilder, StringViewArray};
     use inkwell::{context::Context, OptimizationLevel};
     use itertools::Itertools;
 
-    use crate::{
-        compiled_iter::{datum_to_iter, generate_random_access},
-        pointers_to_str,
-    };
+    use crate::{compiled_iter::datum_to_iter, pointers_to_str};
 
     #[test]
     fn test_view_random_access() {
@@ -192,8 +189,7 @@ mod tests {
 
         let ctx = Context::create();
         let module = ctx.create_module("test_string_view_random_access");
-        let func_access =
-            generate_random_access(&ctx, &module, "access", view.data_type(), &iter).unwrap();
+        let func_access = iter.generate_random_access(&ctx, &module).unwrap();
         let fname = func_access.get_name().to_str().unwrap();
 
         module.verify().unwrap();
@@ -234,8 +230,7 @@ mod tests {
 
         let ctx = Context::create();
         let module = ctx.create_module("test_string_view_random_access");
-        let func_access =
-            generate_random_access(&ctx, &module, "access", view.data_type(), &iter).unwrap();
+        let func_access = iter.generate_random_access(&ctx, &module).unwrap();
         let fname = func_access.get_name().to_str().unwrap();
 
         module.verify().unwrap();

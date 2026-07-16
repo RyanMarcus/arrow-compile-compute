@@ -123,10 +123,9 @@ impl BitmapIterator {
 mod tests {
     use std::ffi::c_void;
 
-    use arrow_array::Array;
     use inkwell::{context::Context, OptimizationLevel};
 
-    use crate::compiled_iter::{array_to_iter, generate_next, generate_random_access};
+    use crate::compiled_iter::array_to_iter;
 
     #[test]
     fn test_bitmap_iter() {
@@ -139,7 +138,7 @@ mod tests {
 
         let ctx = Context::create();
         let module = ctx.create_module("test_bitmap_iter");
-        let func = generate_next(&ctx, &module, "bitmap_iter", data.data_type(), &iter).unwrap();
+        let func = iter.generate_next(&ctx, &module);
         let fname = func.get_name().to_str().unwrap();
 
         module.verify().unwrap();
@@ -239,7 +238,7 @@ mod tests {
 
         let ctx = Context::create();
         let module = ctx.create_module("test_bitmap_iter");
-        let func = generate_next(&ctx, &module, "bitmap_iter", data.data_type(), &iter).unwrap();
+        let func = iter.generate_next(&ctx, &module);
         let fname = func.get_name().to_str().unwrap();
 
         module.verify().unwrap();
@@ -312,8 +311,7 @@ mod tests {
 
         let ctx = Context::create();
         let module = ctx.create_module("test_bitmap_iter");
-        let func =
-            generate_random_access(&ctx, &module, "bitmap_iter", data.data_type(), &iter).unwrap();
+        let func = iter.generate_random_access(&ctx, &module).unwrap();
         let fname = func.get_name().to_str().unwrap();
 
         module.verify().unwrap();
@@ -360,8 +358,7 @@ mod tests {
 
         let ctx = Context::create();
         let module = ctx.create_module("test_bitmap_iter");
-        let func =
-            generate_random_access(&ctx, &module, "bitmap_iter", data.data_type(), &iter).unwrap();
+        let func = iter.generate_random_access(&ctx, &module).unwrap();
         let fname = func.get_name().to_str().unwrap();
 
         module.verify().unwrap();
