@@ -116,14 +116,23 @@ pub struct DSLCompilationContext<'ctx, 'a> {
     pub module: &'a Module<'ctx>,
     pub func: &'a FunctionValue<'ctx>,
     pub b: &'a Builder<'ctx>,
+    /// Maps DSL value IDs to their current LLVM values.
     pub st: HashMap<usize, BasicValueEnum<'ctx>>,
     /// Maps iterable argument IDs to the iterator holders that back them.
     pub iterator_holders: HashMap<usize, IteratorHolder>,
+    /// Maps DSL value IDs to the array argument IDs they came from.
+    pub value_sources: HashMap<usize, usize>,
+    /// Maps randomly accessed value IDs to their generated accessor functions.
     pub access_funcs: HashMap<usize, FunctionValue<'ctx>>,
+    /// Maps writable buffer IDs to their generated writer functions.
     pub writer_funcs: HashMap<usize, FunctionValue<'ctx>>,
+    /// Maps iterable value IDs to their LLVM lengths, when known.
     pub lengths: HashMap<usize, Option<IntValue<'ctx>>>,
+    /// Describes each output writer in return-value order.
     pub output_specs: Vec<WriterSpec>,
+    /// Holds each initialized output writer in return-value order.
     pub outputs: Vec<BoundWriter<'ctx>>,
+    /// Records whether compilation emitted a vectorized loop.
     pub did_vectorize: &'a mut bool,
 }
 
@@ -377,6 +386,12 @@ pub fn compile_inner<'ctx, 'args>(
         writers.push(w);
     }
 
+    let value_sources = f
+        .params
+        .iter()
+        .map(|param| (param.name, param.name))
+        .collect();
+
     let mut dsl_ctx = DSLCompilationContext {
         ctx,
         module: &module,
@@ -384,6 +399,7 @@ pub fn compile_inner<'ctx, 'args>(
         b: &b,
         st,
         iterator_holders: ihs,
+        value_sources,
         access_funcs,
         writer_funcs,
         output_specs,
@@ -468,10 +484,36 @@ fn compile_stmt<'ctx, 'a>(
                         value.get_type(),
                     ));
                 }
-                let value = compile_expr(ctx, value)?;
-                ctx.outputs[idx as usize].llvm_ingest(ctx.ctx, ctx.module, ctx.b, value);
+                let compiled_value = compile_expr(ctx, value)?;
+                if matches!(accepted, DSLType::VarList(_)) {
+                    let source_name = match value {
+                        DSLExpr::At(value, _) => ctx.value_sources[&value.name],
+                        DSLExpr::Value(value) => ctx.value_sources[&value.name],
+                        _ => return Err(ArrowKernelError::InvalidAtSource(value.clone())),
+                    };
+                    ctx.outputs[idx as usize].llvm_ingest_from_iterator(
+                        ctx.ctx,
+                        ctx.module,
+                        ctx.b,
+                        &ctx.iterator_holders[&source_name],
+                        compiled_value,
+                    );
+                } else {
+                    ctx.outputs[idx as usize].llvm_ingest(
+                        ctx.ctx,
+                        ctx.module,
+                        ctx.b,
+                        compiled_value,
+                    );
+                }
                 return Ok(());
             } else {
+                if matches!(value.get_type(), DSLType::VarList(_)) {
+                    return Err(ArrowKernelError::DSLInvalidType(
+                        "dynamic emit does not support variable-size lists",
+                        value.get_type(),
+                    ));
+                }
                 for spec in ctx.output_specs.iter() {
                     let accepted = accepted_type(spec);
                     if value.get_type() != accepted {
@@ -694,6 +736,10 @@ fn compile_stmt<'ctx, 'a>(
                 };
 
                 ctx.st.insert(loop_var.name, val);
+            }
+            for (loop_var, iterator) in floop.loop_vars.iter().zip(floop.iterators.iter()) {
+                let source = ctx.value_sources[&iterator.name];
+                ctx.value_sources.insert(loop_var.name, source);
             }
             for stmt in floop.body.iter() {
                 compile_stmt(ctx, stmt)?;
