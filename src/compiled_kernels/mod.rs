@@ -229,6 +229,13 @@ pub(crate) fn link_req_helpers(
         ee.add_global_mapping(&func, save_ptrs_to_string_saver as *const () as usize);
     }
 
+    if let Some(func) = module.get_function("writer_reserve_for_additional") {
+        ee.add_global_mapping(
+            &func,
+            crate::compiled_writers::writer_reserve_for_additional as *const () as usize,
+        );
+    }
+
     if let Some(func) = module.get_function("debug_i64") {
         println!("linking debug_i64");
         ee.add_global_mapping(&func, debug_i64 as *const () as usize);

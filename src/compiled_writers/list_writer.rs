@@ -14,6 +14,7 @@ use inkwell::{
 use repr_offset::ReprOffset;
 
 use crate::{
+    compiled_iter::IteratorHolder,
     compiled_writers::{
         AnyRuntime, AnyWriter, AnyWriterEmitter, PrimitiveWriter, Writer, WriterCodegen,
         WriterEmitter, WriterRuntime,
@@ -83,6 +84,21 @@ impl ListWriter {
             .unwrap()
             .into_pointer_value();
         value_ptr
+    }
+
+    pub(super) fn llvm_write_from_list<'ctx, 'borrow>(
+        &'borrow self,
+        codegen: WriterCodegen<'ctx, 'borrow>,
+        runtime_ptr: PointerValue<'ctx>,
+        source_child: &IteratorHolder,
+        row: BasicValueEnum<'ctx>,
+    ) -> Result<(), ArrowKernelError> {
+        self.llvm_write(codegen, runtime_ptr, |emitter| {
+            let AnyWriterEmitter::List(emitter) = emitter else {
+                unreachable!("list writer did not produce a list emitter");
+            };
+            emitter.copy_row(source_child, row)
+        })
     }
 }
 
@@ -246,10 +262,16 @@ pub struct ListWriterEmitter<'ctx, 'borrow> {
 }
 impl<'ctx, 'borrow> WriterEmitter<'ctx, 'borrow> for ListWriterEmitter<'ctx, 'borrow> {
     fn emit(&mut self, val: BasicValueEnum<'ctx>) -> Result<(), crate::ArrowKernelError> {
-        let i64_type = self.codegen.ctx.i64_type();
         self.value_writer
             .llvm_write(self.codegen, self.value_ptr, |e| e.emit(val))?;
+        self.increment_value_count();
+        Ok(())
+    }
+}
 
+impl<'ctx, 'borrow> ListWriterEmitter<'ctx, 'borrow> {
+    fn increment_value_count(&self) {
+        let i64_type = self.codegen.ctx.i64_type();
         let curr_run_count = self
             .codegen
             .builder
@@ -269,6 +291,122 @@ impl<'ctx, 'borrow> WriterEmitter<'ctx, 'borrow> for ListWriterEmitter<'ctx, 'bo
             .builder
             .build_store(self.run_counter_ptr, new_run_count)
             .unwrap();
+    }
+
+    fn copy_row(
+        &mut self,
+        source_child: &IteratorHolder,
+        row: BasicValueEnum<'ctx>,
+    ) -> Result<(), ArrowKernelError> {
+        let row = row.into_struct_value();
+        let child_iter = self
+            .codegen
+            .builder
+            .build_extract_value(row, 0, "list_child_iter")
+            .unwrap()
+            .into_pointer_value();
+        let start = self
+            .codegen
+            .builder
+            .build_extract_value(row, 1, "list_start")
+            .unwrap()
+            .into_int_value();
+        let end = self
+            .codegen
+            .builder
+            .build_extract_value(row, 2, "list_end")
+            .unwrap()
+            .into_int_value();
+        let row_len = self
+            .codegen
+            .builder
+            .build_int_sub(end, start, "list_row_len")
+            .unwrap();
+        self.value_writer
+            .llvm_reserve_for_additional(self.codegen, self.value_ptr, row_len);
+
+        let source_child_type = source_child.data_type();
+        let accessor = source_child
+            .generate_random_access(self.codegen.ctx, self.codegen.module)
+            .ok_or_else(|| {
+                ArrowKernelError::InternalError(format!(
+                    "list child type {source_child_type} does not support random access"
+                ))
+            })?;
+
+        let func = self
+            .codegen
+            .builder
+            .get_insert_block()
+            .unwrap()
+            .get_parent()
+            .unwrap();
+        let loop_cond = self.codegen.ctx.append_basic_block(func, "list_copy_cond");
+        let loop_body = self.codegen.ctx.append_basic_block(func, "list_copy_body");
+        let loop_end = self.codegen.ctx.append_basic_block(func, "list_copy_end");
+        let idx_ptr = self
+            .codegen
+            .builder
+            .build_alloca(self.codegen.ctx.i64_type(), "list_copy_idx")
+            .unwrap();
+        self.codegen.builder.build_store(idx_ptr, start).unwrap();
+        self.codegen
+            .builder
+            .build_unconditional_branch(loop_cond)
+            .unwrap();
+
+        self.codegen.builder.position_at_end(loop_cond);
+        let idx = self
+            .codegen
+            .builder
+            .build_load(self.codegen.ctx.i64_type(), idx_ptr, "list_copy_idx")
+            .unwrap()
+            .into_int_value();
+        let have_more = self
+            .codegen
+            .builder
+            .build_int_compare(inkwell::IntPredicate::ULT, idx, end, "list_copy_have_more")
+            .unwrap();
+        self.codegen
+            .builder
+            .build_conditional_branch(have_more, loop_body, loop_end)
+            .unwrap();
+
+        self.codegen.builder.position_at_end(loop_body);
+        let value = self
+            .codegen
+            .builder
+            .build_call(
+                accessor,
+                &[child_iter.into(), idx.into()],
+                "list_child_value",
+            )
+            .unwrap()
+            .try_as_basic_value()
+            .unwrap_basic();
+        self.value_writer.llvm_write_from_iterator(
+            self.codegen,
+            self.value_ptr,
+            source_child,
+            value,
+        )?;
+        self.increment_value_count();
+        let next_idx = self
+            .codegen
+            .builder
+            .build_int_add(
+                idx,
+                self.codegen.ctx.i64_type().const_int(1, false),
+                "list_copy_next_idx",
+            )
+            .unwrap();
+        self.codegen.builder.build_store(idx_ptr, next_idx).unwrap();
+        self.codegen
+            .builder
+            .build_unconditional_branch(loop_cond)
+            .unwrap();
+
+        self.codegen.builder.position_at_end(loop_end);
         Ok(())
     }
 }

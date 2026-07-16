@@ -1569,10 +1569,10 @@ impl From<usize> for DSLExpr {
 #[cfg(test)]
 mod tests {
     use arrow_array::{
-        builder::{FixedSizeListBuilder, Int32Builder},
+        builder::{FixedSizeListBuilder, Int32Builder, ListBuilder},
         cast::AsArray,
         types::{Float32Type, Int32Type, UInt32Type, UInt64Type},
-        BooleanArray, Float32Array, Int32Array, StringArray, UInt32Array,
+        Array, BooleanArray, Float32Array, Int32Array, StringArray, UInt32Array,
     };
     use arrow_schema::DataType;
     use itertools::Itertools;
@@ -1752,6 +1752,109 @@ mod tests {
         assert_eq!(
             out.into_iter().map(|x| x.unwrap()).collect_vec(),
             vec![20, 30, 20]
+        );
+    }
+
+    #[test]
+    fn test_dsl2_take_list() {
+        let mut input = ListBuilder::new(Int32Builder::new());
+        input.values().append_slice(&(0..16).collect_vec());
+        input.append(true);
+        input.append(true);
+        input.values().append_slice(&[20, 21]);
+        input.append(true);
+        let input = input.finish();
+        let idxs_input = UInt32Array::new_null(0);
+
+        let mut ctx = DSLContext::new();
+        let mut func = DSLFunction::new("take_list");
+        let arr = func.add_arg(&mut ctx, DSLType::array_like(&input, "n"));
+        let idxs = func.add_arg(&mut ctx, DSLType::array_of(PrimitiveType::U32, "m"));
+        func.add_body(
+            DSLStmt::for_each(&mut ctx, &[idxs], |loop_vars| {
+                let idx = loop_vars[0].expr().primitive_cast(PrimitiveType::U64)?;
+                DSLStmt::emit(0, arr.expr().at(&idx)?)
+            })
+            .unwrap(),
+        );
+        func.add_ret(WriterSpec::for_data_type(input.data_type()), "m");
+
+        let func = compile(func, dsl_args![input, idxs_input]).unwrap();
+        let idxs = UInt32Array::from(vec![2, 0, 0, 1]);
+        let result = func.run(&dsl_args![input, idxs]).unwrap();
+
+        let mut expected = ListBuilder::new(Int32Builder::new());
+        expected.values().append_slice(&[20, 21]);
+        expected.append(true);
+        expected.values().append_slice(&(0..16).collect_vec());
+        expected.append(true);
+        expected.values().append_slice(&(0..16).collect_vec());
+        expected.append(true);
+        expected.append(true);
+        let expected = expected.finish();
+        let actual = result[0].as_list::<i32>();
+        assert_eq!(actual.offsets(), expected.offsets());
+        assert_eq!(
+            actual.values().as_primitive::<Int32Type>(),
+            expected.values().as_primitive::<Int32Type>()
+        );
+    }
+
+    #[test]
+    fn test_dsl2_filter_nested_list() {
+        let mut input = ListBuilder::new(ListBuilder::new(Int32Builder::new()));
+        input.values().values().append_slice(&[1, 2]);
+        input.values().append(true);
+        input.values().append(true);
+        input.values().values().append_value(3);
+        input.values().append(true);
+        input.append(true);
+        input.append(true);
+        input.values().values().append_value(4);
+        input.values().append(true);
+        input.values().values().append_slice(&[5, 6]);
+        input.values().append(true);
+        input.append(true);
+        let input = input.finish();
+        let mask_input = BooleanArray::new_null(0);
+
+        let mut ctx = DSLContext::new();
+        let mut func = DSLFunction::new("filter_nested_list");
+        let arr = func.add_arg(&mut ctx, DSLType::array_like(&input, "n"));
+        let mask = func.add_arg(&mut ctx, DSLType::set_bits("m"));
+        func.add_body(
+            DSLStmt::for_each(&mut ctx, &[mask], |loop_vars| {
+                DSLStmt::emit(0, arr.expr().at(&loop_vars[0].expr())?)
+            })
+            .unwrap(),
+        );
+        func.add_ret(WriterSpec::for_data_type(input.data_type()), "m");
+
+        let func = compile(func, dsl_args![input, mask_input]).unwrap();
+        let mask = BooleanArray::from(vec![true, false, true]);
+        let result = func.run(&dsl_args![input, mask]).unwrap();
+
+        let mut expected = ListBuilder::new(ListBuilder::new(Int32Builder::new()));
+        expected.values().values().append_slice(&[1, 2]);
+        expected.values().append(true);
+        expected.values().append(true);
+        expected.values().values().append_value(3);
+        expected.values().append(true);
+        expected.append(true);
+        expected.values().values().append_value(4);
+        expected.values().append(true);
+        expected.values().values().append_slice(&[5, 6]);
+        expected.values().append(true);
+        expected.append(true);
+        let expected = expected.finish();
+        let actual = result[0].as_list::<i32>();
+        assert_eq!(actual.offsets(), expected.offsets());
+        let actual_values = actual.values().as_list::<i32>();
+        let expected_values = expected.values().as_list::<i32>();
+        assert_eq!(actual_values.offsets(), expected_values.offsets());
+        assert_eq!(
+            actual_values.values().as_primitive::<Int32Type>(),
+            expected_values.values().as_primitive::<Int32Type>()
         );
     }
 

@@ -54,6 +54,7 @@ use run_end_writer::{RunEndWriter, RunEndWriterEmitter, RunEndWriterRuntime};
 use view_writer::{StringViewWriter, StringViewWriterEmitter, StringViewWriterRuntime};
 
 use crate::{
+    compiled_iter::IteratorHolder,
     compiled_writers::string_writer::{StringWriter, StringWriterEmitter, StringWriterRuntime},
     normalized_base_type, ArrowKernelError, ListItemType, PrimitiveType,
 };
@@ -263,6 +264,19 @@ pub enum AnyRuntime {
     StringView(StringViewWriterRuntime),
 }
 
+#[repr(u64)]
+#[derive(Clone, Copy)]
+pub(crate) enum WriterKind {
+    Boolean,
+    Dictionary,
+    FixedSizeList,
+    Primitive,
+    List,
+    RunEnd,
+    String,
+    StringView,
+}
+
 impl AnyRuntime {
     fn append_integer(&mut self, value: u64) -> Result<(), ArrowKernelError> {
         match self {
@@ -271,6 +285,151 @@ impl AnyRuntime {
                 "integer metadata must use a primitive writer runtime".into(),
             )),
         }
+    }
+}
+
+#[no_mangle]
+pub(crate) extern "C" fn writer_reserve_for_additional(
+    runtime_ptr: *mut c_void,
+    count: u64,
+    writer_kind: WriterKind,
+) {
+    let count = count as usize;
+    unsafe {
+        match writer_kind {
+            WriterKind::Boolean => (&mut *runtime_ptr.cast::<BooleanWriterRuntime>())
+                .reserve_for_additional(count)
+                .unwrap(),
+            WriterKind::Dictionary => (&mut *runtime_ptr.cast::<DictionaryWriterRuntime>())
+                .reserve_for_additional(count)
+                .unwrap(),
+            WriterKind::FixedSizeList => (&mut *runtime_ptr.cast::<FixedSizeListWriterRuntime>())
+                .reserve_for_additional(count)
+                .unwrap(),
+            WriterKind::Primitive => (&mut *runtime_ptr.cast::<PrimitiveWriterRuntime>())
+                .reserve_for_additional(count)
+                .unwrap(),
+            WriterKind::List => (&mut *runtime_ptr.cast::<ListWriterRuntime>())
+                .reserve_for_additional(count)
+                .unwrap(),
+            WriterKind::RunEnd => (&mut *runtime_ptr.cast::<RunEndWriterRuntime>())
+                .reserve_for_additional(count)
+                .unwrap(),
+            WriterKind::String => (&mut *runtime_ptr.cast::<StringWriterRuntime>())
+                .reserve_for_additional(count)
+                .unwrap(),
+            WriterKind::StringView => (&mut *runtime_ptr.cast::<StringViewWriterRuntime>())
+                .reserve_for_additional(count)
+                .unwrap(),
+        }
+    }
+}
+
+impl AnyWriter {
+    fn kind(&self) -> WriterKind {
+        match self {
+            Self::Boolean(_) => WriterKind::Boolean,
+            Self::Dictionary(_) => WriterKind::Dictionary,
+            Self::FixedSizeList(_) => WriterKind::FixedSizeList,
+            Self::Primitive(_) => WriterKind::Primitive,
+            Self::List(_) => WriterKind::List,
+            Self::RunEnd(_) => WriterKind::RunEnd,
+            Self::String(_) => WriterKind::String,
+            Self::StringView(_) => WriterKind::StringView,
+        }
+    }
+
+    fn llvm_reserve_for_additional<'ctx, 'borrow>(
+        &self,
+        codegen: WriterCodegen<'ctx, 'borrow>,
+        runtime_ptr: PointerValue<'ctx>,
+        count: inkwell::values::IntValue<'ctx>,
+    ) {
+        // TODO: Generate a writer-specific capacity check in LLVM and call this
+        // Rust helper only on the slow path when the current allocation is full.
+        let helper = codegen
+            .module
+            .get_function("writer_reserve_for_additional")
+            .unwrap_or_else(|| {
+                let ptr_type = codegen.ctx.ptr_type(inkwell::AddressSpace::default());
+                codegen.module.add_function(
+                    "writer_reserve_for_additional",
+                    codegen.ctx.void_type().fn_type(
+                        &[
+                            ptr_type.into(),
+                            codegen.ctx.i64_type().into(),
+                            codegen.ctx.i64_type().into(),
+                        ],
+                        false,
+                    ),
+                    None,
+                )
+            });
+        codegen
+            .builder
+            .build_call(
+                helper,
+                &[
+                    runtime_ptr.into(),
+                    count.into(),
+                    codegen
+                        .ctx
+                        .i64_type()
+                        .const_int(self.kind() as u64, false)
+                        .into(),
+                ],
+                "reserve_writer",
+            )
+            .unwrap();
+    }
+
+    /// Writes a value using the static structure of the iterator that produced it.
+    ///
+    /// A variable-size list iterator produces a `{ child_iter, start, end }`
+    /// descriptor. Copying that descriptor recursively accesses each child and
+    /// calls this method again, until a scalar value reaches the ordinary writer.
+    pub(crate) fn llvm_write_from_iterator<'ctx, 'borrow>(
+        &'borrow self,
+        codegen: WriterCodegen<'ctx, 'borrow>,
+        runtime_ptr: PointerValue<'ctx>,
+        source_iter: &IteratorHolder,
+        mut value: BasicValueEnum<'ctx>,
+    ) -> Result<(), ArrowKernelError> {
+        // Dictionary and run-end accessors already return decoded logical values,
+        // so continue with the holder for their value iterator.
+        match source_iter {
+            IteratorHolder::Dictionary { values, .. } => {
+                return self.llvm_write_from_iterator(codegen, runtime_ptr, values, value);
+            }
+            IteratorHolder::RunEnd { values, .. } => {
+                return self.llvm_write_from_iterator(codegen, runtime_ptr, values, value);
+            }
+            _ => {}
+        }
+
+        // A list value is a row descriptor; copy its child range into the
+        // destination list, recursively handling nested lists.
+        if let (AnyWriter::List(writer), IteratorHolder::List(source)) = (self, source_iter) {
+            return writer.llvm_write_from_list(codegen, runtime_ptr, source.child(), value);
+        }
+
+        if source_iter.data_type() == DataType::Boolean
+            && value.into_int_value().get_type().get_bit_width() != 1
+        {
+            value = codegen
+                .builder
+                .build_int_truncate(
+                    value.into_int_value(),
+                    codegen.ctx.bool_type(),
+                    "list_child_bool",
+                )
+                .unwrap()
+                .into();
+        }
+
+        // Non-list values are recursion leaves and can use the ordinary scalar
+        // writer for the destination type.
+        self.llvm_write(codegen, runtime_ptr, |emitter| emitter.emit(value))
     }
 }
 
@@ -514,6 +673,28 @@ impl<'ctx> BoundWriter<'ctx> {
                 },
                 self.runtime_ptr,
                 |emitter| emitter.emit(value),
+            )
+            .unwrap();
+    }
+
+    pub fn llvm_ingest_from_iterator<'call>(
+        &'call self,
+        ctx: &'ctx Context,
+        module: &'call Module<'ctx>,
+        builder: &'call Builder<'ctx>,
+        source_iter: &IteratorHolder,
+        value: BasicValueEnum<'ctx>,
+    ) {
+        self.writer
+            .llvm_write_from_iterator(
+                WriterCodegen {
+                    ctx,
+                    module,
+                    builder,
+                },
+                self.runtime_ptr,
+                source_iter,
+                value,
             )
             .unwrap();
     }
