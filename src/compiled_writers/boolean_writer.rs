@@ -3,7 +3,7 @@ use std::{ffi::c_void, sync::Arc};
 use arrow_array::{ArrayRef, BooleanArray};
 use arrow_buffer::{BooleanBuffer, Buffer};
 use inkwell::{
-    values::{BasicValueEnum, PointerValue},
+    values::{BasicValueEnum, PointerValue, VectorValue},
     AddressSpace, IntPredicate,
 };
 use repr_offset::ReprOffset;
@@ -53,6 +53,159 @@ impl Writer for BooleanWriter {
         }
         .into();
         f(&mut emitter)
+    }
+
+    fn llvm_write_multiple<'ctx, 'borrow>(
+        &'borrow self,
+        codegen: WriterCodegen<'ctx, 'borrow>,
+        runtime_ptr: PointerValue<'ctx>,
+        values: VectorValue<'ctx>,
+    ) -> Result<(), ArrowKernelError> {
+        let ctx = codegen.ctx;
+        let builder = codegen.builder;
+
+        if values.get_type().get_size() != 64 {
+            for idx in 0..values.get_type().get_size() {
+                let value = builder
+                    .build_extract_element(
+                        values,
+                        ctx.i64_type().const_int(idx as u64, false),
+                        "boolean_writer_multiple_value",
+                    )
+                    .unwrap();
+                self.llvm_write(codegen, runtime_ptr, |emitter| emitter.emit(value))?;
+            }
+            return Ok(());
+        }
+
+        let i8_type = ctx.i8_type();
+        let i64_type = ctx.i64_type();
+        let i128_type = ctx.i128_type();
+        let packed = builder
+            .build_bit_cast(values, i64_type, "packed_boolean_values")
+            .unwrap()
+            .into_int_value();
+        let alloc_ptr_ptr = increment_pointer!(
+            ctx,
+            builder,
+            runtime_ptr,
+            BooleanWriterRuntime::OFFSET_ALLOC_PTR
+        );
+        let buf_ptr =
+            increment_pointer!(ctx, builder, runtime_ptr, BooleanWriterRuntime::OFFSET_BUF);
+        let buf_idx_ptr = increment_pointer!(
+            ctx,
+            builder,
+            runtime_ptr,
+            BooleanWriterRuntime::OFFSET_BUF_IDX
+        );
+        let num_written_ptr = increment_pointer!(
+            ctx,
+            builder,
+            runtime_ptr,
+            BooleanWriterRuntime::OFFSET_NUM_WRITTEN
+        );
+
+        let alloc_ptr = builder
+            .build_load(
+                ctx.ptr_type(AddressSpace::default()),
+                alloc_ptr_ptr,
+                "boolean_alloc_ptr",
+            )
+            .unwrap()
+            .into_pointer_value();
+        let buf_idx = builder
+            .build_load(i8_type, buf_idx_ptr, "boolean_buf_idx")
+            .unwrap()
+            .into_int_value();
+
+        let func = builder.get_insert_block().unwrap().get_parent().unwrap();
+        declare_blocks!(
+            ctx,
+            func,
+            boolean_block_aligned,
+            boolean_block_unaligned,
+            boolean_block_exit
+        );
+        let is_aligned = builder
+            .build_int_compare(
+                IntPredicate::EQ,
+                buf_idx,
+                i8_type.const_zero(),
+                "boolean_block_is_aligned",
+            )
+            .unwrap();
+        builder
+            .build_conditional_branch(is_aligned, boolean_block_aligned, boolean_block_unaligned)
+            .unwrap();
+
+        builder.position_at_end(boolean_block_aligned);
+        builder.build_store(alloc_ptr, packed).unwrap();
+        builder
+            .build_unconditional_branch(boolean_block_exit)
+            .unwrap();
+
+        builder.position_at_end(boolean_block_unaligned);
+        let buf = builder
+            .build_load(i8_type, buf_ptr, "boolean_buf")
+            .unwrap()
+            .into_int_value();
+        let buf = builder
+            .build_int_z_extend(buf, i128_type, "boolean_buf_i128")
+            .unwrap();
+        let packed = builder
+            .build_int_z_extend(packed, i128_type, "packed_booleans_i128")
+            .unwrap();
+        let shift = builder
+            .build_int_z_extend(buf_idx, i128_type, "boolean_buf_idx_i128")
+            .unwrap();
+        let packed = builder
+            .build_left_shift(packed, shift, "shifted_packed_booleans")
+            .unwrap();
+        let combined = builder
+            .build_or(buf, packed, "combined_packed_booleans")
+            .unwrap();
+        let completed = builder
+            .build_int_truncate(combined, i64_type, "completed_boolean_bytes")
+            .unwrap();
+        builder.build_store(alloc_ptr, completed).unwrap();
+        let remaining = builder
+            .build_right_shift(
+                combined,
+                i128_type.const_int(64, false),
+                false,
+                "remaining_boolean_bits",
+            )
+            .unwrap();
+        let remaining = builder
+            .build_int_truncate(remaining, i8_type, "remaining_boolean_byte")
+            .unwrap();
+        builder.build_store(buf_ptr, remaining).unwrap();
+        builder
+            .build_unconditional_branch(boolean_block_exit)
+            .unwrap();
+
+        builder.position_at_end(boolean_block_exit);
+        builder
+            .build_store(
+                alloc_ptr_ptr,
+                increment_pointer!(ctx, builder, alloc_ptr, 8),
+            )
+            .unwrap();
+        let num_written = builder
+            .build_load(i64_type, num_written_ptr, "boolean_num_written")
+            .unwrap()
+            .into_int_value();
+        let num_written = builder
+            .build_int_add(
+                num_written,
+                i64_type.const_int(64, false),
+                "boolean_new_num_written",
+            )
+            .unwrap();
+        builder.build_store(num_written_ptr, num_written).unwrap();
+
+        Ok(())
     }
 }
 
@@ -367,6 +520,83 @@ mod tests {
         assert_eq!(runtime.len(), values.len());
         let array = runtime.to_array_ref().unwrap();
         assert_eq!(array.as_boolean(), &BooleanArray::from(values.to_vec()));
+    }
+
+    #[test]
+    fn boolean_writer_jit_packs_vector_values() {
+        let block = (0..64).map(|i| i % 3 == 0).collect::<Vec<_>>();
+        let scalars = [true, false, true];
+        let expected = block
+            .iter()
+            .copied()
+            .chain(scalars)
+            .chain(block.iter().copied())
+            .collect::<Vec<_>>();
+        let ctx = Context::create();
+        let llvm_mod = ctx.create_module("compiled_writers_boolean_writer_vector");
+        let build = ctx.create_builder();
+        let ptr_type = ctx.ptr_type(AddressSpace::default());
+        let func = llvm_mod.add_function(
+            "test",
+            ctx.void_type().fn_type(&[ptr_type.into()], false),
+            None,
+        );
+
+        declare_blocks!(ctx, func, entry);
+        build.position_at_end(entry);
+        let dest = func.get_nth_param(0).unwrap().into_pointer_value();
+        let writer = BooleanWriter::compile();
+        let codegen = WriterCodegen {
+            ctx: &ctx,
+            module: &llvm_mod,
+            builder: &build,
+        };
+        let values = block
+            .iter()
+            .map(|value| ctx.bool_type().const_int(u64::from(*value), false))
+            .collect::<Vec<_>>();
+        let values = inkwell::types::VectorType::const_vector(&values);
+        writer.llvm_write_multiple(codegen, dest, values).unwrap();
+        for value in scalars {
+            writer
+                .llvm_write(codegen, dest, |emitter| {
+                    emitter.emit(
+                        ctx.bool_type()
+                            .const_int(u64::from(value), false)
+                            .as_basic_value_enum(),
+                    )
+                })
+                .unwrap();
+        }
+        writer.llvm_write_multiple(codegen, dest, values).unwrap();
+        build.build_return(None).unwrap();
+        llvm_mod.verify().unwrap();
+
+        let ee = llvm_mod
+            .create_jit_execution_engine(OptimizationLevel::None)
+            .unwrap();
+        let f = unsafe {
+            ee.get_function::<unsafe extern "C" fn(*mut c_void)>(func.get_name().to_str().unwrap())
+                .unwrap()
+        };
+        let mut runtime = writer.allocate(expected.len());
+        unsafe {
+            f.call(runtime.as_ptr());
+        }
+
+        runtime.reserve_for_additional(expected.len()).unwrap();
+        unsafe {
+            f.call(runtime.as_ptr());
+        }
+
+        let expected = expected
+            .iter()
+            .copied()
+            .chain(expected.iter().copied())
+            .collect::<Vec<_>>();
+        assert_eq!(runtime.len(), expected.len());
+        let array = runtime.to_array_ref().unwrap();
+        assert_eq!(array.as_boolean(), &BooleanArray::from(expected));
     }
 
     #[test]
