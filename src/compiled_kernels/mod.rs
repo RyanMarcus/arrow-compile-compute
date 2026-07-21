@@ -23,7 +23,7 @@ mod vec;
 use std::{collections::HashMap, sync::RwLock};
 
 pub use aggregate2::{
-    Aggregator, CountAggregator, MaxAggregator, MinAggregator, MostRecentAggregator, SumAggregator,
+    Aggregator, CountAggregator, MaxAggregator, MinAggregator, MostRecentAggregator,
 };
 pub use arith::{BinOpKernel, UnaryOpKernel};
 use arrow_schema::DataType;

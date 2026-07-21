@@ -13,6 +13,8 @@ pub enum ReductionKernelType {
     Max,
     ArgMin,
     ArgMax,
+    Sum,
+    Product,
 }
 
 impl ReductionKernelType {
@@ -22,6 +24,8 @@ impl ReductionKernelType {
             Self::Max => DSLReductionType::Max,
             Self::ArgMin => DSLReductionType::ArgMin,
             Self::ArgMax => DSLReductionType::ArgMax,
+            Self::Sum => DSLReductionType::Sum,
+            Self::Product => DSLReductionType::Product,
         }
     }
 
@@ -79,13 +83,13 @@ impl Kernel for ReductionKernel {
         let data_type = arr.data_type();
         if data_type == &DataType::Boolean {
             return Err(ArrowKernelError::UnsupportedArguments(
-                "min/max reductions do not support boolean values".to_string(),
+                "arithmetic/ordering reductions do not support boolean values".to_string(),
             ));
         }
         let primitive_type = PrimitiveType::for_arrow_type(data_type);
         if matches!(primitive_type, PrimitiveType::List(..)) {
             return Err(ArrowKernelError::UnsupportedArguments(format!(
-                "min/max reductions do not support fixed-size-list values, got {data_type}"
+                "arithmetic/ordering reductions do not support fixed-size-list values, got {data_type}"
             )));
         }
 

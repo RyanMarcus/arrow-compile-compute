@@ -189,6 +189,8 @@ pub fn empty_array_for(dt: &DataType) -> ArrayRef {
         DataType::Struct(_fields) => todo!(),
         DataType::Union(_union_fields, _union_mode) => todo!(),
         DataType::Dictionary(_key, _val) => todo!(),
+        DataType::Decimal32(_, _) => todo!(),
+        DataType::Decimal64(_, _) => todo!(),
         DataType::Decimal128(_, _) => todo!(),
         DataType::Decimal256(_, _) => todo!(),
         DataType::Map(_field, _) => todo!(),

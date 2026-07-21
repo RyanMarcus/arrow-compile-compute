@@ -456,6 +456,8 @@ fn array_to_iter(arr: &dyn Array) -> IteratorHolder {
             arrow_schema::DataType::UInt64 => arr.as_dictionary::<UInt64Type>().into(),
             _ => unreachable!(),
         },
+        arrow_schema::DataType::Decimal32(_, _) => todo!(),
+        arrow_schema::DataType::Decimal64(_, _) => todo!(),
         arrow_schema::DataType::Decimal128(_, _) => todo!(),
         arrow_schema::DataType::Decimal256(_, _) => todo!(),
         arrow_schema::DataType::Map(_field, _) => todo!(),

@@ -6,11 +6,9 @@ use crate::{compiled_kernels::aggregate2::minmax::MinMaxAggregator, ArrowKernelE
 mod count;
 mod minmax;
 mod most_recent;
-mod sum;
 
 pub use count::CountAggregator;
 pub use most_recent::MostRecentAggregator;
-pub use sum::SumAggregator;
 pub type MinAggregator = MinMaxAggregator<true>;
 pub type MaxAggregator = MinMaxAggregator<false>;
 

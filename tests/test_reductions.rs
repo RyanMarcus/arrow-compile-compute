@@ -2,8 +2,8 @@ use std::sync::Arc;
 
 use arrow_array::{
     cast::AsArray,
-    types::{Int16Type, Int32Type},
-    DictionaryArray, Int16Array, Int32Array, RunArray, Scalar,
+    types::{Float64Type, Int16Type, Int32Type},
+    DictionaryArray, Float64Array, Int16Array, Int32Array, RunArray, Scalar,
 };
 use arrow_compile_compute::compute;
 use proptest::prelude::*;
@@ -92,6 +92,96 @@ proptest! {
 
         prop_assert_eq!(compute::argmax(&arr).unwrap(), expected);
     }
+
+    // sum/product wrap in the input type; integer wrap is associative mod 2^32,
+    // so any reduction order matches arrow_arith::aggregate exactly.
+    #[test]
+    fn test_compute_sum_i32(values in prop::collection::vec(any::<i32>(), 1..256)) {
+        let arr = Int32Array::from(values);
+        let expected = arrow_arith::aggregate::sum(&arr);
+
+        let result = compute::sum(&arr).unwrap();
+        let result = result.as_primitive::<Int32Type>();
+        prop_assert_eq!(result.len(), 1);
+        prop_assert_eq!(result.iter().next().unwrap(), expected);
+    }
+
+    #[test]
+    fn test_compute_product_i32(values in prop::collection::vec(any::<i32>(), 1..256)) {
+        let arr = Int32Array::from(values);
+        let expected = arrow_arith::aggregate::product(&arr);
+
+        let result = compute::product(&arr).unwrap();
+        let result = result.as_primitive::<Int32Type>();
+        prop_assert_eq!(result.len(), 1);
+        prop_assert_eq!(result.iter().next().unwrap(), expected);
+    }
+
+    #[test]
+    fn test_compute_sum_nullable_i32(values in prop::collection::vec(prop::option::of(any::<i32>()), 0..256)) {
+        let arr = Int32Array::from(values);
+        let expected = arrow_arith::aggregate::sum(&arr);
+
+        let result = compute::sum(&arr).unwrap();
+        let result = result.as_primitive::<Int32Type>();
+        prop_assert_eq!(result.len(), 1);
+        prop_assert_eq!(result.iter().next().unwrap(), expected);
+    }
+
+    #[test]
+    fn test_compute_product_nullable_i32(values in prop::collection::vec(prop::option::of(any::<i32>()), 0..256)) {
+        let arr = Int32Array::from(values);
+        let expected = arrow_arith::aggregate::product(&arr);
+
+        let result = compute::product(&arr).unwrap();
+        let result = result.as_primitive::<Int32Type>();
+        prop_assert_eq!(result.len(), 1);
+        prop_assert_eq!(result.iter().next().unwrap(), expected);
+    }
+}
+
+#[test]
+fn test_compute_sum_wraps() {
+    let arr = Int32Array::from(vec![i32::MAX, 1]);
+    let result = compute::sum(&arr).unwrap();
+    let result = result.as_primitive::<Int32Type>();
+    assert_eq!(result.value(0), arrow_arith::aggregate::sum(&arr).unwrap());
+    assert_eq!(result.value(0), i32::MIN);
+}
+
+#[test]
+fn test_compute_product_wraps() {
+    let arr = Int32Array::from(vec![i32::MAX, i32::MAX, 4]);
+    let result = compute::product(&arr).unwrap();
+    let result = result.as_primitive::<Int32Type>();
+    assert_eq!(result.value(0), arrow_arith::aggregate::product(&arr).unwrap());
+}
+
+#[test]
+fn test_compute_sum_product_empty_is_null() {
+    let arr = Int32Array::from(Vec::<i32>::new());
+    let sum = compute::sum(&arr).unwrap();
+    assert_eq!(sum.as_primitive::<Int32Type>().iter().next().unwrap(), None);
+    let product = compute::product(&arr).unwrap();
+    assert_eq!(product.as_primitive::<Int32Type>().iter().next().unwrap(), None);
+}
+
+#[test]
+fn test_compute_sum_product_all_null_is_null() {
+    let arr = Int32Array::from(vec![None::<i32>, None, None]);
+    let sum = compute::sum(&arr).unwrap();
+    assert_eq!(sum.as_primitive::<Int32Type>().iter().next().unwrap(), None);
+    let product = compute::product(&arr).unwrap();
+    assert_eq!(product.as_primitive::<Int32Type>().iter().next().unwrap(), None);
+}
+
+#[test]
+fn test_compute_sum_product_f64() {
+    let arr = Float64Array::from(vec![1.5, 2.0, -0.5]);
+    let sum = compute::sum(&arr).unwrap();
+    assert_eq!(sum.as_primitive::<Float64Type>().value(0), 3.0);
+    let product = compute::product(&arr).unwrap();
+    assert_eq!(product.as_primitive::<Float64Type>().value(0), -1.5);
 }
 
 #[test]
