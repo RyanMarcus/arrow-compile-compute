@@ -25,9 +25,9 @@ Comparison against [`arrow::compute`](https://docs.rs/arrow/59.1.0/arrow/compute
 | `sort_to_indices` | `sort_col` | single-column sort → index array |
 | `lexsort_to_indices` | `sort_multi_col` | multi-column sort → index array |
 | `sort_limit` / `partial_sort` | `top_k` | K smallest/largest as indices |
-| `min`, `max` | `ReductionKernel`, `MinMaxAggKernel` | ungrouped and grouped; nulls skipped |
-| `sum` | `SumAggregator` | grouped; ungrouped via `Aggregator::ingest_ungrouped`; nulls skipped |
-| `product` | `ProductAggregator` | grouped; ungrouped via `Aggregator::ingest_ungrouped`; nulls skipped; wrapping semantics only (no `product_checked`) |
+| `min`, `max` | `ReductionKernel`, `MinMaxAggKernel` | ungrouped (`compute::min`/`max`) and grouped; nulls skipped |
+| `sum` | `ReductionKernel` | ungrouped (`compute::sum`); keeps input type, skips nulls, and wraps, matching `arrow_arith::aggregate::sum` |
+| `product` | `ReductionKernel` | ungrouped (`compute::product`); skips nulls and wraps; no `product_checked` |
 | `like` | `compile_string_like` | GLOB-style matching with escape char (case-sensitive only) |
 | `contains` | `string_contains` | substring search |
 | `starts_with`, `ends_with` | `StringStartEndKernel` | prefix / suffix match |
@@ -40,7 +40,7 @@ Comparison against [`arrow::compute`](https://docs.rs/arrow/59.1.0/arrow/compute
 |---|---|---|
 | Between / bounds check | `BetweenKernel`, `BoundsKernel` | fused `lo <= x <= hi` in one pass (Arrow has no `between`) |
 | Argmin / argmax | `ReductionKernel` (`argmin`, `argmax`) | index of the min/max — Arrow has no argmin/argmax |
-| Grouped aggregation | `CountAggregator`, `SumAggregator`, `ProductAggregator`, `MinMaxAggKernel`, `MostRecentAggregator` (+ their `*MergeKernel`s) | SQL-style GROUP BY with mergeable partial states for parallel aggregation — Arrow has no group-by |
+| Grouped aggregation | `CountAggregator`, `MinMaxAggKernel`, `MostRecentAggregator` (+ their `*MergeKernel`s) | SQL-style GROUP BY with mergeable partial states for parallel aggregation — Arrow has no group-by |
 | Hash / grouping | `HashKernel` | Murmur and unchained CRC32 hashing into a ticket table |
 | Sort key normalization | `normalize_columns` | maps raw sort keys to a canonical ordinal encoding |
 | Binary search | `lower_bound` | bisect on a sorted column |
@@ -83,9 +83,9 @@ direct implementation. Otherwise it says no close implementation was found.
 ### `arrow::compute::kernels::aggregate`
 | Function | Description | Candidate existing implementation |
 |---|---|---|
-| `product_checked` | overflow-checked product | Partial: `ProductAggregator` has the same accumulation structure for wrapping product; checked multiply/overflow handling would be new. |
-| `sum_checked` | overflow-checked sum | Partial: `SumAggregator` has the same accumulation structure for wrapping/widened sum; checked addition/overflow handling would be new. |
-| `sum_array`, `sum_array_checked` | list-element sums | No close implementation found. `SumAggregator` reduces rows/groups, not elements inside list rows. |
+| `product_checked` | overflow-checked product | Partial: `ReductionKernel` implements wrapping product; checked multiply/overflow handling would be new. |
+| `sum_checked` | overflow-checked sum | Partial: `ReductionKernel` implements wrapping sum; checked addition/overflow handling would be new. |
+| `sum_array`, `sum_array_checked` | list-element sums | No close implementation found. `ReductionKernel` reduces rows, not elements inside list rows. |
 | `bit_and`, `bit_or`, `bit_xor` | reduce an array via bitwise AND/OR/XOR | No close reduction implementation found. Existing DSL bitwise ops are element-wise only. |
 | `bool_and`, `bool_or` | all-true / any-true reductions | `DSLReductionType::{And, Or}` already implements the reduction core; needs a public Arrow aggregate wrapper and null semantics. |
 

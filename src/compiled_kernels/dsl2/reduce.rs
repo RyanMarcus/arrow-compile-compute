@@ -42,6 +42,8 @@ pub enum DSLReductionType {
     ArgMin,
     Max,
     ArgMax,
+    Sum,
+    Product,
 }
 
 impl DSLReductionType {
@@ -66,6 +68,15 @@ impl DSLReductionType {
                     false,
                 )
                 .as_basic_type_enum(),
+            DSLReductionType::Sum | DSLReductionType::Product => ctx
+                .struct_type(
+                    &[
+                        ctx.bool_type().into(),            // is init (saw >= 1 value)
+                        iter_type.llvm_type(ctx).unwrap(), // running accumulator
+                    ],
+                    false,
+                )
+                .as_basic_type_enum(),
         }
     }
 
@@ -81,6 +92,30 @@ impl DSLReductionType {
             | DSLReductionType::ArgMin
             | DSLReductionType::Max
             | DSLReductionType::ArgMax => self.accum_type(ctx, iter_type).const_zero(),
+            // {is_init = false, accumulator = additive identity 0}
+            DSLReductionType::Sum => self.accum_type(ctx, iter_type).const_zero(),
+            // {is_init = false, accumulator = multiplicative identity 1}
+            DSLReductionType::Product => {
+                let struct_ty = self.accum_type(ctx, iter_type).into_struct_type();
+                let is_init = ctx.bool_type().const_zero().as_basic_value_enum();
+                let one = match iter_type {
+                    DSLType::Primitive(pt) if pt.is_float() => iter_type
+                        .llvm_type(ctx)
+                        .unwrap()
+                        .into_float_type()
+                        .const_float(1.0)
+                        .as_basic_value_enum(),
+                    _ => iter_type
+                        .llvm_type(ctx)
+                        .unwrap()
+                        .into_int_type()
+                        .const_int(1, false)
+                        .as_basic_value_enum(),
+                };
+                struct_ty
+                    .const_named_struct(&[is_init, one])
+                    .as_basic_value_enum()
+            }
         }
     }
 
@@ -140,7 +175,10 @@ impl DSLReductionType {
                 let cmp_op = match self {
                     DSLReductionType::Min | DSLReductionType::ArgMin => DSLComparison::Lt,
                     DSLReductionType::Max | DSLReductionType::ArgMax => DSLComparison::Gt,
-                    DSLReductionType::And | DSLReductionType::Or => unreachable!(),
+                    DSLReductionType::And
+                    | DSLReductionType::Or
+                    | DSLReductionType::Sum
+                    | DSLReductionType::Product => unreachable!(),
                 };
                 let is_better =
                     compile_compare_values(ctx, cmp_op, ty, next, val)?.into_int_value();
@@ -194,6 +232,55 @@ impl DSLReductionType {
 
                 Ok(accum.as_basic_value_enum())
             }
+            DSLReductionType::Sum | DSLReductionType::Product => {
+                let accum = accum.into_struct_value();
+                let is_init = ctx
+                    .b
+                    .build_extract_value(accum, 0, "is_init")
+                    .unwrap()
+                    .into_int_value();
+                let val = ctx.b.build_extract_value(accum, 1, "acc_val").unwrap();
+
+                let is_float = matches!(ty, DSLType::Primitive(pt) if pt.is_float());
+                let combined = match (self, is_float) {
+                    (DSLReductionType::Sum, false) => ctx
+                        .b
+                        .build_int_add(val.into_int_value(), next.into_int_value(), "sum")
+                        .unwrap()
+                        .as_basic_value_enum(),
+                    (DSLReductionType::Sum, true) => ctx
+                        .b
+                        .build_float_add(val.into_float_value(), next.into_float_value(), "sum")
+                        .unwrap()
+                        .as_basic_value_enum(),
+                    (DSLReductionType::Product, false) => ctx
+                        .b
+                        .build_int_mul(val.into_int_value(), next.into_int_value(), "product")
+                        .unwrap()
+                        .as_basic_value_enum(),
+                    (DSLReductionType::Product, true) => ctx
+                        .b
+                        .build_float_mul(val.into_float_value(), next.into_float_value(), "product")
+                        .unwrap()
+                        .as_basic_value_enum(),
+                    _ => unreachable!(),
+                };
+
+                // only fold in the new value when the row is included; is_init
+                // tracks whether any value was seen so an empty/all-null reduction
+                // can report EmptyReduction in output_value.
+                let new_val = ctx.b.build_select(include, combined, val, "new_val").unwrap();
+                let new_is_init = ctx.b.build_or(is_init, include, "new_is_init").unwrap();
+                let accum = ctx
+                    .b
+                    .build_insert_value(accum, new_is_init, 0, "is_init")
+                    .unwrap();
+                let accum = ctx
+                    .b
+                    .build_insert_value(accum, new_val, 1, "acc_val")
+                    .unwrap();
+                Ok(accum.as_basic_value_enum())
+            }
         }
     }
 
@@ -234,11 +321,43 @@ impl DSLReductionType {
                 let field = match self {
                     DSLReductionType::Min | DSLReductionType::Max => 3,
                     DSLReductionType::ArgMin | DSLReductionType::ArgMax => 2,
-                    DSLReductionType::And | DSLReductionType::Or => unreachable!(),
+                    DSLReductionType::And
+                    | DSLReductionType::Or
+                    | DSLReductionType::Sum
+                    | DSLReductionType::Product => unreachable!(),
                 };
                 Ok(ctx
                     .b
                     .build_extract_value(accum, field, "reduce_output")
+                    .unwrap())
+            }
+            DSLReductionType::Sum | DSLReductionType::Product => {
+                let accum = accum.into_struct_value();
+                let is_init = ctx
+                    .b
+                    .build_extract_value(accum, 0, "reduce_is_init")
+                    .unwrap()
+                    .into_int_value();
+
+                let reduce_has_value = ctx.ctx.append_basic_block(*ctx.func, "reduce_has_value");
+                let reduce_empty = ctx.ctx.append_basic_block(*ctx.func, "reduce_empty");
+                ctx.b
+                    .build_conditional_branch(is_init, reduce_has_value, reduce_empty)
+                    .unwrap();
+
+                ctx.b.position_at_end(reduce_empty);
+                ctx.b
+                    .build_return(Some(
+                        &ctx.ctx
+                            .i64_type()
+                            .const_int(KernelReturnCode::EmptyReduction.into(), false),
+                    ))
+                    .unwrap();
+
+                ctx.b.position_at_end(reduce_has_value);
+                Ok(ctx
+                    .b
+                    .build_extract_value(accum, 1, "reduce_output")
                     .unwrap())
             }
         }
@@ -254,7 +373,9 @@ impl DSLReductionType {
             DSLReductionType::Min
             | DSLReductionType::ArgMin
             | DSLReductionType::Max
-            | DSLReductionType::ArgMax => {
+            | DSLReductionType::ArgMax
+            | DSLReductionType::Sum
+            | DSLReductionType::Product => {
                 matches!(
                     expr.get_type(),
                     DSLType::Primitive(pt) if !matches!(pt, PrimitiveType::List(..))
@@ -266,7 +387,10 @@ impl DSLReductionType {
     pub fn out_type(&self, expr: &DSLExpr) -> DSLType {
         match self {
             DSLReductionType::And | DSLReductionType::Or => DSLType::Boolean,
-            DSLReductionType::Min | DSLReductionType::Max => expr.get_type(),
+            DSLReductionType::Min
+            | DSLReductionType::Max
+            | DSLReductionType::Sum
+            | DSLReductionType::Product => expr.get_type(),
             DSLReductionType::ArgMin | DSLReductionType::ArgMax => {
                 DSLType::Primitive(PrimitiveType::U64)
             }

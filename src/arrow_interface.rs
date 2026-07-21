@@ -718,11 +718,12 @@ pub mod compute {
     use arrow_array::{cast::AsArray, Array, ArrayRef, Datum, UInt64Array};
 
     use crate::{
-        compiled_kernels::{
-            HashFunction, HashKernel, KernelCache, ReductionKernel, ReductionKernelType,
-        },
+        compiled_kernels::{HashFunction, HashKernel, KernelCache},
         ArrowKernelError,
     };
+    // Re-exported so benchmarks can drive `Kernel::compile`/`call` directly and
+    // separate compile time from execution time (see `cmp::ComparisonKernel`).
+    pub use crate::compiled_kernels::{ReductionKernel, ReductionKernelType};
 
     static HASH_PROGRAM_CACHE: LazyLock<KernelCache<HashKernel>> = LazyLock::new(KernelCache::new);
     static REDUCTION_PROGRAM_CACHE: LazyLock<KernelCache<ReductionKernel>> =
@@ -778,6 +779,62 @@ pub mod compute {
     /// ```
     pub fn max(data: &dyn Datum) -> Result<ArrayRef, ArrowKernelError> {
         REDUCTION_PROGRAM_CACHE.get(data, ReductionKernelType::Max)
+    }
+
+    /// Return the sum of the non-null values as a one-element array.
+    ///
+    /// Null values are skipped. If there are no non-null values, the returned
+    /// one-element array is null. The result keeps the input type and wraps on
+    /// overflow (no checked or widening variant), matching
+    /// `arrow_arith::aggregate::sum`.
+    ///
+    /// This is a single-array reduction. For groupbys or multi-array
+    /// aggregation, prefer the [`crate::aggregate`] module.
+    ///
+    /// # Example
+    ///
+    /// ```
+    /// use arrow_array::{cast::AsArray, Int32Array};
+    /// use arrow_compile_compute::compute;
+    ///
+    /// let values = Int32Array::from(vec![5, -3, 7, -3]);
+    /// let result = compute::sum(&values).unwrap();
+    /// assert_eq!(result.as_primitive::<arrow_array::types::Int32Type>().value(0), 6);
+    ///
+    /// let nullable = Int32Array::from(vec![None, Some(4), Some(2)]);
+    /// let result = compute::sum(&nullable).unwrap();
+    /// assert_eq!(result.as_primitive::<arrow_array::types::Int32Type>().iter().next().unwrap(), Some(6));
+    /// ```
+    pub fn sum(data: &dyn Datum) -> Result<ArrayRef, ArrowKernelError> {
+        REDUCTION_PROGRAM_CACHE.get(data, ReductionKernelType::Sum)
+    }
+
+    /// Return the product of the non-null values as a one-element array.
+    ///
+    /// Null values are skipped. If there are no non-null values, the returned
+    /// one-element array is null. The result keeps the input type and wraps on
+    /// overflow (no checked variant), matching
+    /// `arrow_arith::aggregate::product`.
+    ///
+    /// This is a single-array reduction. For groupbys or multi-array
+    /// aggregation, prefer the [`crate::aggregate`] module.
+    ///
+    /// # Example
+    ///
+    /// ```
+    /// use arrow_array::{cast::AsArray, Int32Array};
+    /// use arrow_compile_compute::compute;
+    ///
+    /// let values = Int32Array::from(vec![5, -3, 7, -3]);
+    /// let result = compute::product(&values).unwrap();
+    /// assert_eq!(result.as_primitive::<arrow_array::types::Int32Type>().value(0), 315);
+    ///
+    /// let nullable = Int32Array::from(vec![None, Some(4), Some(2)]);
+    /// let result = compute::product(&nullable).unwrap();
+    /// assert_eq!(result.as_primitive::<arrow_array::types::Int32Type>().iter().next().unwrap(), Some(8));
+    /// ```
+    pub fn product(data: &dyn Datum) -> Result<ArrayRef, ArrowKernelError> {
+        REDUCTION_PROGRAM_CACHE.get(data, ReductionKernelType::Product)
     }
 
     /// Return the zero-based index of the first minimum non-null value.
@@ -954,22 +1011,8 @@ pub mod aggregate {
 
     pub use crate::compiled_kernels::{
         Aggregator, CountAggregator, MaxAggregator, MinAggregator, MostRecentAggregator,
-        ProductAggregator, SumAggregator,
     };
     use crate::ArrowKernelError;
-
-    /// Creates a new sum aggregator. Final results are 64-bit versions of their
-    /// inputs (e.g., `f32` is summed to `f64`).
-    pub fn sum(ty: &DataType) -> Result<Box<SumAggregator>, ArrowKernelError> {
-        SumAggregator::create(&[ty])
-    }
-
-    /// Creates a new product aggregator. Final results match the input type and
-    /// wrap on overflow (no checked variant); empty/all-null groups produce no
-    /// value.
-    pub fn product(ty: &DataType) -> Result<Box<ProductAggregator>, ArrowKernelError> {
-        ProductAggregator::create(&[ty])
-    }
 
     /// Creates a new min aggregator. Final results will match the input type.
     pub fn min(ty: &DataType) -> Result<Box<MinAggregator>, ArrowKernelError> {
@@ -998,9 +1041,12 @@ pub mod arith {
     use arrow_array::{ArrayRef, Datum};
 
     use crate::{
-        compiled_kernels::{BinOpKernel, DSLArithBinOp, DSLUnaryOp, KernelCache, UnaryOpKernel},
+        compiled_kernels::{BinOpKernel, DSLArithBinOp, KernelCache},
         ArrowKernelError,
     };
+    // Re-exported so benchmarks can drive `Kernel::compile`/`call` directly and
+    // separate compile time from execution time (see `cmp::ComparisonKernel`).
+    pub use crate::compiled_kernels::{DSLUnaryOp, UnaryOpKernel};
 
     static BINOP_PROGRAM_CACHE: LazyLock<KernelCache<BinOpKernel>> =
         LazyLock::new(KernelCache::new);
