@@ -6,6 +6,29 @@ use arrow_ord::sort::SortColumn;
 use criterion::{black_box, criterion_group, criterion_main, Criterion};
 use itertools::Itertools;
 
+fn bench_multicol_case(c: &mut Criterion, name: &str, columns: &[Arc<dyn Array>]) {
+    let arrow_columns = columns
+        .iter()
+        .map(|values| SortColumn {
+            values: values.clone(),
+            options: None,
+        })
+        .collect_vec();
+    let llvm_columns = columns.iter().map(|column| column.as_ref()).collect_vec();
+    let options = vec![SortOptions::default(); columns.len()];
+    let arrow_name = format!("{name}/arrow");
+    let llvm_name = format!("{name}/llvm");
+
+    c.bench_function(&arrow_name, |b| {
+        b.iter(|| arrow_ord::sort::lexsort_to_indices(&arrow_columns, None).unwrap())
+    });
+    c.bench_function(&llvm_name, |b| {
+        b.iter(|| {
+            arrow_compile_compute::sort::multicol_sort_to_indices(&llvm_columns, &options).unwrap()
+        })
+    });
+}
+
 pub fn criterion_benchmark(c: &mut Criterion) {
     let mut rng = fastrand::Rng::with_seed(42);
     let mut vals = HashSet::new();
@@ -60,41 +83,33 @@ pub fn criterion_benchmark(c: &mut Criterion) {
     let c2: Arc<dyn Array> = Arc::new(Int32Array::from(c2));
     let c3: Arc<dyn Array> = Arc::new(Int64Array::from(c3));
 
-    c.bench_function("sort multicol/arrow", |b| {
-        b.iter(|| {
-            arrow_ord::sort::lexsort_to_indices(
-                &[
-                    SortColumn {
-                        values: c1.clone(),
-                        options: None,
-                    },
-                    SortColumn {
-                        values: c2.clone(),
-                        options: None,
-                    },
-                    SortColumn {
-                        values: c3.clone(),
-                        options: None,
-                    },
-                ],
-                None,
-            )
-            .unwrap()
+    bench_multicol_case(c, "sort multicol", &[c1.clone(), c2.clone(), c3]);
+    let high_cardinality_i32: Arc<dyn Array> = Arc::new(Int32Array::from(
+        vals.iter().map(|value| *value as i32).collect_vec(),
+    ));
+    bench_multicol_case(c, "sort multicol 2 words", &[c1, high_cardinality_i32]);
+
+    let four_word_columns = (0..3)
+        .map(|column| {
+            Arc::new(UInt64Array::from(
+                vals.iter()
+                    .map(|value| value.rotate_left(column * 17))
+                    .collect_vec(),
+            )) as Arc<dyn Array>
         })
-    });
-    c.bench_function("sort multicol/llvm", |b| {
-        b.iter(|| {
-            arrow_compile_compute::sort::multicol_sort_to_indices(
-                &[&c1, &c2, &c3],
-                &[
-                    SortOptions::default(),
-                    SortOptions::default(),
-                    SortOptions::default(),
-                ],
-            )
-            .unwrap()
+        .collect_vec();
+    bench_multicol_case(c, "sort multicol 4 words", &four_word_columns);
+
+    let eight_word_columns = (0..7)
+        .map(|column| {
+            Arc::new(UInt64Array::from(
+                vals.iter()
+                    .map(|value| value.rotate_left(column * 9))
+                    .collect_vec(),
+            )) as Arc<dyn Array>
         })
-    });
+        .collect_vec();
+    bench_multicol_case(c, "sort multicol 8 words", &eight_word_columns);
 }
 
 criterion_group!(benches, criterion_benchmark);
