@@ -216,12 +216,7 @@ pub trait Writer {
         runtime_ptr: PointerValue<'ctx>,
         values: VectorValue<'ctx>,
     ) -> Result<(), ArrowKernelError> {
-        self.llvm_write_block(
-            codegen,
-            runtime_ptr,
-            values.into(),
-            values.get_type().get_size(),
-        )
+        self.llvm_write_block(codegen, runtime_ptr, values, values.get_type().get_size())
     }
 
     /// Writes a flat block containing `logical_len` values. Composite writers
@@ -230,10 +225,9 @@ pub trait Writer {
         &'borrow self,
         codegen: WriterCodegen<'ctx, 'borrow>,
         runtime_ptr: PointerValue<'ctx>,
-        values: BasicValueEnum<'ctx>,
+        values: VectorValue<'ctx>,
         logical_len: u32,
     ) -> Result<(), ArrowKernelError> {
-        let values = values.into_vector_value();
         if values.get_type().get_size() != logical_len {
             return Err(ArrowKernelError::InternalError(format!(
                 "scalar writer cannot ingest {} lanes as {logical_len} logical values",
@@ -736,7 +730,7 @@ impl<'ctx> BoundWriter<'ctx> {
         ctx: &'ctx Context,
         module: &'call Module<'ctx>,
         builder: &'call Builder<'ctx>,
-        values: BasicValueEnum<'ctx>,
+        values: VectorValue<'ctx>,
         logical_len: u32,
     ) {
         self.writer

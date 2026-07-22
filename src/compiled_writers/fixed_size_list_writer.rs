@@ -3,7 +3,7 @@ use std::{ffi::c_void, sync::Arc};
 use arrow_array::FixedSizeListArray;
 use arrow_schema::Field;
 use inkwell::{
-    values::{BasicValueEnum, PointerValue},
+    values::{BasicValueEnum, PointerValue, VectorValue},
     AddressSpace,
 };
 use repr_offset::ReprOffset;
@@ -143,15 +143,11 @@ impl Writer for FixedSizeListWriter {
         &'borrow self,
         codegen: WriterCodegen<'ctx, 'borrow>,
         runtime_ptr: PointerValue<'ctx>,
-        values: BasicValueEnum<'ctx>,
+        values: VectorValue<'ctx>,
         logical_len: u32,
     ) -> Result<(), ArrowKernelError> {
         let expected_lanes = logical_len as usize * self.list_size;
-        let actual_lanes = if values.is_vector_value() {
-            values.into_vector_value().get_type().get_size()
-        } else {
-            values.into_int_value().get_type().get_bit_width()
-        };
+        let actual_lanes = values.get_type().get_size();
         if actual_lanes as usize != expected_lanes {
             return Err(ArrowKernelError::InternalError(format!(
                 "fixed-size-list block has {} lanes, expected {expected_lanes}",
@@ -259,7 +255,7 @@ impl<'ctx, 'borrow> WriterEmitter<'ctx, 'borrow> for FixedSizeListWriterEmitter<
             _ => self.values.llvm_write_block(
                 self.codegen,
                 self.value_runtime_ptr,
-                val,
+                val.into_vector_value(),
                 list_size as u32,
             )?,
         }

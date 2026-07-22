@@ -201,11 +201,11 @@ impl IteratorValueType {
         rows: u32,
     ) -> Option<inkwell::types::BasicTypeEnum<'a>> {
         match self {
-            IteratorValueType::Boolean => Some(ctx.custom_width_int_type(rows).into()),
+            IteratorValueType::Boolean => Some(ctx.bool_type().vec_type(rows).into()),
             IteratorValueType::Primitive(PrimitiveType::List(item, size)) => {
                 let lanes = rows.checked_mul(size as u32)?;
                 match item {
-                    ListItemType::Boolean => Some(ctx.custom_width_int_type(lanes).into()),
+                    ListItemType::Boolean => Some(ctx.bool_type().vec_type(lanes).into()),
                     ListItemType::P64x2 => None,
                     _ => PrimitiveType::from(item)
                         .llvm_vec_type(ctx, lanes)
@@ -1127,7 +1127,10 @@ impl IteratorHolder {
                     (&aligned_value, aligned_end),
                     (&unaligned_value, unaligned_end),
                 ]);
-                build.build_store(out_ptr, phi.as_basic_value()).unwrap();
+                let values = build
+                    .build_bit_cast(phi.as_basic_value(), vec_type, "boolean_block")
+                    .unwrap();
+                build.build_store(out_ptr, values).unwrap();
                 build.build_return(None).unwrap();
             }
             IteratorHolder::FixedSizeList(iter) => {
@@ -1198,8 +1201,10 @@ impl IteratorHolder {
                 let row_buf = build.build_alloca(row_type, "gather_row").unwrap();
                 match item {
                     ListItemType::Boolean => {
-                        let output_int = output_type.into_int_type();
-                        let row_int = row_type.into_int_type();
+                        let output_vec = output_type.into_vector_type();
+                        let row_vec = row_type.into_vector_type();
+                        let output_int = ctx.custom_width_int_type(output_vec.get_size());
+                        let row_int = ctx.custom_width_int_type(row_vec.get_size());
                         let mut output = output_int.const_zero();
                         for row in 0..rows {
                             let idx = build
@@ -1217,7 +1222,10 @@ impl IteratorHolder {
                                 )
                                 .unwrap();
                             let value = build
-                                .build_load(row_int, row_buf, "gather_boolean_row")
+                                .build_load(row_vec, row_buf, "gather_boolean_row")
+                                .unwrap();
+                            let value = build
+                                .build_bit_cast(value, row_int, "gather_boolean_row_packed")
                                 .unwrap()
                                 .into_int_value();
                             let value = build
@@ -1234,6 +1242,9 @@ impl IteratorHolder {
                                 .build_or(output, value, "gather_boolean_rows")
                                 .unwrap();
                         }
+                        let output = build
+                            .build_bit_cast(output, output_vec, "gather_boolean_block")
+                            .unwrap();
                         build.build_store(out_ptr, output).unwrap();
                     }
                     ListItemType::P64x2 => return None,
@@ -1287,7 +1298,8 @@ impl IteratorHolder {
             }
             IteratorHolder::Bitmap(_) => {
                 let scalar_access = self.generate_random_access(ctx, llvm_mod)?;
-                let output_int = output_type.into_int_type();
+                let output_vec = output_type.into_vector_type();
+                let output_int = ctx.custom_width_int_type(rows);
                 let mut output = output_int.const_zero();
                 for row in 0..rows {
                     let idx = build
@@ -1322,6 +1334,9 @@ impl IteratorHolder {
                         .unwrap();
                     output = build.build_or(output, value, "gather_booleans").unwrap();
                 }
+                let output = build
+                    .build_bit_cast(output, output_vec, "gather_boolean_block")
+                    .unwrap();
                 build.build_store(out_ptr, output).unwrap();
             }
             _ => {

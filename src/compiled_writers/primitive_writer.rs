@@ -2,7 +2,7 @@ use arrow_array::{make_array, ArrayRef};
 use arrow_buffer::Buffer;
 use arrow_data::ArrayDataBuilder;
 use inkwell::{
-    values::{BasicValue, BasicValueEnum, PointerValue},
+    values::{BasicValue, BasicValueEnum, PointerValue, VectorValue},
     AddressSpace,
 };
 use repr_offset::ReprOffset;
@@ -159,10 +159,9 @@ impl Writer for PrimitiveWriter {
         &'borrow self,
         codegen: WriterCodegen<'ctx, 'borrow>,
         runtime_ptr: PointerValue<'ctx>,
-        values: BasicValueEnum<'ctx>,
+        values: VectorValue<'ctx>,
         logical_len: u32,
     ) -> Result<(), ArrowKernelError> {
-        let values = values.into_vector_value();
         if values.get_type().get_size() != logical_len {
             return Err(ArrowKernelError::InternalError(format!(
                 "primitive block has {} lanes for {logical_len} values",
@@ -312,9 +311,7 @@ mod tests {
         }
         let values = [8_i32, 9, 10].map(|value| ctx.i32_type().const_int(value as u64, true));
         let values = VectorType::const_vector(&values);
-        writer
-            .llvm_write_block(codegen, dest, values.into(), 3)
-            .unwrap();
+        writer.llvm_write_block(codegen, dest, values, 3).unwrap();
         build.build_return(None).unwrap();
         llvm_mod.verify().unwrap();
 

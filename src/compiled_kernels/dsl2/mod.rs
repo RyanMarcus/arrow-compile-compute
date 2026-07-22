@@ -317,8 +317,8 @@ pub enum DSLType {
     /// A fixed number of logical rows represented as one shaped LLVM value.
     ///
     /// Fixed-size-list rows retain their inner width in `element`; the LLVM
-    /// Numeric values contain `rows * inner_width` lanes in row-major order;
-    /// Boolean values use a packed integer with one bit per physical value.
+    /// values contain `rows * inner_width` lanes in row-major order, including
+    /// boolean values represented as `i1` lanes.
     Block(Box<DSLType>, usize),
     ConstScalar(Arc<dyn Datum>),
     Scalar(Box<DSLType>),
@@ -480,7 +480,7 @@ impl DSLType {
                 match element.as_ref() {
                     DSLType::Boolean
                     | DSLType::Primitive(PrimitiveType::List(ListItemType::Boolean, _)) => {
-                        Some(ctx.custom_width_int_type(lanes as u32).as_basic_type_enum())
+                        Some(ctx.bool_type().vec_type(lanes as u32).as_basic_type_enum())
                     }
                     _ => leaf
                         .llvm_vec_type(ctx, lanes as u32)

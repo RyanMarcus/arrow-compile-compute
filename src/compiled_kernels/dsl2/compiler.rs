@@ -600,7 +600,7 @@ fn compile_stmt<'ctx, 'a>(
                 ctx.ctx,
                 ctx.module,
                 ctx.b,
-                value,
+                value.into_vector_value(),
                 logical_len as u32,
             );
         }
@@ -1036,144 +1036,31 @@ pub fn compile_compare_values<'ctx, 'a>(
     lhs: BasicValueEnum<'ctx>,
     rhs: BasicValueEnum<'ctx>,
 ) -> Result<BasicValueEnum<'ctx>, ArrowKernelError> {
-    match lhs_type {
-        DSLType::Block(element, rows) => {
-            let packed_type = ctx.ctx.custom_width_int_type(*rows as u32);
-            match element.as_ref() {
-                DSLType::Boolean => {
-                    let lhs = lhs.into_int_value();
-                    let rhs = rhs.into_int_value();
-                    let xor = ctx.b.build_xor(lhs, rhs, "boolean_block_xor").unwrap();
-                    let result = match op {
-                        DSLComparison::Eq => ctx.b.build_not(xor, "boolean_block_eq").unwrap(),
-                        DSLComparison::Neq => xor,
-                        DSLComparison::Lt => ctx
-                            .b
-                            .build_and(
-                                ctx.b.build_not(lhs, "boolean_block_not_lhs").unwrap(),
-                                rhs,
-                                "boolean_block_lt",
-                            )
-                            .unwrap(),
-                        DSLComparison::Gt => ctx
-                            .b
-                            .build_and(
-                                lhs,
-                                ctx.b.build_not(rhs, "boolean_block_not_rhs").unwrap(),
-                                "boolean_block_gt",
-                            )
-                            .unwrap(),
-                        DSLComparison::Lte => ctx
-                            .b
-                            .build_or(
-                                ctx.b.build_not(lhs, "boolean_block_not_lhs").unwrap(),
-                                rhs,
-                                "boolean_block_lte",
-                            )
-                            .unwrap(),
-                        DSLComparison::Gte => ctx
-                            .b
-                            .build_or(
-                                lhs,
-                                ctx.b.build_not(rhs, "boolean_block_not_rhs").unwrap(),
-                                "boolean_block_gte",
-                            )
-                            .unwrap(),
-                    };
-                    Ok(result.as_basic_value_enum())
-                }
-                DSLType::Primitive(pt) if !matches!(pt, PrimitiveType::List(_, _)) => {
-                    let (lhs, rhs, signed) = match pt.comparison_type() {
-                        ComparisonType::Int { signed } => {
-                            (lhs.into_vector_value(), rhs.into_vector_value(), signed)
-                        }
-                        ComparisonType::Float => {
-                            let cvt =
-                                add_float_vec_to_int_vec(ctx.ctx, ctx.module, *rows as u32, *pt);
-                            let lhs = ctx
-                                .b
-                                .build_call(cvt, &[lhs.into()], "cvt_lhs_block")
-                                .unwrap()
-                                .try_as_basic_value()
-                                .unwrap_basic()
-                                .into_vector_value();
-                            let rhs = ctx
-                                .b
-                                .build_call(cvt, &[rhs.into()], "cvt_rhs_block")
-                                .unwrap()
-                                .try_as_basic_value()
-                                .unwrap_basic()
-                                .into_vector_value();
-                            (lhs, rhs, true)
-                        }
-                        _ => {
-                            return Err(ArrowKernelError::DSLInvalidType(
-                                "block comparison requires numeric or boolean rows",
-                                lhs_type.clone(),
-                            ))
-                        }
-                    };
-                    let compared = ctx
-                        .b
-                        .build_int_compare(op.as_int_predicate(signed), lhs, rhs, "block_cmp")
-                        .unwrap();
-                    Ok(ctx
-                        .b
-                        .build_bit_cast(compared, packed_type, "packed_block_cmp")
-                        .unwrap())
-                }
-                _ => Err(ArrowKernelError::DSLInvalidType(
-                    "fixed-size-list block comparison is not supported",
-                    lhs_type.clone(),
-                )),
-            }
+    let (element_type, is_block) = match lhs_type {
+        DSLType::Block(element, _) => (element.as_ref(), true),
+        DSLType::Boolean | DSLType::Primitive(_) => (lhs_type, false),
+        _ => {
+            return Err(ArrowKernelError::DSLInvalidType(
+                "comparison requires boolean or primitive values",
+                lhs_type.clone(),
+            ))
         }
-        DSLType::Boolean => Ok(ctx
-            .b
-            .build_int_compare(
-                op.as_int_predicate(false),
-                lhs.into_int_value(),
-                rhs.into_int_value(),
-                "cmp",
-            )
-            .unwrap()
-            .as_basic_value_enum()),
+    };
+
+    match element_type {
+        DSLType::Boolean => build_integer_comparison(ctx, op, false, lhs, rhs, "boolean_cmp"),
         DSLType::Primitive(pt) => match pt.comparison_type() {
             ComparisonType::Float => {
-                let cvt = add_float_to_int(ctx.ctx, ctx.module, *pt);
-                let lhs = ctx
-                    .b
-                    .build_call(cvt, &[lhs.into()], "cvt_lhs_for_total_order")
-                    .unwrap()
-                    .try_as_basic_value()
-                    .unwrap_basic();
-                let rhs = ctx
-                    .b
-                    .build_call(cvt, &[rhs.into()], "cvt_rhs_for_total_order")
-                    .unwrap()
-                    .try_as_basic_value()
-                    .unwrap_basic();
-                Ok(ctx
-                    .b
-                    .build_int_compare(
-                        op.as_int_predicate(true),
-                        lhs.into_int_value(),
-                        rhs.into_int_value(),
-                        "cmp",
-                    )
-                    .unwrap()
-                    .as_basic_value_enum())
+                let (lhs, rhs) = float_total_order_keys(ctx, *pt, lhs, rhs)?;
+                build_integer_comparison(ctx, op, true, lhs, rhs, "float_cmp")
             }
-            ComparisonType::Int { signed } => Ok(ctx
-                .b
-                .build_int_compare(
-                    op.as_int_predicate(signed),
-                    lhs.into_int_value(),
-                    rhs.into_int_value(),
-                    "cmp",
-                )
-                .unwrap()
-                .as_basic_value_enum()),
+            ComparisonType::Int { signed } => {
+                build_integer_comparison(ctx, op, signed, lhs, rhs, "int_cmp")
+            }
+            ComparisonType::String if is_block => Err(ArrowKernelError::DSLInvalidType(
+                "block comparison requires numeric or boolean rows",
+                lhs_type.clone(),
+            )),
             ComparisonType::String => {
                 let memcmp = add_memcmp(ctx.ctx, ctx.module);
                 let memcmp_res = ctx
@@ -1183,18 +1070,19 @@ pub fn compile_compare_values<'ctx, 'a>(
                     .try_as_basic_value()
                     .unwrap_basic()
                     .into_int_value();
-
-                Ok(ctx
-                    .b
-                    .build_int_compare(
-                        op.as_int_predicate(true),
-                        memcmp_res,
-                        ctx.ctx.i64_type().const_zero(),
-                        "cmp",
-                    )
-                    .unwrap()
-                    .as_basic_value_enum())
+                build_integer_comparison(
+                    ctx,
+                    op,
+                    true,
+                    memcmp_res.as_basic_value_enum(),
+                    ctx.ctx.i64_type().const_zero().as_basic_value_enum(),
+                    "string_cmp",
+                )
             }
+            ComparisonType::List(_) if is_block => Err(ArrowKernelError::DSLInvalidType(
+                "fixed-size-list block comparison is not supported",
+                lhs_type.clone(),
+            )),
             ComparisonType::List(_) => compare_list_values(ctx, op, *pt, lhs, rhs),
         },
         _ => Err(ArrowKernelError::DSLInvalidType(
@@ -1202,6 +1090,69 @@ pub fn compile_compare_values<'ctx, 'a>(
             lhs_type.clone(),
         )),
     }
+}
+
+fn build_integer_comparison<'ctx>(
+    ctx: &DSLCompilationContext<'ctx, '_>,
+    op: DSLComparison,
+    signed: bool,
+    lhs: BasicValueEnum<'ctx>,
+    rhs: BasicValueEnum<'ctx>,
+    name: &str,
+) -> Result<BasicValueEnum<'ctx>, ArrowKernelError> {
+    let predicate = op.as_int_predicate(signed);
+    match (lhs, rhs) {
+        (BasicValueEnum::IntValue(lhs), BasicValueEnum::IntValue(rhs)) => Ok(ctx
+            .b
+            .build_int_compare(predicate, lhs, rhs, name)
+            .unwrap()
+            .as_basic_value_enum()),
+        (BasicValueEnum::VectorValue(lhs), BasicValueEnum::VectorValue(rhs)) => Ok(ctx
+            .b
+            .build_int_compare(predicate, lhs, rhs, name)
+            .unwrap()
+            .as_basic_value_enum()),
+        _ => Err(ArrowKernelError::InternalError(
+            "integer comparison operands have different shapes".into(),
+        )),
+    }
+}
+
+fn float_total_order_keys<'ctx>(
+    ctx: &DSLCompilationContext<'ctx, '_>,
+    pt: PrimitiveType,
+    lhs: BasicValueEnum<'ctx>,
+    rhs: BasicValueEnum<'ctx>,
+) -> Result<(BasicValueEnum<'ctx>, BasicValueEnum<'ctx>), ArrowKernelError> {
+    let cvt = match (lhs, rhs) {
+        (BasicValueEnum::VectorValue(lhs), BasicValueEnum::VectorValue(rhs)) => {
+            if lhs.get_type() != rhs.get_type() {
+                return Err(ArrowKernelError::InternalError(
+                    "float comparison operands have different vector types".into(),
+                ));
+            }
+            add_float_vec_to_int_vec(ctx.ctx, ctx.module, lhs.get_type().get_size(), pt)
+        }
+        (BasicValueEnum::FloatValue(_), BasicValueEnum::FloatValue(_)) => {
+            add_float_to_int(ctx.ctx, ctx.module, pt)
+        }
+        _ => {
+            return Err(ArrowKernelError::InternalError(
+                "float comparison operands have different shapes".into(),
+            ))
+        }
+    };
+    let convert = |value, name| {
+        ctx.b
+            .build_call(cvt, &[value], name)
+            .unwrap()
+            .try_as_basic_value()
+            .unwrap_basic()
+    };
+    Ok((
+        convert(lhs.into(), "cvt_lhs_for_total_order"),
+        convert(rhs.into(), "cvt_rhs_for_total_order"),
+    ))
 }
 
 fn compare_list_values<'ctx, 'a>(
@@ -1217,45 +1168,13 @@ fn compare_list_values<'ctx, 'a>(
 
     if item != ListItemType::Boolean && lhs.is_vector_value() && rhs.is_vector_value() {
         return match PrimitiveType::from(item).comparison_type() {
-            ComparisonType::Int { signed } => Ok(ctx
-                .b
-                .build_int_compare(
-                    op.as_int_predicate(signed),
-                    lhs.into_vector_value(),
-                    rhs.into_vector_value(),
-                    "cmpv",
-                )
-                .unwrap()
-                .as_basic_value_enum()),
+            ComparisonType::Int { signed } => {
+                build_integer_comparison(ctx, op, signed, lhs, rhs, "list_int_cmp")
+            }
             ComparisonType::Float => {
-                let cvt = add_float_vec_to_int_vec(
-                    ctx.ctx,
-                    ctx.module,
-                    size as u32,
-                    pt.list_type_into_inner(),
-                );
-                let lhs = ctx
-                    .b
-                    .build_call(cvt, &[lhs.into()], "cvt_lhs_for_total_order")
-                    .unwrap()
-                    .try_as_basic_value()
-                    .unwrap_basic();
-                let rhs = ctx
-                    .b
-                    .build_call(cvt, &[rhs.into()], "cvt_rhs_for_total_order")
-                    .unwrap()
-                    .try_as_basic_value()
-                    .unwrap_basic();
-                Ok(ctx
-                    .b
-                    .build_int_compare(
-                        op.as_int_predicate(true),
-                        lhs.into_vector_value(),
-                        rhs.into_vector_value(),
-                        "cmpfv",
-                    )
-                    .unwrap()
-                    .as_basic_value_enum())
+                let inner = pt.list_type_into_inner();
+                let (lhs, rhs) = float_total_order_keys(ctx, inner, lhs, rhs)?;
+                build_integer_comparison(ctx, op, true, lhs, rhs, "list_float_cmp")
             }
             ComparisonType::String | ComparisonType::List(_) => {
                 Err(ArrowKernelError::DSLInvalidType(
@@ -1500,15 +1419,7 @@ fn compile_expr<'ctx, 'a>(
             match orig_type {
                 DSLType::Block(ref element, rows) => match element.as_ref() {
                     DSLType::Boolean if tar_pt.is_int() => {
-                        let bools = ctx
-                            .b
-                            .build_bit_cast(
-                                val,
-                                ctx.ctx.bool_type().vec_type(rows as u32),
-                                "boolean_block_values",
-                            )
-                            .unwrap()
-                            .into_vector_value();
+                        let bools = val.into_vector_value();
                         let target = tar_pt.llvm_vec_type(ctx.ctx, rows as u32).unwrap();
                         Ok(ctx
                             .b
@@ -1635,7 +1546,7 @@ fn compile_expr<'ctx, 'a>(
         DSLExpr::CastToBool(v) => {
             let child = compile_expr(ctx, v)?;
             match v.get_type() {
-                DSLType::Block(element, rows) => {
+                DSLType::Block(element, _) => {
                     let DSLType::Primitive(pt) = element.as_ref() else {
                         return Err(ArrowKernelError::DSLInvalidType(
                             "cannot cast this block to bool",
@@ -1668,14 +1579,7 @@ fn compile_expr<'ctx, 'a>(
                             )
                             .unwrap()
                     };
-                    Ok(ctx
-                        .b
-                        .build_bit_cast(
-                            bools,
-                            ctx.ctx.custom_width_int_type(rows as u32),
-                            "packed_boolean_block",
-                        )
-                        .unwrap())
+                    Ok(bools.as_basic_value_enum())
                 }
                 DSLType::Boolean => Ok(child),
                 DSLType::Primitive(pt) => {
@@ -2176,15 +2080,13 @@ fn compile_expr<'ctx, 'a>(
         }
 
         DSLExpr::Select(cond, v1, v2) => {
-            let cond_v = compile_expr(ctx, cond)?.into_int_value();
+            let cond_v = compile_expr(ctx, cond)?;
             let v1_v = compile_expr(ctx, v1)?;
             let v2_v = compile_expr(ctx, v2)?;
-            if let DSLType::Block(element, rows) = v1.get_type() {
-                let (lanes_per_row, packed) = match element.as_ref() {
-                    DSLType::Boolean => (1, true),
-                    DSLType::Primitive(PrimitiveType::List(ListItemType::Boolean, size)) => {
-                        (*size, true)
-                    }
+            if let DSLType::Block(element, _) = v1.get_type() {
+                let lanes_per_row = match element.as_ref() {
+                    DSLType::Boolean => 1,
+                    DSLType::Primitive(PrimitiveType::List(ListItemType::Boolean, size)) => *size,
                     DSLType::Primitive(PrimitiveType::List(ListItemType::P64x2, _))
                     | DSLType::Primitive(PrimitiveType::P64x2) => {
                         return Err(ArrowKernelError::DSLInvalidType(
@@ -2192,8 +2094,8 @@ fn compile_expr<'ctx, 'a>(
                             v1.get_type(),
                         ))
                     }
-                    DSLType::Primitive(PrimitiveType::List(_, size)) => (*size, false),
-                    DSLType::Primitive(_) => (1, false),
+                    DSLType::Primitive(PrimitiveType::List(_, size)) => *size,
+                    DSLType::Primitive(_) => 1,
                     _ => {
                         return Err(ArrowKernelError::DSLInvalidType(
                             "cannot select this block type",
@@ -2201,46 +2103,17 @@ fn compile_expr<'ctx, 'a>(
                         ))
                     }
                 };
-                let row_mask_type = ctx.ctx.bool_type().vec_type(rows as u32);
-                let row_mask = ctx
-                    .b
-                    .build_bit_cast(cond_v, row_mask_type, "select_row_mask")
-                    .unwrap()
-                    .into_vector_value();
+                let row_mask = cond_v.into_vector_value();
                 let mask = if lanes_per_row == 1 {
                     row_mask
                 } else {
                     repeat_vector_lanes(ctx, row_mask, lanes_per_row, "select_mask")
                 };
-
-                if packed {
-                    let value_type = v1_v.get_type();
-                    let lane_type = ctx.ctx.bool_type().vec_type((rows * lanes_per_row) as u32);
-                    let v1_lanes = ctx
-                        .b
-                        .build_bit_cast(v1_v, lane_type, "select_true_lanes")
-                        .unwrap()
-                        .into_vector_value();
-                    let v2_lanes = ctx
-                        .b
-                        .build_bit_cast(v2_v, lane_type, "select_false_lanes")
-                        .unwrap()
-                        .into_vector_value();
-                    let selected = ctx
-                        .b
-                        .build_select(mask, v1_lanes, v2_lanes, "select")
-                        .unwrap();
-                    return Ok(ctx
-                        .b
-                        .build_bit_cast(selected, value_type, "select_packed")
-                        .unwrap());
-                }
-
                 return Ok(ctx.b.build_select(mask, v1_v, v2_v, "select").unwrap());
             }
             Ok(ctx
                 .b
-                .build_select(cond_v, v1_v, v2_v, "select")
+                .build_select(cond_v.into_int_value(), v1_v, v2_v, "select")
                 .unwrap()
                 .as_basic_value_enum())
         }
