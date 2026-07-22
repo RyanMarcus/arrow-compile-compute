@@ -244,9 +244,7 @@ mod tests {
         let res = k.call(&arr).unwrap();
         let res = res.as_primitive::<UInt32Type>();
 
-        let expected = UInt32Array::from(
-            (0..arr.len()).map(|i| arr.value(i)).collect::<Vec<_>>(),
-        );
+        let expected = UInt32Array::from((0..arr.len()).map(|i| arr.value(i)).collect::<Vec<_>>());
         assert_eq!(res, &expected);
     }
 

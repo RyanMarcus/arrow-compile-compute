@@ -161,18 +161,24 @@ impl RunnableDSLFunction {
 
             match input {
                 DSLArgument::Datum(datum) => {
+                    let (array, is_scalar) = datum.get();
                     if !arg_type.is_set_bit() {
                         let ih = datum_to_iter(*datum)?;
                         prepared.ihs.push(ih);
                     } else {
-                        let ih = array_to_setbit_iter(datum.get().0.as_boolean())?;
+                        let ih = array_to_setbit_iter(array.as_boolean())?;
                         prepared.ihs.push(ih);
                     }
                     prepared
                         .ptrs
                         .push(prepared.ihs.last().unwrap().get_ptr() as *mut c_void);
-                    if !datum.get().1 {
-                        prepared.input_lengths.push(datum.get().0.len());
+                    if !is_scalar {
+                        let len = if arg_type.is_set_bit() {
+                            array.as_boolean().true_count()
+                        } else {
+                            array.len()
+                        };
+                        prepared.input_lengths.push(len);
                     }
                 }
                 DSLArgument::TwoDArray(datums) => {
@@ -219,5 +225,28 @@ fn resolved_len(res: ResolveResult) -> usize {
             // inputs. In that case, allocate capacity for a single result.
             1
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use arrow_array::BooleanArray;
+
+    use crate::compiled_kernels::dsl2::{compile, dsl_args, DSLContext, DSLFunction, DSLType};
+
+    #[test]
+    fn set_bit_input_length_is_selected_bit_count() {
+        let mut ctx = DSLContext::new();
+        let mut function = DSLFunction::new("set_bit_input_length");
+        function.add_arg(&mut ctx, DSLType::set_bits("m"));
+
+        let compile_input = BooleanArray::new_null(0);
+        let function = compile(function, dsl_args![compile_input]).unwrap();
+
+        let input = BooleanArray::from(vec![true, false, false, true, false]);
+        let args = dsl_args![input];
+        let prepared = function.prepare_inputs(&args).unwrap();
+
+        assert_eq!(prepared.input_lengths, vec![2]);
     }
 }

@@ -2030,7 +2030,9 @@ fn compile_expr<'ctx, 'a>(
                 DSLType::Primitive(pt) if pt.is_int() && !pt.is_signed() => Ok(value),
                 DSLType::Primitive(pt) if pt.is_int() => {
                     let abs = Intrinsic::find("llvm.abs").unwrap();
-                    let abs = abs.get_declaration(ctx.module, &[value.get_type()]).unwrap();
+                    let abs = abs
+                        .get_declaration(ctx.module, &[value.get_type()])
+                        .unwrap();
                     Ok(ctx
                         .b
                         .build_call(abs, &[value.into(), no_poison.into()], "abs")
@@ -2040,7 +2042,9 @@ fn compile_expr<'ctx, 'a>(
                 }
                 DSLType::Primitive(pt) if pt.is_float() => {
                     let fabs = Intrinsic::find("llvm.fabs").unwrap();
-                    let fabs = fabs.get_declaration(ctx.module, &[value.get_type()]).unwrap();
+                    let fabs = fabs
+                        .get_declaration(ctx.module, &[value.get_type()])
+                        .unwrap();
                     Ok(ctx
                         .b
                         .build_call(fabs, &[value.into()], "abs")
@@ -2052,7 +2056,9 @@ fn compile_expr<'ctx, 'a>(
                     let inner = PrimitiveType::from(item);
                     if inner.is_float() {
                         let fabs = Intrinsic::find("llvm.fabs").unwrap();
-                        let fabs = fabs.get_declaration(ctx.module, &[value.get_type()]).unwrap();
+                        let fabs = fabs
+                            .get_declaration(ctx.module, &[value.get_type()])
+                            .unwrap();
                         Ok(ctx
                             .b
                             .build_call(fabs, &[value.into()], "abs")
@@ -2061,7 +2067,9 @@ fn compile_expr<'ctx, 'a>(
                             .unwrap_basic())
                     } else if inner.is_signed() {
                         let abs = Intrinsic::find("llvm.abs").unwrap();
-                        let abs = abs.get_declaration(ctx.module, &[value.get_type()]).unwrap();
+                        let abs = abs
+                            .get_declaration(ctx.module, &[value.get_type()])
+                            .unwrap();
                         Ok(ctx
                             .b
                             .build_call(abs, &[value.into(), no_poison.into()], "abs")

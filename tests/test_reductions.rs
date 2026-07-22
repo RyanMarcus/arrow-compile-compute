@@ -154,7 +154,10 @@ fn test_compute_product_wraps() {
     let arr = Int32Array::from(vec![i32::MAX, i32::MAX, 4]);
     let result = compute::product(&arr).unwrap();
     let result = result.as_primitive::<Int32Type>();
-    assert_eq!(result.value(0), arrow_arith::aggregate::product(&arr).unwrap());
+    assert_eq!(
+        result.value(0),
+        arrow_arith::aggregate::product(&arr).unwrap()
+    );
 }
 
 #[test]
@@ -163,7 +166,10 @@ fn test_compute_sum_product_empty_is_null() {
     let sum = compute::sum(&arr).unwrap();
     assert_eq!(sum.as_primitive::<Int32Type>().iter().next().unwrap(), None);
     let product = compute::product(&arr).unwrap();
-    assert_eq!(product.as_primitive::<Int32Type>().iter().next().unwrap(), None);
+    assert_eq!(
+        product.as_primitive::<Int32Type>().iter().next().unwrap(),
+        None
+    );
 }
 
 #[test]
@@ -172,7 +178,10 @@ fn test_compute_sum_product_all_null_is_null() {
     let sum = compute::sum(&arr).unwrap();
     assert_eq!(sum.as_primitive::<Int32Type>().iter().next().unwrap(), None);
     let product = compute::product(&arr).unwrap();
-    assert_eq!(product.as_primitive::<Int32Type>().iter().next().unwrap(), None);
+    assert_eq!(
+        product.as_primitive::<Int32Type>().iter().next().unwrap(),
+        None
+    );
 }
 
 #[test]

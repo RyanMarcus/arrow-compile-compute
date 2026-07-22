@@ -269,7 +269,10 @@ impl DSLReductionType {
                 // only fold in the new value when the row is included; is_init
                 // tracks whether any value was seen so an empty/all-null reduction
                 // can report EmptyReduction in output_value.
-                let new_val = ctx.b.build_select(include, combined, val, "new_val").unwrap();
+                let new_val = ctx
+                    .b
+                    .build_select(include, combined, val, "new_val")
+                    .unwrap();
                 let new_is_init = ctx.b.build_or(is_init, include, "new_is_init").unwrap();
                 let accum = ctx
                     .b

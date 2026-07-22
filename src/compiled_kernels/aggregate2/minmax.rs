@@ -102,7 +102,11 @@ impl Kernel for MinMaxAggKernel {
                             DSLStmt::cond(
                                 data.cmp(
                                     &cur,
-                                    if is_min { DSLComparison::Lt } else { DSLComparison::Gt },
+                                    if is_min {
+                                        DSLComparison::Lt
+                                    } else {
+                                        DSLComparison::Gt
+                                    },
                                 )?,
                                 DSLStmt::set_with_saver(&buf_arg, &ticket, &data, &ss_arg)?,
                             )?,
@@ -132,7 +136,11 @@ impl Kernel for MinMaxAggKernel {
                         DSLStmt::cond(
                             data.cmp(
                                 &cur,
-                                if is_min { DSLComparison::Lt } else { DSLComparison::Gt },
+                                if is_min {
+                                    DSLComparison::Lt
+                                } else {
+                                    DSLComparison::Gt
+                                },
                             )?,
                             DSLStmt::set_with_saver(&buf_arg, &ticket, &data, &ss_arg)?,
                         )?,
@@ -164,10 +172,7 @@ impl Kernel for MinMaxAggKernel {
         }
         let func = compile(func, args)?;
 
-        Ok(Self {
-            k: func,
-            has_nulls,
-        })
+        Ok(Self { k: func, has_nulls })
     }
 
     fn get_key_for_input(
@@ -591,5 +596,4 @@ mod tests {
             ]
         );
     }
-
 }
