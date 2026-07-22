@@ -80,7 +80,7 @@ pub fn criterion_benchmark(c: &mut Criterion) {
             b.iter(|| arrow_ord::cmp::eq(&data1, &data2).unwrap())
         });
         c.bench_function("dict_i32/execute llvm", |b| {
-            b.iter(|| arrow_ord::cmp::eq(&data1, &data2).unwrap());
+            b.iter(|| arrow_compile_compute::cmp::eq(&data1, &data2).unwrap());
         });
     }
 

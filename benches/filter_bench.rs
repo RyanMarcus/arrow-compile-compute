@@ -53,11 +53,11 @@ pub fn criterion_benchmark(c: &mut Criterion) {
             our_res.len()
         );
 
-        c.bench_function("take ree i32/llvm", |b| {
+        c.bench_function("filter ree i32/llvm", |b| {
             b.iter(|| arrow_compile_compute::select::filter(&data, &mask).unwrap())
         });
 
-        c.bench_function("take ree i32/arrow", |b| {
+        c.bench_function("filter ree i32/arrow", |b| {
             b.iter(|| arrow_select::filter::filter(&data, &mask).unwrap())
         });
     }

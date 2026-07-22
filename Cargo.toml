@@ -96,3 +96,15 @@ harness = false
 [[bench]]
 name = "bounds_bench"
 harness = false
+
+[[bench]]
+name = "neg_bench"
+harness = false
+
+[[bench]]
+name = "aggregate_bench"
+harness = false
+
+[[bench]]
+name = "matrix_bench"
+harness = false

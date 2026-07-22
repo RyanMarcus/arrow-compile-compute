@@ -1,0 +1,121 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>arrow-compile-compute benchmarks</title>
+<style>
+  :root { color-scheme: light dark; }
+  body { font: 15px/1.5 -apple-system, system-ui, sans-serif; max-width: 1000px;
+         margin: 2rem auto; padding: 0 1rem; }
+  h1 { margin-bottom: .2rem; }
+  .meta { color: #888; margin-top: 0; }
+  h2 { margin-top: 2.4rem; border-bottom: 1px solid #8884; padding-bottom: .3rem; }
+  .count { font-size: .7em; color: #888; font-weight: normal; }
+  .sub { color: #888; margin-top: .2rem; }
+  table { border-collapse: collapse; width: 100%; margin-top: .5rem; }
+  th, td { text-align: left; padding: .35rem .6rem; border-bottom: 1px solid #8883; }
+  th { font-size: .78em; text-transform: uppercase; letter-spacing: .03em; color: #888; }
+  .num { font-variant-numeric: tabular-nums; font-family: ui-monospace, monospace; text-align: right; }
+  td.name { font-family: ui-monospace, monospace; }
+  td.compile { color: #9a6700; }
+  td.total { color: #888; }
+  .badge { font-weight: 600; }
+  tr.win  td.badge { color: #1a7f37; }
+  tr.loss td.badge { color: #b3261e; }
+  tr.win  { background: #1a7f3712; }
+  tr.loss { background: #b3261e10; }
+  details { margin-top: 2rem; }
+  summary { cursor: pointer; color: #888; }
+</style>
+</head>
+<body>
+<h1>arrow-compile-compute &mdash; JIT vs arrow-rs</h1>
+<p class="meta">Criterion medians, host CPU. Generated 2026-07-21. Lower is better.</p>
+
+<h2>Input matrix: compile vs execute <span class="count">8</span></h2>
+<p class="sub">The JIT pays <b>compile</b> once per kernel shape (LLVM IR-gen + JIT), then every
+call is the warm <b>execute</b> cost. <b>total = compile + execute</b> is the cost of a single
+cold call; amortized over many calls it tends to <b>execute</b>. The verdict compares
+<b>execute</b> vs arrow. For dict inputs the JIT reads the encoding directly while arrow must
+decode first.</p>
+<table>
+<thead><tr><th>benchmark</th><th>llvm compile</th><th>llvm execute</th><th>total (1 call)</th><th>arrow</th><th>execute vs arrow</th></tr></thead>
+<tbody>
+<tr class="win"><td class="name">cmp::lt i32 dict-scalar</td><td class="num compile">24.6 ms</td><td class="num">191 µs</td><td class="num total">24.8 ms</td><td class="num">508 µs</td><td class="num badge">2.65× faster</td></tr>
+<tr class="win"><td class="name">cmp::lt i32 array-scalar</td><td class="num compile">6.51 ms</td><td class="num">44.3 µs</td><td class="num total">6.56 ms</td><td class="num">111 µs</td><td class="num badge">2.50× faster</td></tr>
+<tr class="win"><td class="name">cmp::lt i32 array-array</td><td class="num compile">7.76 ms</td><td class="num">72.2 µs</td><td class="num total">7.83 ms</td><td class="num">112 µs</td><td class="num badge">1.55× faster</td></tr>
+<tr class="win"><td class="name">cmp::lt utf8 array-array</td><td class="num compile">5.58 ms</td><td class="num">1.67 ms</td><td class="num total">7.25 ms</td><td class="num">1.81 ms</td><td class="num badge">1.08× faster</td></tr>
+<tr class="loss"><td class="name">aggregate::sum i32 dict</td><td class="num compile">2.84 ms</td><td class="num">307 µs</td><td class="num total">3.15 ms</td><td class="num">291 µs</td><td class="num badge">1.05× slower</td></tr>
+<tr class="loss"><td class="name">numeric::neg wrapping i32 array</td><td class="num compile">4.24 ms</td><td class="num">82.3 µs</td><td class="num total">4.33 ms</td><td class="num">66.1 µs</td><td class="num badge">1.24× slower</td></tr>
+<tr class="loss"><td class="name">aggregate::sum i32 array</td><td class="num compile">3.65 ms</td><td class="num">63.3 µs</td><td class="num total">3.71 ms</td><td class="num">35.6 µs</td><td class="num badge">1.78× slower</td></tr>
+<tr class="loss"><td class="name">numeric::neg wrapping i32 dict</td><td class="num compile">2.26 ms</td><td class="num">1.08 ms</td><td class="num total">3.34 ms</td><td class="num">322 µs</td><td class="num badge">3.36× slower</td></tr>
+</tbody></table>
+
+<h2>Other benchmarks: execute vs arrow <span class="count">36</span></h2>
+<p class="sub">Older two-phase benches (execution only; compile not isolated).</p>
+<table>
+<thead><tr><th>benchmark</th><th>llvm</th><th>arrow</th><th>result</th></tr></thead>
+<tbody>
+<tr class="win"><td class="name">norm</td><td class="num">2.7 ms</td><td class="num">19.1 ms</td><td class="num badge">7.07× faster</td></tr>
+<tr class="win"><td class="name">dot</td><td class="num">1.01 ms</td><td class="num">7.04 ms</td><td class="num badge">6.97× faster</td></tr>
+<tr class="win"><td class="name">dict</td><td class="num">63.7 ms</td><td class="num">395 ms</td><td class="num badge">6.20× faster</td></tr>
+<tr class="win"><td class="name">convert u64 to dict</td><td class="num">27 ms</td><td class="num">130 ms</td><td class="num badge">4.83× faster</td></tr>
+<tr class="win"><td class="name">bounds scalar i32</td><td class="num">64 µs</td><td class="num">229 µs</td><td class="num badge">3.58× faster</td></tr>
+<tr class="win"><td class="name">strlt execute</td><td class="num">1.05 ms</td><td class="num">3.47 ms</td><td class="num badge">3.31× faster</td></tr>
+<tr class="win"><td class="name">dict prim i32 execute</td><td class="num">2.26 ms</td><td class="num">6.66 ms</td><td class="num badge">2.94× faster</td></tr>
+<tr class="win"><td class="name">convert ree i64 to i64</td><td class="num">1.57 ms</td><td class="num">4.56 ms</td><td class="num badge">2.90× faster</td></tr>
+<tr class="win"><td class="name">cast eq execute</td><td class="num">1.71 ms</td><td class="num">4.32 ms</td><td class="num badge">2.53× faster</td></tr>
+<tr class="win"><td class="name">i32scalar execute</td><td class="num">602 µs</td><td class="num">1.15 ms</td><td class="num badge">1.92× faster</td></tr>
+<tr class="win"><td class="name">f32 lt execute</td><td class="num">1.39 ms</td><td class="num">2.06 ms</td><td class="num badge">1.48× faster</td></tr>
+<tr class="win"><td class="name">convert str to dict</td><td class="num">37.6 ms</td><td class="num">54.8 ms</td><td class="num badge">1.46× faster</td></tr>
+<tr class="win"><td class="name">cmpi32 execute</td><td class="num">1.1 ms</td><td class="num">1.15 ms</td><td class="num badge">1.05× faster</td></tr>
+<tr class="win"><td class="name">concat cast i32</td><td class="num">2.51 ms</td><td class="num">2.58 ms</td><td class="num badge">1.03× faster</td></tr>
+<tr class="win"><td class="name">dict i32 execute</td><td class="num">7.16 ms</td><td class="num">7.32 ms</td><td class="num badge">1.02× faster</td></tr>
+<tr class="loss"><td class="name">filter i32</td><td class="num">4.05 ms</td><td class="num">3.64 ms</td><td class="num badge">1.11× slower</td></tr>
+<tr class="loss"><td class="name">take bool</td><td class="num">891 µs</td><td class="num">782 µs</td><td class="num badge">1.14× slower</td></tr>
+<tr class="loss"><td class="name">take i32</td><td class="num">2.56 ms</td><td class="num">2.22 ms</td><td class="num badge">1.15× slower</td></tr>
+<tr class="loss"><td class="name">sort i32</td><td class="num">16.4 ms</td><td class="num">13.8 ms</td><td class="num badge">1.19× slower</td></tr>
+<tr class="loss"><td class="name">convert dict i64 to i64</td><td class="num">4.25 ms</td><td class="num">3.57 ms</td><td class="num badge">1.19× slower</td></tr>
+<tr class="loss"><td class="name">neg f64</td><td class="num">2.8 ms</td><td class="num">2.28 ms</td><td class="num badge">1.23× slower</td></tr>
+<tr class="loss"><td class="name">convert dict to str</td><td class="num">13.6 ms</td><td class="num">10.6 ms</td><td class="num badge">1.28× slower</td></tr>
+<tr class="loss"><td class="name">convert prim i8 to i16</td><td class="num">654 µs</td><td class="num">494 µs</td><td class="num badge">1.32× slower</td></tr>
+<tr class="loss"><td class="name">convert prim i32 to i64</td><td class="num">3.09 ms</td><td class="num">2.14 ms</td><td class="num badge">1.44× slower</td></tr>
+<tr class="loss"><td class="name">sort nullable i32</td><td class="num">11.1 ms</td><td class="num">7.31 ms</td><td class="num badge">1.52× slower</td></tr>
+<tr class="loss"><td class="name">neg i32</td><td class="num">1.38 ms</td><td class="num">906 µs</td><td class="num badge">1.52× slower</td></tr>
+<tr class="loss"><td class="name">sort multicol</td><td class="num">113 ms</td><td class="num">70.5 ms</td><td class="num badge">1.61× slower</td></tr>
+<tr class="loss"><td class="name">min i32</td><td class="num">950 µs</td><td class="num">580 µs</td><td class="num badge">1.64× slower</td></tr>
+<tr class="loss"><td class="name">product i32</td><td class="num">957 µs</td><td class="num">568 µs</td><td class="num badge">1.69× slower</td></tr>
+<tr class="loss"><td class="name">sum i32</td><td class="num">958 µs</td><td class="num">556 µs</td><td class="num badge">1.72× slower</td></tr>
+<tr class="loss"><td class="name">max i32</td><td class="num">1.05 ms</td><td class="num">550 µs</td><td class="num badge">1.91× slower</td></tr>
+<tr class="loss"><td class="name">take ree i32</td><td class="num">2.75 ms</td><td class="num">1.42 ms</td><td class="num badge">1.93× slower</td></tr>
+<tr class="loss"><td class="name">concat i32</td><td class="num">2.18 ms</td><td class="num">1 ms</td><td class="num badge">2.17× slower</td></tr>
+<tr class="loss"><td class="name">ree</td><td class="num">6.01 µs</td><td class="num">1.34 µs</td><td class="num badge">4.48× slower</td></tr>
+<tr class="loss"><td class="name">dict eq ree i32 execute</td><td class="num">1.88 ms</td><td class="num">104 µs</td><td class="num badge">18.10× slower</td></tr>
+<tr class="loss"><td class="name">concat fixed bool[8]</td><td class="num">5.63 ms</td><td class="num">203 µs</td><td class="num badge">27.71× slower</td></tr>
+</tbody></table>
+
+<details>
+<summary>Unpaired benchmarks (16) &mdash; no arrow oracle / internal</summary>
+<table><thead><tr><th>benchmark</th><th>median</th></tr></thead>
+<tbody>
+<tr><td class="name">boolean array from Vec_bool_</td><td class="num">6.47 ms</td></tr>
+<tr><td class="name">compile</td><td class="num">7.86 ms</td></tr>
+<tr><td class="name">dict eq ree cast i32 execute (execute)</td><td class="num">1.92 ms</td></tr>
+<tr><td class="name">fixed bool writer byte materialize</td><td class="num">6.47 ms</td></tr>
+<tr><td class="name">iter_dict</td><td class="num">262 ms</td></tr>
+<tr><td class="name">murmur i32</td><td class="num">30.8 ms</td></tr>
+<tr><td class="name">murmur i64</td><td class="num">56.1 ms</td></tr>
+<tr><td class="name">nearest neighbor 256x8 -dsl (execute)</td><td class="num">858 ns</td></tr>
+<tr><td class="name">overhead (arrow)</td><td class="num">53.8 ns</td></tr>
+<tr><td class="name">overhead ht (execute)</td><td class="num">416 ns</td></tr>
+<tr><td class="name">overhead kernel (execute)</td><td class="num">380 ns</td></tr>
+<tr><td class="name">parallel_rayon</td><td class="num">2.73 ms</td></tr>
+<tr><td class="name">parallel_serial</td><td class="num">12.3 ms</td></tr>
+<tr><td class="name">ree eq execute (execute)</td><td class="num">1.52 ms</td></tr>
+<tr><td class="name">unchained i32</td><td class="num">83.4 ms</td></tr>
+<tr><td class="name">unchained i64</td><td class="num">83.1 ms</td></tr>
+</tbody></table>
+</details>
+</body>
+</html>
