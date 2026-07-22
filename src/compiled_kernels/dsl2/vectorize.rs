@@ -121,9 +121,9 @@ impl DSLExpr {
                 }),
                 Box::new(rhs.try_vectorize(lvm)?),
             )),
-            DSLExpr::Cast(expr, pt) => {
+            DSLExpr::Cast(expr, target) => {
                 let vec_expr = expr.try_vectorize(lvm)?;
-                Some(DSLExpr::Cast(Box::new(vec_expr), *pt))
+                Some(DSLExpr::Cast(Box::new(vec_expr), target.clone()))
             }
             DSLExpr::BitCast(expr, pt) => {
                 let vec_expr = expr.try_vectorize(lvm)?;

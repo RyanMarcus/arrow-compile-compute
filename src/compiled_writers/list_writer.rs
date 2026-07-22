@@ -14,7 +14,7 @@ use inkwell::{
 use repr_offset::ReprOffset;
 
 use crate::{
-    compiled_iter::IteratorHolder,
+    compiled_iter::IteratorSource,
     compiled_writers::{
         AnyRuntime, AnyWriter, AnyWriterEmitter, PrimitiveWriter, Writer, WriterCodegen,
         WriterEmitter, WriterRuntime,
@@ -90,7 +90,7 @@ impl ListWriter {
         &'borrow self,
         codegen: WriterCodegen<'ctx, 'borrow>,
         runtime_ptr: PointerValue<'ctx>,
-        source_child: &IteratorHolder,
+        source_child: IteratorSource<'_, 'ctx>,
         row: BasicValueEnum<'ctx>,
     ) -> Result<(), ArrowKernelError> {
         self.llvm_write(codegen, runtime_ptr, |emitter| {
@@ -295,7 +295,7 @@ impl<'ctx, 'borrow> ListWriterEmitter<'ctx, 'borrow> {
 
     fn copy_row(
         &mut self,
-        source_child: &IteratorHolder,
+        source_child: IteratorSource<'_, 'ctx>,
         row: BasicValueEnum<'ctx>,
     ) -> Result<(), ArrowKernelError> {
         let row = row.into_struct_value();
@@ -325,7 +325,7 @@ impl<'ctx, 'borrow> ListWriterEmitter<'ctx, 'borrow> {
         self.value_writer
             .llvm_reserve_for_additional(self.codegen, self.value_ptr, row_len);
 
-        let source_child_type = source_child.data_type();
+        let source_child_type = source_child.description();
         let accessor = source_child
             .generate_random_access(self.codegen.ctx, self.codegen.module)
             .ok_or_else(|| {

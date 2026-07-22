@@ -1,10 +1,13 @@
+use std::sync::Arc;
+
 use arrow_array::{
     cast::AsArray,
     types::{Int32Type, Int64Type},
-    Array, Int32Array, PrimitiveArray, RunArray, StringArray, StringViewArray,
+    Array, Int32Array, LargeListArray, ListArray, PrimitiveArray, RunArray, StringArray,
+    StringViewArray,
 };
 use arrow_compile_compute::{dictionary_data_type, run_end_data_type};
-use arrow_schema::DataType;
+use arrow_schema::{DataType, Field};
 use itertools::Itertools;
 use proptest::proptest;
 
@@ -27,6 +30,60 @@ proptest! {
         let our_res = arrow_compile_compute::cast::cast(&arr1, &DataType::Int64).unwrap();
         let arrow_res = arrow_cast::cast(&arr1, &DataType::Int64).unwrap();
         assert_eq!(our_res.len(), arrow_res.len());
+    }
+
+    #[test]
+    fn test_list_cast_matches_arrow_or_preserves_shape(
+        rows: Vec<Option<Vec<Option<i32>>>>,
+        large_list: bool,
+        target_leaf_index in 0usize..4,
+    ) {
+        let input: Arc<dyn Array> = if large_list {
+            Arc::new(LargeListArray::from_iter_primitive::<Int32Type, _, _>(
+                rows.clone(),
+            ))
+        } else {
+            Arc::new(ListArray::from_iter_primitive::<Int32Type, _, _>(
+                rows.clone(),
+            ))
+        };
+        let target_leaf = match target_leaf_index {
+            0 => DataType::Int32,
+            1 => DataType::Int64,
+            2 => DataType::Float32,
+            _ => DataType::Float64,
+        };
+        let target_field = Arc::new(Field::new_list_field(target_leaf.clone(), true));
+        let target = if large_list {
+            DataType::LargeList(target_field)
+        } else {
+            DataType::List(target_field)
+        };
+
+        let our_res = arrow_compile_compute::cast::cast(input.as_ref(), &target).unwrap();
+        if let Ok(arrow_res) = arrow_cast::cast(input.as_ref(), &target) {
+            assert_eq!(&our_res, &arrow_res);
+        } else {
+            assert_eq!(our_res.data_type(), &target);
+            assert_eq!(our_res.len(), input.len());
+            if large_list {
+                let input = input.as_list::<i64>();
+                let output = our_res.as_list::<i64>();
+                assert_eq!(output.values().data_type(), &target_leaf);
+                for row in 0..input.len() {
+                    assert_eq!(output.is_null(row), input.is_null(row));
+                    assert_eq!(output.value_length(row), input.value_length(row));
+                }
+            } else {
+                let input = input.as_list::<i32>();
+                let output = our_res.as_list::<i32>();
+                assert_eq!(output.values().data_type(), &target_leaf);
+                for row in 0..input.len() {
+                    assert_eq!(output.is_null(row), input.is_null(row));
+                    assert_eq!(output.value_length(row), input.value_length(row));
+                }
+            }
+        }
     }
 
     #[test]

@@ -2,6 +2,7 @@ mod bitmap;
 mod dictionary;
 mod fixed_size_list;
 mod list;
+mod map;
 mod primitive;
 mod runend;
 mod scalar;
@@ -32,6 +33,7 @@ use inkwell::{
     values::{BasicValue, FunctionValue, IntValue, PointerValue},
     AddressSpace, IntPredicate,
 };
+pub use map::{IteratorMapType, IteratorSource};
 use primitive::PrimitiveIterator;
 use runend::{add_bsearch, RunEndIterator};
 use scalar::{ScalarPrimitiveIterator, ScalarStringIterator};
