@@ -15,16 +15,30 @@ pub fn vectorize_for_each(ctx: &DSLCompilationContext, f: &DSLForEach) -> Option
         return None;
     }
 
+    let widest_row = f
+        .loop_vars
+        .iter()
+        .filter_map(|value| value.ty.fixed_width_bits())
+        .chain(f.body.iter().filter_map(|stmt| match stmt {
+            DSLStmt::Emit { value, .. } => value.get_type().fixed_width_bits(),
+            _ => None,
+        }))
+        .max()?;
+    let rows = 64_usize.min(4096_usize.checked_div(widest_row)?.max(1));
+    if rows < 2 {
+        return None;
+    }
+
     // see if every iterator has a next block function
     for iv in f.iterators.iter() {
-        ctx.iterator_holders[&iv.name].generate_next_block::<64>(ctx.ctx, ctx.module)?;
+        ctx.iterator_holders[&iv.name].generate_next_block(ctx.ctx, ctx.module, rows as u32)?;
     }
 
     // see if all loop vars have a block type
     let mut loop_var_types = HashMap::new();
     let mut loop_vars = Vec::new();
     for lv in f.loop_vars.iter() {
-        let new_ty = lv.ty.block_type()?;
+        let new_ty = lv.ty.block_type(rows)?;
         loop_var_types.insert(lv.name, new_ty.clone());
         loop_vars.push(DSLValue {
             name: lv.name,
@@ -60,18 +74,28 @@ impl DSLExpr {
     fn try_vectorize(&self, lvm: &HashMap<usize, DSLType>) -> Option<DSLExpr> {
         match self {
             DSLExpr::Value(v) => match v.ty {
-                DSLType::Primitive(pt) => match pt {
-                    PrimitiveType::List(_, _) => Some(self.clone()),
-                    _ => {
-                        let ty = lvm.get(&v.name)?.clone();
-                        Some(DSLExpr::Value(DSLValue { name: v.name, ty }))
-                    }
-                },
-                DSLType::ConstScalar(..) => Some(DSLExpr::Splat(Box::new(self.clone()), 64)),
+                DSLType::Primitive(_) | DSLType::Boolean => {
+                    let ty = lvm.get(&v.name)?.clone();
+                    Some(DSLExpr::Value(DSLValue { name: v.name, ty }))
+                }
                 _ => None,
             },
 
+            DSLExpr::At(value, indices) if indices.len() == 1 => {
+                value.ty.iter_type()?.fixed_width_bits()?;
+                Some(DSLExpr::At(
+                    value.clone(),
+                    vec![indices[0].try_vectorize(lvm)?],
+                ))
+            }
+
             DSLExpr::BitNot(v) => Some(DSLExpr::BitNot(Box::new(v.try_vectorize(lvm)?))),
+
+            DSLExpr::Sqrt(v) => Some(DSLExpr::Sqrt(Box::new(v.try_vectorize(lvm)?))),
+
+            DSLExpr::VecSum(_) => None,
+
+            DSLExpr::Splat(v, size) => Some(DSLExpr::Splat(Box::new(v.try_vectorize(lvm)?), *size)),
 
             DSLExpr::BitwiseBinOp(op, lhs, rhs) => Some(DSLExpr::BitwiseBinOp(
                 *op,
@@ -86,17 +110,33 @@ impl DSLExpr {
             )),
             DSLExpr::Compare(op, lhs, rhs) => Some(DSLExpr::Compare(
                 *op,
-                Box::new(lhs.try_vectorize(lvm)?),
+                Box::new({
+                    if matches!(
+                        lhs.get_type(),
+                        DSLType::Primitive(PrimitiveType::List(_, _))
+                    ) {
+                        return None;
+                    }
+                    lhs.try_vectorize(lvm)?
+                }),
                 Box::new(rhs.try_vectorize(lvm)?),
             )),
             DSLExpr::Cast(expr, pt) => {
                 let vec_expr = expr.try_vectorize(lvm)?;
-                Some(DSLExpr::Cast(Box::new(vec_expr), pt.as_list(64)?))
+                Some(DSLExpr::Cast(Box::new(vec_expr), *pt))
             }
             DSLExpr::BitCast(expr, pt) => {
                 let vec_expr = expr.try_vectorize(lvm)?;
-                Some(DSLExpr::BitCast(Box::new(vec_expr), pt.as_list(64)?))
+                Some(DSLExpr::BitCast(Box::new(vec_expr), *pt))
             }
+            DSLExpr::CastToBool(expr) => {
+                Some(DSLExpr::CastToBool(Box::new(expr.try_vectorize(lvm)?)))
+            }
+            DSLExpr::Select(cond, v1, v2) => Some(DSLExpr::Select(
+                Box::new(cond.try_vectorize(lvm)?),
+                Box::new(v1.try_vectorize(lvm)?),
+                Box::new(v2.try_vectorize(lvm)?),
+            )),
             _ => None,
         }
     }

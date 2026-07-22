@@ -451,7 +451,7 @@ mod tests {
 
         let ctx = Context::create();
         let module = ctx.create_module("test_scalar_prim");
-        let func_block = iter.generate_next_block::<4>(&ctx, &module).unwrap();
+        let func_block = iter.generate_next_block(&ctx, &module, 4).unwrap();
         let func_next = iter.generate_next(&ctx, &module);
 
         let fname_block = func_block.get_name().to_str().unwrap();
@@ -503,7 +503,7 @@ mod tests {
 
         let ctx = Context::create();
         let module = ctx.create_module("test_scalar_prim");
-        let func_block = iter.generate_next_block::<4>(&ctx, &module).unwrap();
+        let func_block = iter.generate_next_block(&ctx, &module, 4).unwrap();
         let func_next = iter.generate_next(&ctx, &module);
 
         let fname_block = func_block.get_name().to_str().unwrap();

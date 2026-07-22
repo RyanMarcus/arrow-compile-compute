@@ -169,6 +169,7 @@ fn list_value_llvm_type<'a>(ctx: &'a Context) -> inkwell::types::StructType<'a> 
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum IteratorValueType {
+    Boolean,
     Primitive(PrimitiveType),
     VariableList,
 }
@@ -176,6 +177,7 @@ enum IteratorValueType {
 impl IteratorValueType {
     fn llvm_type<'a>(self, ctx: &'a Context) -> inkwell::types::BasicTypeEnum<'a> {
         match self {
+            IteratorValueType::Boolean => ctx.i8_type().into(),
             IteratorValueType::Primitive(ptype) => ptype.llvm_type(ctx),
             IteratorValueType::VariableList => list_value_llvm_type(ctx).into(),
         }
@@ -183,12 +185,35 @@ impl IteratorValueType {
 
     fn vectorizable_primitive(self) -> Option<PrimitiveType> {
         match self {
+            IteratorValueType::Boolean => None,
             IteratorValueType::Primitive(ptype)
                 if !matches!(ptype, PrimitiveType::P64x2 | PrimitiveType::List(_, _)) =>
             {
                 Some(ptype)
             }
             IteratorValueType::Primitive(_) | IteratorValueType::VariableList => None,
+        }
+    }
+
+    fn block_llvm_type<'a>(
+        self,
+        ctx: &'a Context,
+        rows: u32,
+    ) -> Option<inkwell::types::BasicTypeEnum<'a>> {
+        match self {
+            IteratorValueType::Boolean => Some(ctx.custom_width_int_type(rows).into()),
+            IteratorValueType::Primitive(PrimitiveType::List(item, size)) => {
+                let lanes = rows.checked_mul(size as u32)?;
+                match item {
+                    ListItemType::Boolean => Some(ctx.custom_width_int_type(lanes).into()),
+                    ListItemType::P64x2 => None,
+                    _ => PrimitiveType::from(item)
+                        .llvm_vec_type(ctx, lanes)
+                        .map(Into::into),
+                }
+            }
+            IteratorValueType::Primitive(ptype) => ptype.llvm_vec_type(ctx, rows).map(Into::into),
+            IteratorValueType::VariableList => None,
         }
     }
 }
@@ -674,9 +699,9 @@ impl IteratorHolder {
                 next_block: false,
             },
             IteratorHolder::Bitmap(_) => IteratorCodegenInfo {
-                value_type: IteratorValueType::Primitive(PrimitiveType::U8),
+                value_type: IteratorValueType::Boolean,
                 random_access: true,
-                next_block: false,
+                next_block: true,
             },
             IteratorHolder::SetBit(_) => IteratorCodegenInfo {
                 value_type: IteratorValueType::Primitive(PrimitiveType::U64),
@@ -710,7 +735,8 @@ impl IteratorHolder {
             IteratorHolder::FixedSizeList(iter) => IteratorCodegenInfo {
                 value_type: IteratorValueType::Primitive(iter.ptype()),
                 random_access: iter.child().codegen_info().random_access,
-                next_block: false,
+                next_block: iter.child().codegen_info().random_access
+                    && !matches!(iter.ptype(), PrimitiveType::List(ListItemType::P64x2, _)),
             },
             IteratorHolder::List(_) => IteratorCodegenInfo {
                 value_type: IteratorValueType::VariableList,
@@ -841,21 +867,1040 @@ impl IteratorHolder {
     ///
     /// `fn reset(iter: ptr)`
     pub fn generate_reset<'a>(&self, ctx: &'a Context, llvm_mod: &Module<'a>) -> FunctionValue<'a> {
-        generate_reset_iterator(ctx, llvm_mod, self)
+        let build = ctx.create_builder();
+        let ptr_type = ctx.ptr_type(AddressSpace::default());
+        let name = format!("{}_reset", self.codegen_label());
+
+        if let Some(existing) = llvm_mod.get_function(&name) {
+            assert_eq!(
+                existing.get_type(),
+                ctx.void_type().fn_type(&[ptr_type.into()], false)
+            );
+            return existing;
+        }
+
+        let fn_type = ctx.void_type().fn_type(&[ptr_type.into()], false);
+        let reset = llvm_mod.add_function(
+            &name,
+            fn_type,
+            Some(
+                #[cfg(test)]
+                Linkage::External,
+                #[cfg(not(test))]
+                Linkage::Private,
+            ),
+        );
+        set_noalias_params(&reset);
+        let iter_ptr = reset.get_nth_param(0).unwrap().into_pointer_value();
+
+        match self {
+            IteratorHolder::Primitive(iter) => {
+                declare_blocks!(ctx, reset, entry);
+                build.position_at_end(entry);
+                iter.llvm_reset(ctx, &build, iter_ptr);
+                build.build_return(None).unwrap();
+                reset
+            }
+            IteratorHolder::String(iter) => {
+                declare_blocks!(ctx, reset, entry);
+                build.position_at_end(entry);
+                iter.llvm_reset(ctx, &build, iter_ptr);
+                build.build_return(None).unwrap();
+                reset
+            }
+            IteratorHolder::LargeString(iter) => {
+                declare_blocks!(ctx, reset, entry);
+                build.position_at_end(entry);
+                iter.llvm_reset(ctx, &build, iter_ptr);
+                build.build_return(None).unwrap();
+                reset
+            }
+            IteratorHolder::View(iter) => {
+                declare_blocks!(ctx, reset, entry);
+                build.position_at_end(entry);
+                iter.llvm_reset(ctx, &build, iter_ptr);
+                build.build_return(None).unwrap();
+                reset
+            }
+            IteratorHolder::Bitmap(iter) => {
+                declare_blocks!(ctx, reset, entry);
+                build.position_at_end(entry);
+                iter.llvm_reset(ctx, &build, iter_ptr);
+                build.build_return(None).unwrap();
+                reset
+            }
+            IteratorHolder::SetBit(iter) => {
+                declare_blocks!(ctx, reset, entry);
+                build.position_at_end(entry);
+                iter.llvm_reset(ctx, &build, iter_ptr);
+                build.build_return(None).unwrap();
+                reset
+            }
+            IteratorHolder::Dictionary { arr, keys, values } => {
+                let key_reset = keys.generate_reset(ctx, llvm_mod);
+                let value_reset = values.generate_reset(ctx, llvm_mod);
+
+                declare_blocks!(ctx, reset, entry);
+                build.position_at_end(entry);
+                let key_ptr = arr.llvm_key_iter_ptr(ctx, &build, iter_ptr);
+                let val_ptr = arr.llvm_val_iter_ptr(ctx, &build, iter_ptr);
+                build
+                    .build_call(key_reset, &[key_ptr.into()], "reset_key_iter")
+                    .unwrap();
+                build
+                    .build_call(value_reset, &[val_ptr.into()], "reset_value_iter")
+                    .unwrap();
+                build.build_return(None).unwrap();
+                reset
+            }
+            IteratorHolder::RunEnd {
+                arr,
+                run_ends,
+                values,
+            } => {
+                let re_reset = run_ends.generate_reset(ctx, llvm_mod);
+                let value_reset = values.generate_reset(ctx, llvm_mod);
+
+                declare_blocks!(ctx, reset, entry);
+                build.position_at_end(entry);
+                let re_ptr = arr.llvm_re_iter_ptr(ctx, &build, iter_ptr);
+                let val_ptr = arr.llvm_val_iter_ptr(ctx, &build, iter_ptr);
+                build
+                    .build_call(re_reset, &[re_ptr.into()], "reset_run_end_iter")
+                    .unwrap();
+                build
+                    .build_call(value_reset, &[val_ptr.into()], "reset_value_iter")
+                    .unwrap();
+                arr.llvm_reset(ctx, &build, iter_ptr);
+                build.build_return(None).unwrap();
+                reset
+            }
+            IteratorHolder::FixedSizeList(iter) => {
+                declare_blocks!(ctx, reset, entry);
+                build.position_at_end(entry);
+                iter.llvm_reset(ctx, &build, iter_ptr);
+                build.build_return(None).unwrap();
+                reset
+            }
+            IteratorHolder::List(iter) => {
+                let child_reset = iter.child().generate_reset(ctx, llvm_mod);
+
+                declare_blocks!(ctx, reset, entry);
+                build.position_at_end(entry);
+                let child_ptr = iter.llvm_child_iter(ctx, &build, iter_ptr);
+                build
+                    .build_call(child_reset, &[child_ptr.into()], "reset_list_child_iter")
+                    .unwrap();
+                iter.llvm_reset(ctx, &build, iter_ptr);
+                build.build_return(None).unwrap();
+                reset
+            }
+            IteratorHolder::ScalarPrimitive(_)
+            | IteratorHolder::ScalarBoolean(_)
+            | IteratorHolder::ScalarString(_)
+            | IteratorHolder::ScalarBinary(_)
+            | IteratorHolder::ScalarVec(_) => {
+                declare_blocks!(ctx, reset, entry);
+                build.position_at_end(entry);
+                build.build_return(None).unwrap();
+                reset
+            }
+        }
+    }
+
+    pub fn generate_random_access_block<'a>(
+        &self,
+        ctx: &'a Context,
+        llvm_mod: &Module<'a>,
+        rows: u32,
+    ) -> Option<FunctionValue<'a>> {
+        let vec_type = self.codegen_info().value_type.block_llvm_type(ctx, rows)?;
+        let ptr_type = ctx.ptr_type(AddressSpace::default());
+        let i64_type = ctx.i64_type();
+        let fn_type = ctx
+            .void_type()
+            .fn_type(&[ptr_type.into(), i64_type.into(), ptr_type.into()], false);
+        let name = format!("{}_access_block_{}", self.codegen_label(), rows);
+        if let Some(existing) = llvm_mod.get_function(&name) {
+            return Some(existing);
+        }
+
+        let access = llvm_mod.add_function(&name, fn_type, Some(Linkage::Private));
+        let iter_ptr = access.get_nth_param(0).unwrap().into_pointer_value();
+        let idx = access.get_nth_param(1).unwrap().into_int_value();
+        let out_ptr = access.get_nth_param(2).unwrap().into_pointer_value();
+        let build = ctx.create_builder();
+
+        match self {
+            IteratorHolder::Primitive(iter) => {
+                declare_blocks!(ctx, access, entry);
+                build.position_at_end(entry);
+                let ptype = PrimitiveType::for_arrow_type(&self.data_type());
+                let data_ptr = iter.llvm_data(ctx, &build, iter_ptr);
+                let data_ptr = increment_pointer!(ctx, build, data_ptr, ptype.width(), idx);
+                let value = build.build_load(vec_type, data_ptr, "block").unwrap();
+                value
+                    .as_instruction_value()
+                    .unwrap()
+                    .set_alignment(1)
+                    .unwrap();
+                build.build_store(out_ptr, value).unwrap();
+                build.build_return(None).unwrap();
+            }
+            IteratorHolder::Bitmap(iter) => {
+                let bit_count = rows;
+                let aligned_bytes = bit_count.div_ceil(8);
+                let aligned_width = aligned_bytes * 8;
+                let aligned_type = ctx.custom_width_int_type(aligned_width);
+                let packed_type = ctx.custom_width_int_type(bit_count);
+                let unaligned_type = ctx.custom_width_int_type(aligned_width + 8);
+                declare_blocks!(ctx, access, entry, aligned, unaligned, merge);
+
+                build.position_at_end(entry);
+                let data = iter.llvm_get_data_ptr(ctx, &build, iter_ptr);
+                let bit_idx = build
+                    .build_int_add(
+                        iter.llvm_slice_offset(ctx, &build, iter_ptr),
+                        idx,
+                        "bit_idx",
+                    )
+                    .unwrap();
+                let byte_idx = build
+                    .build_right_shift(bit_idx, i64_type.const_int(3, false), false, "byte_idx")
+                    .unwrap();
+                let shift = build
+                    .build_and(bit_idx, i64_type.const_int(7, false), "bit_shift")
+                    .unwrap();
+                let src = increment_pointer!(ctx, build, data, 1, byte_idx);
+                let is_aligned = build
+                    .build_int_compare(IntPredicate::EQ, shift, i64_type.const_zero(), "aligned")
+                    .unwrap();
+                build
+                    .build_conditional_branch(is_aligned, aligned, unaligned)
+                    .unwrap();
+
+                build.position_at_end(aligned);
+                let aligned_value = build
+                    .build_load(aligned_type, src, "aligned_bits")
+                    .unwrap()
+                    .into_int_value();
+                aligned_value
+                    .as_instruction_value()
+                    .unwrap()
+                    .set_alignment(1)
+                    .unwrap();
+                let aligned_value = if aligned_width == bit_count {
+                    aligned_value
+                } else {
+                    build
+                        .build_int_truncate(aligned_value, packed_type, "aligned_packed")
+                        .unwrap()
+                };
+                build.build_unconditional_branch(merge).unwrap();
+                let aligned_end = build.get_insert_block().unwrap();
+
+                build.position_at_end(unaligned);
+                let unaligned_value = build
+                    .build_load(unaligned_type, src, "unaligned_bits")
+                    .unwrap()
+                    .into_int_value();
+                unaligned_value
+                    .as_instruction_value()
+                    .unwrap()
+                    .set_alignment(1)
+                    .unwrap();
+                let wide_shift = build
+                    .build_int_cast(shift, unaligned_type, "wide_shift")
+                    .unwrap();
+                let unaligned_value = build
+                    .build_right_shift(unaligned_value, wide_shift, false, "shifted_bits")
+                    .unwrap();
+                let unaligned_value = build
+                    .build_int_truncate(unaligned_value, packed_type, "unaligned_packed")
+                    .unwrap();
+                build.build_unconditional_branch(merge).unwrap();
+                let unaligned_end = build.get_insert_block().unwrap();
+
+                build.position_at_end(merge);
+                let phi = build.build_phi(packed_type, "packed_bits").unwrap();
+                phi.add_incoming(&[
+                    (&aligned_value, aligned_end),
+                    (&unaligned_value, unaligned_end),
+                ]);
+                build.build_store(out_ptr, phi.as_basic_value()).unwrap();
+                build.build_return(None).unwrap();
+            }
+            IteratorHolder::FixedSizeList(iter) => {
+                let PrimitiveType::List(_, list_size) = iter.ptype() else {
+                    unreachable!()
+                };
+                let child_rows = rows.checked_mul(list_size as u32)?;
+                let child_access = iter
+                    .child()
+                    .generate_random_access_block(ctx, llvm_mod, child_rows)?;
+                declare_blocks!(ctx, access, entry);
+                build.position_at_end(entry);
+                let child_idx = build
+                    .build_int_mul(
+                        idx,
+                        i64_type.const_int(list_size as u64, false),
+                        "fsl_block_child_idx",
+                    )
+                    .unwrap();
+                let child_ptr = iter.llvm_child_iter(ctx, &build, iter_ptr);
+                build
+                    .build_call(
+                        child_access,
+                        &[child_ptr.into(), child_idx.into(), out_ptr.into()],
+                        "fsl_child_block",
+                    )
+                    .unwrap();
+                build.build_return(None).unwrap();
+            }
+            _ => return None,
+        }
+        Some(access)
+    }
+
+    pub fn generate_gather_block<'a>(
+        &self,
+        ctx: &'a Context,
+        llvm_mod: &Module<'a>,
+        rows: u32,
+    ) -> Option<FunctionValue<'a>> {
+        let output_type = self.codegen_info().value_type.block_llvm_type(ctx, rows)?;
+        let ptr_type = ctx.ptr_type(AddressSpace::default());
+        let i64_type = ctx.i64_type();
+        let index_type = i64_type.vec_type(rows);
+        let fn_type = ctx.void_type().fn_type(
+            &[ptr_type.into(), index_type.into(), ptr_type.into()],
+            false,
+        );
+        let name = format!("{}_gather_block_{}", self.codegen_label(), rows);
+        if let Some(existing) = llvm_mod.get_function(&name) {
+            return Some(existing);
+        }
+        let gather = llvm_mod.add_function(&name, fn_type, Some(Linkage::Private));
+        let iter_ptr = gather.get_nth_param(0).unwrap().into_pointer_value();
+        let indices = gather.get_nth_param(1).unwrap().into_vector_value();
+        let out_ptr = gather.get_nth_param(2).unwrap().into_pointer_value();
+        let build = ctx.create_builder();
+        declare_blocks!(ctx, gather, entry);
+        build.position_at_end(entry);
+
+        match self {
+            IteratorHolder::FixedSizeList(iter) => {
+                let PrimitiveType::List(item, list_size) = iter.ptype() else {
+                    unreachable!()
+                };
+                let row_access = self.generate_random_access_block(ctx, llvm_mod, 1)?;
+                let row_type = self.codegen_info().value_type.block_llvm_type(ctx, 1)?;
+                let row_buf = build.build_alloca(row_type, "gather_row").unwrap();
+                match item {
+                    ListItemType::Boolean => {
+                        let output_int = output_type.into_int_type();
+                        let row_int = row_type.into_int_type();
+                        let mut output = output_int.const_zero();
+                        for row in 0..rows {
+                            let idx = build
+                                .build_extract_element(
+                                    indices,
+                                    i64_type.const_int(row as u64, false),
+                                    "gather_idx",
+                                )
+                                .unwrap();
+                            build
+                                .build_call(
+                                    row_access,
+                                    &[iter_ptr.into(), idx.into(), row_buf.into()],
+                                    "gather_fsl_row",
+                                )
+                                .unwrap();
+                            let value = build
+                                .build_load(row_int, row_buf, "gather_boolean_row")
+                                .unwrap()
+                                .into_int_value();
+                            let value = build
+                                .build_int_z_extend(value, output_int, "gather_boolean_row_wide")
+                                .unwrap();
+                            let value = build
+                                .build_left_shift(
+                                    value,
+                                    output_int.const_int((row as usize * list_size) as u64, false),
+                                    "gather_boolean_row_shifted",
+                                )
+                                .unwrap();
+                            output = build
+                                .build_or(output, value, "gather_boolean_rows")
+                                .unwrap();
+                        }
+                        build.build_store(out_ptr, output).unwrap();
+                    }
+                    ListItemType::P64x2 => return None,
+                    _ => {
+                        let output_vec = output_type.into_vector_type();
+                        let row_vec = row_type.into_vector_type();
+                        let mut output = output_vec.const_zero();
+                        for row in 0..rows {
+                            let idx = build
+                                .build_extract_element(
+                                    indices,
+                                    i64_type.const_int(row as u64, false),
+                                    "gather_idx",
+                                )
+                                .unwrap();
+                            build
+                                .build_call(
+                                    row_access,
+                                    &[iter_ptr.into(), idx.into(), row_buf.into()],
+                                    "gather_fsl_row",
+                                )
+                                .unwrap();
+                            let value = build
+                                .build_load(row_vec, row_buf, "gather_numeric_row")
+                                .unwrap()
+                                .into_vector_value();
+                            for child in 0..list_size as u32 {
+                                let lane = build
+                                    .build_extract_element(
+                                        value,
+                                        i64_type.const_int(child as u64, false),
+                                        "gather_child",
+                                    )
+                                    .unwrap();
+                                output = build
+                                    .build_insert_element(
+                                        output,
+                                        lane,
+                                        i64_type.const_int(
+                                            (row as usize * list_size + child as usize) as u64,
+                                            false,
+                                        ),
+                                        "gather_insert_child",
+                                    )
+                                    .unwrap();
+                            }
+                        }
+                        build.build_store(out_ptr, output).unwrap();
+                    }
+                }
+            }
+            IteratorHolder::Bitmap(_) => {
+                let scalar_access = self.generate_random_access(ctx, llvm_mod)?;
+                let output_int = output_type.into_int_type();
+                let mut output = output_int.const_zero();
+                for row in 0..rows {
+                    let idx = build
+                        .build_extract_element(
+                            indices,
+                            i64_type.const_int(row as u64, false),
+                            "gather_idx",
+                        )
+                        .unwrap();
+                    let value = build
+                        .build_call(
+                            scalar_access,
+                            &[iter_ptr.into(), idx.into()],
+                            "gather_boolean",
+                        )
+                        .unwrap()
+                        .try_as_basic_value()
+                        .unwrap_basic()
+                        .into_int_value();
+                    let value = build
+                        .build_int_truncate(value, ctx.bool_type(), "gather_boolean_i1")
+                        .unwrap();
+                    let value = build
+                        .build_int_z_extend(value, output_int, "gather_boolean_wide")
+                        .unwrap();
+                    let value = build
+                        .build_left_shift(
+                            value,
+                            output_int.const_int(row as u64, false),
+                            "gather_boolean_shifted",
+                        )
+                        .unwrap();
+                    output = build.build_or(output, value, "gather_booleans").unwrap();
+                }
+                build.build_store(out_ptr, output).unwrap();
+            }
+            _ => {
+                let scalar_access = self.generate_random_access(ctx, llvm_mod)?;
+                let output_vec = output_type.into_vector_type();
+                let mut output = output_vec.const_zero();
+                for row in 0..rows {
+                    let idx = build
+                        .build_extract_element(
+                            indices,
+                            i64_type.const_int(row as u64, false),
+                            "gather_idx",
+                        )
+                        .unwrap();
+                    let value = build
+                        .build_call(
+                            scalar_access,
+                            &[iter_ptr.into(), idx.into()],
+                            "gather_value",
+                        )
+                        .unwrap()
+                        .try_as_basic_value()
+                        .unwrap_basic();
+                    output = build
+                        .build_insert_element(
+                            output,
+                            value,
+                            i64_type.const_int(row as u64, false),
+                            "gather_insert",
+                        )
+                        .unwrap();
+                }
+                build.build_store(out_ptr, output).unwrap();
+            }
+        }
+        build.build_return(None).unwrap();
+        Some(gather)
     }
 
     /// Adds or reuses the block-next function for this iterator's code-generation shape.
     ///
-    /// The generated function fetches `N` elements and advances the iterator.
+    /// The generated function fetches `rows` elements and advances the iterator.
     /// Its signature is:
     ///
     /// `fn next_block(iter: ptr, out: ptr_to_vec_of_size_n) -> bool`
-    pub fn generate_next_block<'a, const N: u32>(
+    pub fn generate_next_block<'a>(
         &self,
         ctx: &'a Context,
         llvm_mod: &Module<'a>,
+        n: u32,
     ) -> Option<FunctionValue<'a>> {
-        generate_next_block::<N>(ctx, llvm_mod, self)
+        let build = ctx.create_builder();
+        let info = self.codegen_info();
+        if !info.next_block {
+            return None;
+        }
+        let dt = self.data_type();
+        let vec_type = info.value_type.block_llvm_type(ctx, n)?;
+        let bool_type = ctx.bool_type();
+        let ptr_type = ctx.ptr_type(AddressSpace::default());
+        let i64_type = ctx.i64_type();
+        let llvm_n = i64_type.const_int(n as u64, false);
+
+        let fn_type = bool_type.fn_type(&[ptr_type.into(), ptr_type.into()], false);
+        let name = format!("{}_next_block_{}", self.codegen_label(), n);
+        if let Some(existing) = llvm_mod.get_function(&name) {
+            assert_eq!(existing.get_type(), fn_type);
+            return Some(existing);
+        }
+        let next = llvm_mod.add_function(
+            &name,
+            fn_type,
+            Some(
+                #[cfg(test)]
+                Linkage::External,
+                #[cfg(not(test))]
+                Linkage::Private,
+            ),
+        );
+        let iter_ptr = next.get_nth_param(0).unwrap().into_pointer_value();
+        let out_ptr = next.get_nth_param(1).unwrap().into_pointer_value();
+
+        let res = match self {
+            IteratorHolder::Primitive(primitive_iter) => {
+                let ptype = PrimitiveType::for_arrow_type(&dt);
+                declare_blocks!(ctx, next, entry, none_left, get_next);
+
+                build.position_at_end(entry);
+                let curr_pos = primitive_iter.llvm_pos(ctx, &build, iter_ptr);
+                let curr_len = primitive_iter.llvm_len(ctx, &build, iter_ptr);
+
+                let remaining = build
+                    .build_int_sub(curr_len, curr_pos, "remaining")
+                    .unwrap();
+                let have_enough = build
+                    .build_int_compare(IntPredicate::UGE, remaining, llvm_n, "have_enough")
+                    .unwrap();
+                build
+                    .build_conditional_branch(have_enough, get_next, none_left)
+                    .unwrap();
+
+                build.position_at_end(none_left);
+                build
+                    .build_return(Some(&bool_type.const_int(0, false)))
+                    .unwrap();
+
+                build.position_at_end(get_next);
+                // there are at least n elements left, we can load them and increment
+                let data_ptr = primitive_iter.llvm_data(ctx, &build, iter_ptr);
+                let data_ptr = increment_pointer!(ctx, build, data_ptr, ptype.width(), curr_pos);
+                let vec = build.build_load(vec_type, data_ptr, "vec").unwrap();
+                vec.as_instruction_value()
+                    .unwrap()
+                    .set_alignment(1)
+                    .unwrap();
+
+                build.build_store(out_ptr, vec).unwrap();
+                primitive_iter.llvm_increment_pos(ctx, &build, iter_ptr, llvm_n);
+                build
+                    .build_return(Some(&bool_type.const_int(1, false)))
+                    .unwrap();
+
+                next
+            }
+            IteratorHolder::Bitmap(iter) => {
+                let access = self.generate_random_access_block(ctx, llvm_mod, n)?;
+                declare_blocks!(ctx, next, entry, none_left, get_next);
+                build.position_at_end(entry);
+                let curr_pos = iter.llvm_pos(ctx, &build, iter_ptr);
+                let remaining = build
+                    .build_int_sub(iter.llvm_len(ctx, &build, iter_ptr), curr_pos, "remaining")
+                    .unwrap();
+                let have_enough = build
+                    .build_int_compare(IntPredicate::UGE, remaining, llvm_n, "have_enough")
+                    .unwrap();
+                build
+                    .build_conditional_branch(have_enough, get_next, none_left)
+                    .unwrap();
+                build.position_at_end(none_left);
+                build.build_return(Some(&bool_type.const_zero())).unwrap();
+                build.position_at_end(get_next);
+                build
+                    .build_call(
+                        access,
+                        &[iter_ptr.into(), curr_pos.into(), out_ptr.into()],
+                        "bitmap_block",
+                    )
+                    .unwrap();
+                iter.llvm_increment_pos(ctx, &build, iter_ptr, llvm_n);
+                build
+                    .build_return(Some(&bool_type.const_all_ones()))
+                    .unwrap();
+                next
+            }
+            IteratorHolder::FixedSizeList(iter) => {
+                let access = self.generate_random_access_block(ctx, llvm_mod, n)?;
+                declare_blocks!(ctx, next, entry, none_left, get_next);
+                build.position_at_end(entry);
+                let curr_pos = iter.llvm_pos(ctx, &build, iter_ptr);
+                let remaining = build
+                    .build_int_sub(iter.llvm_len(ctx, &build, iter_ptr), curr_pos, "remaining")
+                    .unwrap();
+                let have_enough = build
+                    .build_int_compare(IntPredicate::UGE, remaining, llvm_n, "have_enough")
+                    .unwrap();
+                build
+                    .build_conditional_branch(have_enough, get_next, none_left)
+                    .unwrap();
+                build.position_at_end(none_left);
+                build.build_return(Some(&bool_type.const_zero())).unwrap();
+                build.position_at_end(get_next);
+                build
+                    .build_call(
+                        access,
+                        &[iter_ptr.into(), curr_pos.into(), out_ptr.into()],
+                        "fixed_size_list_block",
+                    )
+                    .unwrap();
+                iter.llvm_increment_pos(ctx, &build, iter_ptr, llvm_n);
+                build
+                    .build_return(Some(&bool_type.const_all_ones()))
+                    .unwrap();
+                next
+            }
+            IteratorHolder::Dictionary { arr, keys, values } => match &dt {
+                DataType::Dictionary(k_dt, _) => {
+                    let vec_type = vec_type.into_vector_type();
+                    let key_block_next = keys
+                        .generate_next_block(ctx, llvm_mod, n)
+                        .expect("dictionary block capability requires block-readable keys");
+
+                    let value_access = values
+                        .generate_random_access(ctx, llvm_mod)
+                        .expect("dictionary block capability requires random-access values");
+
+                    declare_blocks!(ctx, next, entry, none_left, get_next);
+
+                    build.position_at_end(entry);
+                    let key_prim_type = PrimitiveType::for_arrow_type(k_dt);
+                    let key_iter = arr.llvm_key_iter_ptr(ctx, &build, iter_ptr);
+                    let key_vec_type = key_prim_type.llvm_vec_type(ctx, n).unwrap();
+                    let key_buf = build.build_alloca(key_vec_type, "key_block").unwrap();
+                    let key_block_result = build
+                        .build_call(
+                            key_block_next,
+                            &[key_iter.into(), key_buf.into()],
+                            "key_block_result",
+                        )
+                        .unwrap()
+                        .try_as_basic_value()
+                        .unwrap_basic()
+                        .into_int_value();
+                    build
+                        .build_conditional_branch(key_block_result, get_next, none_left)
+                        .unwrap();
+
+                    build.position_at_end(none_left);
+                    build
+                        .build_return(Some(&bool_type.const_int(0, false)))
+                        .unwrap();
+
+                    build.position_at_end(get_next);
+                    let key_vec = build
+                        .build_load(key_vec_type, key_buf, "key_vec")
+                        .unwrap()
+                        .into_vector_value();
+                    let key_vec = build
+                        .build_int_cast(key_vec, i64_type.vec_type(n), "key_vec_cast")
+                        .unwrap();
+                    let mut out_vec = vec_type.const_zero();
+                    for idx in 0..n as u64 {
+                        let key = build
+                            .build_extract_element(key_vec, i64_type.const_int(idx, false), "key")
+                            .unwrap()
+                            .into_int_value();
+                        let val_iter = arr.llvm_val_iter_ptr(ctx, &build, iter_ptr);
+                        let value = build
+                            .build_call(value_access, &[val_iter.into(), key.into()], "value")
+                            .unwrap()
+                            .try_as_basic_value()
+                            .unwrap_basic();
+                        out_vec = build
+                            .build_insert_element(
+                                out_vec,
+                                value,
+                                i64_type.const_int(idx, false),
+                                &format!("insert{}", idx),
+                            )
+                            .unwrap();
+                    }
+                    build.build_store(out_ptr, out_vec).unwrap();
+                    build
+                        .build_return(Some(&bool_type.const_int(1, false)))
+                        .unwrap();
+
+                    next
+                }
+                _ => unreachable!("dict iterator but not dict data type ({:?})", dt),
+            },
+            IteratorHolder::RunEnd {
+                arr,
+                run_ends,
+                values,
+            } => match &dt {
+                DataType::RunEndEncoded(_, _) => {
+                    let vec_type = vec_type.into_vector_type();
+                    let access_ends = run_ends
+                        .generate_random_access(ctx, llvm_mod)
+                        .expect("run-end block capability requires random-access run ends");
+                    let access_values = values
+                        .generate_random_access(ctx, llvm_mod)
+                        .expect("run-end block capability requires random-access values");
+
+                    let umin = Intrinsic::find("llvm.umin").unwrap();
+                    let umin_f = umin.get_declaration(llvm_mod, &[i64_type.into()]).unwrap();
+                    declare_blocks!(
+                        ctx,
+                        next,
+                        entry,
+                        check_for_next,
+                        fetch_next,
+                        not_enough,
+                        loop_cond,
+                        check_vec_full,
+                        fill_vec,
+                        exit
+                    );
+
+                    build.position_at_end(entry);
+                    let orig_pos = arr.llvm_pos(ctx, &build, iter_ptr);
+                    let orig_rem = arr.llvm_remaining(ctx, &build, iter_ptr);
+                    let ends_iter = arr.llvm_re_iter_ptr(ctx, &build, iter_ptr);
+                    let vals_iter = arr.llvm_val_iter_ptr(ctx, &build, iter_ptr);
+                    let vbuf = build.build_alloca(vec_type, "vbuf").unwrap();
+                    build.build_store(vbuf, vec_type.const_zero()).unwrap();
+                    let buf_idx_ptr = build.build_alloca(i64_type, "buf_idx").unwrap();
+                    build
+                        .build_store(buf_idx_ptr, i64_type.const_zero())
+                        .unwrap();
+
+                    let log_pos = arr.llvm_logical_pos(ctx, &build, iter_ptr);
+                    let log_len = arr.llvm_logical_len(ctx, &build, iter_ptr);
+                    let log_rem = build.build_int_sub(log_len, log_pos, "log_rem").unwrap();
+                    let log_have_more = build
+                        .build_int_compare(IntPredicate::UGE, log_rem, llvm_n, "have_log_next")
+                        .unwrap();
+                    build
+                        .build_conditional_branch(log_have_more, loop_cond, not_enough)
+                        .unwrap();
+
+                    build.position_at_end(check_vec_full);
+                    let buf_idx = build
+                        .build_load(i64_type, buf_idx_ptr, "buf_idx")
+                        .unwrap()
+                        .into_int_value();
+                    let res = build
+                        .build_int_compare(
+                            IntPredicate::ULT,
+                            buf_idx,
+                            i64_type.const_int(n as u64, false),
+                            "vec_full",
+                        )
+                        .unwrap();
+                    build
+                        .build_conditional_branch(res, loop_cond, exit)
+                        .unwrap();
+
+                    build.position_at_end(loop_cond);
+                    let remaining = arr.llvm_remaining(ctx, &build, iter_ptr);
+                    let res = build
+                        .build_int_compare(
+                            IntPredicate::UGT,
+                            remaining,
+                            i64_type.const_zero(),
+                            "have_remaining",
+                        )
+                        .unwrap();
+                    build
+                        .build_conditional_branch(res, fill_vec, check_for_next)
+                        .unwrap();
+
+                    build.position_at_end(check_for_next);
+                    arr.llvm_inc_pos(ctx, &build, iter_ptr, i64_type.const_int(1, false));
+                    let pos = arr.llvm_pos(ctx, &build, iter_ptr);
+                    let len = arr.llvm_len(ctx, &build, iter_ptr);
+                    let phs_have_more = build
+                        .build_int_compare(IntPredicate::ULT, pos, len, "have_phs_next")
+                        .unwrap();
+                    build
+                        .build_conditional_branch(phs_have_more, fetch_next, not_enough)
+                        .unwrap();
+
+                    build.position_at_end(not_enough);
+                    arr.llvm_set_remaining(ctx, &build, iter_ptr, orig_rem);
+                    arr.llvm_set_pos(ctx, &build, iter_ptr, orig_pos);
+                    build.build_return(Some(&bool_type.const_zero())).unwrap();
+
+                    build.position_at_end(fetch_next);
+                    let my_end = build
+                        .build_call(access_ends, &[ends_iter.into(), pos.into()], "my_end")
+                        .unwrap()
+                        .try_as_basic_value()
+                        .unwrap_basic()
+                        .into_int_value();
+
+                    let pr_end = build
+                        .build_call(
+                            access_ends,
+                            &[
+                                ends_iter.into(),
+                                build
+                                    .build_int_sub(pos, i64_type.const_int(1, false), "minus1")
+                                    .unwrap()
+                                    .into(),
+                            ],
+                            "pr_end",
+                        )
+                        .unwrap()
+                        .try_as_basic_value()
+                        .unwrap_basic()
+                        .into_int_value();
+                    let remaining = build.build_int_sub(my_end, pr_end, "remaining").unwrap();
+                    let remaining = build
+                        .build_int_cast(remaining, i64_type, "remaining_cast")
+                        .unwrap();
+                    arr.llvm_set_remaining(ctx, &build, iter_ptr, remaining);
+                    build.build_unconditional_branch(loop_cond).unwrap();
+
+                    build.position_at_end(fill_vec);
+                    let pos = arr.llvm_pos(ctx, &build, iter_ptr);
+                    let curr_val = build
+                        .build_call(access_values, &[vals_iter.into(), pos.into()], "val")
+                        .unwrap()
+                        .try_as_basic_value()
+                        .unwrap_basic();
+                    let curr_val = build
+                        .build_insert_element(
+                            vec_type.const_zero(),
+                            curr_val,
+                            i64_type.const_zero(),
+                            "curr_val_vec",
+                        )
+                        .unwrap();
+                    let curr_val = build
+                        .build_shuffle_vector(
+                            curr_val,
+                            vec_type.get_undef(),
+                            vec_type.const_zero(),
+                            "broadcasted",
+                        )
+                        .unwrap();
+
+                    let remaining_values = arr.llvm_remaining(ctx, &build, iter_ptr);
+                    let buf_idx = build
+                        .build_load(i64_type, buf_idx_ptr, "buf_idx")
+                        .unwrap()
+                        .into_int_value();
+                    let remaining_slots = build
+                        .build_int_sub(
+                            i64_type.const_int(n as u64, false),
+                            buf_idx,
+                            "remaining_slots",
+                        )
+                        .unwrap();
+                    let to_fill = build
+                        .build_call(
+                            umin_f,
+                            &[remaining_slots.into(), remaining_values.into()],
+                            "to_fill",
+                        )
+                        .unwrap()
+                        .try_as_basic_value()
+                        .unwrap_basic()
+                        .into_int_value();
+
+                    // build a mask that 1 in the slots we want to insert value into
+                    // ex: suppose block size = 8, to_fill = 2, curr_pos = 3
+                    // desired mask: 00011000
+                    // formula: ((1 << to_fill) - 1) << curr_pos
+                    //
+                    let mask = build
+                        .build_left_shift(
+                            build
+                                .build_int_sub(
+                                    build
+                                        .build_left_shift(
+                                            i64_type.const_int(1, false),
+                                            to_fill,
+                                            "mask",
+                                        )
+                                        .unwrap(),
+                                    i64_type.const_int(1, false),
+                                    "mask",
+                                )
+                                .unwrap(),
+                            buf_idx,
+                            "mask",
+                        )
+                        .unwrap();
+                    let max_width_cond = build
+                        .build_int_compare(
+                            IntPredicate::EQ,
+                            to_fill,
+                            i64_type.const_int(n as u64, false),
+                            "is_full",
+                        )
+                        .unwrap();
+                    let mask = build
+                        .build_select(max_width_cond, i64_type.const_all_ones(), mask, "mask")
+                        .unwrap()
+                        .into_int_value();
+
+                    let mask = match n {
+                        8 => build
+                            .build_int_truncate(mask, ctx.i8_type(), "mask")
+                            .unwrap(),
+                        16 => build
+                            .build_int_truncate(mask, ctx.i16_type(), "mask")
+                            .unwrap(),
+                        32 => build
+                            .build_int_truncate(mask, ctx.i32_type(), "mask")
+                            .unwrap(),
+                        64 => mask,
+                        _ => return None,
+                    };
+
+                    let mask = build
+                        .build_bit_cast(mask, bool_type.vec_type(n), "mask_v")
+                        .unwrap()
+                        .into_vector_value();
+
+                    let curr_buf = build
+                        .build_load(vec_type, vbuf, "curr_buf")
+                        .unwrap()
+                        .into_vector_value();
+
+                    let new_buf = build
+                        .build_select(mask, curr_val, curr_buf, "new_buf")
+                        .unwrap();
+
+                    build.build_store(vbuf, new_buf).unwrap();
+                    arr.llvm_dec_remaining(ctx, &build, iter_ptr, to_fill);
+                    let new_buf_ptr = build
+                        .build_int_add(buf_idx, to_fill, "new_buf_ptr")
+                        .unwrap();
+                    build.build_store(buf_idx_ptr, new_buf_ptr).unwrap();
+                    build.build_unconditional_branch(check_vec_full).unwrap();
+
+                    build.position_at_end(exit);
+                    let result = build.build_load(vec_type, vbuf, "result").unwrap();
+                    arr.llvm_inc_logical_pos(
+                        ctx,
+                        &build,
+                        iter_ptr,
+                        i64_type.const_int(n as u64, false),
+                    );
+                    build.build_store(out_ptr, result).unwrap();
+                    build
+                        .build_return(Some(&bool_type.const_all_ones()))
+                        .unwrap();
+
+                    next
+                }
+                _ => unreachable!("run-end iterator but not run-end data type ({:?})", dt),
+            },
+            IteratorHolder::ScalarPrimitive(s) => {
+                let vec_type = vec_type.into_vector_type();
+                let ptype = s.ptype;
+                let llvm_type = ptype.llvm_type(ctx);
+                assert_eq!(ptype.width(), s.width as usize);
+                let get_next_single = self.generate_next(ctx, llvm_mod);
+                declare_blocks!(ctx, next, entry);
+                build.position_at_end(entry);
+                let val_buf = build.build_alloca(llvm_type, "val_buf").unwrap();
+                build
+                    .build_call(get_next_single, &[iter_ptr.into(), val_buf.into()], "get")
+                    .unwrap();
+                let constant = build.build_load(llvm_type, val_buf, "constant").unwrap();
+                constant
+                    .as_instruction_value()
+                    .unwrap()
+                    .set_metadata(ctx.metadata_node(&[]), ctx.get_kind_id("invariant.load"))
+                    .unwrap();
+                let v = build
+                    .build_insert_element(
+                        vec_type.const_zero(),
+                        constant,
+                        i64_type.const_zero(),
+                        "v",
+                    )
+                    .unwrap();
+                let v = build
+                    .build_shuffle_vector(
+                        v,
+                        vec_type.const_zero(),
+                        vec_type.const_zero(),
+                        "splatted",
+                    )
+                    .unwrap();
+                build.build_store(out_ptr, v).unwrap();
+                build
+                    .build_return(Some(&bool_type.const_int(1, false)))
+                    .unwrap();
+                next
+            }
+            IteratorHolder::String(_)
+            | IteratorHolder::LargeString(_)
+            | IteratorHolder::View(_)
+            | IteratorHolder::SetBit(_)
+            | IteratorHolder::List(_)
+            | IteratorHolder::ScalarBoolean(_)
+            | IteratorHolder::ScalarString(_)
+            | IteratorHolder::ScalarBinary(_)
+            | IteratorHolder::ScalarVec(_) => {
+                unreachable!("next-block capability disagrees with iterator variant")
+            }
+        };
+
+        Some(res)
     }
 
     /// Adds or reuses the scalar-next function for this iterator's code-generation shape.
@@ -865,7 +1910,818 @@ impl IteratorHolder {
     ///
     /// `fn next(iter: ptr, out: ptr_to_el) -> bool`
     pub fn generate_next<'a>(&self, ctx: &'a Context, llvm_mod: &Module<'a>) -> FunctionValue<'a> {
-        generate_next(ctx, llvm_mod, self)
+        let build = ctx.create_builder();
+        let dt = self.data_type();
+        let llvm_type = self.codegen_info().value_type.llvm_type(ctx);
+        let bool_type = ctx.bool_type();
+        let ptr_type = ctx.ptr_type(AddressSpace::default());
+        let i64_type = ctx.i64_type();
+
+        let fn_type = bool_type.fn_type(&[ptr_type.into(), ptr_type.into()], false);
+        let name = format!("{}_next", self.codegen_label());
+        if let Some(existing) = llvm_mod.get_function(&name) {
+            assert_eq!(existing.get_type(), fn_type);
+            return existing;
+        }
+        let next = llvm_mod.add_function(
+            &name,
+            fn_type,
+            Some(
+                #[cfg(test)]
+                Linkage::External,
+                #[cfg(not(test))]
+                Linkage::Private,
+            ),
+        );
+        let iter_ptr = next.get_nth_param(0).unwrap().into_pointer_value();
+        let out_ptr = next.get_nth_param(1).unwrap().into_pointer_value();
+        set_noalias_params(&next);
+        match self {
+            IteratorHolder::Primitive(primitive_iter) => {
+                let ptype = PrimitiveType::for_arrow_type(&dt);
+                declare_blocks!(ctx, next, entry, none_left, get_next);
+
+                build.position_at_end(entry);
+                let curr_pos = primitive_iter.llvm_pos(ctx, &build, iter_ptr);
+                let curr_len = primitive_iter.llvm_len(ctx, &build, iter_ptr);
+                let have_more = build
+                    .build_int_compare(IntPredicate::ULT, curr_pos, curr_len, "have_enough")
+                    .unwrap();
+                build
+                    .build_conditional_branch(have_more, get_next, none_left)
+                    .unwrap();
+
+                build.position_at_end(none_left);
+                build
+                    .build_return(Some(&bool_type.const_int(0, false)))
+                    .unwrap();
+
+                build.position_at_end(get_next);
+                // there are at least n elements left, we can load them and increment
+                let data_ptr = primitive_iter.llvm_data(ctx, &build, iter_ptr);
+                let data_ptr = increment_pointer!(ctx, build, data_ptr, ptype.width(), curr_pos);
+                let out = build.build_load(llvm_type, data_ptr, "elem").unwrap();
+                build.build_store(out_ptr, out).unwrap();
+                primitive_iter.llvm_increment_pos(
+                    ctx,
+                    &build,
+                    iter_ptr,
+                    i64_type.const_int(1, false),
+                );
+                build
+                    .build_return(Some(&bool_type.const_int(1, false)))
+                    .unwrap();
+
+                next
+            }
+            IteratorHolder::String(iter) => {
+                let access = self.generate_random_access(ctx, llvm_mod).unwrap();
+                declare_blocks!(ctx, next, entry, none_left, get_next);
+
+                build.position_at_end(entry);
+                let curr_pos = iter.llvm_pos(ctx, &build, iter_ptr);
+                let curr_len = iter.llvm_len(ctx, &build, iter_ptr);
+                let have_more = build
+                    .build_int_compare(IntPredicate::ULT, curr_pos, curr_len, "have_enough")
+                    .unwrap();
+                build
+                    .build_conditional_branch(have_more, get_next, none_left)
+                    .unwrap();
+
+                build.position_at_end(none_left);
+                build
+                    .build_return(Some(&bool_type.const_int(0, false)))
+                    .unwrap();
+
+                build.position_at_end(get_next);
+                // there are at least n elements left, we can load them and increment
+                let result = build
+                    .build_call(access, &[iter_ptr.into(), curr_pos.into()], "access_result")
+                    .unwrap()
+                    .try_as_basic_value()
+                    .unwrap_basic();
+
+                build.build_store(out_ptr, result).unwrap();
+                iter.llvm_increment_pos(ctx, &build, iter_ptr, i64_type.const_int(1, false));
+                build
+                    .build_return(Some(&bool_type.const_int(1, false)))
+                    .unwrap();
+
+                next
+            }
+            IteratorHolder::LargeString(iter) => {
+                let access = self.generate_random_access(ctx, llvm_mod).unwrap();
+                declare_blocks!(ctx, next, entry, none_left, get_next);
+
+                build.position_at_end(entry);
+                let curr_pos = iter.llvm_pos(ctx, &build, iter_ptr);
+                let curr_len = iter.llvm_len(ctx, &build, iter_ptr);
+                let have_more = build
+                    .build_int_compare(IntPredicate::ULT, curr_pos, curr_len, "have_enough")
+                    .unwrap();
+                build
+                    .build_conditional_branch(have_more, get_next, none_left)
+                    .unwrap();
+
+                build.position_at_end(none_left);
+                build
+                    .build_return(Some(&bool_type.const_int(0, false)))
+                    .unwrap();
+
+                build.position_at_end(get_next);
+                // there are at least n elements left, we can load them and increment
+                let result = build
+                    .build_call(access, &[iter_ptr.into(), curr_pos.into()], "access_result")
+                    .unwrap()
+                    .try_as_basic_value()
+                    .unwrap_basic();
+
+                build.build_store(out_ptr, result).unwrap();
+                iter.llvm_increment_pos(ctx, &build, iter_ptr, i64_type.const_int(1, false));
+                build
+                    .build_return(Some(&bool_type.const_int(1, false)))
+                    .unwrap();
+
+                next
+            }
+            IteratorHolder::View(iter) => {
+                let access = self.generate_random_access(ctx, llvm_mod).unwrap();
+                declare_blocks!(ctx, next, entry, none_left, get_next);
+
+                build.position_at_end(entry);
+                let curr_pos = iter.llvm_pos(ctx, &build, iter_ptr);
+                let curr_len = iter.llvm_len(ctx, &build, iter_ptr);
+                let have_more = build
+                    .build_int_compare(IntPredicate::ULT, curr_pos, curr_len, "have_enough")
+                    .unwrap();
+                build
+                    .build_conditional_branch(have_more, get_next, none_left)
+                    .unwrap();
+
+                build.position_at_end(none_left);
+                build
+                    .build_return(Some(&bool_type.const_int(0, false)))
+                    .unwrap();
+
+                build.position_at_end(get_next);
+                // there are at least n elements left, we can load them and increment
+                let result = build
+                    .build_call(access, &[iter_ptr.into(), curr_pos.into()], "access_result")
+                    .unwrap()
+                    .try_as_basic_value()
+                    .unwrap_basic();
+
+                build.build_store(out_ptr, result).unwrap();
+                iter.llvm_increment_pos(ctx, &build, iter_ptr, i64_type.const_int(1, false));
+                build
+                    .build_return(Some(&bool_type.const_int(1, false)))
+                    .unwrap();
+
+                next
+            }
+            IteratorHolder::Bitmap(bitmap_iterator) => {
+                let access = self.generate_random_access(ctx, llvm_mod).unwrap();
+                declare_blocks!(ctx, next, entry, none_left, get_next);
+
+                build.position_at_end(entry);
+                let curr_pos = bitmap_iterator.llvm_pos(ctx, &build, iter_ptr);
+                let curr_len = bitmap_iterator.llvm_len(ctx, &build, iter_ptr);
+                let have_more = build
+                    .build_int_compare(IntPredicate::ULT, curr_pos, curr_len, "have_enough")
+                    .unwrap();
+                build
+                    .build_conditional_branch(have_more, get_next, none_left)
+                    .unwrap();
+
+                build.position_at_end(none_left);
+                build
+                    .build_return(Some(&bool_type.const_int(0, false)))
+                    .unwrap();
+
+                build.position_at_end(get_next);
+                let result = build
+                    .build_call(access, &[iter_ptr.into(), curr_pos.into()], "access_result")
+                    .unwrap()
+                    .try_as_basic_value()
+                    .unwrap_basic();
+                build.build_store(out_ptr, result).unwrap();
+                bitmap_iterator.llvm_increment_pos(
+                    ctx,
+                    &build,
+                    iter_ptr,
+                    i64_type.const_int(1, false),
+                );
+                build
+                    .build_return(Some(&bool_type.const_int(1, false)))
+                    .unwrap();
+
+                next
+            }
+            IteratorHolder::SetBit(it) => {
+                declare_blocks!(
+                    ctx,
+                    next,
+                    entry,
+                    head_cond,
+                    head_body,
+                    main_cond,
+                    main_body,
+                    fetch_next_segment,
+                    use_curr_segment,
+                    increment_and_return_from_segment,
+                    return_from_segment,
+                    tail_cond,
+                    tail_body,
+                    exit
+                );
+
+                let cttz_id =
+                    Intrinsic::find("llvm.cttz").expect("llvm.cttz not in Intrinsic list");
+                let cttz_i64 = cttz_id
+                    .get_declaration(llvm_mod, &[ctx.i64_type().into()])
+                    .expect("Couldn't declare llvm.cttz.i64");
+
+                build.position_at_end(entry);
+                build.build_unconditional_branch(head_cond).unwrap();
+
+                build.position_at_end(head_cond);
+                let (header_ptr, header_pos, header_len) =
+                    it.llvm_header_info(ctx, &build, iter_ptr);
+                let have_header = build
+                    .build_int_compare(IntPredicate::ULT, header_pos, header_len, "have_header")
+                    .unwrap();
+                build
+                    .build_conditional_branch(have_header, head_body, main_cond)
+                    .unwrap();
+
+                build.position_at_end(head_body);
+                let res = build
+                    .build_load(
+                        i64_type,
+                        increment_pointer!(ctx, build, header_ptr, 8, header_pos),
+                        "head_val",
+                    )
+                    .unwrap()
+                    .into_int_value();
+                it.llvm_inc_header_pos(ctx, &build, iter_ptr);
+                build.build_store(out_ptr, res).unwrap();
+
+                build
+                    .build_return(Some(&bool_type.const_int(1, false)))
+                    .unwrap();
+
+                // check if the current segment is zero or not
+                build.position_at_end(main_cond);
+                let curr_segment = it.llvm_get_current_u64(ctx, &build, iter_ptr);
+                let is_zero = build
+                    .build_int_compare(
+                        IntPredicate::EQ,
+                        curr_segment,
+                        i64_type.const_zero(),
+                        "is_curr_zero",
+                    )
+                    .unwrap();
+                build
+                    .build_conditional_branch(is_zero, main_body, use_curr_segment)
+                    .unwrap();
+
+                // check if we still have segments left to read
+                build.position_at_end(main_body);
+                let curr_segment_idx = it.llvm_get_curr_segment_pos(ctx, &build, iter_ptr);
+                let segment_len = it.llvm_get_num_segments(ctx, &build, iter_ptr);
+                let cmp = build
+                    .build_int_compare(IntPredicate::ULT, curr_segment_idx, segment_len, "cmp")
+                    .unwrap();
+                build
+                    .build_conditional_branch(cmp, fetch_next_segment, tail_cond)
+                    .unwrap();
+
+                build.position_at_end(fetch_next_segment);
+                let new_segment = it.llvm_get_segment(ctx, &build, curr_segment_idx, iter_ptr);
+                it.llvm_set_current_u64(ctx, &build, new_segment, iter_ptr);
+                let rel_segment_idx = build
+                    .build_int_sub(
+                        curr_segment_idx,
+                        it.llvm_segment_start(ctx, &build, iter_ptr),
+                        "rel_segment_idx",
+                    )
+                    .unwrap();
+                let segment_bit_offset = build
+                    .build_int_mul(
+                        rel_segment_idx,
+                        i64_type.const_int(64, false),
+                        "segment_bit_offset",
+                    )
+                    .unwrap();
+                let segment_base = build
+                    .build_int_add(
+                        it.llvm_head_len(ctx, &build, iter_ptr),
+                        segment_bit_offset,
+                        "segment_base",
+                    )
+                    .unwrap();
+                it.llvm_set_current_bit_idx(ctx, &build, segment_base, iter_ptr);
+                it.llvm_inc_curr_segment(ctx, &build, iter_ptr);
+                build.build_unconditional_branch(main_cond).unwrap();
+
+                build.position_at_end(use_curr_segment);
+                let num_trailing = build
+                    .build_call(
+                        cttz_i64,
+                        &[curr_segment.into(), bool_type.const_all_ones().into()],
+                        "num_trailing",
+                    )
+                    .unwrap()
+                    .try_as_basic_value()
+                    .unwrap_basic()
+                    .into_int_value();
+                it.llvm_clear_last(ctx, &build, iter_ptr);
+                let res =
+                    it.llvm_add_and_get_current_bit_idx(ctx, &build, iter_ptr, num_trailing, false);
+                build.build_store(out_ptr, res).unwrap();
+                let is_now_zero = build
+                    .build_int_compare(
+                        IntPredicate::EQ,
+                        it.llvm_get_current_u64(ctx, &build, iter_ptr),
+                        i64_type.const_zero(),
+                        "is_now_zero",
+                    )
+                    .unwrap();
+                build
+                    .build_conditional_branch(
+                        is_now_zero,
+                        increment_and_return_from_segment,
+                        return_from_segment,
+                    )
+                    .unwrap();
+
+                build.position_at_end(increment_and_return_from_segment);
+                it.llvm_add_and_get_current_bit_idx(
+                    ctx,
+                    &build,
+                    iter_ptr,
+                    i64_type.const_int(64, false),
+                    true,
+                );
+                build
+                    .build_return(Some(&bool_type.const_int(1, false)))
+                    .unwrap();
+
+                build.position_at_end(return_from_segment);
+                build
+                    .build_return(Some(&bool_type.const_int(1, false)))
+                    .unwrap();
+
+                build.position_at_end(tail_cond);
+                let rel_segments_done = build
+                    .build_int_sub(
+                        it.llvm_get_curr_segment_pos(ctx, &build, iter_ptr),
+                        it.llvm_segment_start(ctx, &build, iter_ptr),
+                        "segments_done",
+                    )
+                    .unwrap();
+                let tail_bit_offset = build
+                    .build_int_mul(
+                        rel_segments_done,
+                        i64_type.const_int(64, false),
+                        "tail_bit_offset",
+                    )
+                    .unwrap();
+                let tail_base = build
+                    .build_int_add(
+                        it.llvm_head_len(ctx, &build, iter_ptr),
+                        tail_bit_offset,
+                        "tail_base",
+                    )
+                    .unwrap();
+                it.llvm_set_current_bit_idx(ctx, &build, tail_base, iter_ptr);
+                let (tail_ptr, tail_pos, tail_len) = it.llvm_tail_info(ctx, &build, iter_ptr);
+                let have_tail = build
+                    .build_int_compare(IntPredicate::ULT, tail_pos, tail_len, "have_tail")
+                    .unwrap();
+                build
+                    .build_conditional_branch(have_tail, tail_body, exit)
+                    .unwrap();
+
+                build.position_at_end(tail_body);
+                let res = build
+                    .build_load(
+                        i64_type,
+                        increment_pointer!(ctx, build, tail_ptr, 8, tail_pos),
+                        "tail_val",
+                    )
+                    .unwrap()
+                    .into_int_value();
+                it.llvm_inc_tail_pos(ctx, &build, iter_ptr);
+                let res = it.llvm_add_and_get_current_bit_idx(ctx, &build, iter_ptr, res, false);
+                build.build_store(out_ptr, res).unwrap();
+                build
+                    .build_return(Some(&bool_type.const_int(1, false)))
+                    .unwrap();
+
+                build.position_at_end(exit);
+                build
+                    .build_return(Some(&bool_type.const_int(0, false)))
+                    .unwrap();
+
+                next
+            }
+            IteratorHolder::Dictionary { arr, keys, values } => match &dt {
+                DataType::Dictionary(k_dt, _) => {
+                    let key_next = keys.generate_next(ctx, llvm_mod);
+                    let values_access = values
+                        .generate_random_access(ctx, llvm_mod)
+                        .expect("dictionary iteration requires random-access values");
+                    declare_blocks!(ctx, next, entry, none_left, fetch);
+
+                    build.position_at_end(entry);
+                    let key_type = PrimitiveType::for_arrow_type(k_dt).llvm_type(ctx);
+                    let key_iter = arr.llvm_key_iter_ptr(ctx, &build, iter_ptr);
+                    let val_iter = arr.llvm_val_iter_ptr(ctx, &build, iter_ptr);
+
+                    let key_buf = build.build_alloca(key_type, "key_buf").unwrap();
+                    let had_next = build
+                        .build_call(key_next, &[key_iter.into(), key_buf.into()], "next_key")
+                        .unwrap()
+                        .try_as_basic_value()
+                        .unwrap_basic()
+                        .into_int_value();
+                    build
+                        .build_conditional_branch(had_next, fetch, none_left)
+                        .unwrap();
+
+                    build.position_at_end(fetch);
+                    let next_key = build
+                        .build_int_cast(
+                            build
+                                .build_load(key_type, key_buf, "next_key")
+                                .unwrap()
+                                .into_int_value(),
+                            i64_type,
+                            "casted_key",
+                        )
+                        .unwrap();
+                    let value = build
+                        .build_call(values_access, &[val_iter.into(), next_key.into()], "value")
+                        .unwrap()
+                        .try_as_basic_value()
+                        .unwrap_basic();
+                    build.build_store(out_ptr, value).unwrap();
+                    build
+                        .build_return(Some(&bool_type.const_int(1, false)))
+                        .unwrap();
+
+                    build.position_at_end(none_left);
+                    build
+                        .build_return(Some(&bool_type.const_int(0, false)))
+                        .unwrap();
+                    next
+                }
+                _ => unreachable!("dict iterator but not dict data type ({:?})", dt),
+            },
+            IteratorHolder::RunEnd {
+                arr,
+                run_ends,
+                values,
+            } => match &dt {
+                DataType::RunEndEncoded(_, _) => {
+                    let re_access = run_ends
+                        .generate_random_access(ctx, llvm_mod)
+                        .expect("run-end iteration requires random-access run ends");
+                    let val_access = values
+                        .generate_random_access(ctx, llvm_mod)
+                        .expect("run-end iteration requires random-access values");
+
+                    declare_blocks!(
+                        ctx,
+                        next,
+                        entry,
+                        check_remaining,
+                        has_remaining,
+                        none_remaining,
+                        load_next_run,
+                        exhausted
+                    );
+
+                    build.position_at_end(entry);
+                    let val_iter_ptr = arr.llvm_val_iter_ptr(ctx, &build, iter_ptr);
+                    let re_iter_ptr = arr.llvm_re_iter_ptr(ctx, &build, iter_ptr);
+                    let log_pos = arr.llvm_logical_pos(ctx, &build, iter_ptr);
+                    let log_len = arr.llvm_logical_len(ctx, &build, iter_ptr);
+                    let log_have_more = build
+                        .build_int_compare(IntPredicate::ULT, log_pos, log_len, "have_log_next")
+                        .unwrap();
+                    build
+                        .build_conditional_branch(log_have_more, check_remaining, exhausted)
+                        .unwrap();
+
+                    build.position_at_end(check_remaining);
+                    let remaining = arr.llvm_remaining(ctx, &build, iter_ptr);
+                    let res = build
+                        .build_int_compare(
+                            IntPredicate::UGT,
+                            remaining,
+                            i64_type.const_zero(),
+                            "has_remaining",
+                        )
+                        .unwrap();
+                    build
+                        .build_conditional_branch(res, has_remaining, none_remaining)
+                        .unwrap();
+
+                    build.position_at_end(has_remaining);
+                    // there are values left in the current run
+                    let curr_pos = arr.llvm_pos(ctx, &build, iter_ptr);
+                    let val = build
+                        .build_call(val_access, &[val_iter_ptr.into(), curr_pos.into()], "value")
+                        .unwrap()
+                        .try_as_basic_value()
+                        .unwrap_basic();
+                    build.build_store(out_ptr, val).unwrap();
+                    arr.llvm_dec_remaining(ctx, &build, iter_ptr, i64_type.const_int(1, false));
+                    arr.llvm_inc_logical_pos(ctx, &build, iter_ptr, i64_type.const_int(1, false));
+                    build
+                        .build_return(Some(&bool_type.const_all_ones()))
+                        .unwrap();
+
+                    build.position_at_end(none_remaining);
+                    // there are no values left in the current run -- either load a
+                    // new run, or return false
+                    arr.llvm_inc_pos(ctx, &build, iter_ptr, i64_type.const_int(1, false));
+                    let curr_pos = arr.llvm_pos(ctx, &build, iter_ptr);
+                    let re_len = arr.llvm_len(ctx, &build, iter_ptr);
+                    let have_another_run = build
+                        .build_int_compare(IntPredicate::ULT, curr_pos, re_len, "another_run")
+                        .unwrap();
+                    build
+                        .build_conditional_branch(have_another_run, load_next_run, exhausted)
+                        .unwrap();
+
+                    build.position_at_end(load_next_run);
+                    let curr_pos = arr.llvm_pos(ctx, &build, iter_ptr);
+                    let my_end = build
+                        .build_call(re_access, &[re_iter_ptr.into(), curr_pos.into()], "my_end")
+                        .unwrap()
+                        .try_as_basic_value()
+                        .unwrap_basic()
+                        .into_int_value();
+                    let prev_end = build
+                        .build_call(
+                            re_access,
+                            &[
+                                re_iter_ptr.into(),
+                                build
+                                    .build_int_sub(
+                                        curr_pos,
+                                        i64_type.const_int(1, false),
+                                        "prev_pos",
+                                    )
+                                    .unwrap()
+                                    .into(),
+                            ],
+                            "prev_end",
+                        )
+                        .unwrap()
+                        .try_as_basic_value()
+                        .unwrap_basic()
+                        .into_int_value();
+                    let new_remaining = build
+                        .build_int_sub(my_end, prev_end, "new_remaining")
+                        .unwrap();
+                    let new_remaining_cast = build
+                        .build_int_cast(new_remaining, i64_type, "new_remaining_cast")
+                        .unwrap();
+                    arr.llvm_set_remaining(ctx, &build, iter_ptr, new_remaining_cast);
+                    build.build_unconditional_branch(check_remaining).unwrap();
+
+                    build.position_at_end(exhausted);
+                    build.build_return(Some(&bool_type.const_zero())).unwrap();
+
+                    next
+                }
+                _ => unreachable!("run-end iterator but not run-end data type ({:?})", dt),
+            },
+            IteratorHolder::FixedSizeList(iter) => {
+                declare_blocks!(ctx, next, entry, none_left, get_next);
+
+                build.position_at_end(entry);
+                let curr_pos = iter.llvm_pos(ctx, &build, iter_ptr);
+                let curr_len = iter.llvm_len(ctx, &build, iter_ptr);
+                let have_more = build
+                    .build_int_compare(IntPredicate::ULT, curr_pos, curr_len, "have_enough")
+                    .unwrap();
+                build
+                    .build_conditional_branch(have_more, get_next, none_left)
+                    .unwrap();
+
+                build.position_at_end(none_left);
+                build
+                    .build_return(Some(&bool_type.const_int(0, false)))
+                    .unwrap();
+
+                build.position_at_end(get_next);
+                let out = build_fixed_size_list_value(
+                    ctx, llvm_mod, &build, &dt, iter, iter_ptr, curr_pos,
+                )
+                .expect("fixed-size-list iteration requires a random-access child");
+                build.build_store(out_ptr, out).unwrap();
+                iter.llvm_increment_pos(ctx, &build, iter_ptr, i64_type.const_int(1, false));
+                build
+                    .build_return(Some(&bool_type.const_int(1, false)))
+                    .unwrap();
+
+                next
+            }
+            IteratorHolder::List(iter) => {
+                declare_blocks!(ctx, next, entry, none_left, get_next);
+
+                build.position_at_end(entry);
+                let curr_pos = iter.llvm_pos(ctx, &build, iter_ptr);
+                let curr_len = iter.llvm_len(ctx, &build, iter_ptr);
+                let have_more = build
+                    .build_int_compare(IntPredicate::ULT, curr_pos, curr_len, "have_enough")
+                    .unwrap();
+                build
+                    .build_conditional_branch(have_more, get_next, none_left)
+                    .unwrap();
+
+                build.position_at_end(none_left);
+                build
+                    .build_return(Some(&bool_type.const_int(0, false)))
+                    .unwrap();
+
+                build.position_at_end(get_next);
+                let out = build_variable_list_value(ctx, &build, iter, iter_ptr, curr_pos);
+                build.build_store(out_ptr, out).unwrap();
+                iter.llvm_increment_pos(ctx, &build, iter_ptr, i64_type.const_int(1, false));
+                build
+                    .build_return(Some(&bool_type.const_int(1, false)))
+                    .unwrap();
+
+                next
+            }
+            IteratorHolder::ScalarPrimitive(s) => {
+                let ptype = PrimitiveType::for_arrow_type(&dt);
+                assert_eq!(ptype.width(), s.width as usize);
+                declare_blocks!(ctx, next, entry);
+                build.position_at_end(entry);
+                let ptr = s.llvm_val_ptr(ctx, &build, iter_ptr);
+                let constant = match &dt {
+                    DataType::Int8
+                    | DataType::Int16
+                    | DataType::Int32
+                    | DataType::Int64
+                    | DataType::UInt8
+                    | DataType::UInt16
+                    | DataType::UInt32
+                    | DataType::UInt64 => {
+                        let data = build
+                            .build_load(i64_type, ptr, "const_u64")
+                            .unwrap()
+                            .into_int_value();
+                        data.as_instruction_value()
+                            .unwrap()
+                            .set_metadata(ctx.metadata_node(&[]), ctx.get_kind_id("invariant.load"))
+                            .unwrap();
+                        build
+                            .build_int_cast(data, llvm_type.into_int_type(), "casted")
+                            .unwrap()
+                            .as_basic_value_enum()
+                    }
+                    DataType::Float16 | DataType::Float32 | DataType::Float64 => {
+                        let data = build
+                            .build_load(i64_type, ptr, "const_u64")
+                            .unwrap()
+                            .into_int_value();
+                        data.as_instruction_value()
+                            .unwrap()
+                            .set_metadata(ctx.metadata_node(&[]), ctx.get_kind_id("invariant.load"))
+                            .unwrap();
+                        let data = build
+                            .build_int_cast(
+                                data,
+                                PrimitiveType::int_with_width(s.width as usize)
+                                    .llvm_type(ctx)
+                                    .into_int_type(),
+                                "const_int",
+                            )
+                            .unwrap();
+                        build
+                            .build_bit_cast(data, llvm_type, "const_float")
+                            .unwrap()
+                    }
+                    _ => unreachable!(),
+                };
+                build.build_store(out_ptr, constant).unwrap();
+                build
+                    .build_return(Some(&bool_type.const_int(1, false)))
+                    .unwrap();
+                next
+            }
+            IteratorHolder::ScalarBoolean(s) => {
+                declare_blocks!(ctx, next, entry);
+                build.position_at_end(entry);
+                let ptr = s.llvm_val_ptr(ctx, &build, iter_ptr);
+                let constant = build
+                    .build_load(ctx.i8_type(), ptr, "const_bool_u8")
+                    .unwrap()
+                    .into_int_value();
+                mark_load_invariant!(ctx, constant);
+                let constant = build
+                    .build_int_truncate(constant, ctx.bool_type(), "trunc_const")
+                    .unwrap();
+                build.build_store(out_ptr, constant).unwrap();
+                build
+                    .build_return(Some(&bool_type.const_int(1, false)))
+                    .unwrap();
+                next
+            }
+            IteratorHolder::ScalarString(s) => {
+                let ptr_type = ctx.ptr_type(AddressSpace::default());
+                let ret_type = PrimitiveType::P64x2.llvm_type(ctx).into_struct_type();
+                declare_blocks!(ctx, next, entry);
+                build.position_at_end(entry);
+                let (ptr1, ptr2) = s.llvm_val_ptr(ctx, &build, iter_ptr);
+                let ptr1 = build
+                    .build_load(ptr_type, ptr1, "ptr1")
+                    .unwrap()
+                    .into_pointer_value();
+                ptr1.as_instruction_value()
+                    .unwrap()
+                    .set_metadata(ctx.metadata_node(&[]), ctx.get_kind_id("invariant.load"))
+                    .unwrap();
+                let ptr2 = build
+                    .build_load(ptr_type, ptr2, "ptr2")
+                    .unwrap()
+                    .into_pointer_value();
+                ptr2.as_instruction_value()
+                    .unwrap()
+                    .set_metadata(ctx.metadata_node(&[]), ctx.get_kind_id("invariant.load"))
+                    .unwrap();
+
+                let to_return = ret_type.const_zero();
+                let to_return = build
+                    .build_insert_value(to_return, ptr1, 0, "to_return")
+                    .unwrap();
+                let to_return = build
+                    .build_insert_value(to_return, ptr2, 1, "to_return")
+                    .unwrap();
+                build.build_store(out_ptr, to_return).unwrap();
+                build
+                    .build_return(Some(&bool_type.const_int(1, false)))
+                    .unwrap();
+
+                next
+            }
+            IteratorHolder::ScalarBinary(s) => {
+                let ptr_type = ctx.ptr_type(AddressSpace::default());
+                let ret_type = PrimitiveType::P64x2.llvm_type(ctx).into_struct_type();
+                declare_blocks!(ctx, next, entry);
+                build.position_at_end(entry);
+                let (ptr1, ptr2) = s.llvm_val_ptr(ctx, &build, iter_ptr);
+                let ptr1 = build
+                    .build_load(ptr_type, ptr1, "ptr1")
+                    .unwrap()
+                    .into_pointer_value();
+                ptr1.as_instruction_value()
+                    .unwrap()
+                    .set_metadata(ctx.metadata_node(&[]), ctx.get_kind_id("invariant.load"))
+                    .unwrap();
+                let ptr2 = build
+                    .build_load(ptr_type, ptr2, "ptr2")
+                    .unwrap()
+                    .into_pointer_value();
+                ptr2.as_instruction_value()
+                    .unwrap()
+                    .set_metadata(ctx.metadata_node(&[]), ctx.get_kind_id("invariant.load"))
+                    .unwrap();
+
+                let to_return = ret_type.const_zero();
+                let to_return = build
+                    .build_insert_value(to_return, ptr1, 0, "to_return")
+                    .unwrap();
+                let to_return = build
+                    .build_insert_value(to_return, ptr2, 1, "to_return")
+                    .unwrap();
+                build.build_store(out_ptr, to_return).unwrap();
+                build
+                    .build_return(Some(&bool_type.const_int(1, false)))
+                    .unwrap();
+
+                next
+            }
+            IteratorHolder::ScalarVec(iter) => {
+                declare_blocks!(ctx, next, entry);
+                build.position_at_end(entry);
+                let val = iter.llvm_val(ctx, &build, iter_ptr);
+                build.build_store(out_ptr, val).unwrap();
+                build
+                    .build_return(Some(&bool_type.const_int(1, false)))
+                    .unwrap();
+
+                next
+            }
+        }
     }
 
     /// Adds or reuses the random-access function for this iterator's code-generation shape.
@@ -879,1807 +2735,390 @@ impl IteratorHolder {
         ctx: &'a Context,
         llvm_mod: &Module<'a>,
     ) -> Option<FunctionValue<'a>> {
-        generate_random_access(ctx, llvm_mod, self)
-    }
-}
+        let info = self.codegen_info();
+        if !info.random_access {
+            return None;
+        }
 
-fn generate_reset_iterator<'a>(
-    ctx: &'a Context,
-    llvm_mod: &Module<'a>,
-    ih: &IteratorHolder,
-) -> FunctionValue<'a> {
-    let build = ctx.create_builder();
-    let ptr_type = ctx.ptr_type(AddressSpace::default());
-    let name = format!("{}_reset", ih.codegen_label());
+        let build = ctx.create_builder();
+        let dt = self.data_type();
+        let llvm_type = info.value_type.llvm_type(ctx);
+        let ptr_type = ctx.ptr_type(AddressSpace::default());
+        let i64_type = ctx.i64_type();
 
-    if let Some(existing) = llvm_mod.get_function(&name) {
-        assert_eq!(
-            existing.get_type(),
-            ctx.void_type().fn_type(&[ptr_type.into()], false)
+        let fn_type = llvm_type.fn_type(&[ptr_type.into(), i64_type.into()], false);
+        let name = format!("{}_access", self.codegen_label());
+        if let Some(existing) = llvm_mod.get_function(&name) {
+            assert_eq!(existing.get_type(), fn_type);
+            return Some(existing);
+        }
+        let access_f = llvm_mod.add_function(
+            &name,
+            fn_type,
+            Some(
+                #[cfg(test)]
+                Linkage::External,
+                #[cfg(not(test))]
+                Linkage::Private,
+            ),
         );
-        return existing;
-    }
+        let iter_ptr = access_f.get_nth_param(0).unwrap().into_pointer_value();
+        let idx = access_f.get_nth_param(1).unwrap().into_int_value();
 
-    let fn_type = ctx.void_type().fn_type(&[ptr_type.into()], false);
-    let reset = llvm_mod.add_function(
-        &name,
-        fn_type,
-        Some(
-            #[cfg(test)]
-            Linkage::External,
-            #[cfg(not(test))]
-            Linkage::Private,
-        ),
-    );
-    set_noalias_params(&reset);
-    let iter_ptr = reset.get_nth_param(0).unwrap().into_pointer_value();
-
-    match ih {
-        IteratorHolder::Primitive(iter) => {
-            declare_blocks!(ctx, reset, entry);
-            build.position_at_end(entry);
-            iter.llvm_reset(ctx, &build, iter_ptr);
-            build.build_return(None).unwrap();
-            reset
-        }
-        IteratorHolder::String(iter) => {
-            declare_blocks!(ctx, reset, entry);
-            build.position_at_end(entry);
-            iter.llvm_reset(ctx, &build, iter_ptr);
-            build.build_return(None).unwrap();
-            reset
-        }
-        IteratorHolder::LargeString(iter) => {
-            declare_blocks!(ctx, reset, entry);
-            build.position_at_end(entry);
-            iter.llvm_reset(ctx, &build, iter_ptr);
-            build.build_return(None).unwrap();
-            reset
-        }
-        IteratorHolder::View(iter) => {
-            declare_blocks!(ctx, reset, entry);
-            build.position_at_end(entry);
-            iter.llvm_reset(ctx, &build, iter_ptr);
-            build.build_return(None).unwrap();
-            reset
-        }
-        IteratorHolder::Bitmap(iter) => {
-            declare_blocks!(ctx, reset, entry);
-            build.position_at_end(entry);
-            iter.llvm_reset(ctx, &build, iter_ptr);
-            build.build_return(None).unwrap();
-            reset
-        }
-        IteratorHolder::SetBit(iter) => {
-            declare_blocks!(ctx, reset, entry);
-            build.position_at_end(entry);
-            iter.llvm_reset(ctx, &build, iter_ptr);
-            build.build_return(None).unwrap();
-            reset
-        }
-        IteratorHolder::Dictionary { arr, keys, values } => {
-            let key_reset = keys.generate_reset(ctx, llvm_mod);
-            let value_reset = values.generate_reset(ctx, llvm_mod);
-
-            declare_blocks!(ctx, reset, entry);
-            build.position_at_end(entry);
-            let key_ptr = arr.llvm_key_iter_ptr(ctx, &build, iter_ptr);
-            let val_ptr = arr.llvm_val_iter_ptr(ctx, &build, iter_ptr);
-            build
-                .build_call(key_reset, &[key_ptr.into()], "reset_key_iter")
-                .unwrap();
-            build
-                .build_call(value_reset, &[val_ptr.into()], "reset_value_iter")
-                .unwrap();
-            build.build_return(None).unwrap();
-            reset
-        }
-        IteratorHolder::RunEnd {
-            arr,
-            run_ends,
-            values,
-        } => {
-            let re_reset = run_ends.generate_reset(ctx, llvm_mod);
-            let value_reset = values.generate_reset(ctx, llvm_mod);
-
-            declare_blocks!(ctx, reset, entry);
-            build.position_at_end(entry);
-            let re_ptr = arr.llvm_re_iter_ptr(ctx, &build, iter_ptr);
-            let val_ptr = arr.llvm_val_iter_ptr(ctx, &build, iter_ptr);
-            build
-                .build_call(re_reset, &[re_ptr.into()], "reset_run_end_iter")
-                .unwrap();
-            build
-                .build_call(value_reset, &[val_ptr.into()], "reset_value_iter")
-                .unwrap();
-            arr.llvm_reset(ctx, &build, iter_ptr);
-            build.build_return(None).unwrap();
-            reset
-        }
-        IteratorHolder::FixedSizeList(iter) => {
-            declare_blocks!(ctx, reset, entry);
-            build.position_at_end(entry);
-            iter.llvm_reset(ctx, &build, iter_ptr);
-            build.build_return(None).unwrap();
-            reset
-        }
-        IteratorHolder::List(iter) => {
-            let child_reset = iter.child().generate_reset(ctx, llvm_mod);
-
-            declare_blocks!(ctx, reset, entry);
-            build.position_at_end(entry);
-            let child_ptr = iter.llvm_child_iter(ctx, &build, iter_ptr);
-            build
-                .build_call(child_reset, &[child_ptr.into()], "reset_list_child_iter")
-                .unwrap();
-            iter.llvm_reset(ctx, &build, iter_ptr);
-            build.build_return(None).unwrap();
-            reset
-        }
-        IteratorHolder::ScalarPrimitive(_)
-        | IteratorHolder::ScalarBoolean(_)
-        | IteratorHolder::ScalarString(_)
-        | IteratorHolder::ScalarBinary(_)
-        | IteratorHolder::ScalarVec(_) => {
-            declare_blocks!(ctx, reset, entry);
-            build.position_at_end(entry);
-            build.build_return(None).unwrap();
-            reset
-        }
-    }
-}
-
-fn generate_next_block<'a, const N: u32>(
-    ctx: &'a Context,
-    llvm_mod: &Module<'a>,
-    ih: &IteratorHolder,
-) -> Option<FunctionValue<'a>> {
-    let build = ctx.create_builder();
-    let info = ih.codegen_info();
-    if !info.next_block {
-        return None;
-    }
-    let dt = ih.data_type();
-    let ptype = info
-        .value_type
-        .vectorizable_primitive()
-        .expect("next-block capability requires a vectorizable primitive value");
-    let vec_type = ptype
-        .llvm_vec_type(ctx, N)
-        .expect("vectorizable primitive should have an LLVM vector type");
-    let llvm_type = ptype.llvm_type(ctx);
-    let bool_type = ctx.bool_type();
-    let ptr_type = ctx.ptr_type(AddressSpace::default());
-    let i64_type = ctx.i64_type();
-    let llvm_n = i64_type.const_int(N as u64, false);
-
-    let fn_type = bool_type.fn_type(&[ptr_type.into(), ptr_type.into()], false);
-    let name = format!("{}_next_block_{}", ih.codegen_label(), N);
-    if let Some(existing) = llvm_mod.get_function(&name) {
-        assert_eq!(existing.get_type(), fn_type);
-        return Some(existing);
-    }
-    let next = llvm_mod.add_function(
-        &name,
-        fn_type,
-        Some(
-            #[cfg(test)]
-            Linkage::External,
-            #[cfg(not(test))]
-            Linkage::Private,
-        ),
-    );
-    let iter_ptr = next.get_nth_param(0).unwrap().into_pointer_value();
-    let out_ptr = next.get_nth_param(1).unwrap().into_pointer_value();
-
-    let res = match ih {
-        IteratorHolder::Primitive(primitive_iter) => {
-            declare_blocks!(ctx, next, entry, none_left, get_next);
-
-            build.position_at_end(entry);
-            let curr_pos = primitive_iter.llvm_pos(ctx, &build, iter_ptr);
-            let curr_len = primitive_iter.llvm_len(ctx, &build, iter_ptr);
-
-            let remaining = build
-                .build_int_sub(curr_len, curr_pos, "remaining")
-                .unwrap();
-            let have_enough = build
-                .build_int_compare(IntPredicate::UGE, remaining, llvm_n, "have_enough")
-                .unwrap();
-            build
-                .build_conditional_branch(have_enough, get_next, none_left)
-                .unwrap();
-
-            build.position_at_end(none_left);
-            build
-                .build_return(Some(&bool_type.const_int(0, false)))
-                .unwrap();
-
-            build.position_at_end(get_next);
-            // there are at least n elements left, we can load them and increment
-            let data_ptr = primitive_iter.llvm_data(ctx, &build, iter_ptr);
-            let data_ptr = increment_pointer!(ctx, build, data_ptr, ptype.width(), curr_pos);
-            let vec = build.build_load(vec_type, data_ptr, "vec").unwrap();
-            vec.as_instruction_value()
-                .unwrap()
-                .set_alignment(1)
-                .unwrap();
-
-            build.build_store(out_ptr, vec).unwrap();
-            primitive_iter.llvm_increment_pos(ctx, &build, iter_ptr, llvm_n);
-            build
-                .build_return(Some(&bool_type.const_int(1, false)))
-                .unwrap();
-
-            next
-        }
-        IteratorHolder::Dictionary { arr, keys, values } => match &dt {
-            DataType::Dictionary(k_dt, _) => {
-                let key_block_next = keys
-                    .generate_next_block::<N>(ctx, llvm_mod)
-                    .expect("dictionary block capability requires block-readable keys");
-
-                let value_access = values
-                    .generate_random_access(ctx, llvm_mod)
-                    .expect("dictionary block capability requires random-access values");
-
-                declare_blocks!(ctx, next, entry, none_left, get_next);
+        match self {
+            IteratorHolder::Primitive(primitive_iter) => {
+                let ptype = PrimitiveType::for_arrow_type(&dt);
+                declare_blocks!(ctx, access_f, entry);
 
                 build.position_at_end(entry);
-                let key_prim_type = PrimitiveType::for_arrow_type(k_dt);
-                let key_iter = arr.llvm_key_iter_ptr(ctx, &build, iter_ptr);
-                let key_vec_type = key_prim_type.llvm_vec_type(ctx, N).unwrap();
-                let key_buf = build.build_alloca(key_vec_type, "key_block").unwrap();
-                let key_block_result = build
-                    .build_call(
-                        key_block_next,
-                        &[key_iter.into(), key_buf.into()],
-                        "key_block_result",
+                let data_ptr = primitive_iter.llvm_data(ctx, &build, iter_ptr);
+                let data_ptr = increment_pointer!(ctx, build, data_ptr, ptype.width(), idx);
+                let out = build.build_load(llvm_type, data_ptr, "elem").unwrap();
+                build.build_return(Some(&out)).unwrap();
+
+                Some(access_f)
+            }
+            IteratorHolder::FixedSizeList(iter) => {
+                declare_blocks!(ctx, access_f, entry);
+
+                build.position_at_end(entry);
+                let out =
+                    build_fixed_size_list_value(ctx, llvm_mod, &build, &dt, iter, iter_ptr, idx)
+                        .expect("fixed-size-list access requires a random-access child");
+                build.build_return(Some(&out)).unwrap();
+
+                Some(access_f)
+            }
+            IteratorHolder::List(iter) => {
+                declare_blocks!(ctx, access_f, entry);
+
+                build.position_at_end(entry);
+                let out = build_variable_list_value(ctx, &build, iter, iter_ptr, idx);
+                build.build_return(Some(&out)).unwrap();
+
+                Some(access_f)
+            }
+            IteratorHolder::String(ih) => {
+                let i32_type = ctx.i32_type();
+                let ret_type = PrimitiveType::P64x2.llvm_type(ctx).into_struct_type();
+
+                declare_blocks!(ctx, access_f, entry);
+
+                build.position_at_end(entry);
+                let offsets = ih.llvm_get_offset_ptr(ctx, &build, iter_ptr);
+                let offset1 = build
+                    .build_load(
+                        i32_type,
+                        increment_pointer!(ctx, build, offsets, 4, idx),
+                        "offset1",
                     )
                     .unwrap()
-                    .try_as_basic_value()
-                    .unwrap_basic()
                     .into_int_value();
-                build
-                    .build_conditional_branch(key_block_result, get_next, none_left)
+                let offset2 = build
+                    .build_load(
+                        i32_type,
+                        increment_pointer!(
+                            ctx,
+                            build,
+                            offsets,
+                            4,
+                            build
+                                .build_int_add(idx, i64_type.const_int(1, false), "inc")
+                                .unwrap()
+                        ),
+                        "offset2",
+                    )
+                    .unwrap()
+                    .into_int_value();
+
+                let offset1 = build
+                    .build_int_z_extend(offset1, i64_type, "offset1")
+                    .unwrap();
+                let offset2 = build
+                    .build_int_z_extend(offset2, i64_type, "offset1")
                     .unwrap();
 
-                build.position_at_end(none_left);
-                build
-                    .build_return(Some(&bool_type.const_int(0, false)))
+                let data = ih.llvm_get_data_ptr(ctx, &build, iter_ptr);
+                let ptr1 = increment_pointer!(ctx, build, data, 1, offset1);
+                let ptr2 = increment_pointer!(ctx, build, data, 1, offset2);
+                let to_return = ret_type.const_zero();
+                let to_return = build
+                    .build_insert_value(to_return, ptr1, 0, "to_return")
                     .unwrap();
+                let to_return = build
+                    .build_insert_value(to_return, ptr2, 1, "to_return")
+                    .unwrap();
+                build.build_return(Some(&to_return)).unwrap();
+                Some(access_f)
+            }
+            IteratorHolder::LargeString(ih) => {
+                let ret_type = PrimitiveType::P64x2.llvm_type(ctx).into_struct_type();
 
-                build.position_at_end(get_next);
-                let key_vec = build
-                    .build_load(key_vec_type, key_buf, "key_vec")
+                declare_blocks!(ctx, access_f, entry);
+
+                build.position_at_end(entry);
+                let offsets = ih.llvm_get_offset_ptr(ctx, &build, iter_ptr);
+                let offset1 = build
+                    .build_load(
+                        i64_type,
+                        increment_pointer!(ctx, build, offsets, 8, idx),
+                        "offset1",
+                    )
+                    .unwrap()
+                    .into_int_value();
+                let offset2 = build
+                    .build_load(
+                        i64_type,
+                        increment_pointer!(
+                            ctx,
+                            build,
+                            offsets,
+                            8,
+                            build
+                                .build_int_add(idx, i64_type.const_int(1, false), "inc")
+                                .unwrap()
+                        ),
+                        "offset2",
+                    )
+                    .unwrap()
+                    .into_int_value();
+
+                let data = ih.llvm_get_data_ptr(ctx, &build, iter_ptr);
+                let ptr1 = increment_pointer!(ctx, build, data, 1, offset1);
+                let ptr2 = increment_pointer!(ctx, build, data, 1, offset2);
+                let to_return = ret_type.const_zero();
+                let to_return = build
+                    .build_insert_value(to_return, ptr1, 0, "to_return")
+                    .unwrap();
+                let to_return = build
+                    .build_insert_value(to_return, ptr2, 1, "to_return")
+                    .unwrap();
+                build.build_return(Some(&to_return)).unwrap();
+                Some(access_f)
+            }
+            IteratorHolder::View(iter) => {
+                let i128_type = ctx.i128_type();
+                let i32_type = ctx.i32_type();
+                let ret_type = PrimitiveType::P64x2.llvm_type(ctx).into_struct_type();
+
+                declare_blocks!(ctx, access_f, entry, short_str, long_str);
+
+                build.position_at_end(entry);
+                let view_ptr = iter.llvm_view_ptr(ctx, &build, iter_ptr);
+                let our_view_ptr = increment_pointer!(ctx, build, view_ptr, 16, idx);
+                let our_view = build
+                    .build_load(i128_type, our_view_ptr, "our_view")
+                    .unwrap()
+                    .into_int_value();
+                let as_vec = build
+                    .build_bit_cast(our_view, i32_type.vec_type(4), "as_vec")
                     .unwrap()
                     .into_vector_value();
-                let key_vec = build
-                    .build_int_cast(key_vec, i64_type.vec_type(N), "key_vec_cast")
+                let str_len = build
+                    .build_extract_element(as_vec, i64_type.const_zero(), "str_len")
+                    .unwrap()
+                    .into_int_value();
+                let str_len = build
+                    .build_int_s_extend(str_len, i64_type, "ext_len")
                     .unwrap();
-                let mut out_vec = vec_type.const_zero();
-                for idx in 0..N as u64 {
+                let cmp = build
+                    .build_int_compare(
+                        IntPredicate::SLE,
+                        str_len,
+                        i64_type.const_int(12, true),
+                        "cmp",
+                    )
+                    .unwrap();
+                build
+                    .build_conditional_branch(cmp, short_str, long_str)
+                    .unwrap();
+
+                build.position_at_end(short_str);
+                let ptr1 = increment_pointer!(ctx, build, our_view_ptr, 4);
+                let ptr2 = increment_pointer!(ctx, build, ptr1, 1, str_len);
+                let to_return = ret_type.const_zero();
+                let to_return = build
+                    .build_insert_value(to_return, ptr1, 0, "to_return")
+                    .unwrap();
+                let to_return = build
+                    .build_insert_value(to_return, ptr2, 1, "to_return")
+                    .unwrap();
+                build.build_return(Some(&to_return)).unwrap();
+
+                build.position_at_end(long_str);
+                let buf_idx = build
+                    .build_extract_element(as_vec, i64_type.const_int(2, false), "buf_idx")
+                    .unwrap()
+                    .into_int_value();
+                let buf_base = iter.llvm_buffer_ptr(ctx, &build, iter_ptr, buf_idx);
+                let offset = build
+                    .build_extract_element(as_vec, i64_type.const_int(3, false), "offset")
+                    .unwrap()
+                    .into_int_value();
+                let offset = build
+                    .build_int_s_extend_or_bit_cast(offset, i64_type, "offset_ext")
+                    .unwrap();
+                let ptr1 = increment_pointer!(ctx, build, buf_base, 1, offset);
+                let ptr2 = increment_pointer!(ctx, build, ptr1, 1, str_len);
+                let to_return = ret_type.const_zero();
+                let to_return = build
+                    .build_insert_value(to_return, ptr1, 0, "to_return")
+                    .unwrap();
+                let to_return = build
+                    .build_insert_value(to_return, ptr2, 1, "to_return")
+                    .unwrap();
+                build.build_return(Some(&to_return)).unwrap();
+
+                Some(access_f)
+            }
+            IteratorHolder::Bitmap(bitmap_iterator) => {
+                let ptype = PrimitiveType::for_arrow_type(&dt);
+                declare_blocks!(ctx, access_f, entry);
+
+                build.position_at_end(entry);
+                let data_ptr = bitmap_iterator.llvm_get_data_ptr(ctx, &build, iter_ptr);
+                let slice_offset = bitmap_iterator.llvm_slice_offset(ctx, &build, iter_ptr);
+                let bit_index = build
+                    .build_int_add(slice_offset, idx, "slice_offset_plus_index")
+                    .unwrap();
+                let byte_index = build
+                    .build_right_shift(bit_index, i64_type.const_int(3, false), false, "byte_index")
+                    .unwrap();
+                let bit_in_byte_i64 = build
+                    .build_and(bit_index, i64_type.const_int(7, false), "bit_in_byte_i64")
+                    .unwrap();
+                let bit_in_byte_i8 = build
+                    .build_int_truncate(bit_in_byte_i64, ctx.i8_type(), "bit_in_byte_i8")
+                    .unwrap();
+                let data_byte_ptr =
+                    increment_pointer!(ctx, build, data_ptr, ptype.width(), byte_index);
+                let data_byte_i8 = build
+                    .build_load(ctx.i8_type(), data_byte_ptr, "get_data_byte_i8")
+                    .unwrap()
+                    .into_int_value();
+                let data_byte_shifted_i8 = build
+                    .build_right_shift(data_byte_i8, bit_in_byte_i8, false, "data_byte_shifted_i8")
+                    .unwrap();
+                let data_bit_i8 = build
+                    .build_and(
+                        data_byte_shifted_i8,
+                        ctx.i8_type().const_int(1, false),
+                        "data_bit_i8",
+                    )
+                    .unwrap();
+                build.build_return(Some(&data_bit_i8)).unwrap();
+
+                Some(access_f)
+            }
+            IteratorHolder::Dictionary { arr, keys, values } => match &dt {
+                DataType::Dictionary(_, _) => {
+                    let keys_access = keys
+                        .generate_random_access(ctx, llvm_mod)
+                        .expect("dictionary access requires random-access keys");
+                    let values_access = values
+                        .generate_random_access(ctx, llvm_mod)
+                        .expect("dictionary access requires random-access values");
+
+                    declare_blocks!(ctx, access_f, entry);
+
+                    build.position_at_end(entry);
                     let key = build
-                        .build_extract_element(key_vec, i64_type.const_int(idx, false), "key")
+                        .build_call(
+                            keys_access,
+                            &[
+                                arr.llvm_key_iter_ptr(ctx, &build, iter_ptr).into(),
+                                idx.into(),
+                            ],
+                            "key",
+                        )
                         .unwrap()
+                        .try_as_basic_value()
+                        .unwrap_basic()
                         .into_int_value();
-                    let val_iter = arr.llvm_val_iter_ptr(ctx, &build, iter_ptr);
+                    let key_conv = build
+                        .build_int_cast(key, ctx.i64_type(), "key_conv")
+                        .unwrap();
+
                     let value = build
-                        .build_call(value_access, &[val_iter.into(), key.into()], "value")
+                        .build_call(
+                            values_access,
+                            &[
+                                arr.llvm_val_iter_ptr(ctx, &build, iter_ptr).into(),
+                                key_conv.into(),
+                            ],
+                            "value",
+                        )
                         .unwrap()
                         .try_as_basic_value()
                         .unwrap_basic();
-                    out_vec = build
-                        .build_insert_element(
-                            out_vec,
-                            value,
-                            i64_type.const_int(idx, false),
-                            &format!("insert{}", idx),
+                    build.build_return(Some(&value)).unwrap();
+
+                    Some(access_f)
+                }
+                _ => unreachable!("dictionary iterator but non-iterator data type ({:?})", dt),
+            },
+            IteratorHolder::RunEnd {
+                arr,
+                run_ends,
+                values,
+            } => match &dt {
+                DataType::RunEndEncoded(r_dt, _) => {
+                    let runs_prim_type = PrimitiveType::for_arrow_type(r_dt.data_type());
+                    let runs_t = runs_prim_type.llvm_type(ctx).into_int_type();
+                    let bsearch =
+                        add_bsearch(ctx, llvm_mod, run_ends.as_primitive(), runs_prim_type);
+                    let value_access = values
+                        .generate_random_access(ctx, llvm_mod)
+                        .expect("run-end access requires random-access values");
+
+                    declare_blocks!(ctx, access_f, entry);
+                    build.position_at_end(entry);
+                    let idx = build
+                        .build_int_truncate_or_bit_cast(idx, runs_t, "casted_idx")
+                        .unwrap();
+
+                    let v_idx = build
+                        .build_call(
+                            bsearch,
+                            &[
+                                arr.llvm_re_iter_ptr(ctx, &build, iter_ptr).into(),
+                                idx.into(),
+                            ],
+                            "v_idx",
                         )
-                        .unwrap();
-                }
-                build.build_store(out_ptr, out_vec).unwrap();
-                build
-                    .build_return(Some(&bool_type.const_int(1, false)))
-                    .unwrap();
-
-                next
-            }
-            _ => unreachable!("dict iterator but not dict data type ({:?})", dt),
-        },
-        IteratorHolder::RunEnd {
-            arr,
-            run_ends,
-            values,
-        } => match &dt {
-            DataType::RunEndEncoded(_, _) => {
-                let access_ends = run_ends
-                    .generate_random_access(ctx, llvm_mod)
-                    .expect("run-end block capability requires random-access run ends");
-                let access_values = values
-                    .generate_random_access(ctx, llvm_mod)
-                    .expect("run-end block capability requires random-access values");
-
-                let umin = Intrinsic::find("llvm.umin").unwrap();
-                let umin_f = umin.get_declaration(llvm_mod, &[i64_type.into()]).unwrap();
-                declare_blocks!(
-                    ctx,
-                    next,
-                    entry,
-                    check_for_next,
-                    fetch_next,
-                    not_enough,
-                    loop_cond,
-                    check_vec_full,
-                    fill_vec,
-                    exit
-                );
-
-                build.position_at_end(entry);
-                let orig_pos = arr.llvm_pos(ctx, &build, iter_ptr);
-                let orig_rem = arr.llvm_remaining(ctx, &build, iter_ptr);
-                let ends_iter = arr.llvm_re_iter_ptr(ctx, &build, iter_ptr);
-                let vals_iter = arr.llvm_val_iter_ptr(ctx, &build, iter_ptr);
-                let vbuf = build.build_alloca(vec_type, "vbuf").unwrap();
-                build.build_store(vbuf, vec_type.const_zero()).unwrap();
-                let buf_idx_ptr = build.build_alloca(i64_type, "buf_idx").unwrap();
-                build
-                    .build_store(buf_idx_ptr, i64_type.const_zero())
-                    .unwrap();
-
-                let log_pos = arr.llvm_logical_pos(ctx, &build, iter_ptr);
-                let log_len = arr.llvm_logical_len(ctx, &build, iter_ptr);
-                let log_rem = build.build_int_sub(log_len, log_pos, "log_rem").unwrap();
-                let log_have_more = build
-                    .build_int_compare(IntPredicate::UGE, log_rem, llvm_n, "have_log_next")
-                    .unwrap();
-                build
-                    .build_conditional_branch(log_have_more, loop_cond, not_enough)
-                    .unwrap();
-
-                build.position_at_end(check_vec_full);
-                let buf_idx = build
-                    .build_load(i64_type, buf_idx_ptr, "buf_idx")
-                    .unwrap()
-                    .into_int_value();
-                let res = build
-                    .build_int_compare(
-                        IntPredicate::ULT,
-                        buf_idx,
-                        i64_type.const_int(N as u64, false),
-                        "vec_full",
-                    )
-                    .unwrap();
-                build
-                    .build_conditional_branch(res, loop_cond, exit)
-                    .unwrap();
-
-                build.position_at_end(loop_cond);
-                let remaining = arr.llvm_remaining(ctx, &build, iter_ptr);
-                let res = build
-                    .build_int_compare(
-                        IntPredicate::UGT,
-                        remaining,
-                        i64_type.const_zero(),
-                        "have_remaining",
-                    )
-                    .unwrap();
-                build
-                    .build_conditional_branch(res, fill_vec, check_for_next)
-                    .unwrap();
-
-                build.position_at_end(check_for_next);
-                arr.llvm_inc_pos(ctx, &build, iter_ptr, i64_type.const_int(1, false));
-                let pos = arr.llvm_pos(ctx, &build, iter_ptr);
-                let len = arr.llvm_len(ctx, &build, iter_ptr);
-                let phs_have_more = build
-                    .build_int_compare(IntPredicate::ULT, pos, len, "have_phs_next")
-                    .unwrap();
-                build
-                    .build_conditional_branch(phs_have_more, fetch_next, not_enough)
-                    .unwrap();
-
-                build.position_at_end(not_enough);
-                arr.llvm_set_remaining(ctx, &build, iter_ptr, orig_rem);
-                arr.llvm_set_pos(ctx, &build, iter_ptr, orig_pos);
-                build.build_return(Some(&bool_type.const_zero())).unwrap();
-
-                build.position_at_end(fetch_next);
-                let my_end = build
-                    .build_call(access_ends, &[ends_iter.into(), pos.into()], "my_end")
-                    .unwrap()
-                    .try_as_basic_value()
-                    .unwrap_basic()
-                    .into_int_value();
-
-                let pr_end = build
-                    .build_call(
-                        access_ends,
-                        &[
-                            ends_iter.into(),
-                            build
-                                .build_int_sub(pos, i64_type.const_int(1, false), "minus1")
-                                .unwrap()
-                                .into(),
-                        ],
-                        "pr_end",
-                    )
-                    .unwrap()
-                    .try_as_basic_value()
-                    .unwrap_basic()
-                    .into_int_value();
-                let remaining = build.build_int_sub(my_end, pr_end, "remaining").unwrap();
-                let remaining = build
-                    .build_int_cast(remaining, i64_type, "remaining_cast")
-                    .unwrap();
-                arr.llvm_set_remaining(ctx, &build, iter_ptr, remaining);
-                build.build_unconditional_branch(loop_cond).unwrap();
-
-                build.position_at_end(fill_vec);
-                let pos = arr.llvm_pos(ctx, &build, iter_ptr);
-                let curr_val = build
-                    .build_call(access_values, &[vals_iter.into(), pos.into()], "val")
-                    .unwrap()
-                    .try_as_basic_value()
-                    .unwrap_basic();
-                let curr_val = build
-                    .build_insert_element(
-                        vec_type.const_zero(),
-                        curr_val,
-                        i64_type.const_zero(),
-                        "curr_val_vec",
-                    )
-                    .unwrap();
-                let curr_val = build
-                    .build_shuffle_vector(
-                        curr_val,
-                        vec_type.get_undef(),
-                        vec_type.const_zero(),
-                        "broadcasted",
-                    )
-                    .unwrap();
-
-                let remaining_values = arr.llvm_remaining(ctx, &build, iter_ptr);
-                let buf_idx = build
-                    .build_load(i64_type, buf_idx_ptr, "buf_idx")
-                    .unwrap()
-                    .into_int_value();
-                let remaining_slots = build
-                    .build_int_sub(
-                        i64_type.const_int(N as u64, false),
-                        buf_idx,
-                        "remaining_slots",
-                    )
-                    .unwrap();
-                let to_fill = build
-                    .build_call(
-                        umin_f,
-                        &[remaining_slots.into(), remaining_values.into()],
-                        "to_fill",
-                    )
-                    .unwrap()
-                    .try_as_basic_value()
-                    .unwrap_basic()
-                    .into_int_value();
-
-                // build a mask that 1 in the slots we want to insert value into
-                // ex: suppose block size = 8, to_fill = 2, curr_pos = 3
-                // desired mask: 00011000
-                // formula: ((1 << to_fill) - 1) << curr_pos
-                //
-                let mask = build
-                    .build_left_shift(
-                        build
-                            .build_int_sub(
-                                build
-                                    .build_left_shift(i64_type.const_int(1, false), to_fill, "mask")
-                                    .unwrap(),
-                                i64_type.const_int(1, false),
-                                "mask",
-                            )
-                            .unwrap(),
-                        buf_idx,
-                        "mask",
-                    )
-                    .unwrap();
-                let max_width_cond = build
-                    .build_int_compare(
-                        IntPredicate::EQ,
-                        to_fill,
-                        i64_type.const_int(N as u64, false),
-                        "is_full",
-                    )
-                    .unwrap();
-                let mask = build
-                    .build_select(max_width_cond, i64_type.const_all_ones(), mask, "mask")
-                    .unwrap()
-                    .into_int_value();
-
-                let mask = match N {
-                    8 => build
-                        .build_int_truncate(mask, ctx.i8_type(), "mask")
-                        .unwrap(),
-                    16 => build
-                        .build_int_truncate(mask, ctx.i16_type(), "mask")
-                        .unwrap(),
-                    32 => build
-                        .build_int_truncate(mask, ctx.i32_type(), "mask")
-                        .unwrap(),
-                    64 => mask,
-                    _ => return None,
-                };
-
-                let mask = build
-                    .build_bit_cast(mask, bool_type.vec_type(N), "mask_v")
-                    .unwrap()
-                    .into_vector_value();
-
-                let curr_buf = build
-                    .build_load(vec_type, vbuf, "curr_buf")
-                    .unwrap()
-                    .into_vector_value();
-
-                let new_buf = build
-                    .build_select(mask, curr_val, curr_buf, "new_buf")
-                    .unwrap();
-
-                build.build_store(vbuf, new_buf).unwrap();
-                arr.llvm_dec_remaining(ctx, &build, iter_ptr, to_fill);
-                let new_buf_ptr = build
-                    .build_int_add(buf_idx, to_fill, "new_buf_ptr")
-                    .unwrap();
-                build.build_store(buf_idx_ptr, new_buf_ptr).unwrap();
-                build.build_unconditional_branch(check_vec_full).unwrap();
-
-                build.position_at_end(exit);
-                let result = build.build_load(vec_type, vbuf, "result").unwrap();
-                arr.llvm_inc_logical_pos(
-                    ctx,
-                    &build,
-                    iter_ptr,
-                    i64_type.const_int(N as u64, false),
-                );
-                build.build_store(out_ptr, result).unwrap();
-                build
-                    .build_return(Some(&bool_type.const_all_ones()))
-                    .unwrap();
-
-                next
-            }
-            _ => unreachable!("run-end iterator but not run-end data type ({:?})", dt),
-        },
-        IteratorHolder::ScalarPrimitive(s) => {
-            assert_eq!(ptype.width(), s.width as usize);
-            let get_next_single = ih.generate_next(ctx, llvm_mod);
-            declare_blocks!(ctx, next, entry);
-            build.position_at_end(entry);
-            let val_buf = build.build_alloca(llvm_type, "val_buf").unwrap();
-            build
-                .build_call(get_next_single, &[iter_ptr.into(), val_buf.into()], "get")
-                .unwrap();
-            let constant = build.build_load(llvm_type, val_buf, "constant").unwrap();
-            constant
-                .as_instruction_value()
-                .unwrap()
-                .set_metadata(ctx.metadata_node(&[]), ctx.get_kind_id("invariant.load"))
-                .unwrap();
-            let v = build
-                .build_insert_element(vec_type.const_zero(), constant, i64_type.const_zero(), "v")
-                .unwrap();
-            let v = build
-                .build_shuffle_vector(v, vec_type.const_zero(), vec_type.const_zero(), "splatted")
-                .unwrap();
-            build.build_store(out_ptr, v).unwrap();
-            build
-                .build_return(Some(&bool_type.const_int(1, false)))
-                .unwrap();
-            next
-        }
-        IteratorHolder::String(_)
-        | IteratorHolder::LargeString(_)
-        | IteratorHolder::View(_)
-        | IteratorHolder::Bitmap(_)
-        | IteratorHolder::SetBit(_)
-        | IteratorHolder::FixedSizeList(_)
-        | IteratorHolder::List(_)
-        | IteratorHolder::ScalarBoolean(_)
-        | IteratorHolder::ScalarString(_)
-        | IteratorHolder::ScalarBinary(_)
-        | IteratorHolder::ScalarVec(_) => {
-            unreachable!("next-block capability disagrees with iterator variant")
-        }
-    };
-
-    Some(res)
-}
-
-fn generate_next<'a>(
-    ctx: &'a Context,
-    llvm_mod: &Module<'a>,
-    ih: &IteratorHolder,
-) -> FunctionValue<'a> {
-    let build = ctx.create_builder();
-    let dt = ih.data_type();
-    let llvm_type = ih.codegen_info().value_type.llvm_type(ctx);
-    let bool_type = ctx.bool_type();
-    let ptr_type = ctx.ptr_type(AddressSpace::default());
-    let i64_type = ctx.i64_type();
-
-    let fn_type = bool_type.fn_type(&[ptr_type.into(), ptr_type.into()], false);
-    let name = format!("{}_next", ih.codegen_label());
-    if let Some(existing) = llvm_mod.get_function(&name) {
-        assert_eq!(existing.get_type(), fn_type);
-        return existing;
-    }
-    let next = llvm_mod.add_function(
-        &name,
-        fn_type,
-        Some(
-            #[cfg(test)]
-            Linkage::External,
-            #[cfg(not(test))]
-            Linkage::Private,
-        ),
-    );
-    let iter_ptr = next.get_nth_param(0).unwrap().into_pointer_value();
-    let out_ptr = next.get_nth_param(1).unwrap().into_pointer_value();
-    set_noalias_params(&next);
-    match ih {
-        IteratorHolder::Primitive(primitive_iter) => {
-            let ptype = PrimitiveType::for_arrow_type(&dt);
-            declare_blocks!(ctx, next, entry, none_left, get_next);
-
-            build.position_at_end(entry);
-            let curr_pos = primitive_iter.llvm_pos(ctx, &build, iter_ptr);
-            let curr_len = primitive_iter.llvm_len(ctx, &build, iter_ptr);
-            let have_more = build
-                .build_int_compare(IntPredicate::ULT, curr_pos, curr_len, "have_enough")
-                .unwrap();
-            build
-                .build_conditional_branch(have_more, get_next, none_left)
-                .unwrap();
-
-            build.position_at_end(none_left);
-            build
-                .build_return(Some(&bool_type.const_int(0, false)))
-                .unwrap();
-
-            build.position_at_end(get_next);
-            // there are at least n elements left, we can load them and increment
-            let data_ptr = primitive_iter.llvm_data(ctx, &build, iter_ptr);
-            let data_ptr = increment_pointer!(ctx, build, data_ptr, ptype.width(), curr_pos);
-            let out = build.build_load(llvm_type, data_ptr, "elem").unwrap();
-            build.build_store(out_ptr, out).unwrap();
-            primitive_iter.llvm_increment_pos(ctx, &build, iter_ptr, i64_type.const_int(1, false));
-            build
-                .build_return(Some(&bool_type.const_int(1, false)))
-                .unwrap();
-
-            next
-        }
-        IteratorHolder::String(iter) => {
-            let access = ih.generate_random_access(ctx, llvm_mod).unwrap();
-            declare_blocks!(ctx, next, entry, none_left, get_next);
-
-            build.position_at_end(entry);
-            let curr_pos = iter.llvm_pos(ctx, &build, iter_ptr);
-            let curr_len = iter.llvm_len(ctx, &build, iter_ptr);
-            let have_more = build
-                .build_int_compare(IntPredicate::ULT, curr_pos, curr_len, "have_enough")
-                .unwrap();
-            build
-                .build_conditional_branch(have_more, get_next, none_left)
-                .unwrap();
-
-            build.position_at_end(none_left);
-            build
-                .build_return(Some(&bool_type.const_int(0, false)))
-                .unwrap();
-
-            build.position_at_end(get_next);
-            // there are at least n elements left, we can load them and increment
-            let result = build
-                .build_call(access, &[iter_ptr.into(), curr_pos.into()], "access_result")
-                .unwrap()
-                .try_as_basic_value()
-                .unwrap_basic();
-
-            build.build_store(out_ptr, result).unwrap();
-            iter.llvm_increment_pos(ctx, &build, iter_ptr, i64_type.const_int(1, false));
-            build
-                .build_return(Some(&bool_type.const_int(1, false)))
-                .unwrap();
-
-            next
-        }
-        IteratorHolder::LargeString(iter) => {
-            let access = ih.generate_random_access(ctx, llvm_mod).unwrap();
-            declare_blocks!(ctx, next, entry, none_left, get_next);
-
-            build.position_at_end(entry);
-            let curr_pos = iter.llvm_pos(ctx, &build, iter_ptr);
-            let curr_len = iter.llvm_len(ctx, &build, iter_ptr);
-            let have_more = build
-                .build_int_compare(IntPredicate::ULT, curr_pos, curr_len, "have_enough")
-                .unwrap();
-            build
-                .build_conditional_branch(have_more, get_next, none_left)
-                .unwrap();
-
-            build.position_at_end(none_left);
-            build
-                .build_return(Some(&bool_type.const_int(0, false)))
-                .unwrap();
-
-            build.position_at_end(get_next);
-            // there are at least n elements left, we can load them and increment
-            let result = build
-                .build_call(access, &[iter_ptr.into(), curr_pos.into()], "access_result")
-                .unwrap()
-                .try_as_basic_value()
-                .unwrap_basic();
-
-            build.build_store(out_ptr, result).unwrap();
-            iter.llvm_increment_pos(ctx, &build, iter_ptr, i64_type.const_int(1, false));
-            build
-                .build_return(Some(&bool_type.const_int(1, false)))
-                .unwrap();
-
-            next
-        }
-        IteratorHolder::View(iter) => {
-            let access = ih.generate_random_access(ctx, llvm_mod).unwrap();
-            declare_blocks!(ctx, next, entry, none_left, get_next);
-
-            build.position_at_end(entry);
-            let curr_pos = iter.llvm_pos(ctx, &build, iter_ptr);
-            let curr_len = iter.llvm_len(ctx, &build, iter_ptr);
-            let have_more = build
-                .build_int_compare(IntPredicate::ULT, curr_pos, curr_len, "have_enough")
-                .unwrap();
-            build
-                .build_conditional_branch(have_more, get_next, none_left)
-                .unwrap();
-
-            build.position_at_end(none_left);
-            build
-                .build_return(Some(&bool_type.const_int(0, false)))
-                .unwrap();
-
-            build.position_at_end(get_next);
-            // there are at least n elements left, we can load them and increment
-            let result = build
-                .build_call(access, &[iter_ptr.into(), curr_pos.into()], "access_result")
-                .unwrap()
-                .try_as_basic_value()
-                .unwrap_basic();
-
-            build.build_store(out_ptr, result).unwrap();
-            iter.llvm_increment_pos(ctx, &build, iter_ptr, i64_type.const_int(1, false));
-            build
-                .build_return(Some(&bool_type.const_int(1, false)))
-                .unwrap();
-
-            next
-        }
-        IteratorHolder::Bitmap(bitmap_iterator) => {
-            let access = ih.generate_random_access(ctx, llvm_mod).unwrap();
-            declare_blocks!(ctx, next, entry, none_left, get_next);
-
-            build.position_at_end(entry);
-            let curr_pos = bitmap_iterator.llvm_pos(ctx, &build, iter_ptr);
-            let curr_len = bitmap_iterator.llvm_len(ctx, &build, iter_ptr);
-            let have_more = build
-                .build_int_compare(IntPredicate::ULT, curr_pos, curr_len, "have_enough")
-                .unwrap();
-            build
-                .build_conditional_branch(have_more, get_next, none_left)
-                .unwrap();
-
-            build.position_at_end(none_left);
-            build
-                .build_return(Some(&bool_type.const_int(0, false)))
-                .unwrap();
-
-            build.position_at_end(get_next);
-            let result = build
-                .build_call(access, &[iter_ptr.into(), curr_pos.into()], "access_result")
-                .unwrap()
-                .try_as_basic_value()
-                .unwrap_basic();
-            build.build_store(out_ptr, result).unwrap();
-            bitmap_iterator.llvm_increment_pos(ctx, &build, iter_ptr, i64_type.const_int(1, false));
-            build
-                .build_return(Some(&bool_type.const_int(1, false)))
-                .unwrap();
-
-            next
-        }
-        IteratorHolder::SetBit(it) => {
-            declare_blocks!(
-                ctx,
-                next,
-                entry,
-                head_cond,
-                head_body,
-                main_cond,
-                main_body,
-                fetch_next_segment,
-                use_curr_segment,
-                increment_and_return_from_segment,
-                return_from_segment,
-                tail_cond,
-                tail_body,
-                exit
-            );
-
-            let cttz_id = Intrinsic::find("llvm.cttz").expect("llvm.cttz not in Intrinsic list");
-            let cttz_i64 = cttz_id
-                .get_declaration(llvm_mod, &[ctx.i64_type().into()])
-                .expect("Couldn't declare llvm.cttz.i64");
-
-            build.position_at_end(entry);
-            build.build_unconditional_branch(head_cond).unwrap();
-
-            build.position_at_end(head_cond);
-            let (header_ptr, header_pos, header_len) = it.llvm_header_info(ctx, &build, iter_ptr);
-            let have_header = build
-                .build_int_compare(IntPredicate::ULT, header_pos, header_len, "have_header")
-                .unwrap();
-            build
-                .build_conditional_branch(have_header, head_body, main_cond)
-                .unwrap();
-
-            build.position_at_end(head_body);
-            let res = build
-                .build_load(
-                    i64_type,
-                    increment_pointer!(ctx, build, header_ptr, 8, header_pos),
-                    "head_val",
-                )
-                .unwrap()
-                .into_int_value();
-            it.llvm_inc_header_pos(ctx, &build, iter_ptr);
-            build.build_store(out_ptr, res).unwrap();
-
-            build
-                .build_return(Some(&bool_type.const_int(1, false)))
-                .unwrap();
-
-            // check if the current segment is zero or not
-            build.position_at_end(main_cond);
-            let curr_segment = it.llvm_get_current_u64(ctx, &build, iter_ptr);
-            let is_zero = build
-                .build_int_compare(
-                    IntPredicate::EQ,
-                    curr_segment,
-                    i64_type.const_zero(),
-                    "is_curr_zero",
-                )
-                .unwrap();
-            build
-                .build_conditional_branch(is_zero, main_body, use_curr_segment)
-                .unwrap();
-
-            // check if we still have segments left to read
-            build.position_at_end(main_body);
-            let curr_segment_idx = it.llvm_get_curr_segment_pos(ctx, &build, iter_ptr);
-            let segment_len = it.llvm_get_num_segments(ctx, &build, iter_ptr);
-            let cmp = build
-                .build_int_compare(IntPredicate::ULT, curr_segment_idx, segment_len, "cmp")
-                .unwrap();
-            build
-                .build_conditional_branch(cmp, fetch_next_segment, tail_cond)
-                .unwrap();
-
-            build.position_at_end(fetch_next_segment);
-            let new_segment = it.llvm_get_segment(ctx, &build, curr_segment_idx, iter_ptr);
-            it.llvm_set_current_u64(ctx, &build, new_segment, iter_ptr);
-            let rel_segment_idx = build
-                .build_int_sub(
-                    curr_segment_idx,
-                    it.llvm_segment_start(ctx, &build, iter_ptr),
-                    "rel_segment_idx",
-                )
-                .unwrap();
-            let segment_bit_offset = build
-                .build_int_mul(
-                    rel_segment_idx,
-                    i64_type.const_int(64, false),
-                    "segment_bit_offset",
-                )
-                .unwrap();
-            let segment_base = build
-                .build_int_add(
-                    it.llvm_head_len(ctx, &build, iter_ptr),
-                    segment_bit_offset,
-                    "segment_base",
-                )
-                .unwrap();
-            it.llvm_set_current_bit_idx(ctx, &build, segment_base, iter_ptr);
-            it.llvm_inc_curr_segment(ctx, &build, iter_ptr);
-            build.build_unconditional_branch(main_cond).unwrap();
-
-            build.position_at_end(use_curr_segment);
-            let num_trailing = build
-                .build_call(
-                    cttz_i64,
-                    &[curr_segment.into(), bool_type.const_all_ones().into()],
-                    "num_trailing",
-                )
-                .unwrap()
-                .try_as_basic_value()
-                .unwrap_basic()
-                .into_int_value();
-            it.llvm_clear_last(ctx, &build, iter_ptr);
-            let res =
-                it.llvm_add_and_get_current_bit_idx(ctx, &build, iter_ptr, num_trailing, false);
-            build.build_store(out_ptr, res).unwrap();
-            let is_now_zero = build
-                .build_int_compare(
-                    IntPredicate::EQ,
-                    it.llvm_get_current_u64(ctx, &build, iter_ptr),
-                    i64_type.const_zero(),
-                    "is_now_zero",
-                )
-                .unwrap();
-            build
-                .build_conditional_branch(
-                    is_now_zero,
-                    increment_and_return_from_segment,
-                    return_from_segment,
-                )
-                .unwrap();
-
-            build.position_at_end(increment_and_return_from_segment);
-            it.llvm_add_and_get_current_bit_idx(
-                ctx,
-                &build,
-                iter_ptr,
-                i64_type.const_int(64, false),
-                true,
-            );
-            build
-                .build_return(Some(&bool_type.const_int(1, false)))
-                .unwrap();
-
-            build.position_at_end(return_from_segment);
-            build
-                .build_return(Some(&bool_type.const_int(1, false)))
-                .unwrap();
-
-            build.position_at_end(tail_cond);
-            let rel_segments_done = build
-                .build_int_sub(
-                    it.llvm_get_curr_segment_pos(ctx, &build, iter_ptr),
-                    it.llvm_segment_start(ctx, &build, iter_ptr),
-                    "segments_done",
-                )
-                .unwrap();
-            let tail_bit_offset = build
-                .build_int_mul(
-                    rel_segments_done,
-                    i64_type.const_int(64, false),
-                    "tail_bit_offset",
-                )
-                .unwrap();
-            let tail_base = build
-                .build_int_add(
-                    it.llvm_head_len(ctx, &build, iter_ptr),
-                    tail_bit_offset,
-                    "tail_base",
-                )
-                .unwrap();
-            it.llvm_set_current_bit_idx(ctx, &build, tail_base, iter_ptr);
-            let (tail_ptr, tail_pos, tail_len) = it.llvm_tail_info(ctx, &build, iter_ptr);
-            let have_tail = build
-                .build_int_compare(IntPredicate::ULT, tail_pos, tail_len, "have_tail")
-                .unwrap();
-            build
-                .build_conditional_branch(have_tail, tail_body, exit)
-                .unwrap();
-
-            build.position_at_end(tail_body);
-            let res = build
-                .build_load(
-                    i64_type,
-                    increment_pointer!(ctx, build, tail_ptr, 8, tail_pos),
-                    "tail_val",
-                )
-                .unwrap()
-                .into_int_value();
-            it.llvm_inc_tail_pos(ctx, &build, iter_ptr);
-            let res = it.llvm_add_and_get_current_bit_idx(ctx, &build, iter_ptr, res, false);
-            build.build_store(out_ptr, res).unwrap();
-            build
-                .build_return(Some(&bool_type.const_int(1, false)))
-                .unwrap();
-
-            build.position_at_end(exit);
-            build
-                .build_return(Some(&bool_type.const_int(0, false)))
-                .unwrap();
-
-            next
-        }
-        IteratorHolder::Dictionary { arr, keys, values } => match &dt {
-            DataType::Dictionary(k_dt, _) => {
-                let key_next = keys.generate_next(ctx, llvm_mod);
-                let values_access = values
-                    .generate_random_access(ctx, llvm_mod)
-                    .expect("dictionary iteration requires random-access values");
-                declare_blocks!(ctx, next, entry, none_left, fetch);
-
-                build.position_at_end(entry);
-                let key_type = PrimitiveType::for_arrow_type(k_dt).llvm_type(ctx);
-                let key_iter = arr.llvm_key_iter_ptr(ctx, &build, iter_ptr);
-                let val_iter = arr.llvm_val_iter_ptr(ctx, &build, iter_ptr);
-
-                let key_buf = build.build_alloca(key_type, "key_buf").unwrap();
-                let had_next = build
-                    .build_call(key_next, &[key_iter.into(), key_buf.into()], "next_key")
-                    .unwrap()
-                    .try_as_basic_value()
-                    .unwrap_basic()
-                    .into_int_value();
-                build
-                    .build_conditional_branch(had_next, fetch, none_left)
-                    .unwrap();
-
-                build.position_at_end(fetch);
-                let next_key = build
-                    .build_int_cast(
-                        build
-                            .build_load(key_type, key_buf, "next_key")
-                            .unwrap()
-                            .into_int_value(),
-                        i64_type,
-                        "casted_key",
-                    )
-                    .unwrap();
-                let value = build
-                    .build_call(values_access, &[val_iter.into(), next_key.into()], "value")
-                    .unwrap()
-                    .try_as_basic_value()
-                    .unwrap_basic();
-                build.build_store(out_ptr, value).unwrap();
-                build
-                    .build_return(Some(&bool_type.const_int(1, false)))
-                    .unwrap();
-
-                build.position_at_end(none_left);
-                build
-                    .build_return(Some(&bool_type.const_int(0, false)))
-                    .unwrap();
-                next
-            }
-            _ => unreachable!("dict iterator but not dict data type ({:?})", dt),
-        },
-        IteratorHolder::RunEnd {
-            arr,
-            run_ends,
-            values,
-        } => match &dt {
-            DataType::RunEndEncoded(_, _) => {
-                let re_access = run_ends
-                    .generate_random_access(ctx, llvm_mod)
-                    .expect("run-end iteration requires random-access run ends");
-                let val_access = values
-                    .generate_random_access(ctx, llvm_mod)
-                    .expect("run-end iteration requires random-access values");
-
-                declare_blocks!(
-                    ctx,
-                    next,
-                    entry,
-                    check_remaining,
-                    has_remaining,
-                    none_remaining,
-                    load_next_run,
-                    exhausted
-                );
-
-                build.position_at_end(entry);
-                let val_iter_ptr = arr.llvm_val_iter_ptr(ctx, &build, iter_ptr);
-                let re_iter_ptr = arr.llvm_re_iter_ptr(ctx, &build, iter_ptr);
-                let log_pos = arr.llvm_logical_pos(ctx, &build, iter_ptr);
-                let log_len = arr.llvm_logical_len(ctx, &build, iter_ptr);
-                let log_have_more = build
-                    .build_int_compare(IntPredicate::ULT, log_pos, log_len, "have_log_next")
-                    .unwrap();
-                build
-                    .build_conditional_branch(log_have_more, check_remaining, exhausted)
-                    .unwrap();
-
-                build.position_at_end(check_remaining);
-                let remaining = arr.llvm_remaining(ctx, &build, iter_ptr);
-                let res = build
-                    .build_int_compare(
-                        IntPredicate::UGT,
-                        remaining,
-                        i64_type.const_zero(),
-                        "has_remaining",
-                    )
-                    .unwrap();
-                build
-                    .build_conditional_branch(res, has_remaining, none_remaining)
-                    .unwrap();
-
-                build.position_at_end(has_remaining);
-                // there are values left in the current run
-                let curr_pos = arr.llvm_pos(ctx, &build, iter_ptr);
-                let val = build
-                    .build_call(val_access, &[val_iter_ptr.into(), curr_pos.into()], "value")
-                    .unwrap()
-                    .try_as_basic_value()
-                    .unwrap_basic();
-                build.build_store(out_ptr, val).unwrap();
-                arr.llvm_dec_remaining(ctx, &build, iter_ptr, i64_type.const_int(1, false));
-                arr.llvm_inc_logical_pos(ctx, &build, iter_ptr, i64_type.const_int(1, false));
-                build
-                    .build_return(Some(&bool_type.const_all_ones()))
-                    .unwrap();
-
-                build.position_at_end(none_remaining);
-                // there are no values left in the current run -- either load a
-                // new run, or return false
-                arr.llvm_inc_pos(ctx, &build, iter_ptr, i64_type.const_int(1, false));
-                let curr_pos = arr.llvm_pos(ctx, &build, iter_ptr);
-                let re_len = arr.llvm_len(ctx, &build, iter_ptr);
-                let have_another_run = build
-                    .build_int_compare(IntPredicate::ULT, curr_pos, re_len, "another_run")
-                    .unwrap();
-                build
-                    .build_conditional_branch(have_another_run, load_next_run, exhausted)
-                    .unwrap();
-
-                build.position_at_end(load_next_run);
-                let curr_pos = arr.llvm_pos(ctx, &build, iter_ptr);
-                let my_end = build
-                    .build_call(re_access, &[re_iter_ptr.into(), curr_pos.into()], "my_end")
-                    .unwrap()
-                    .try_as_basic_value()
-                    .unwrap_basic()
-                    .into_int_value();
-                let prev_end = build
-                    .build_call(
-                        re_access,
-                        &[
-                            re_iter_ptr.into(),
-                            build
-                                .build_int_sub(curr_pos, i64_type.const_int(1, false), "prev_pos")
-                                .unwrap()
-                                .into(),
-                        ],
-                        "prev_end",
-                    )
-                    .unwrap()
-                    .try_as_basic_value()
-                    .unwrap_basic()
-                    .into_int_value();
-                let new_remaining = build
-                    .build_int_sub(my_end, prev_end, "new_remaining")
-                    .unwrap();
-                let new_remaining_cast = build
-                    .build_int_cast(new_remaining, i64_type, "new_remaining_cast")
-                    .unwrap();
-                arr.llvm_set_remaining(ctx, &build, iter_ptr, new_remaining_cast);
-                build.build_unconditional_branch(check_remaining).unwrap();
-
-                build.position_at_end(exhausted);
-                build.build_return(Some(&bool_type.const_zero())).unwrap();
-
-                next
-            }
-            _ => unreachable!("run-end iterator but not run-end data type ({:?})", dt),
-        },
-        IteratorHolder::FixedSizeList(iter) => {
-            declare_blocks!(ctx, next, entry, none_left, get_next);
-
-            build.position_at_end(entry);
-            let curr_pos = iter.llvm_pos(ctx, &build, iter_ptr);
-            let curr_len = iter.llvm_len(ctx, &build, iter_ptr);
-            let have_more = build
-                .build_int_compare(IntPredicate::ULT, curr_pos, curr_len, "have_enough")
-                .unwrap();
-            build
-                .build_conditional_branch(have_more, get_next, none_left)
-                .unwrap();
-
-            build.position_at_end(none_left);
-            build
-                .build_return(Some(&bool_type.const_int(0, false)))
-                .unwrap();
-
-            build.position_at_end(get_next);
-            let out =
-                build_fixed_size_list_value(ctx, llvm_mod, &build, &dt, iter, iter_ptr, curr_pos)
-                    .expect("fixed-size-list iteration requires a random-access child");
-            build.build_store(out_ptr, out).unwrap();
-            iter.llvm_increment_pos(ctx, &build, iter_ptr, i64_type.const_int(1, false));
-            build
-                .build_return(Some(&bool_type.const_int(1, false)))
-                .unwrap();
-
-            next
-        }
-        IteratorHolder::List(iter) => {
-            declare_blocks!(ctx, next, entry, none_left, get_next);
-
-            build.position_at_end(entry);
-            let curr_pos = iter.llvm_pos(ctx, &build, iter_ptr);
-            let curr_len = iter.llvm_len(ctx, &build, iter_ptr);
-            let have_more = build
-                .build_int_compare(IntPredicate::ULT, curr_pos, curr_len, "have_enough")
-                .unwrap();
-            build
-                .build_conditional_branch(have_more, get_next, none_left)
-                .unwrap();
-
-            build.position_at_end(none_left);
-            build
-                .build_return(Some(&bool_type.const_int(0, false)))
-                .unwrap();
-
-            build.position_at_end(get_next);
-            let out = build_variable_list_value(ctx, &build, iter, iter_ptr, curr_pos);
-            build.build_store(out_ptr, out).unwrap();
-            iter.llvm_increment_pos(ctx, &build, iter_ptr, i64_type.const_int(1, false));
-            build
-                .build_return(Some(&bool_type.const_int(1, false)))
-                .unwrap();
-
-            next
-        }
-        IteratorHolder::ScalarPrimitive(s) => {
-            let ptype = PrimitiveType::for_arrow_type(&dt);
-            assert_eq!(ptype.width(), s.width as usize);
-            declare_blocks!(ctx, next, entry);
-            build.position_at_end(entry);
-            let ptr = s.llvm_val_ptr(ctx, &build, iter_ptr);
-            let constant = match &dt {
-                DataType::Int8
-                | DataType::Int16
-                | DataType::Int32
-                | DataType::Int64
-                | DataType::UInt8
-                | DataType::UInt16
-                | DataType::UInt32
-                | DataType::UInt64 => {
-                    let data = build
-                        .build_load(i64_type, ptr, "const_u64")
                         .unwrap()
+                        .try_as_basic_value()
+                        .unwrap_basic()
                         .into_int_value();
-                    data.as_instruction_value()
-                        .unwrap()
-                        .set_metadata(ctx.metadata_node(&[]), ctx.get_kind_id("invariant.load"))
-                        .unwrap();
-                    build
-                        .build_int_cast(data, llvm_type.into_int_type(), "casted")
-                        .unwrap()
-                        .as_basic_value_enum()
-                }
-                DataType::Float16 | DataType::Float32 | DataType::Float64 => {
-                    let data = build
-                        .build_load(i64_type, ptr, "const_u64")
-                        .unwrap()
-                        .into_int_value();
-                    data.as_instruction_value()
-                        .unwrap()
-                        .set_metadata(ctx.metadata_node(&[]), ctx.get_kind_id("invariant.load"))
-                        .unwrap();
-                    let data = build
-                        .build_int_cast(
-                            data,
-                            PrimitiveType::int_with_width(s.width as usize)
-                                .llvm_type(ctx)
-                                .into_int_type(),
-                            "const_int",
+                    let v = build
+                        .build_call(
+                            value_access,
+                            &[
+                                arr.llvm_val_iter_ptr(ctx, &build, iter_ptr).into(),
+                                v_idx.into(),
+                            ],
+                            "v",
                         )
-                        .unwrap();
-                    build
-                        .build_bit_cast(data, llvm_type, "const_float")
                         .unwrap()
+                        .try_as_basic_value()
+                        .unwrap_basic();
+                    build.build_return(Some(&v)).unwrap();
+                    Some(access_f)
                 }
-                _ => unreachable!(),
-            };
-            build.build_store(out_ptr, constant).unwrap();
-            build
-                .build_return(Some(&bool_type.const_int(1, false)))
-                .unwrap();
-            next
-        }
-        IteratorHolder::ScalarBoolean(s) => {
-            declare_blocks!(ctx, next, entry);
-            build.position_at_end(entry);
-            let ptr = s.llvm_val_ptr(ctx, &build, iter_ptr);
-            let constant = build
-                .build_load(ctx.i8_type(), ptr, "const_bool_u8")
-                .unwrap()
-                .into_int_value();
-            mark_load_invariant!(ctx, constant);
-            let constant = build
-                .build_int_truncate(constant, ctx.bool_type(), "trunc_const")
-                .unwrap();
-            build.build_store(out_ptr, constant).unwrap();
-            build
-                .build_return(Some(&bool_type.const_int(1, false)))
-                .unwrap();
-            next
-        }
-        IteratorHolder::ScalarString(s) => {
-            let ptr_type = ctx.ptr_type(AddressSpace::default());
-            let ret_type = PrimitiveType::P64x2.llvm_type(ctx).into_struct_type();
-            declare_blocks!(ctx, next, entry);
-            build.position_at_end(entry);
-            let (ptr1, ptr2) = s.llvm_val_ptr(ctx, &build, iter_ptr);
-            let ptr1 = build
-                .build_load(ptr_type, ptr1, "ptr1")
-                .unwrap()
-                .into_pointer_value();
-            ptr1.as_instruction_value()
-                .unwrap()
-                .set_metadata(ctx.metadata_node(&[]), ctx.get_kind_id("invariant.load"))
-                .unwrap();
-            let ptr2 = build
-                .build_load(ptr_type, ptr2, "ptr2")
-                .unwrap()
-                .into_pointer_value();
-            ptr2.as_instruction_value()
-                .unwrap()
-                .set_metadata(ctx.metadata_node(&[]), ctx.get_kind_id("invariant.load"))
-                .unwrap();
-
-            let to_return = ret_type.const_zero();
-            let to_return = build
-                .build_insert_value(to_return, ptr1, 0, "to_return")
-                .unwrap();
-            let to_return = build
-                .build_insert_value(to_return, ptr2, 1, "to_return")
-                .unwrap();
-            build.build_store(out_ptr, to_return).unwrap();
-            build
-                .build_return(Some(&bool_type.const_int(1, false)))
-                .unwrap();
-
-            next
-        }
-        IteratorHolder::ScalarBinary(s) => {
-            let ptr_type = ctx.ptr_type(AddressSpace::default());
-            let ret_type = PrimitiveType::P64x2.llvm_type(ctx).into_struct_type();
-            declare_blocks!(ctx, next, entry);
-            build.position_at_end(entry);
-            let (ptr1, ptr2) = s.llvm_val_ptr(ctx, &build, iter_ptr);
-            let ptr1 = build
-                .build_load(ptr_type, ptr1, "ptr1")
-                .unwrap()
-                .into_pointer_value();
-            ptr1.as_instruction_value()
-                .unwrap()
-                .set_metadata(ctx.metadata_node(&[]), ctx.get_kind_id("invariant.load"))
-                .unwrap();
-            let ptr2 = build
-                .build_load(ptr_type, ptr2, "ptr2")
-                .unwrap()
-                .into_pointer_value();
-            ptr2.as_instruction_value()
-                .unwrap()
-                .set_metadata(ctx.metadata_node(&[]), ctx.get_kind_id("invariant.load"))
-                .unwrap();
-
-            let to_return = ret_type.const_zero();
-            let to_return = build
-                .build_insert_value(to_return, ptr1, 0, "to_return")
-                .unwrap();
-            let to_return = build
-                .build_insert_value(to_return, ptr2, 1, "to_return")
-                .unwrap();
-            build.build_store(out_ptr, to_return).unwrap();
-            build
-                .build_return(Some(&bool_type.const_int(1, false)))
-                .unwrap();
-
-            next
-        }
-        IteratorHolder::ScalarVec(iter) => {
-            declare_blocks!(ctx, next, entry);
-            build.position_at_end(entry);
-            let val = iter.llvm_val(ctx, &build, iter_ptr);
-            build.build_store(out_ptr, val).unwrap();
-            build
-                .build_return(Some(&bool_type.const_int(1, false)))
-                .unwrap();
-
-            next
-        }
-    }
-}
-
-fn generate_random_access<'a>(
-    ctx: &'a Context,
-    llvm_mod: &Module<'a>,
-    ih: &IteratorHolder,
-) -> Option<FunctionValue<'a>> {
-    let info = ih.codegen_info();
-    if !info.random_access {
-        return None;
-    }
-
-    let build = ctx.create_builder();
-    let dt = ih.data_type();
-    let llvm_type = info.value_type.llvm_type(ctx);
-    let ptr_type = ctx.ptr_type(AddressSpace::default());
-    let i64_type = ctx.i64_type();
-
-    let fn_type = llvm_type.fn_type(&[ptr_type.into(), i64_type.into()], false);
-    let name = format!("{}_access", ih.codegen_label());
-    if let Some(existing) = llvm_mod.get_function(&name) {
-        assert_eq!(existing.get_type(), fn_type);
-        return Some(existing);
-    }
-    let access_f = llvm_mod.add_function(
-        &name,
-        fn_type,
-        Some(
-            #[cfg(test)]
-            Linkage::External,
-            #[cfg(not(test))]
-            Linkage::Private,
-        ),
-    );
-    let iter_ptr = access_f.get_nth_param(0).unwrap().into_pointer_value();
-    let idx = access_f.get_nth_param(1).unwrap().into_int_value();
-
-    match ih {
-        IteratorHolder::Primitive(primitive_iter) => {
-            let ptype = PrimitiveType::for_arrow_type(&dt);
-            declare_blocks!(ctx, access_f, entry);
-
-            build.position_at_end(entry);
-            let data_ptr = primitive_iter.llvm_data(ctx, &build, iter_ptr);
-            let data_ptr = increment_pointer!(ctx, build, data_ptr, ptype.width(), idx);
-            let out = build.build_load(llvm_type, data_ptr, "elem").unwrap();
-            build.build_return(Some(&out)).unwrap();
-
-            Some(access_f)
-        }
-        IteratorHolder::FixedSizeList(iter) => {
-            declare_blocks!(ctx, access_f, entry);
-
-            build.position_at_end(entry);
-            let out = build_fixed_size_list_value(ctx, llvm_mod, &build, &dt, iter, iter_ptr, idx)
-                .expect("fixed-size-list access requires a random-access child");
-            build.build_return(Some(&out)).unwrap();
-
-            Some(access_f)
-        }
-        IteratorHolder::List(iter) => {
-            declare_blocks!(ctx, access_f, entry);
-
-            build.position_at_end(entry);
-            let out = build_variable_list_value(ctx, &build, iter, iter_ptr, idx);
-            build.build_return(Some(&out)).unwrap();
-
-            Some(access_f)
-        }
-        IteratorHolder::String(ih) => {
-            let i32_type = ctx.i32_type();
-            let ret_type = PrimitiveType::P64x2.llvm_type(ctx).into_struct_type();
-
-            declare_blocks!(ctx, access_f, entry);
-
-            build.position_at_end(entry);
-            let offsets = ih.llvm_get_offset_ptr(ctx, &build, iter_ptr);
-            let offset1 = build
-                .build_load(
-                    i32_type,
-                    increment_pointer!(ctx, build, offsets, 4, idx),
-                    "offset1",
-                )
-                .unwrap()
-                .into_int_value();
-            let offset2 = build
-                .build_load(
-                    i32_type,
-                    increment_pointer!(
-                        ctx,
-                        build,
-                        offsets,
-                        4,
-                        build
-                            .build_int_add(idx, i64_type.const_int(1, false), "inc")
-                            .unwrap()
-                    ),
-                    "offset2",
-                )
-                .unwrap()
-                .into_int_value();
-
-            let offset1 = build
-                .build_int_z_extend(offset1, i64_type, "offset1")
-                .unwrap();
-            let offset2 = build
-                .build_int_z_extend(offset2, i64_type, "offset1")
-                .unwrap();
-
-            let data = ih.llvm_get_data_ptr(ctx, &build, iter_ptr);
-            let ptr1 = increment_pointer!(ctx, build, data, 1, offset1);
-            let ptr2 = increment_pointer!(ctx, build, data, 1, offset2);
-            let to_return = ret_type.const_zero();
-            let to_return = build
-                .build_insert_value(to_return, ptr1, 0, "to_return")
-                .unwrap();
-            let to_return = build
-                .build_insert_value(to_return, ptr2, 1, "to_return")
-                .unwrap();
-            build.build_return(Some(&to_return)).unwrap();
-            Some(access_f)
-        }
-        IteratorHolder::LargeString(ih) => {
-            let ret_type = PrimitiveType::P64x2.llvm_type(ctx).into_struct_type();
-
-            declare_blocks!(ctx, access_f, entry);
-
-            build.position_at_end(entry);
-            let offsets = ih.llvm_get_offset_ptr(ctx, &build, iter_ptr);
-            let offset1 = build
-                .build_load(
-                    i64_type,
-                    increment_pointer!(ctx, build, offsets, 8, idx),
-                    "offset1",
-                )
-                .unwrap()
-                .into_int_value();
-            let offset2 = build
-                .build_load(
-                    i64_type,
-                    increment_pointer!(
-                        ctx,
-                        build,
-                        offsets,
-                        8,
-                        build
-                            .build_int_add(idx, i64_type.const_int(1, false), "inc")
-                            .unwrap()
-                    ),
-                    "offset2",
-                )
-                .unwrap()
-                .into_int_value();
-
-            let data = ih.llvm_get_data_ptr(ctx, &build, iter_ptr);
-            let ptr1 = increment_pointer!(ctx, build, data, 1, offset1);
-            let ptr2 = increment_pointer!(ctx, build, data, 1, offset2);
-            let to_return = ret_type.const_zero();
-            let to_return = build
-                .build_insert_value(to_return, ptr1, 0, "to_return")
-                .unwrap();
-            let to_return = build
-                .build_insert_value(to_return, ptr2, 1, "to_return")
-                .unwrap();
-            build.build_return(Some(&to_return)).unwrap();
-            Some(access_f)
-        }
-        IteratorHolder::View(iter) => {
-            let i128_type = ctx.i128_type();
-            let i32_type = ctx.i32_type();
-            let ret_type = PrimitiveType::P64x2.llvm_type(ctx).into_struct_type();
-
-            declare_blocks!(ctx, access_f, entry, short_str, long_str);
-
-            build.position_at_end(entry);
-            let view_ptr = iter.llvm_view_ptr(ctx, &build, iter_ptr);
-            let our_view_ptr = increment_pointer!(ctx, build, view_ptr, 16, idx);
-            let our_view = build
-                .build_load(i128_type, our_view_ptr, "our_view")
-                .unwrap()
-                .into_int_value();
-            let as_vec = build
-                .build_bit_cast(our_view, i32_type.vec_type(4), "as_vec")
-                .unwrap()
-                .into_vector_value();
-            let str_len = build
-                .build_extract_element(as_vec, i64_type.const_zero(), "str_len")
-                .unwrap()
-                .into_int_value();
-            let str_len = build
-                .build_int_s_extend(str_len, i64_type, "ext_len")
-                .unwrap();
-            let cmp = build
-                .build_int_compare(
-                    IntPredicate::SLE,
-                    str_len,
-                    i64_type.const_int(12, true),
-                    "cmp",
-                )
-                .unwrap();
-            build
-                .build_conditional_branch(cmp, short_str, long_str)
-                .unwrap();
-
-            build.position_at_end(short_str);
-            let ptr1 = increment_pointer!(ctx, build, our_view_ptr, 4);
-            let ptr2 = increment_pointer!(ctx, build, ptr1, 1, str_len);
-            let to_return = ret_type.const_zero();
-            let to_return = build
-                .build_insert_value(to_return, ptr1, 0, "to_return")
-                .unwrap();
-            let to_return = build
-                .build_insert_value(to_return, ptr2, 1, "to_return")
-                .unwrap();
-            build.build_return(Some(&to_return)).unwrap();
-
-            build.position_at_end(long_str);
-            let buf_idx = build
-                .build_extract_element(as_vec, i64_type.const_int(2, false), "buf_idx")
-                .unwrap()
-                .into_int_value();
-            let buf_base = iter.llvm_buffer_ptr(ctx, &build, iter_ptr, buf_idx);
-            let offset = build
-                .build_extract_element(as_vec, i64_type.const_int(3, false), "offset")
-                .unwrap()
-                .into_int_value();
-            let offset = build
-                .build_int_s_extend_or_bit_cast(offset, i64_type, "offset_ext")
-                .unwrap();
-            let ptr1 = increment_pointer!(ctx, build, buf_base, 1, offset);
-            let ptr2 = increment_pointer!(ctx, build, ptr1, 1, str_len);
-            let to_return = ret_type.const_zero();
-            let to_return = build
-                .build_insert_value(to_return, ptr1, 0, "to_return")
-                .unwrap();
-            let to_return = build
-                .build_insert_value(to_return, ptr2, 1, "to_return")
-                .unwrap();
-            build.build_return(Some(&to_return)).unwrap();
-
-            Some(access_f)
-        }
-        IteratorHolder::Bitmap(bitmap_iterator) => {
-            let ptype = PrimitiveType::for_arrow_type(&dt);
-            declare_blocks!(ctx, access_f, entry);
-
-            build.position_at_end(entry);
-            let data_ptr = bitmap_iterator.llvm_get_data_ptr(ctx, &build, iter_ptr);
-            let slice_offset = bitmap_iterator.llvm_slice_offset(ctx, &build, iter_ptr);
-            let bit_index = build
-                .build_int_add(slice_offset, idx, "slice_offset_plus_index")
-                .unwrap();
-            let byte_index = build
-                .build_right_shift(bit_index, i64_type.const_int(3, false), false, "byte_index")
-                .unwrap();
-            let bit_in_byte_i64 = build
-                .build_and(bit_index, i64_type.const_int(7, false), "bit_in_byte_i64")
-                .unwrap();
-            let bit_in_byte_i8 = build
-                .build_int_truncate(bit_in_byte_i64, ctx.i8_type(), "bit_in_byte_i8")
-                .unwrap();
-            let data_byte_ptr = increment_pointer!(ctx, build, data_ptr, ptype.width(), byte_index);
-            let data_byte_i8 = build
-                .build_load(ctx.i8_type(), data_byte_ptr, "get_data_byte_i8")
-                .unwrap()
-                .into_int_value();
-            let data_byte_shifted_i8 = build
-                .build_right_shift(data_byte_i8, bit_in_byte_i8, false, "data_byte_shifted_i8")
-                .unwrap();
-            let data_bit_i8 = build
-                .build_and(
-                    data_byte_shifted_i8,
-                    ctx.i8_type().const_int(1, false),
-                    "data_bit_i8",
-                )
-                .unwrap();
-            build.build_return(Some(&data_bit_i8)).unwrap();
-
-            Some(access_f)
-        }
-        IteratorHolder::Dictionary { arr, keys, values } => match &dt {
-            DataType::Dictionary(_, _) => {
-                let keys_access = keys
-                    .generate_random_access(ctx, llvm_mod)
-                    .expect("dictionary access requires random-access keys");
-                let values_access = values
-                    .generate_random_access(ctx, llvm_mod)
-                    .expect("dictionary access requires random-access values");
-
-                declare_blocks!(ctx, access_f, entry);
-
-                build.position_at_end(entry);
-                let key = build
-                    .build_call(
-                        keys_access,
-                        &[
-                            arr.llvm_key_iter_ptr(ctx, &build, iter_ptr).into(),
-                            idx.into(),
-                        ],
-                        "key",
-                    )
-                    .unwrap()
-                    .try_as_basic_value()
-                    .unwrap_basic()
-                    .into_int_value();
-                let key_conv = build
-                    .build_int_cast(key, ctx.i64_type(), "key_conv")
-                    .unwrap();
-
-                let value = build
-                    .build_call(
-                        values_access,
-                        &[
-                            arr.llvm_val_iter_ptr(ctx, &build, iter_ptr).into(),
-                            key_conv.into(),
-                        ],
-                        "value",
-                    )
-                    .unwrap()
-                    .try_as_basic_value()
-                    .unwrap_basic();
-                build.build_return(Some(&value)).unwrap();
-
+                _ => unreachable!("run-end iterator but non-iterator data type ({:?})", dt),
+            },
+            IteratorHolder::ScalarVec(iter) => {
+                let val = iter.llvm_val(ctx, &build, iter_ptr);
+                build.build_return(Some(&val)).unwrap();
                 Some(access_f)
             }
-            _ => unreachable!("dictionary iterator but non-iterator data type ({:?})", dt),
-        },
-        IteratorHolder::RunEnd {
-            arr,
-            run_ends,
-            values,
-        } => match &dt {
-            DataType::RunEndEncoded(r_dt, _) => {
-                let runs_prim_type = PrimitiveType::for_arrow_type(r_dt.data_type());
-                let runs_t = runs_prim_type.llvm_type(ctx).into_int_type();
-                let bsearch = add_bsearch(ctx, llvm_mod, run_ends.as_primitive(), runs_prim_type);
-                let value_access = values
-                    .generate_random_access(ctx, llvm_mod)
-                    .expect("run-end access requires random-access values");
-
-                declare_blocks!(ctx, access_f, entry);
-                build.position_at_end(entry);
-                let idx = build
-                    .build_int_truncate_or_bit_cast(idx, runs_t, "casted_idx")
-                    .unwrap();
-
-                let v_idx = build
-                    .build_call(
-                        bsearch,
-                        &[
-                            arr.llvm_re_iter_ptr(ctx, &build, iter_ptr).into(),
-                            idx.into(),
-                        ],
-                        "v_idx",
-                    )
-                    .unwrap()
-                    .try_as_basic_value()
-                    .unwrap_basic()
-                    .into_int_value();
-                let v = build
-                    .build_call(
-                        value_access,
-                        &[
-                            arr.llvm_val_iter_ptr(ctx, &build, iter_ptr).into(),
-                            v_idx.into(),
-                        ],
-                        "v",
-                    )
-                    .unwrap()
-                    .try_as_basic_value()
-                    .unwrap_basic();
-                build.build_return(Some(&v)).unwrap();
-                Some(access_f)
+            IteratorHolder::SetBit(_)
+            | IteratorHolder::ScalarPrimitive(_)
+            | IteratorHolder::ScalarBoolean(_)
+            | IteratorHolder::ScalarString(_)
+            | IteratorHolder::ScalarBinary(_) => {
+                unreachable!("random-access capability disagrees with iterator variant")
             }
-            _ => unreachable!("run-end iterator but non-iterator data type ({:?})", dt),
-        },
-        IteratorHolder::ScalarVec(iter) => {
-            let val = iter.llvm_val(ctx, &build, iter_ptr);
-            build.build_return(Some(&val)).unwrap();
-            Some(access_f)
-        }
-        IteratorHolder::SetBit(_)
-        | IteratorHolder::ScalarPrimitive(_)
-        | IteratorHolder::ScalarBoolean(_)
-        | IteratorHolder::ScalarString(_)
-        | IteratorHolder::ScalarBinary(_) => {
-            unreachable!("random-access capability disagrees with iterator variant")
         }
     }
 }
@@ -2738,13 +3177,13 @@ mod codegen_cache_tests {
 
         let first_access = first.generate_random_access(&ctx, &module).unwrap();
         let first_next = first.generate_next(&ctx, &module);
-        let first_next_block = first.generate_next_block::<8>(&ctx, &module).unwrap();
+        let first_next_block = first.generate_next_block(&ctx, &module, 8).unwrap();
         let first_reset = first.generate_reset(&ctx, &module);
         let function_count = module.get_functions().count();
 
         let second_access = second.generate_random_access(&ctx, &module).unwrap();
         let second_next = second.generate_next(&ctx, &module);
-        let second_next_block = second.generate_next_block::<8>(&ctx, &module).unwrap();
+        let second_next_block = second.generate_next_block(&ctx, &module, 8).unwrap();
         let second_reset = second.generate_reset(&ctx, &module);
 
         assert_eq!(first_access, second_access);
@@ -2839,8 +3278,8 @@ mod codegen_cache_tests {
         let ctx = Context::create();
         let module = ctx.create_module("iterator_block_widths");
 
-        let block_8 = iter.generate_next_block::<8>(&ctx, &module).unwrap();
-        let block_64 = iter.generate_next_block::<64>(&ctx, &module).unwrap();
+        let block_8 = iter.generate_next_block(&ctx, &module, 8).unwrap();
+        let block_64 = iter.generate_next_block(&ctx, &module, 64).unwrap();
 
         assert_eq!(
             block_8.get_name().to_str().unwrap(),
@@ -2866,8 +3305,8 @@ mod codegen_cache_tests {
         let ctx = Context::create();
         let module = ctx.create_module("unsupported_iterator_codegen");
 
-        assert!(list.generate_next_block::<8>(&ctx, &module).is_none());
-        assert!(run_end.generate_next_block::<8>(&ctx, &module).is_none());
+        assert!(list.generate_next_block(&ctx, &module, 8).is_none());
+        assert!(run_end.generate_next_block(&ctx, &module, 8).is_none());
         assert!(set_bits.generate_random_access(&ctx, &module).is_none());
         assert_eq!(module.get_functions().count(), 0);
         module.verify().unwrap();

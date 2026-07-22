@@ -207,6 +207,266 @@ impl Writer for BooleanWriter {
 
         Ok(())
     }
+
+    fn llvm_write_block<'ctx, 'borrow>(
+        &'borrow self,
+        codegen: WriterCodegen<'ctx, 'borrow>,
+        runtime_ptr: PointerValue<'ctx>,
+        values: BasicValueEnum<'ctx>,
+        logical_len: u32,
+    ) -> Result<(), ArrowKernelError> {
+        let packed_type = codegen.ctx.custom_width_int_type(logical_len);
+        let packed = if values.is_vector_value() {
+            let values = values.into_vector_value();
+            if values.get_type().get_size() != logical_len {
+                return Err(ArrowKernelError::InternalError(format!(
+                    "boolean block has {} lanes for {logical_len} values",
+                    values.get_type().get_size()
+                )));
+            }
+            codegen
+                .builder
+                .build_bit_cast(values, packed_type, "packed_boolean_block")
+                .unwrap()
+                .into_int_value()
+        } else {
+            values.into_int_value()
+        };
+        if packed.get_type().get_bit_width() != logical_len {
+            return Err(ArrowKernelError::InternalError(format!(
+                "boolean block has {} bits for {logical_len} values",
+                packed.get_type().get_bit_width()
+            )));
+        }
+        if !logical_len.is_multiple_of(8) {
+            for idx in 0..logical_len {
+                let shifted = codegen
+                    .builder
+                    .build_right_shift(
+                        packed,
+                        packed_type.const_int(idx as u64, false),
+                        false,
+                        "boolean_block_shifted",
+                    )
+                    .unwrap();
+                let value = codegen
+                    .builder
+                    .build_int_truncate(shifted, codegen.ctx.bool_type(), "boolean_block_value")
+                    .unwrap()
+                    .into();
+                self.llvm_write(codegen, runtime_ptr, |emitter| emitter.emit(value))?;
+            }
+            return Ok(());
+        }
+
+        let i8_type = codegen.ctx.i8_type();
+        let i64_type = codegen.ctx.i64_type();
+        let buf_idx_ptr = increment_pointer!(
+            codegen.ctx,
+            codegen.builder,
+            runtime_ptr,
+            BooleanWriterRuntime::OFFSET_BUF_IDX
+        );
+        let buf_idx = codegen
+            .builder
+            .build_load(i8_type, buf_idx_ptr, "boolean_block_buf_idx")
+            .unwrap()
+            .into_int_value();
+        let func = codegen
+            .builder
+            .get_insert_block()
+            .unwrap()
+            .get_parent()
+            .unwrap();
+        declare_blocks!(
+            codegen.ctx,
+            func,
+            boolean_block_direct,
+            boolean_block_unaligned,
+            boolean_block_done
+        );
+        let aligned = codegen
+            .builder
+            .build_int_compare(
+                IntPredicate::EQ,
+                buf_idx,
+                i8_type.const_zero(),
+                "boolean_block_aligned",
+            )
+            .unwrap();
+        codegen
+            .builder
+            .build_conditional_branch(aligned, boolean_block_direct, boolean_block_unaligned)
+            .unwrap();
+
+        codegen.builder.position_at_end(boolean_block_direct);
+        let alloc_ptr_ptr = increment_pointer!(
+            codegen.ctx,
+            codegen.builder,
+            runtime_ptr,
+            BooleanWriterRuntime::OFFSET_ALLOC_PTR
+        );
+        let alloc_ptr = codegen
+            .builder
+            .build_load(
+                codegen.ctx.ptr_type(AddressSpace::default()),
+                alloc_ptr_ptr,
+                "boolean_block_alloc_ptr",
+            )
+            .unwrap()
+            .into_pointer_value();
+        let store = codegen.builder.build_store(alloc_ptr, packed).unwrap();
+        store.set_alignment(1).unwrap();
+        codegen
+            .builder
+            .build_store(
+                alloc_ptr_ptr,
+                increment_pointer!(
+                    codegen.ctx,
+                    codegen.builder,
+                    alloc_ptr,
+                    logical_len as usize / 8
+                ),
+            )
+            .unwrap();
+        let num_written_ptr = increment_pointer!(
+            codegen.ctx,
+            codegen.builder,
+            runtime_ptr,
+            BooleanWriterRuntime::OFFSET_NUM_WRITTEN
+        );
+        let num_written = codegen
+            .builder
+            .build_load(i64_type, num_written_ptr, "boolean_block_num_written")
+            .unwrap()
+            .into_int_value();
+        let new_num_written = codegen
+            .builder
+            .build_int_add(
+                num_written,
+                i64_type.const_int(logical_len as u64, false),
+                "boolean_block_new_num_written",
+            )
+            .unwrap();
+        codegen
+            .builder
+            .build_store(num_written_ptr, new_num_written)
+            .unwrap();
+        codegen
+            .builder
+            .build_unconditional_branch(boolean_block_done)
+            .unwrap();
+
+        codegen.builder.position_at_end(boolean_block_unaligned);
+        let wide_type = codegen.ctx.custom_width_int_type(logical_len + 8);
+        let buf_ptr = increment_pointer!(
+            codegen.ctx,
+            codegen.builder,
+            runtime_ptr,
+            BooleanWriterRuntime::OFFSET_BUF
+        );
+        let buf = codegen
+            .builder
+            .build_load(i8_type, buf_ptr, "boolean_block_buf")
+            .unwrap()
+            .into_int_value();
+        let buf = codegen
+            .builder
+            .build_int_z_extend(buf, wide_type, "boolean_block_buf_wide")
+            .unwrap();
+        let packed = codegen
+            .builder
+            .build_int_z_extend(packed, wide_type, "boolean_block_values_wide")
+            .unwrap();
+        let shift = codegen
+            .builder
+            .build_int_z_extend(buf_idx, wide_type, "boolean_block_shift")
+            .unwrap();
+        let packed = codegen
+            .builder
+            .build_left_shift(packed, shift, "boolean_block_values_shifted")
+            .unwrap();
+        let combined = codegen
+            .builder
+            .build_or(buf, packed, "boolean_block_combined")
+            .unwrap();
+        let completed = codegen
+            .builder
+            .build_int_truncate(combined, packed_type, "boolean_block_completed")
+            .unwrap();
+        let alloc_ptr_ptr = increment_pointer!(
+            codegen.ctx,
+            codegen.builder,
+            runtime_ptr,
+            BooleanWriterRuntime::OFFSET_ALLOC_PTR
+        );
+        let alloc_ptr = codegen
+            .builder
+            .build_load(
+                codegen.ctx.ptr_type(AddressSpace::default()),
+                alloc_ptr_ptr,
+                "boolean_block_alloc_ptr",
+            )
+            .unwrap()
+            .into_pointer_value();
+        let store = codegen.builder.build_store(alloc_ptr, completed).unwrap();
+        store.set_alignment(1).unwrap();
+        codegen
+            .builder
+            .build_store(
+                alloc_ptr_ptr,
+                increment_pointer!(
+                    codegen.ctx,
+                    codegen.builder,
+                    alloc_ptr,
+                    logical_len as usize / 8
+                ),
+            )
+            .unwrap();
+        let remaining = codegen
+            .builder
+            .build_right_shift(
+                combined,
+                wide_type.const_int(logical_len as u64, false),
+                false,
+                "boolean_block_remaining",
+            )
+            .unwrap();
+        let remaining = codegen
+            .builder
+            .build_int_truncate(remaining, i8_type, "boolean_block_remaining_byte")
+            .unwrap();
+        codegen.builder.build_store(buf_ptr, remaining).unwrap();
+        let num_written_ptr = increment_pointer!(
+            codegen.ctx,
+            codegen.builder,
+            runtime_ptr,
+            BooleanWriterRuntime::OFFSET_NUM_WRITTEN
+        );
+        let num_written = codegen
+            .builder
+            .build_load(i64_type, num_written_ptr, "boolean_block_num_written")
+            .unwrap()
+            .into_int_value();
+        let new_num_written = codegen
+            .builder
+            .build_int_add(
+                num_written,
+                i64_type.const_int(logical_len as u64, false),
+                "boolean_block_new_num_written",
+            )
+            .unwrap();
+        codegen
+            .builder
+            .build_store(num_written_ptr, new_num_written)
+            .unwrap();
+        codegen
+            .builder
+            .build_unconditional_branch(boolean_block_done)
+            .unwrap();
+        codegen.builder.position_at_end(boolean_block_done);
+        Ok(())
+    }
 }
 
 #[repr(C)]
@@ -556,7 +816,9 @@ mod tests {
             .map(|value| ctx.bool_type().const_int(u64::from(*value), false))
             .collect::<Vec<_>>();
         let values = inkwell::types::VectorType::const_vector(&values);
-        writer.llvm_write_multiple(codegen, dest, values).unwrap();
+        writer
+            .llvm_write_block(codegen, dest, values.into(), block.len() as u32)
+            .unwrap();
         for value in scalars {
             writer
                 .llvm_write(codegen, dest, |emitter| {
@@ -568,7 +830,9 @@ mod tests {
                 })
                 .unwrap();
         }
-        writer.llvm_write_multiple(codegen, dest, values).unwrap();
+        writer
+            .llvm_write_block(codegen, dest, values.into(), block.len() as u32)
+            .unwrap();
         build.build_return(None).unwrap();
         llvm_mod.verify().unwrap();
 

@@ -55,6 +55,37 @@ impl FixedSizeListWriter {
             .unwrap()
             .into_pointer_value()
     }
+
+    fn llvm_increment_num_written<'ctx>(
+        codegen: WriterCodegen<'ctx, '_>,
+        runtime_ptr: PointerValue<'ctx>,
+        count: u64,
+    ) {
+        let i64_type = codegen.ctx.i64_type();
+        let num_written_ptr = increment_pointer!(
+            codegen.ctx,
+            codegen.builder,
+            runtime_ptr,
+            FixedSizeListWriterRuntime::OFFSET_NUM_WRITTEN
+        );
+        let num_written = codegen
+            .builder
+            .build_load(i64_type, num_written_ptr, "fixed_size_lists_written")
+            .unwrap()
+            .into_int_value();
+        let new_num_written = codegen
+            .builder
+            .build_int_add(
+                num_written,
+                i64_type.const_int(count, false),
+                "new_fixed_size_lists_written",
+            )
+            .unwrap();
+        codegen
+            .builder
+            .build_store(num_written_ptr, new_num_written)
+            .unwrap();
+    }
 }
 
 impl Writer for FixedSizeListWriter {
@@ -104,30 +135,36 @@ impl Writer for FixedSizeListWriter {
             ));
         }
 
-        let i64_type = codegen.ctx.i64_type();
-        let num_written_ptr = increment_pointer!(
-            codegen.ctx,
-            codegen.builder,
-            runtime_ptr,
-            FixedSizeListWriterRuntime::OFFSET_NUM_WRITTEN
-        );
-        let num_written = codegen
-            .builder
-            .build_load(i64_type, num_written_ptr, "fixed_size_lists_written")
-            .unwrap()
-            .into_int_value();
-        let new_num_written = codegen
-            .builder
-            .build_int_add(
-                num_written,
-                i64_type.const_int(1, false),
-                "new_fixed_size_lists_written",
-            )
-            .unwrap();
-        codegen
-            .builder
-            .build_store(num_written_ptr, new_num_written)
-            .unwrap();
+        Self::llvm_increment_num_written(codegen, runtime_ptr, 1);
+        Ok(())
+    }
+
+    fn llvm_write_block<'ctx, 'borrow>(
+        &'borrow self,
+        codegen: WriterCodegen<'ctx, 'borrow>,
+        runtime_ptr: PointerValue<'ctx>,
+        values: BasicValueEnum<'ctx>,
+        logical_len: u32,
+    ) -> Result<(), ArrowKernelError> {
+        let expected_lanes = logical_len as usize * self.list_size;
+        let actual_lanes = if values.is_vector_value() {
+            values.into_vector_value().get_type().get_size()
+        } else {
+            values.into_int_value().get_type().get_bit_width()
+        };
+        if actual_lanes as usize != expected_lanes {
+            return Err(ArrowKernelError::InternalError(format!(
+                "fixed-size-list block has {} lanes, expected {expected_lanes}",
+                actual_lanes
+            )));
+        }
+        self.values.llvm_write_block(
+            codegen,
+            Self::get_value_ptr(codegen, runtime_ptr),
+            values,
+            expected_lanes as u32,
+        )?;
+        Self::llvm_increment_num_written(codegen, runtime_ptr, logical_len as u64);
         Ok(())
     }
 }
@@ -219,10 +256,11 @@ impl<'ctx, 'borrow> WriterEmitter<'ctx, 'borrow> for FixedSizeListWriterEmitter<
                         .llvm_write(self.codegen, self.value_runtime_ptr, |e| e.emit(value))?;
                 }
             }
-            _ => self.values.llvm_write_multiple(
+            _ => self.values.llvm_write_block(
                 self.codegen,
                 self.value_runtime_ptr,
-                val.into_vector_value(),
+                val,
+                list_size as u32,
             )?,
         }
         Ok(())

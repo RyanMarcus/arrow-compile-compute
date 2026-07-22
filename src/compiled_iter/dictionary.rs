@@ -90,7 +90,7 @@ mod tests {
 
         let ctx = Context::create();
         let module = ctx.create_module("test_iter");
-        let func = iter.generate_next_block::<8>(&ctx, &module).unwrap();
+        let func = iter.generate_next_block(&ctx, &module, 8).unwrap();
         let fname = func.get_name().to_str().unwrap();
 
         module.verify().unwrap();
@@ -126,7 +126,7 @@ mod tests {
 
         let ctx = Context::create();
         let module = ctx.create_module("test_iter");
-        let func = iter.generate_next_block::<2>(&ctx, &module).unwrap();
+        let func = iter.generate_next_block(&ctx, &module, 2).unwrap();
         let fname = func.get_name().to_str().unwrap();
 
         module.verify().unwrap();
@@ -170,7 +170,7 @@ mod tests {
 
         let ctx = Context::create();
         let module = ctx.create_module("test_iter");
-        let func = iter.generate_next_block::<2>(&ctx, &module).unwrap();
+        let func = iter.generate_next_block(&ctx, &module, 2).unwrap();
         let fname = func.get_name().to_str().unwrap();
 
         module.verify().unwrap();

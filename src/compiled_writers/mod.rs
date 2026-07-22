@@ -209,12 +209,37 @@ pub trait Writer {
     /// Writers may override this to ingest a vector more efficiently. The
     /// default preserves the single-value emitter contract by creating a new
     /// emitter for every lane.
+    #[allow(dead_code)]
     fn llvm_write_multiple<'ctx, 'borrow>(
         &'borrow self,
         codegen: WriterCodegen<'ctx, 'borrow>,
         runtime_ptr: PointerValue<'ctx>,
         values: VectorValue<'ctx>,
     ) -> Result<(), ArrowKernelError> {
+        self.llvm_write_block(
+            codegen,
+            runtime_ptr,
+            values.into(),
+            values.get_type().get_size(),
+        )
+    }
+
+    /// Writes a flat block containing `logical_len` values. Composite writers
+    /// interpret the vector lanes using their static child shape.
+    fn llvm_write_block<'ctx, 'borrow>(
+        &'borrow self,
+        codegen: WriterCodegen<'ctx, 'borrow>,
+        runtime_ptr: PointerValue<'ctx>,
+        values: BasicValueEnum<'ctx>,
+        logical_len: u32,
+    ) -> Result<(), ArrowKernelError> {
+        let values = values.into_vector_value();
+        if values.get_type().get_size() != logical_len {
+            return Err(ArrowKernelError::InternalError(format!(
+                "scalar writer cannot ingest {} lanes as {logical_len} logical values",
+                values.get_type().get_size()
+            )));
+        }
         for idx in 0..values.get_type().get_size() {
             let value = codegen
                 .builder
@@ -711,10 +736,11 @@ impl<'ctx> BoundWriter<'ctx> {
         ctx: &'ctx Context,
         module: &'call Module<'ctx>,
         builder: &'call Builder<'ctx>,
-        values: VectorValue<'ctx>,
+        values: BasicValueEnum<'ctx>,
+        logical_len: u32,
     ) {
         self.writer
-            .llvm_write_multiple(
+            .llvm_write_block(
                 WriterCodegen {
                     ctx,
                     module,
@@ -722,6 +748,7 @@ impl<'ctx> BoundWriter<'ctx> {
                 },
                 self.runtime_ptr,
                 values,
+                logical_len,
             )
             .unwrap();
     }

@@ -4,7 +4,7 @@ use arrow_array::{
     types::Float32Type,
     Datum, Float32Array, Scalar,
 };
-use criterion::{black_box, criterion_group, criterion_main, Criterion};
+use criterion::{black_box, criterion_group, criterion_main, BenchmarkId, Criterion};
 
 const NN_VALUES: usize = 256;
 const NN_DIMS: usize = 8;
@@ -84,6 +84,23 @@ unsafe fn nearest_neighbor_avx512_f32x8_256(
 
 pub fn criterion_benchmark(c: &mut Criterion) {
     let mut rng = fastrand::Rng::with_seed(42);
+
+    for dims in [3, 8, 32, 64] {
+        let mut vecs = FixedSizeListBuilder::new(Float32Builder::new(), dims);
+        for _ in 0..16384 {
+            for _ in 0..dims {
+                vecs.values().append_value(2.0 * rng.f32() - 1.0);
+            }
+            vecs.append(true);
+        }
+        let vecs = vecs.finish();
+
+        c.bench_with_input(
+            BenchmarkId::new("norm/llvm-short", format!("16384x{dims}")),
+            &vecs,
+            |b, vecs| b.iter(|| arrow_compile_compute::vec::norm(vecs).unwrap()),
+        );
+    }
 
     {
         let mut vecs = FixedSizeListBuilder::new(Float32Builder::new(), 768);

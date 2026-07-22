@@ -154,6 +154,50 @@ impl Writer for PrimitiveWriter {
         .into();
         f(&mut emitter)
     }
+
+    fn llvm_write_block<'ctx, 'borrow>(
+        &'borrow self,
+        codegen: WriterCodegen<'ctx, 'borrow>,
+        runtime_ptr: PointerValue<'ctx>,
+        values: BasicValueEnum<'ctx>,
+        logical_len: u32,
+    ) -> Result<(), ArrowKernelError> {
+        let values = values.into_vector_value();
+        if values.get_type().get_size() != logical_len {
+            return Err(ArrowKernelError::InternalError(format!(
+                "primitive block has {} lanes for {logical_len} values",
+                values.get_type().get_size()
+            )));
+        }
+        let curr_alloc_ptr_ptr = increment_pointer!(
+            codegen.ctx,
+            codegen.builder,
+            runtime_ptr,
+            PrimitiveWriterRuntime::OFFSET_ALLOC_PTR
+        );
+        let curr_alloc_ptr = codegen
+            .builder
+            .build_load(
+                codegen.ctx.ptr_type(AddressSpace::default()),
+                curr_alloc_ptr_ptr,
+                "primitive_block_ptr",
+            )
+            .unwrap()
+            .into_pointer_value();
+        let store = codegen.builder.build_store(curr_alloc_ptr, values).unwrap();
+        store.set_alignment(1).unwrap();
+        let new_alloc_ptr = increment_pointer!(
+            codegen.ctx,
+            codegen.builder,
+            curr_alloc_ptr,
+            self.pt.width() * logical_len as usize
+        );
+        codegen
+            .builder
+            .build_store(curr_alloc_ptr_ptr, new_alloc_ptr)
+            .unwrap();
+        Ok(())
+    }
 }
 
 pub struct PrimitiveWriterEmitter<'ctx, 'borrow> {
@@ -267,8 +311,9 @@ mod tests {
                 .unwrap();
         }
         let values = [8_i32, 9, 10].map(|value| ctx.i32_type().const_int(value as u64, true));
+        let values = VectorType::const_vector(&values);
         writer
-            .llvm_write_multiple(codegen, dest, VectorType::const_vector(&values))
+            .llvm_write_block(codegen, dest, values.into(), 3)
             .unwrap();
         build.build_return(None).unwrap();
         llvm_mod.verify().unwrap();
