@@ -314,6 +314,12 @@ impl Debug for DSLArgument<'_> {
 pub enum DSLType {
     Boolean,
     Primitive(PrimitiveType),
+    /// A fixed number of logical rows represented as one shaped LLVM value.
+    ///
+    /// Fixed-size-list rows retain their inner width in `element`; the LLVM
+    /// values contain `rows * inner_width` lanes in row-major order, including
+    /// boolean values represented as `i1` lanes.
+    Block(Box<DSLType>, usize),
     ConstScalar(Arc<dyn Datum>),
     Scalar(Box<DSLType>),
     Array(Box<DSLType>, String),
@@ -331,6 +337,7 @@ impl PartialEq for DSLType {
         match (self, other) {
             (DSLType::Boolean, DSLType::Boolean) => true,
             (DSLType::Primitive(a), DSLType::Primitive(b)) => a == b,
+            (DSLType::Block(a, a_rows), DSLType::Block(b, b_rows)) => a == b && a_rows == b_rows,
             (DSLType::ConstScalar(a), DSLType::ConstScalar(b)) => {
                 a.get().0.data_type() == b.get().0.data_type()
             }
@@ -351,6 +358,11 @@ impl Debug for DSLType {
         match self {
             DSLType::Boolean => write!(f, "Boolean"),
             DSLType::Primitive(ty) => f.debug_tuple("Primitive").field(ty).finish(),
+            DSLType::Block(ty, rows) => f
+                .debug_struct("Block")
+                .field("element", ty)
+                .field("rows", rows)
+                .finish(),
             DSLType::SetBits(len_expr) => f.debug_tuple("SetBits").field(len_expr).finish(),
             DSLType::ConstScalar(x) => write!(f, "ConstScalar({:?})", x.get().0),
             DSLType::Scalar(ty) => f.debug_tuple("Scalar").field(ty).finish(),
@@ -378,12 +390,20 @@ impl DSLType {
         }
     }
 
-    pub fn block_type(&self) -> Option<DSLType> {
+    pub fn block_type(&self, rows: usize) -> Option<DSLType> {
+        self.fixed_width_bits()?;
+        Some(DSLType::Block(Box::new(self.clone()), rows))
+    }
+
+    pub fn fixed_width_bits(&self) -> Option<usize> {
         match self {
-            DSLType::Primitive(pt) => Some(DSLType::Primitive(PrimitiveType::List(
-                ListItemType::try_from(*pt).ok()?,
-                64,
-            ))),
+            DSLType::Boolean => Some(1),
+            DSLType::Primitive(PrimitiveType::List(ListItemType::Boolean, size)) => Some(*size),
+            DSLType::Primitive(PrimitiveType::List(ListItemType::P64x2, _))
+            | DSLType::Primitive(PrimitiveType::P64x2) => None,
+            DSLType::Primitive(pt) => Some(pt.width().checked_mul(8)?),
+            DSLType::Block(element, rows) => element.fixed_width_bits()?.checked_mul(*rows),
+            DSLType::Scalar(element) => element.fixed_width_bits(),
             _ => None,
         }
     }
@@ -421,6 +441,7 @@ impl DSLType {
         match self {
             DSLType::Boolean => None,
             DSLType::Primitive(pt) => Some(pt.is_signed()),
+            DSLType::Block(t, _) => t.is_signed(),
             DSLType::SetBits(..) => Some(false),
             DSLType::ConstScalar(v) => {
                 Some(PrimitiveType::for_arrow_type(v.get().0.data_type()).is_signed())
@@ -447,6 +468,25 @@ impl DSLType {
         match self {
             DSLType::Boolean => Some(ctx.bool_type().as_basic_type_enum()),
             DSLType::Primitive(pt) => Some(pt.llvm_type(ctx)),
+            DSLType::Block(element, rows) => {
+                let (leaf, lanes) = match element.as_ref() {
+                    DSLType::Boolean => (PrimitiveType::U8, *rows),
+                    DSLType::Primitive(PrimitiveType::List(item, size)) => {
+                        (item.physical_primitive_type(), rows.checked_mul(*size)?)
+                    }
+                    DSLType::Primitive(pt) => (*pt, *rows),
+                    _ => return None,
+                };
+                match element.as_ref() {
+                    DSLType::Boolean
+                    | DSLType::Primitive(PrimitiveType::List(ListItemType::Boolean, _)) => {
+                        Some(ctx.bool_type().vec_type(lanes as u32).as_basic_type_enum())
+                    }
+                    _ => leaf
+                        .llvm_vec_type(ctx, lanes as u32)
+                        .map(|t| t.as_basic_type_enum()),
+                }
+            }
             DSLType::SetBits(..) => Some(ctx.i64_type().as_basic_type_enum()),
             DSLType::VarList(_) => Some(
                 ctx.struct_type(
@@ -473,6 +513,7 @@ impl DSLType {
     pub fn as_primitive(&self) -> Option<PrimitiveType> {
         match self {
             DSLType::Primitive(pt) => Some(*pt),
+            DSLType::Block(element, _) => element.as_primitive(),
             _ => None,
         }
     }
@@ -1361,15 +1402,17 @@ impl DSLExpr {
                 rhs.get_type(),
             ));
         }
-        if matches!(
-            self.get_type(),
-            DSLType::Primitive(PrimitiveType::List(
-                ListItemType::Boolean | ListItemType::P64x2,
-                _
-            ))
-        ) {
+        let valid_type = match self.get_type() {
+            DSLType::Boolean => true,
+            DSLType::Primitive(pt) if pt.is_int() => true,
+            DSLType::Primitive(PrimitiveType::List(item, _)) => {
+                item != ListItemType::Boolean && PrimitiveType::from(item).is_int()
+            }
+            _ => false,
+        };
+        if !valid_type {
             return Err(ArrowKernelError::DSLInvalidType(
-                "bitwise operators require numeric fixed-size-list elements",
+                "bitwise operators require integer or boolean values",
                 self.get_type(),
             ));
         }
@@ -1427,8 +1470,11 @@ impl DSLExpr {
             DSLType::Primitive(pt) if pt.as_numeric_primitive_type().is_some() => {
                 Ok(DSLExpr::BitNot(Box::new(self.clone())))
             }
+            DSLType::Primitive(PrimitiveType::List(item, _)) if item.is_numeric() => {
+                Ok(DSLExpr::BitNot(Box::new(self.clone())))
+            }
             _ => Err(ArrowKernelError::DSLInvalidType(
-                "can only bit_not numeric primitive types or booleans",
+                "can only bit_not numeric primitive or fixed-size-list types or booleans",
                 self.get_type(),
             )),
         }
@@ -1536,37 +1582,65 @@ impl DSLExpr {
 
     pub fn get_type(&self) -> DSLType {
         match self {
-            DSLExpr::Compare(..) | DSLExpr::StringPredicate(..) => DSLType::Boolean,
+            DSLExpr::Compare(_, lhs, _) => match lhs.get_type() {
+                DSLType::Block(_, rows) => DSLType::Block(Box::new(DSLType::Boolean), rows),
+                _ => DSLType::Boolean,
+            },
+            DSLExpr::StringPredicate(..) => DSLType::Boolean,
             DSLExpr::At(val, idxes) => {
                 let mut t = val.ty.clone();
+                let block_rows = idxes.iter().find_map(|idx| match idx.get_type() {
+                    DSLType::Block(_, rows) => Some(rows),
+                    _ => None,
+                });
                 for _ in idxes {
                     t = t
                         .iter_type()
                         .unwrap_or_else(|| panic!("unable to iterate type: {:?}", t));
                 }
-                t
+                match block_rows {
+                    Some(rows) => DSLType::Block(Box::new(t), rows),
+                    None => t,
+                }
             }
             DSLExpr::Value(v) => v.ty.clone(),
             DSLExpr::BitwiseBinOp(_, v, _) | DSLExpr::ArithBinOp(_, v, _) => v.get_type().clone(),
-            DSLExpr::FloatToTotalOrderSInt(v) => DSLType::Primitive(PrimitiveType::int_with_width(
-                v.get_type().as_primitive().unwrap().width(),
-            )),
+            DSLExpr::FloatToTotalOrderSInt(v) => {
+                let result = DSLType::Primitive(PrimitiveType::int_with_width(
+                    v.get_type().as_primitive().unwrap().width(),
+                ));
+                match v.get_type() {
+                    DSLType::Block(_, rows) => DSLType::Block(Box::new(result), rows),
+                    _ => result,
+                }
+            }
             DSLExpr::Bswap(v)
             | DSLExpr::BitNot(v)
             | DSLExpr::Sqrt(v)
             | DSLExpr::Neg(v)
             | DSLExpr::Abs(v) => v.get_type(),
-
             DSLExpr::VecSum(v) => {
                 DSLType::Primitive(v.get_type().as_primitive().unwrap().list_type_into_inner())
             }
             DSLExpr::ListLen(_) => DSLType::Primitive(PrimitiveType::U64),
-            DSLExpr::Splat(v, size) => DSLType::Primitive(PrimitiveType::List(
-                v.get_type().as_primitive().unwrap().try_into().unwrap(),
-                *size,
-            )),
-            DSLExpr::Cast(_, pt) | DSLExpr::BitCast(_, pt) => DSLType::Primitive(*pt),
-            DSLExpr::CastToBool(_) => DSLType::Boolean,
+            DSLExpr::Splat(v, size) => {
+                let list = DSLType::Primitive(PrimitiveType::List(
+                    v.get_type().as_primitive().unwrap().try_into().unwrap(),
+                    *size,
+                ));
+                match v.get_type() {
+                    DSLType::Block(_, rows) => DSLType::Block(Box::new(list), rows),
+                    _ => list,
+                }
+            }
+            DSLExpr::Cast(v, pt) | DSLExpr::BitCast(v, pt) => match v.get_type() {
+                DSLType::Block(_, rows) => DSLType::Block(Box::new(DSLType::Primitive(*pt)), rows),
+                _ => DSLType::Primitive(*pt),
+            },
+            DSLExpr::CastToBool(v) => match v.get_type() {
+                DSLType::Block(_, rows) => DSLType::Block(Box::new(DSLType::Boolean), rows),
+                _ => DSLType::Boolean,
+            },
             DSLExpr::Len(_) => DSLType::Primitive(PrimitiveType::U64),
             DSLExpr::Select(_, v1, _v2) => v1.get_type().clone(),
         }
@@ -1629,11 +1703,13 @@ impl From<usize> for DSLExpr {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::Arc;
+
     use arrow_array::{
-        builder::{FixedSizeListBuilder, Int32Builder},
+        builder::{BooleanBuilder, FixedSizeListBuilder, Int32Builder, ListBuilder},
         cast::AsArray,
-        types::{Float32Type, Int32Type, UInt32Type, UInt64Type},
-        BooleanArray, Float32Array, Int32Array, StringArray, UInt32Array,
+        types::{Float32Type, Float64Type, Int32Type, UInt32Type, UInt64Type},
+        Array, BooleanArray, Float32Array, Float64Array, Int32Array, StringArray, UInt32Array,
     };
     use arrow_schema::DataType;
     use itertools::Itertools;
@@ -1642,12 +1718,149 @@ mod tests {
         compiled_kernels::{
             cast::coalesce_type,
             dsl2::{
-                buffer::DSLBuffer, compiler::compile, writers::WriterSpec, DSLComparison,
-                DSLContext, DSLFunction, DSLReductionType, DSLStmt, DSLType, DSLValue, OutputSpec,
+                buffer::DSLBuffer, compiler::compile, writers::WriterSpec, DSLArithBinOp,
+                DSLBitwiseBinOp, DSLComparison, DSLContext, DSLExpr, DSLFunction, DSLReductionType,
+                DSLStmt, DSLType, DSLValue, OutputSpec,
             },
         },
-        ArrowKernelError, ListItemType, PrimitiveType,
+        compiled_writers::RunEndType,
+        ArrowKernelError, PrimitiveType,
     };
+
+    #[test]
+    fn test_dsl2_compile_rejects_boolean_list_arithmetic() {
+        let mut input = FixedSizeListBuilder::new(BooleanBuilder::new(), 2);
+        input.values().append_slice(&[true, false]);
+        input.append(true);
+        let input = input.finish();
+
+        let mut ctx = DSLContext::new();
+        let mut func = DSLFunction::new("boolean_list_arithmetic");
+        let lhs = func.add_arg(&mut ctx, DSLType::array_like(&input, "n"));
+        let rhs = func.add_arg(&mut ctx, DSLType::array_like(&input, "n"));
+        func.add_body(
+            DSLStmt::for_each(&mut ctx, &[lhs, rhs], |loop_vars| {
+                DSLStmt::emit(
+                    0,
+                    DSLExpr::ArithBinOp(
+                        DSLArithBinOp::Add,
+                        Box::new(loop_vars[0].expr()),
+                        Box::new(loop_vars[1].expr()),
+                    ),
+                )
+            })
+            .unwrap(),
+        );
+        func.add_ret(
+            WriterSpec::FixedSizeList(Box::new(WriterSpec::Boolean), 2),
+            "n",
+        );
+
+        let rhs_input = input.clone();
+        let err = compile(func, dsl_args![input, rhs_input]).err().unwrap();
+        assert!(matches!(
+            err,
+            ArrowKernelError::DSLInvalidType(
+                "arith operators do not support boolean list elements",
+                _
+            )
+        ));
+    }
+
+    #[test]
+    fn test_dsl2_compile_rejects_float_block_bitwise_ops() {
+        let lhs_input = Float32Array::new_null(0);
+        let rhs_input = Float32Array::new_null(0);
+        let mut ctx = DSLContext::new();
+        let mut func = DSLFunction::new("float_bitwise");
+        let lhs = func.add_arg(&mut ctx, DSLType::array_like(&lhs_input, "n"));
+        let rhs = func.add_arg(&mut ctx, DSLType::array_like(&rhs_input, "n"));
+        func.add_body(
+            DSLStmt::for_each(&mut ctx, &[lhs, rhs], |loop_vars| {
+                DSLStmt::emit(
+                    0,
+                    DSLExpr::BitwiseBinOp(
+                        DSLBitwiseBinOp::And,
+                        Box::new(loop_vars[0].expr()),
+                        Box::new(loop_vars[1].expr()),
+                    ),
+                )
+            })
+            .unwrap(),
+        );
+        func.add_ret(WriterSpec::Primitive(PrimitiveType::F32), "n");
+
+        let err = compile(func, dsl_args![lhs_input, rhs_input])
+            .err()
+            .unwrap();
+        assert!(matches!(
+            err,
+            ArrowKernelError::DSLInvalidType(
+                "bitwise operators require integer or boolean values",
+                _
+            )
+        ));
+    }
+
+    #[test]
+    fn test_dsl2_float_to_unsigned_cast_block_and_tail() {
+        let values = (0..65)
+            .map(|idx| {
+                if idx % 2 == 0 {
+                    3_000_000_000.0_f32
+                } else {
+                    idx as f32
+                }
+            })
+            .collect_vec();
+        let expected = values.iter().map(|value| *value as u32).collect_vec();
+        let input = Float32Array::from(values);
+
+        let mut ctx = DSLContext::new();
+        let mut func = DSLFunction::new("float_to_unsigned");
+        let input_arg = func.add_arg(&mut ctx, DSLType::array_like(&input, "n"));
+        func.add_body(
+            DSLStmt::for_each(&mut ctx, &[input_arg], |loop_vars| {
+                DSLStmt::emit(0, loop_vars[0].expr().primitive_cast(PrimitiveType::U32)?)
+            })
+            .unwrap(),
+        );
+        func.add_ret(WriterSpec::Primitive(PrimitiveType::U32), "n");
+
+        let func = compile(func, dsl_args![input]).unwrap();
+        let result = func.run(&dsl_args![input]).unwrap();
+        assert_eq!(
+            result[0].as_primitive::<UInt32Type>().values(),
+            expected.as_slice()
+        );
+    }
+
+    #[test]
+    fn test_dsl2_f64_constant_lowering() {
+        let input = Int32Array::from(vec![1, 2]);
+        let constant = DSLValue {
+            name: 0,
+            ty: DSLType::ConstScalar(Arc::new(Float64Array::new_scalar(1.25))),
+        };
+
+        let mut ctx = DSLContext::new();
+        let mut func = DSLFunction::new("f64_constant");
+        let input_arg = func.add_arg(&mut ctx, DSLType::array_like(&input, "n"));
+        func.add_body(
+            DSLStmt::for_each(&mut ctx, &[input_arg], |_| {
+                DSLStmt::emit(0, constant.expr().primitive_cast(PrimitiveType::F64)?)
+            })
+            .unwrap(),
+        );
+        func.add_ret(WriterSpec::Primitive(PrimitiveType::F64), "n");
+
+        let func = compile(func, dsl_args![input]).unwrap();
+        let result = func.run(&dsl_args![input]).unwrap();
+        assert_eq!(
+            result[0].as_primitive::<Float64Type>().values(),
+            &[1.25, 1.25]
+        );
+    }
 
     #[test]
     fn test_dsl2_lt() {
@@ -1731,6 +1944,46 @@ mod tests {
     }
 
     #[test]
+    fn test_dsl2_run_into_run_end_strings_owns_values_between_calls() {
+        let mut ctx = DSLContext::new();
+        let mut func = DSLFunction::new("append_run_end_strings");
+        let arr_input = StringArray::new_null(0);
+
+        let arr = func.add_arg(&mut ctx, DSLType::array_of(PrimitiveType::P64x2, "n"));
+        func.add_body(
+            DSLStmt::for_each(&mut ctx, &[arr], |loop_vars| {
+                DSLStmt::emit(0, loop_vars[0].expr())
+            })
+            .unwrap(),
+        );
+        let spec = WriterSpec::RunEndEncoded(RunEndType::Int32, Box::new(WriterSpec::String));
+        func.add_ret(spec.clone(), "n");
+
+        let func = compile(func, dsl_args![arr_input]).unwrap();
+        let mut output = OutputSpec::new(spec, "n").allocate(5);
+        let arr1 = StringArray::from(vec!["a", "a", "b"]);
+        func.run_into(&dsl_args![arr1], std::slice::from_mut(&mut output))
+            .unwrap();
+        drop(arr1);
+
+        let arr2 = StringArray::from(vec!["b", "c"]);
+        func.run_into(&dsl_args![arr2], std::slice::from_mut(&mut output))
+            .unwrap();
+
+        let out = output.into_array_ref(None);
+        let out = out.as_run::<Int32Type>();
+        assert_eq!(out.run_ends().values(), &[2, 3, 4, 5]);
+        assert_eq!(
+            out.values()
+                .as_binary::<i32>()
+                .iter()
+                .map(|value| std::str::from_utf8(value.unwrap()).unwrap())
+                .collect::<Vec<_>>(),
+            ["a", "b", "b", "c"]
+        );
+    }
+
+    #[test]
     fn test_dsl2_take() {
         let mut ctx = DSLContext::new();
         let mut func = DSLFunction::new("take");
@@ -1772,6 +2025,109 @@ mod tests {
         assert_eq!(
             out.into_iter().map(|x| x.unwrap()).collect_vec(),
             vec![20, 30, 20]
+        );
+    }
+
+    #[test]
+    fn test_dsl2_take_list() {
+        let mut input = ListBuilder::new(Int32Builder::new());
+        input.values().append_slice(&(0..16).collect_vec());
+        input.append(true);
+        input.append(true);
+        input.values().append_slice(&[20, 21]);
+        input.append(true);
+        let input = input.finish();
+        let idxs_input = UInt32Array::new_null(0);
+
+        let mut ctx = DSLContext::new();
+        let mut func = DSLFunction::new("take_list");
+        let arr = func.add_arg(&mut ctx, DSLType::array_like(&input, "n"));
+        let idxs = func.add_arg(&mut ctx, DSLType::array_of(PrimitiveType::U32, "m"));
+        func.add_body(
+            DSLStmt::for_each(&mut ctx, &[idxs], |loop_vars| {
+                let idx = loop_vars[0].expr().primitive_cast(PrimitiveType::U64)?;
+                DSLStmt::emit(0, arr.expr().at(&idx)?)
+            })
+            .unwrap(),
+        );
+        func.add_ret(WriterSpec::for_data_type(input.data_type()), "m");
+
+        let func = compile(func, dsl_args![input, idxs_input]).unwrap();
+        let idxs = UInt32Array::from(vec![2, 0, 0, 1]);
+        let result = func.run(&dsl_args![input, idxs]).unwrap();
+
+        let mut expected = ListBuilder::new(Int32Builder::new());
+        expected.values().append_slice(&[20, 21]);
+        expected.append(true);
+        expected.values().append_slice(&(0..16).collect_vec());
+        expected.append(true);
+        expected.values().append_slice(&(0..16).collect_vec());
+        expected.append(true);
+        expected.append(true);
+        let expected = expected.finish();
+        let actual = result[0].as_list::<i32>();
+        assert_eq!(actual.offsets(), expected.offsets());
+        assert_eq!(
+            actual.values().as_primitive::<Int32Type>(),
+            expected.values().as_primitive::<Int32Type>()
+        );
+    }
+
+    #[test]
+    fn test_dsl2_filter_nested_list() {
+        let mut input = ListBuilder::new(ListBuilder::new(Int32Builder::new()));
+        input.values().values().append_slice(&[1, 2]);
+        input.values().append(true);
+        input.values().append(true);
+        input.values().values().append_value(3);
+        input.values().append(true);
+        input.append(true);
+        input.append(true);
+        input.values().values().append_value(4);
+        input.values().append(true);
+        input.values().values().append_slice(&[5, 6]);
+        input.values().append(true);
+        input.append(true);
+        let input = input.finish();
+        let mask_input = BooleanArray::new_null(0);
+
+        let mut ctx = DSLContext::new();
+        let mut func = DSLFunction::new("filter_nested_list");
+        let arr = func.add_arg(&mut ctx, DSLType::array_like(&input, "n"));
+        let mask = func.add_arg(&mut ctx, DSLType::set_bits("m"));
+        func.add_body(
+            DSLStmt::for_each(&mut ctx, &[mask], |loop_vars| {
+                DSLStmt::emit(0, arr.expr().at(&loop_vars[0].expr())?)
+            })
+            .unwrap(),
+        );
+        func.add_ret(WriterSpec::for_data_type(input.data_type()), "m");
+
+        let func = compile(func, dsl_args![input, mask_input]).unwrap();
+        let mask = BooleanArray::from(vec![true, false, true]);
+        let result = func.run(&dsl_args![input, mask]).unwrap();
+
+        let mut expected = ListBuilder::new(ListBuilder::new(Int32Builder::new()));
+        expected.values().values().append_slice(&[1, 2]);
+        expected.values().append(true);
+        expected.values().append(true);
+        expected.values().values().append_value(3);
+        expected.values().append(true);
+        expected.append(true);
+        expected.values().values().append_value(4);
+        expected.values().append(true);
+        expected.values().values().append_slice(&[5, 6]);
+        expected.values().append(true);
+        expected.append(true);
+        let expected = expected.finish();
+        let actual = result[0].as_list::<i32>();
+        assert_eq!(actual.offsets(), expected.offsets());
+        let actual_values = actual.values().as_list::<i32>();
+        let expected_values = expected.values().as_list::<i32>();
+        assert_eq!(actual_values.offsets(), expected_values.offsets());
+        assert_eq!(
+            actual_values.values().as_primitive::<Int32Type>(),
+            expected_values.values().as_primitive::<Int32Type>()
         );
     }
 
@@ -1925,6 +2281,41 @@ mod tests {
             out.into_iter().map(|x| x.unwrap()).collect_vec(),
             vec![!1.0f32.to_bits(), !(-0.0f32).to_bits(), !42.25f32.to_bits()]
         );
+    }
+
+    #[test]
+    fn test_dsl2_bit_not_fixed_size_list_block_and_tail() {
+        let mut input = FixedSizeListBuilder::new(Int32Builder::new(), 3);
+        let mut expected = Vec::new();
+        for row in 0_i32..65 {
+            let values = [row, -row, row * 3];
+            input.values().append_slice(&values);
+            input.append(true);
+            expected.extend(values.map(|value| !value));
+        }
+        let input = input.finish();
+
+        let mut ctx = DSLContext::new();
+        let mut func = DSLFunction::new("bit_not_fixed_size_list");
+        let input_arg = func.add_arg(&mut ctx, DSLType::array_like(&input, "n"));
+        func.add_body(
+            DSLStmt::for_each(&mut ctx, &[input_arg], |loop_vars| {
+                DSLStmt::emit(0, loop_vars[0].expr().bit_not()?)
+            })
+            .unwrap(),
+        );
+        func.add_ret(
+            WriterSpec::FixedSizeList(Box::new(WriterSpec::Primitive(PrimitiveType::I32)), 3),
+            "n",
+        );
+
+        let func = compile(func, dsl_args![input]).unwrap();
+        let result = func.run(&dsl_args![input]).unwrap();
+        let values = result[0]
+            .as_fixed_size_list()
+            .values()
+            .as_primitive::<Int32Type>();
+        assert_eq!(values.values(), expected.as_slice());
     }
 
     #[test]
@@ -2204,6 +2595,116 @@ mod tests {
         let result = func.run(&dsl_args![input]).unwrap();
         let result = result[0].as_primitive::<Int32Type>();
         assert_eq!(result.values(), &[6, 1]);
+    }
+
+    #[test]
+    fn test_dsl2_block_select_fixed_size_lists() {
+        let conditions = BooleanArray::from((0..65).map(|idx| idx % 2 == 0).collect::<Vec<_>>());
+        let mut if_true = FixedSizeListBuilder::new(Int32Builder::new(), 2);
+        let mut if_false = FixedSizeListBuilder::new(Int32Builder::new(), 2);
+        for idx in 0..65 {
+            if_true.values().append_slice(&[idx, -idx]);
+            if_true.append(true);
+            if_false.values().append_slice(&[idx + 100, idx + 200]);
+            if_false.append(true);
+        }
+        let if_true = if_true.finish();
+        let if_false = if_false.finish();
+
+        let mut ctx = DSLContext::new();
+        let mut func = DSLFunction::new("block_select_fixed_size_lists");
+        let conditions_arg = func.add_arg(&mut ctx, DSLType::array_like(&conditions, "n"));
+        let if_true_arg = func.add_arg(&mut ctx, DSLType::array_like(&if_true, "n"));
+        let if_false_arg = func.add_arg(&mut ctx, DSLType::array_like(&if_false, "n"));
+        func.add_body(
+            DSLStmt::for_each(
+                &mut ctx,
+                &[conditions_arg, if_true_arg, if_false_arg],
+                |loop_vars| {
+                    DSLStmt::emit(
+                        0,
+                        loop_vars[0]
+                            .expr()
+                            .select(loop_vars[1].expr(), loop_vars[2].expr())?,
+                    )
+                },
+            )
+            .unwrap(),
+        );
+        func.add_ret(
+            WriterSpec::FixedSizeList(Box::new(WriterSpec::Primitive(PrimitiveType::I32)), 2),
+            "n",
+        );
+
+        let func = compile(func, dsl_args![conditions, if_true, if_false]).unwrap();
+        let result = func.run(&dsl_args![conditions, if_true, if_false]).unwrap();
+        let values = result[0]
+            .as_fixed_size_list()
+            .values()
+            .as_primitive::<Int32Type>();
+        let expected = (0..65)
+            .flat_map(|idx| {
+                if idx % 2 == 0 {
+                    [idx, -idx]
+                } else {
+                    [idx + 100, idx + 200]
+                }
+            })
+            .collect_vec();
+        assert_eq!(values.values().as_ref(), expected.as_slice());
+    }
+
+    #[test]
+    fn test_dsl2_block_select_boolean_fixed_size_lists() {
+        let conditions = BooleanArray::from((0..65).map(|idx| idx % 2 == 0).collect::<Vec<_>>());
+        let mut if_true = FixedSizeListBuilder::new(BooleanBuilder::new(), 3);
+        let mut if_false = FixedSizeListBuilder::new(BooleanBuilder::new(), 3);
+        let mut expected = Vec::new();
+        for idx in 0..65 {
+            let true_values = [true, idx % 3 == 0, false];
+            let false_values = [false, idx % 3 != 0, true];
+            if_true.values().append_slice(&true_values);
+            if_true.append(true);
+            if_false.values().append_slice(&false_values);
+            if_false.append(true);
+            expected.extend(if idx % 2 == 0 {
+                true_values
+            } else {
+                false_values
+            });
+        }
+        let if_true = if_true.finish();
+        let if_false = if_false.finish();
+
+        let mut ctx = DSLContext::new();
+        let mut func = DSLFunction::new("block_select_boolean_fixed_size_lists");
+        let conditions_arg = func.add_arg(&mut ctx, DSLType::array_like(&conditions, "n"));
+        let if_true_arg = func.add_arg(&mut ctx, DSLType::array_like(&if_true, "n"));
+        let if_false_arg = func.add_arg(&mut ctx, DSLType::array_like(&if_false, "n"));
+        func.add_body(
+            DSLStmt::for_each(
+                &mut ctx,
+                &[conditions_arg, if_true_arg, if_false_arg],
+                |loop_vars| {
+                    DSLStmt::emit(
+                        0,
+                        loop_vars[0]
+                            .expr()
+                            .select(loop_vars[1].expr(), loop_vars[2].expr())?,
+                    )
+                },
+            )
+            .unwrap(),
+        );
+        func.add_ret(
+            WriterSpec::FixedSizeList(Box::new(WriterSpec::Boolean), 3),
+            "n",
+        );
+
+        let func = compile(func, dsl_args![conditions, if_true, if_false]).unwrap();
+        let result = func.run(&dsl_args![conditions, if_true, if_false]).unwrap();
+        let values = result[0].as_fixed_size_list().values().as_boolean();
+        assert_eq!(values.values().iter().collect_vec(), expected);
     }
 
     #[test]
@@ -2556,29 +3057,33 @@ mod tests {
 
     #[test]
     fn test_dsl2_splat() {
-        let input = Float32Array::from(vec![1.0, -2.5]);
+        let input_values = (0..65).map(|idx| idx as f32 - 10.5).collect::<Vec<_>>();
+        let expected = input_values
+            .iter()
+            .flat_map(|value| [*value; 3])
+            .collect_vec();
+        let input = Float32Array::from(input_values);
 
         let mut ctx = DSLContext::new();
         let mut func = DSLFunction::new("splat");
         let arr = func.add_arg(&mut ctx, DSLType::array_of(PrimitiveType::F32, "n"));
         func.add_body(
             DSLStmt::for_each(&mut ctx, &[arr], |loop_vars| {
-                DSLStmt::emit(0, loop_vars[0].expr().splat(2)?)
+                DSLStmt::emit(0, loop_vars[0].expr().splat(3)?)
             })
             .unwrap(),
         );
-        func.add_ret(WriterSpec::FixedSizeList(ListItemType::F32, 2), "n");
+        func.add_ret(
+            WriterSpec::FixedSizeList(Box::new(WriterSpec::Primitive(PrimitiveType::F32)), 3),
+            "n",
+        );
 
         let func = compile(func, dsl_args![input]).unwrap();
         let result = func.run(&dsl_args![input]).unwrap();
         let result = result[0].as_fixed_size_list();
         assert_eq!(
-            result.value(0).as_primitive::<Float32Type>().values(),
-            &[1.0, 1.0]
-        );
-        assert_eq!(
-            result.value(1).as_primitive::<Float32Type>().values(),
-            &[-2.5, -2.5]
+            result.values().as_primitive::<Float32Type>().values(),
+            expected.as_slice()
         );
     }
 }

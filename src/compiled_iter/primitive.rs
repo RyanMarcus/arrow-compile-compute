@@ -27,7 +27,7 @@ pub struct PrimitiveIterator {
     data: *const c_void,
     pos: u64,
     len: u64,
-    array_ref: Arc<dyn Array>,
+    pub(super) array_ref: Arc<dyn Array>,
 }
 
 impl<K: ArrowPrimitiveType> From<&PrimitiveArray<K>> for Box<PrimitiveIterator> {
@@ -45,7 +45,7 @@ impl PrimitiveIterator {
     pub fn llvm_len<'a>(
         &self,
         ctx: &'a Context,
-        builder: &'a Builder,
+        builder: &Builder<'a>,
         ptr: PointerValue<'a>,
     ) -> IntValue<'a> {
         let len_ptr = increment_pointer!(ctx, builder, ptr, PrimitiveIterator::OFFSET_LEN);
@@ -156,13 +156,11 @@ impl PrimitiveIterator {
 mod test {
     use std::ffi::c_void;
 
-    use arrow_array::{Array, Int32Array};
+    use arrow_array::Int32Array;
     use inkwell::{context::Context, OptimizationLevel};
     use itertools::Itertools;
 
-    use crate::compiled_iter::{
-        array_to_iter, generate_next, generate_next_block, generate_random_access,
-    };
+    use crate::compiled_iter::array_to_iter;
 
     #[test]
     fn test_primitive_iter_block() {
@@ -180,9 +178,7 @@ mod test {
 
         let ctx = Context::create();
         let module = ctx.create_module("test_iter");
-        let func =
-            generate_next_block::<8>(&ctx, &module, "iter_prim_test", data.data_type(), &iter)
-                .unwrap();
+        let func = iter.generate_next_block(&ctx, &module, 8).unwrap();
         let fname = func.get_name().to_str().unwrap();
 
         module.verify().unwrap();
@@ -222,9 +218,7 @@ mod test {
 
         let ctx = Context::create();
         let module = ctx.create_module("test_iter");
-        let func =
-            generate_next_block::<8>(&ctx, &module, "iter_prim_test", data.data_type(), &iter)
-                .unwrap();
+        let func = iter.generate_next_block(&ctx, &module, 8).unwrap();
         let fname = func.get_name().to_str().unwrap();
 
         module.verify().unwrap();
@@ -263,7 +257,7 @@ mod test {
 
         let ctx = Context::create();
         let module = ctx.create_module("test_iter");
-        let func = generate_next(&ctx, &module, "iter_prim_test", data.data_type(), &iter).unwrap();
+        let func = iter.generate_next(&ctx, &module);
         let fname = func.get_name().to_str().unwrap();
 
         module.verify().unwrap();
@@ -327,7 +321,7 @@ mod test {
 
         let ctx = Context::create();
         let module = ctx.create_module("test_iter");
-        let func = generate_next(&ctx, &module, "iter_prim_test", data.data_type(), &iter).unwrap();
+        let func = iter.generate_next(&ctx, &module);
         let fname = func.get_name().to_str().unwrap();
 
         module.verify().unwrap();
@@ -371,8 +365,7 @@ mod test {
 
         let ctx = Context::create();
         let module = ctx.create_module("test_iter");
-        let func = generate_random_access(&ctx, &module, "iter_prim_test", data.data_type(), &iter)
-            .unwrap();
+        let func = iter.generate_random_access(&ctx, &module).unwrap();
         let fname = func.get_name().to_str().unwrap();
 
         module.verify().unwrap();
@@ -402,8 +395,7 @@ mod test {
 
         let ctx = Context::create();
         let module = ctx.create_module("test_iter");
-        let func = generate_random_access(&ctx, &module, "iter_prim_test", data.data_type(), &iter)
-            .unwrap();
+        let func = iter.generate_random_access(&ctx, &module).unwrap();
         let fname = func.get_name().to_str().unwrap();
 
         module.verify().unwrap();

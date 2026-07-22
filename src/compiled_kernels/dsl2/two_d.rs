@@ -7,7 +7,7 @@ use inkwell::{
 use itertools::Itertools;
 
 use crate::{
-    compiled_iter::{datum_to_iter, generate_random_access, IteratorHolder},
+    compiled_iter::{datum_to_iter, IteratorHolder},
     increment_pointer, mark_load_invariant, ArrowKernelError, PrimitiveType,
 };
 
@@ -35,21 +35,14 @@ pub fn generate_two_d_access<'ctx>(
 ) -> Result<FunctionValue<'ctx>, ArrowKernelError> {
     let witness_type = PrimitiveType::for_arrow_type(arrs[0].get().0.data_type());
     let mut funcs = Vec::new();
-    for (idx, arr) in arrs.iter().copied().enumerate() {
+    for arr in arrs.iter().copied() {
         let ty = PrimitiveType::for_arrow_type(arr.get().0.data_type());
         if witness_type != ty {
             return Err(ArrowKernelError::Inconsistent2DArray(witness_type, ty));
         }
 
         let ih = datum_to_iter(arr)?;
-        let func = generate_random_access(
-            ctx,
-            module,
-            &format!("two_d_accessor_{}", idx),
-            arr.get().0.data_type(),
-            &ih,
-        )
-        .unwrap();
+        let func = ih.generate_random_access(ctx, module).unwrap();
         funcs.push(func);
     }
 

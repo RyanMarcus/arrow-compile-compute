@@ -37,6 +37,7 @@ pub use ht::{HashFunction, HashKernel};
 use inkwell::execution_engine::ExecutionEngine;
 pub use interleave::InterleaveKernel;
 pub use list_len::ListLenKernel;
+pub(crate) use llvm_utils::llvm_add_str_writer_append_bytes;
 use llvm_utils::str_writer_append_bytes;
 pub use null_utils::intersect_and_copy_nulls;
 pub use partition::PartitionKernel;
@@ -63,7 +64,6 @@ use inkwell::{
 };
 use thiserror::Error;
 
-use crate::compiled_iter::load_packed_bool_chunk;
 use crate::compiled_kernels::llvm_utils::save_ptrs_to_string_saver;
 use crate::compiled_kernels::llvm_utils::str_view_writer_append_bytes;
 use crate::llvm_debug::debug_i64;
@@ -152,6 +152,9 @@ pub enum ArrowKernelError {
 
     #[error("dsl error")]
     DSLError(#[from] DSLError),
+
+    #[error("internal error: {0}")]
+    InternalError(String),
 }
 
 pub trait Kernel: Sized {
@@ -226,8 +229,11 @@ pub(crate) fn link_req_helpers(
         ee.add_global_mapping(&func, save_ptrs_to_string_saver as *const () as usize);
     }
 
-    if let Some(func) = module.get_function("load_packed_bool_chunk") {
-        ee.add_global_mapping(&func, load_packed_bool_chunk as *const () as usize);
+    if let Some(func) = module.get_function("writer_reserve_for_additional") {
+        ee.add_global_mapping(
+            &func,
+            crate::compiled_writers::writer_reserve_for_additional as *const () as usize,
+        );
     }
 
     if let Some(func) = module.get_function("debug_i64") {

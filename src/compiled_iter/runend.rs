@@ -48,7 +48,7 @@ pub struct RunEndIterator {
     /// the remaining number of values in the current run
     remaining: u64,
 
-    array_ref: Arc<dyn Array>,
+    pub(super) array_ref: Arc<dyn Array>,
 }
 
 impl<R: RunEndIndexType + ArrowPrimitiveType> From<&RunArray<R>> for IteratorHolder {
@@ -99,7 +99,7 @@ impl RunEndIterator {
     pub fn llvm_re_iter_ptr<'a>(
         &self,
         ctx: &'a Context,
-        builder: &'a Builder,
+        builder: &Builder<'a>,
         ptr: PointerValue<'a>,
     ) -> PointerValue<'a> {
         let ptr_ptr = increment_pointer!(ctx, builder, ptr, RunEndIterator::OFFSET_RUN_ENDS);
@@ -447,10 +447,7 @@ mod tests {
     use inkwell::{context::Context, OptimizationLevel};
 
     use crate::{
-        compiled_iter::{
-            array_to_iter, datum_to_iter, generate_next, generate_next_block,
-            generate_random_access, IteratorHolder,
-        },
+        compiled_iter::{array_to_iter, datum_to_iter, IteratorHolder},
         PrimitiveType,
     };
 
@@ -466,12 +463,10 @@ mod tests {
 
         let ctx = Context::create();
         let module = ctx.create_module("test_iter");
-        let func =
-            generate_next_block::<8>(&ctx, &module, "iter_block_next", ree.data_type(), &iter)
-                .unwrap();
+        let func = iter.generate_next_block(&ctx, &module, 8).unwrap();
         let fname = func.get_name().to_str().unwrap();
 
-        let next_func = generate_next(&ctx, &module, "iter_next", ree.data_type(), &iter).unwrap();
+        let next_func = iter.generate_next(&ctx, &module);
         let next_fname = next_func.get_name().to_str().unwrap();
 
         module.verify().unwrap();
@@ -517,12 +512,10 @@ mod tests {
 
         let ctx = Context::create();
         let module = ctx.create_module("test_iter");
-        let func =
-            generate_next_block::<8>(&ctx, &module, "iter_block_next", ree.data_type(), &iter)
-                .unwrap();
+        let func = iter.generate_next_block(&ctx, &module, 8).unwrap();
         let fname = func.get_name().to_str().unwrap();
 
-        let next_func = generate_next(&ctx, &module, "iter_next", ree.data_type(), &iter).unwrap();
+        let next_func = iter.generate_next(&ctx, &module);
         let next_fname = next_func.get_name().to_str().unwrap();
 
         module.verify().unwrap();
@@ -569,7 +562,7 @@ mod tests {
         let ctx = Context::create();
         let module = ctx.create_module("test_runend");
 
-        let func = generate_next(&ctx, &module, "runend", ree.data_type(), &iter).unwrap();
+        let func = iter.generate_next(&ctx, &module);
         let fname = func.get_name().to_str().unwrap();
 
         module.verify().unwrap();
@@ -608,7 +601,7 @@ mod tests {
         let ctx = Context::create();
         let module = ctx.create_module("test_runend");
 
-        let func = generate_next(&ctx, &module, "runend", ree.data_type(), &iter).unwrap();
+        let func = iter.generate_next(&ctx, &module);
         let fname = func.get_name().to_str().unwrap();
 
         module.verify().unwrap();
@@ -656,7 +649,7 @@ mod tests {
         let ctx = Context::create();
         let module = ctx.create_module("test_runend");
 
-        let func = generate_next(&ctx, &module, "runend", ree.data_type(), &iter).unwrap();
+        let func = iter.generate_next(&ctx, &module);
         let fname = func.get_name().to_str().unwrap();
 
         module.verify().unwrap();
@@ -694,7 +687,7 @@ mod tests {
         let ctx = Context::create();
         let module = ctx.create_module("test_runend");
 
-        let func = generate_random_access(&ctx, &module, "access", ree.data_type(), &iter).unwrap();
+        let func = iter.generate_random_access(&ctx, &module).unwrap();
         let fname = func.get_name().to_str().unwrap();
 
         module.verify().unwrap();

@@ -14,7 +14,7 @@ use crate::{
         KernelCache,
     },
     compiled_writers::WriterSpec,
-    logical_arrow_type, logical_nulls, ArrowKernelError, Kernel, ListItemType, PrimitiveType,
+    logical_arrow_type, logical_nulls, ArrowKernelError, Kernel, PrimitiveType,
 };
 
 pub fn concat_all(data: &[&dyn Array]) -> Result<ArrayRef, ArrowKernelError> {
@@ -113,7 +113,7 @@ fn concat_writer_spec(dt: &DataType) -> WriterSpec {
         | DataType::LargeBinary
         | DataType::BinaryView => WriterSpec::StringView,
         DataType::FixedSizeList(field, len) => WriterSpec::FixedSizeList(
-            ListItemType::for_arrow_type(field.data_type()),
+            Box::new(WriterSpec::for_data_type(field.data_type())),
             len as usize,
         ),
         dt => WriterSpec::Primitive(PrimitiveType::for_arrow_type(&dt)),
@@ -238,6 +238,40 @@ mod tests {
         assert_eq!(
             res.iter().map(|x| x.unwrap()).collect_vec(),
             vec![true, false, true, false, true]
+        );
+    }
+
+    #[test]
+    fn test_concat_fixed_size_list_bools_block_tail_and_bit_offsets() {
+        let value_count = 65 * 3;
+        let d1_expected = (0..value_count).map(|idx| idx % 3 == 0).collect::<Vec<_>>();
+        let d2_expected = (0..value_count).map(|idx| idx % 5 < 2).collect::<Vec<_>>();
+        let mut d1_storage = vec![false];
+        d1_storage.extend_from_slice(&d1_expected);
+        let mut d2_storage = vec![false, true];
+        d2_storage.extend_from_slice(&d2_expected);
+        let d1_values = BooleanArray::from(d1_storage).slice(1, value_count);
+        let d2_values = BooleanArray::from(d2_storage).slice(2, value_count);
+        let field = Arc::new(arrow_schema::Field::new_list_field(
+            arrow_schema::DataType::Boolean,
+            false,
+        ));
+        let d1 = FixedSizeListArray::try_new(field.clone(), 3, Arc::new(d1_values), None).unwrap();
+        let d2 = FixedSizeListArray::try_new(field, 3, Arc::new(d2_values), None).unwrap();
+        let mut alloc =
+            OutputSpec::new(super::concat_writer_spec(d1.data_type()), "n").allocate(130);
+
+        let k = ConcatKernel::compile(&(&d1, &mut alloc), ()).unwrap();
+        k.call((&d1, &mut alloc)).unwrap();
+        k.call((&d2, &mut alloc)).unwrap();
+
+        let res = alloc.into_array_ref(None);
+        let values = res.as_fixed_size_list().values().as_boolean();
+        let mut expected = d1_expected;
+        expected.extend(d2_expected);
+        assert_eq!(
+            values.iter().map(|value| value.unwrap()).collect_vec(),
+            expected
         );
     }
 }

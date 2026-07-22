@@ -25,7 +25,7 @@ pub struct FixedSizeListIterator {
     list_size: usize,
     list_ptype: ListItemType,
     child: Box<IteratorHolder>,
-    array_ref: Arc<dyn Array>,
+    pub(super) array_ref: Arc<dyn Array>,
 }
 
 impl From<&FixedSizeListArray> for Box<FixedSizeListIterator> {
@@ -67,10 +67,7 @@ mod test {
     use arrow_schema::{DataType, Field};
     use inkwell::{context::Context, AddressSpace, OptimizationLevel};
 
-    use crate::{
-        compiled_iter::{array_to_iter, generate_next, generate_random_access},
-        PrimitiveType,
-    };
+    use crate::{compiled_iter::array_to_iter, PrimitiveType};
 
     fn make_list_array() -> FixedSizeListArray {
         let values = Int32Array::from((0..12).collect::<Vec<_>>());
@@ -90,9 +87,7 @@ mod test {
 
         let ctx = Context::create();
         let module = ctx.create_module("test_fixed_size_list_random_access");
-        let access_fn =
-            generate_random_access(&ctx, &module, "iter_fixed_list", data.data_type(), &iter)
-                .unwrap();
+        let access_fn = iter.generate_random_access(&ctx, &module).unwrap();
 
         let ptr_type = ctx.ptr_type(AddressSpace::default());
         let i32_type = ctx.i32_type();
@@ -168,8 +163,7 @@ mod test {
 
         let ctx = Context::create();
         let module = ctx.create_module("test_fixed_size_list_next");
-        let next_fn =
-            generate_next(&ctx, &module, "iter_fixed_list", data.data_type(), &iter).unwrap();
+        let next_fn = iter.generate_next(&ctx, &module);
 
         let ptr_type = ctx.ptr_type(AddressSpace::default());
         let bool_type = ctx.bool_type();

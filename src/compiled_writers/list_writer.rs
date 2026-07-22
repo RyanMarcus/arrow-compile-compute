@@ -1,0 +1,562 @@
+use std::{ffi::c_void, sync::Arc};
+
+use arrow_array::{
+    cast::AsArray,
+    make_array,
+    types::{Int32Type, Int64Type},
+};
+use arrow_data::ArrayDataBuilder;
+use arrow_schema::{DataType, Field};
+use inkwell::{
+    values::{BasicValue, BasicValueEnum, PointerValue},
+    AddressSpace,
+};
+use repr_offset::ReprOffset;
+
+use crate::{
+    compiled_iter::IteratorHolder,
+    compiled_writers::{
+        AnyRuntime, AnyWriter, AnyWriterEmitter, PrimitiveWriter, Writer, WriterCodegen,
+        WriterEmitter, WriterRuntime,
+    },
+    increment_pointer, ArrowKernelError, PrimitiveType,
+};
+
+pub struct ListWriter {
+    offsets: PrimitiveWriter,
+    inner: Box<AnyWriter>,
+}
+
+impl ListWriter {
+    pub fn compile(offset_type: PrimitiveType, inner: AnyWriter) -> Result<Self, ArrowKernelError> {
+        if !matches!(offset_type, PrimitiveType::I32 | PrimitiveType::I64) {
+            return Err(ArrowKernelError::InternalError(format!(
+                "list offsets must be I32 or I64, got {offset_type}"
+            )));
+        }
+        Ok(Self {
+            offsets: PrimitiveWriter::compile(offset_type)?,
+            inner: Box::new(inner),
+        })
+    }
+
+    fn get_offset_ptr<'a>(
+        &self,
+        codegen: WriterCodegen<'a, '_>,
+        runtime_ptr: PointerValue<'a>,
+    ) -> PointerValue<'a> {
+        let offset_ptr_ptr = increment_pointer!(
+            codegen.ctx,
+            codegen.builder,
+            runtime_ptr,
+            ListWriterRuntime::OFFSET_OFFSET_RUNTIME_PTR
+        );
+        let offset_ptr = codegen
+            .builder
+            .build_load(
+                codegen.ctx.ptr_type(AddressSpace::default()),
+                offset_ptr_ptr,
+                "offset_ptr",
+            )
+            .unwrap()
+            .into_pointer_value();
+        offset_ptr
+    }
+
+    fn get_value_ptr<'a>(
+        &self,
+        codegen: WriterCodegen<'a, '_>,
+        runtime_ptr: PointerValue<'a>,
+    ) -> PointerValue<'a> {
+        let value_ptr_ptr = increment_pointer!(
+            codegen.ctx,
+            codegen.builder,
+            runtime_ptr,
+            ListWriterRuntime::OFFSET_VALUE_RUNTIME_PTR
+        );
+        let value_ptr = codegen
+            .builder
+            .build_load(
+                codegen.ctx.ptr_type(AddressSpace::default()),
+                value_ptr_ptr,
+                "value_ptr",
+            )
+            .unwrap()
+            .into_pointer_value();
+        value_ptr
+    }
+
+    pub(super) fn llvm_write_from_list<'ctx, 'borrow>(
+        &'borrow self,
+        codegen: WriterCodegen<'ctx, 'borrow>,
+        runtime_ptr: PointerValue<'ctx>,
+        source_child: &IteratorHolder,
+        row: BasicValueEnum<'ctx>,
+    ) -> Result<(), ArrowKernelError> {
+        self.llvm_write(codegen, runtime_ptr, |emitter| {
+            let AnyWriterEmitter::List(emitter) = emitter else {
+                unreachable!("list writer did not produce a list emitter");
+            };
+            emitter.copy_row(source_child, row)
+        })
+    }
+}
+
+impl Writer for ListWriter {
+    fn allocate(&self, size: usize) -> AnyRuntime {
+        let mut runtime = ListWriterRuntime {
+            offset_runtime_ptr: std::ptr::null_mut(),
+            value_runtime_ptr: std::ptr::null_mut(),
+            curr_count: 0,
+            offset_runtime: Box::new(self.offsets.allocate(size + 1)),
+            value_runtime: Box::new(self.inner.allocate(size)),
+        };
+        runtime.offset_runtime_ptr = runtime.offset_runtime.as_ptr();
+        runtime.value_runtime_ptr = runtime.value_runtime.as_ptr();
+        runtime.into()
+    }
+
+    fn llvm_init<'ctx, 'borrow>(
+        &self,
+        codegen: WriterCodegen<'ctx, 'borrow>,
+        runtime_ptr: PointerValue<'ctx>,
+    ) {
+        self.offsets
+            .llvm_init(codegen, self.get_offset_ptr(codegen, runtime_ptr));
+        self.inner
+            .llvm_init(codegen, self.get_value_ptr(codegen, runtime_ptr));
+    }
+
+    fn llvm_write<'ctx, 'borrow, F>(
+        &'borrow self,
+        codegen: WriterCodegen<'ctx, 'borrow>,
+        runtime_ptr: PointerValue<'ctx>,
+        f: F,
+    ) -> Result<(), crate::ArrowKernelError>
+    where
+        F: Fn(&mut AnyWriterEmitter<'ctx, 'borrow>) -> Result<(), crate::ArrowKernelError>,
+    {
+        let curr_count_ptr = increment_pointer!(
+            codegen.ctx,
+            codegen.builder,
+            runtime_ptr,
+            ListWriterRuntime::OFFSET_CURR_COUNT
+        );
+        let curr_count = codegen
+            .builder
+            .build_load(codegen.ctx.i64_type(), curr_count_ptr, "curr_count")
+            .unwrap();
+
+        let mut emitter = ListWriterEmitter {
+            codegen,
+            run_counter_ptr: curr_count_ptr,
+            value_ptr: self.get_value_ptr(codegen, runtime_ptr),
+            value_writer: self.inner.as_ref(),
+        }
+        .into();
+
+        f(&mut emitter)?;
+
+        let curr_offset = match self.offsets.primitive_type() {
+            PrimitiveType::I32 => codegen
+                .builder
+                .build_int_truncate(
+                    curr_count.into_int_value(),
+                    codegen.ctx.i32_type(),
+                    "list_offset_i32",
+                )
+                .unwrap()
+                .as_basic_value_enum(),
+            PrimitiveType::I64 => curr_count,
+            _ => unreachable!(),
+        };
+        self.offsets
+            .llvm_write(codegen, self.get_offset_ptr(codegen, runtime_ptr), |e| {
+                e.emit(curr_offset)
+            })?;
+
+        Ok(())
+    }
+}
+
+#[repr(C)]
+#[derive(ReprOffset)]
+#[roff(usize_offsets)]
+pub struct ListWriterRuntime {
+    offset_runtime_ptr: *mut c_void,
+    value_runtime_ptr: *mut c_void,
+    curr_count: u64,
+    offset_runtime: Box<AnyRuntime>,
+    value_runtime: Box<AnyRuntime>,
+}
+
+impl WriterRuntime for ListWriterRuntime {
+    fn as_ptr(&mut self) -> *mut std::ffi::c_void {
+        self as *mut Self as *mut std::ffi::c_void
+    }
+
+    fn reserve_for_additional(&mut self, count: usize) -> Result<(), ArrowKernelError> {
+        self.offset_runtime.reserve_for_additional(count + 1)?;
+        self.value_runtime.reserve_for_additional(count)?;
+        self.offset_runtime_ptr = self.offset_runtime.as_ptr();
+        self.value_runtime_ptr = self.value_runtime.as_ptr();
+        Ok(())
+    }
+
+    fn len(&self) -> usize {
+        self.offset_runtime.len()
+    }
+
+    fn to_array(mut self, len: usize) -> Result<arrow_array::ArrayRef, crate::ArrowKernelError> {
+        let written = self.offset_runtime.len();
+        if len > written {
+            return Err(ArrowKernelError::InternalError(format!(
+                "list writer contains {written} values but {len} were requested"
+            )));
+        }
+        if len == written {
+            self.offset_runtime.append_integer(self.curr_count)?;
+        }
+        let offsets = self.offset_runtime.to_array(len + 1)?;
+
+        let (is_large, value_len) = match offsets.data_type() {
+            DataType::Int32 => (
+                false,
+                offsets.as_primitive::<Int32Type>().value(len) as usize,
+            ),
+            DataType::Int64 => (
+                true,
+                offsets.as_primitive::<Int64Type>().value(len) as usize,
+            ),
+            dt => {
+                return Err(ArrowKernelError::InternalError(format!(
+                    "list offsets must be Int32 or Int64, got {dt}"
+                )))
+            }
+        };
+        let values = self.value_runtime.to_array(value_len)?;
+        let field = Arc::new(Field::new("item", values.data_type().clone(), false));
+        let data_type = if is_large {
+            DataType::LargeList(field)
+        } else {
+            DataType::List(field)
+        };
+        let offsets = offsets.to_data();
+        let data = unsafe {
+            ArrayDataBuilder::new(data_type)
+                .len(len)
+                .add_buffer(offsets.buffers()[0].clone())
+                .add_child_data(values.to_data())
+                .build_unchecked()
+        };
+
+        Ok(make_array(data))
+    }
+}
+
+pub struct ListWriterEmitter<'ctx, 'borrow> {
+    codegen: WriterCodegen<'ctx, 'borrow>,
+    run_counter_ptr: PointerValue<'ctx>,
+    value_ptr: PointerValue<'ctx>,
+    value_writer: &'borrow AnyWriter,
+}
+impl<'ctx, 'borrow> WriterEmitter<'ctx, 'borrow> for ListWriterEmitter<'ctx, 'borrow> {
+    fn emit(&mut self, val: BasicValueEnum<'ctx>) -> Result<(), crate::ArrowKernelError> {
+        self.value_writer
+            .llvm_write(self.codegen, self.value_ptr, |e| e.emit(val))?;
+        self.increment_value_count();
+        Ok(())
+    }
+}
+
+impl<'ctx, 'borrow> ListWriterEmitter<'ctx, 'borrow> {
+    fn increment_value_count(&self) {
+        let i64_type = self.codegen.ctx.i64_type();
+        let curr_run_count = self
+            .codegen
+            .builder
+            .build_load(i64_type, self.run_counter_ptr, "curr_run_count")
+            .unwrap()
+            .into_int_value();
+        let new_run_count = self
+            .codegen
+            .builder
+            .build_int_add(
+                curr_run_count,
+                i64_type.const_int(1, false),
+                "new_run_count",
+            )
+            .unwrap();
+        self.codegen
+            .builder
+            .build_store(self.run_counter_ptr, new_run_count)
+            .unwrap();
+    }
+
+    fn copy_row(
+        &mut self,
+        source_child: &IteratorHolder,
+        row: BasicValueEnum<'ctx>,
+    ) -> Result<(), ArrowKernelError> {
+        let row = row.into_struct_value();
+        let child_iter = self
+            .codegen
+            .builder
+            .build_extract_value(row, 0, "list_child_iter")
+            .unwrap()
+            .into_pointer_value();
+        let start = self
+            .codegen
+            .builder
+            .build_extract_value(row, 1, "list_start")
+            .unwrap()
+            .into_int_value();
+        let end = self
+            .codegen
+            .builder
+            .build_extract_value(row, 2, "list_end")
+            .unwrap()
+            .into_int_value();
+        let row_len = self
+            .codegen
+            .builder
+            .build_int_sub(end, start, "list_row_len")
+            .unwrap();
+        self.value_writer
+            .llvm_reserve_for_additional(self.codegen, self.value_ptr, row_len);
+
+        let source_child_type = source_child.data_type();
+        let accessor = source_child
+            .generate_random_access(self.codegen.ctx, self.codegen.module)
+            .ok_or_else(|| {
+                ArrowKernelError::InternalError(format!(
+                    "list child type {source_child_type} does not support random access"
+                ))
+            })?;
+
+        let func = self
+            .codegen
+            .builder
+            .get_insert_block()
+            .unwrap()
+            .get_parent()
+            .unwrap();
+        let loop_cond = self.codegen.ctx.append_basic_block(func, "list_copy_cond");
+        let loop_body = self.codegen.ctx.append_basic_block(func, "list_copy_body");
+        let loop_end = self.codegen.ctx.append_basic_block(func, "list_copy_end");
+        let idx_ptr = self
+            .codegen
+            .builder
+            .build_alloca(self.codegen.ctx.i64_type(), "list_copy_idx")
+            .unwrap();
+        self.codegen.builder.build_store(idx_ptr, start).unwrap();
+        self.codegen
+            .builder
+            .build_unconditional_branch(loop_cond)
+            .unwrap();
+
+        self.codegen.builder.position_at_end(loop_cond);
+        let idx = self
+            .codegen
+            .builder
+            .build_load(self.codegen.ctx.i64_type(), idx_ptr, "list_copy_idx")
+            .unwrap()
+            .into_int_value();
+        let have_more = self
+            .codegen
+            .builder
+            .build_int_compare(inkwell::IntPredicate::ULT, idx, end, "list_copy_have_more")
+            .unwrap();
+        self.codegen
+            .builder
+            .build_conditional_branch(have_more, loop_body, loop_end)
+            .unwrap();
+
+        self.codegen.builder.position_at_end(loop_body);
+        let value = self
+            .codegen
+            .builder
+            .build_call(
+                accessor,
+                &[child_iter.into(), idx.into()],
+                "list_child_value",
+            )
+            .unwrap()
+            .try_as_basic_value()
+            .unwrap_basic();
+        self.value_writer.llvm_write_from_iterator(
+            self.codegen,
+            self.value_ptr,
+            source_child,
+            value,
+        )?;
+        self.increment_value_count();
+        let next_idx = self
+            .codegen
+            .builder
+            .build_int_add(
+                idx,
+                self.codegen.ctx.i64_type().const_int(1, false),
+                "list_copy_next_idx",
+            )
+            .unwrap();
+        self.codegen.builder.build_store(idx_ptr, next_idx).unwrap();
+        self.codegen
+            .builder
+            .build_unconditional_branch(loop_cond)
+            .unwrap();
+
+        self.codegen.builder.position_at_end(loop_end);
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::ffi::c_void;
+
+    use arrow_array::{cast::AsArray, types::Int32Type};
+    use inkwell::{context::Context, values::BasicValue, AddressSpace, OptimizationLevel};
+
+    use crate::{
+        compiled_writers::{Writer, WriterCodegen, WriterEmitter, WriterRuntime, WriterSpec},
+        declare_blocks, PrimitiveType,
+    };
+
+    #[test]
+    fn large_list_writer_runtime_to_array_appends_final_offset() {
+        let ctx = Context::create();
+        let llvm_mod = ctx.create_module("compiled_writers_list_writer");
+        let build = ctx.create_builder();
+        let ptr_type = ctx.ptr_type(AddressSpace::default());
+
+        let func = llvm_mod.add_function(
+            "test",
+            ctx.void_type().fn_type(&[ptr_type.into()], false),
+            None,
+        );
+
+        declare_blocks!(ctx, func, entry);
+        build.position_at_end(entry);
+
+        let dest = func.get_nth_param(0).unwrap().into_pointer_value();
+        let writer = WriterSpec::LargeList(Box::new(WriterSpec::Primitive(PrimitiveType::I32)))
+            .compile()
+            .unwrap();
+        let codegen = WriterCodegen {
+            ctx: &ctx,
+            module: &llvm_mod,
+            builder: &build,
+        };
+
+        writer.llvm_init(codegen, dest);
+        writer
+            .llvm_write(codegen, dest, |emitter| {
+                emitter.emit(ctx.i32_type().const_int(10, true).as_basic_value_enum())?;
+                emitter.emit(ctx.i32_type().const_int(11, true).as_basic_value_enum())
+            })
+            .unwrap();
+        writer.llvm_write(codegen, dest, |_emitter| Ok(())).unwrap();
+        writer
+            .llvm_write(codegen, dest, |emitter| {
+                emitter.emit(ctx.i32_type().const_int(12, true).as_basic_value_enum())?;
+                emitter.emit(ctx.i32_type().const_int(13, true).as_basic_value_enum())?;
+                emitter.emit(ctx.i32_type().const_int(14, true).as_basic_value_enum())
+            })
+            .unwrap();
+        build.build_return(None).unwrap();
+        llvm_mod.verify().unwrap();
+
+        let ee = llvm_mod
+            .create_jit_execution_engine(OptimizationLevel::None)
+            .unwrap();
+        let f = unsafe {
+            ee.get_function::<unsafe extern "C" fn(*mut c_void)>(func.get_name().to_str().unwrap())
+                .unwrap()
+        };
+
+        let mut runtime = writer.allocate(5);
+        unsafe {
+            f.call(runtime.as_ptr());
+        }
+
+        let array = runtime.to_array(3).unwrap();
+        let list = array.as_list::<i64>();
+        assert_eq!(list.offsets().as_ref(), &[0, 2, 2, 5]);
+        assert_eq!(
+            list.values().as_primitive::<Int32Type>().values(),
+            &[10, 11, 12, 13, 14]
+        );
+    }
+
+    #[test]
+    fn list_writer_writes_nested_list() {
+        let ctx = Context::create();
+        let llvm_mod = ctx.create_module("compiled_writers_nested_list_writer");
+        let build = ctx.create_builder();
+        let ptr_type = ctx.ptr_type(AddressSpace::default());
+
+        let func = llvm_mod.add_function(
+            "test",
+            ctx.void_type().fn_type(&[ptr_type.into()], false),
+            None,
+        );
+
+        declare_blocks!(ctx, func, entry);
+        build.position_at_end(entry);
+
+        let dest = func.get_nth_param(0).unwrap().into_pointer_value();
+        let writer = WriterSpec::List(Box::new(WriterSpec::List(Box::new(WriterSpec::Primitive(
+            PrimitiveType::I32,
+        )))))
+        .compile()
+        .unwrap();
+        let codegen = WriterCodegen {
+            ctx: &ctx,
+            module: &llvm_mod,
+            builder: &build,
+        };
+
+        writer.llvm_init(codegen, dest);
+        writer
+            .llvm_write(codegen, dest, |emitter| {
+                emitter.emit(ctx.i32_type().const_int(10, true).as_basic_value_enum())?;
+                emitter.emit(ctx.i32_type().const_int(11, true).as_basic_value_enum())
+            })
+            .unwrap();
+        writer.llvm_write(codegen, dest, |_emitter| Ok(())).unwrap();
+        writer
+            .llvm_write(codegen, dest, |emitter| {
+                emitter.emit(ctx.i32_type().const_int(12, true).as_basic_value_enum())?;
+                emitter.emit(ctx.i32_type().const_int(13, true).as_basic_value_enum())?;
+                emitter.emit(ctx.i32_type().const_int(14, true).as_basic_value_enum())
+            })
+            .unwrap();
+        build.build_return(None).unwrap();
+        llvm_mod.verify().unwrap();
+
+        let ee = llvm_mod
+            .create_jit_execution_engine(OptimizationLevel::None)
+            .unwrap();
+        let f = unsafe {
+            ee.get_function::<unsafe extern "C" fn(*mut c_void)>(func.get_name().to_str().unwrap())
+                .unwrap()
+        };
+
+        let mut runtime = writer.allocate(5);
+        unsafe {
+            f.call(runtime.as_ptr());
+        }
+
+        let array = runtime.to_array(3).unwrap();
+        let outer = array.as_list::<i32>();
+        assert_eq!(outer.offsets().as_ref(), &[0, 2, 2, 5]);
+
+        let inner = outer.values().as_list::<i32>();
+        assert_eq!(inner.offsets().as_ref(), &[0, 1, 2, 3, 4, 5]);
+        assert_eq!(
+            inner.values().as_primitive::<Int32Type>().values(),
+            &[10, 11, 12, 13, 14]
+        );
+    }
+}

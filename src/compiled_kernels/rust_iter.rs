@@ -8,9 +8,7 @@ use inkwell::{
 use ouroboros::self_referencing;
 
 use crate::{
-    compiled_iter::{
-        array_to_setbit_iter, datum_to_iter, generate_next, generate_random_access, IteratorHolder,
-    },
+    compiled_iter::{array_to_setbit_iter, datum_to_iter, IteratorHolder},
     compiled_kernels::{gen_convert_numeric_vec, link_req_helpers, optimize_module},
     declare_blocks, increment_pointer, logical_nulls, Kernel, PrimitiveType,
 };
@@ -319,10 +317,9 @@ fn generate_call<'a>(
         None,
     );
 
-    let next = generate_next(ctx, &module, "call", dt, ih).unwrap();
-    let access = generate_random_access(ctx, &module, "call", dt, ih).unwrap();
-    let next_bit = setbit_ih
-        .map(|ih| generate_next(ctx, &module, "call_bit", &DataType::Boolean, ih).unwrap());
+    let next = ih.generate_next(ctx, &module);
+    let access = ih.generate_random_access(ctx, &module).unwrap();
+    let next_bit = setbit_ih.map(|ih| ih.generate_next(ctx, &module));
 
     let build = ctx.create_builder();
     declare_blocks!(ctx, func, entry, loop_cond, loop_body, exit);

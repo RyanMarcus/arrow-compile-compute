@@ -25,7 +25,7 @@ use inkwell::{
 mod arrow_interface;
 mod compiled_iter;
 mod compiled_kernels;
-pub(crate) mod compiled_writers;
+mod compiled_writers;
 mod llvm_debug;
 
 pub use arrow_interface::aggregate;
@@ -414,7 +414,7 @@ impl PrimitiveType {
             PrimitiveType::F32 => ctx.f32_type().into(),
             PrimitiveType::F64 => ctx.f64_type().into(),
             PrimitiveType::List(ListItemType::Boolean, s) => {
-                ctx.i64_type().array_type(s.div_ceil(64) as u32).into()
+                ctx.bool_type().vec_type(*s as u32).into()
             }
             PrimitiveType::List(ListItemType::P64x2, s) => PrimitiveType::P64x2
                 .llvm_type(ctx)

@@ -19,18 +19,15 @@ use inkwell::{
         LLVMFastMathApproxFunc,
     },
     module::{Linkage, Module},
-    types::{BasicType, BasicTypeEnum},
-    values::{BasicValue, BasicValueEnum, FunctionValue, IntValue, VectorValue},
+    types::{BasicType, BasicTypeEnum, VectorType},
+    values::{BasicValue, BasicValueEnum, FunctionValue, InstructionOpcode, IntValue, VectorValue},
     AddressSpace, FloatPredicate, IntPredicate, OptimizationLevel,
 };
 use itertools::Itertools;
 use ouroboros::self_referencing;
 
 use crate::{
-    compiled_iter::{
-        array_to_setbit_iter, datum_to_iter, generate_next, generate_next_block,
-        generate_random_access, generate_reset_iterator, get_iterator_length,
-    },
+    compiled_iter::{array_to_setbit_iter, datum_to_iter, get_iterator_length, IteratorHolder},
     compiled_kernels::{
         cmp::{add_float_to_int, add_float_vec_to_int_vec, add_memcmp},
         dsl2::{
@@ -43,7 +40,7 @@ use crate::{
         llvm_utils::llvm_add_save_ptrs_string_saver,
         optimize_module,
     },
-    compiled_writers::BoundWriter,
+    compiled_writers::{BoundWriter, WriterSpec},
     increment_pointer, set_noalias_params, ArrowKernelError, ComparisonType, ListItemType,
     NumericPrimitiveType, PrimitiveType,
 };
@@ -82,6 +79,7 @@ fn dsl_type_to_llvm_type<'a>(ctx: &'a Context, v: &DSLType) -> BasicTypeEnum<'a>
     match v {
         DSLType::Boolean => ctx.bool_type().as_basic_type_enum(),
         DSLType::Primitive(pt) => pt.llvm_type(ctx),
+        DSLType::Block(..) => v.llvm_type(ctx).unwrap(),
         DSLType::ConstScalar(datum) => {
             let dt = datum.get().0.data_type();
             match dt {
@@ -114,20 +112,45 @@ fn build_entry_alloca<'ctx>(
     builder.build_alloca(ty, name).unwrap()
 }
 
+fn repeat_vector_lanes<'ctx>(
+    ctx: &DSLCompilationContext<'ctx, '_>,
+    value: VectorValue<'ctx>,
+    repeats: usize,
+    name: &str,
+) -> VectorValue<'ctx> {
+    let mask = (0..value.get_type().get_size())
+        .flat_map(|lane| {
+            std::iter::repeat_n(ctx.ctx.i32_type().const_int(lane as u64, false), repeats)
+        })
+        .collect_vec();
+    let mask = VectorType::const_vector(&mask);
+    ctx.b
+        .build_shuffle_vector(value, value.get_type().get_poison(), mask, name)
+        .unwrap()
+}
+
 pub struct DSLCompilationContext<'ctx, 'a> {
     pub ctx: &'ctx Context,
     pub module: &'a Module<'ctx>,
     pub func: &'a FunctionValue<'ctx>,
     pub b: &'a Builder<'ctx>,
-    pub st: HashMap<usize, BasicValueEnum<'a>>,
-    pub access_funcs: HashMap<usize, FunctionValue<'a>>,
-    pub next_funcs: HashMap<usize, FunctionValue<'a>>,
-    pub next_block_funcs: HashMap<usize, FunctionValue<'a>>,
-    pub writer_funcs: HashMap<usize, FunctionValue<'a>>,
-    pub reset_funcs: HashMap<usize, FunctionValue<'a>>,
-    pub lengths: HashMap<usize, Option<IntValue<'a>>>,
-    pub output_specs: Vec<crate::compiled_writers::WriterSpec>,
-    pub outputs: Vec<BoundWriter<'a, 'a>>,
+    /// Maps DSL value IDs to their current LLVM values.
+    pub st: HashMap<usize, BasicValueEnum<'ctx>>,
+    /// Maps iterable argument IDs to the iterator holders that back them.
+    pub iterator_holders: HashMap<usize, IteratorHolder>,
+    /// Maps DSL value IDs to the array argument IDs they came from.
+    pub value_sources: HashMap<usize, usize>,
+    /// Maps randomly accessed value IDs to their generated accessor functions.
+    pub access_funcs: HashMap<usize, FunctionValue<'ctx>>,
+    /// Maps writable buffer IDs to their generated writer functions.
+    pub writer_funcs: HashMap<usize, FunctionValue<'ctx>>,
+    /// Maps iterable value IDs to their LLVM lengths, when known.
+    pub lengths: HashMap<usize, Option<IntValue<'ctx>>>,
+    /// Describes each output writer in return-value order.
+    pub output_specs: Vec<WriterSpec>,
+    /// Holds each initialized output writer in return-value order.
+    pub outputs: Vec<BoundWriter<'ctx>>,
+    /// Records whether compilation emitted a vectorized loop.
     pub did_vectorize: &'a mut bool,
 }
 
@@ -220,12 +243,9 @@ pub fn compile_inner<'ctx, 'args>(
 
     let mut st = HashMap::new();
     let mut access_funcs = HashMap::new();
-    let mut next_funcs = HashMap::new();
-    let mut next_block_funcs = HashMap::new();
     let mut writer_funcs = HashMap::new();
     let mut ihs = HashMap::new();
     let mut lengths = HashMap::new();
-    let mut reset_funcs = HashMap::new();
 
     // load LLVM function parameters into the symbol table
     for (idx, param) in f.params.iter().enumerate() {
@@ -281,14 +301,7 @@ pub fn compile_inner<'ctx, 'args>(
                     ));
                 }
 
-                let access_func = generate_random_access(
-                    ctx,
-                    &module,
-                    &format!("access_{}", param.name),
-                    &arg.data_type(),
-                    ih,
-                )
-                .unwrap();
+                let access_func = ih.generate_random_access(ctx, &module).unwrap();
                 access_funcs.insert(param.name, access_func);
             }
             DSLType::Buffer(t, _) => {
@@ -314,7 +327,6 @@ pub fn compile_inner<'ctx, 'args>(
     // setup iterators
     for idx in f.iterated_parameters() {
         let param = names_to_params[&idx];
-        let arg = &names_to_args[&idx];
 
         match &param.ty {
             DSLType::Scalar(t) | DSLType::Array(t, ..) => {
@@ -327,63 +339,8 @@ pub fn compile_inner<'ctx, 'args>(
                         detected_dtype,
                     ));
                 }
-
-                let next_func = generate_next(
-                    ctx,
-                    &module,
-                    &format!("next_{}", param.name),
-                    &arg.data_type(),
-                    ih,
-                )
-                .unwrap();
-                next_funcs.insert(param.name, next_func);
-
-                let reset_func =
-                    generate_reset_iterator(ctx, &module, &format!("{}", param.name), ih).unwrap();
-                reset_funcs.insert(param.name, reset_func);
             }
-            DSLType::SetBits(_) => {
-                let ih = &ihs[&idx];
-
-                let next_func = generate_next(
-                    ctx,
-                    &module,
-                    &format!("next_setbit_{}", param.name),
-                    &arg.data_type(),
-                    ih,
-                )
-                .unwrap();
-                next_funcs.insert(param.name, next_func);
-
-                let reset_func =
-                    generate_reset_iterator(ctx, &module, &format!("{}", param.name), ih).unwrap();
-                reset_funcs.insert(param.name, reset_func);
-            }
-            _ => return Err(ArrowKernelError::NonIterableType(param.ty.clone())),
-        };
-    }
-
-    // setup block iterators
-    for idx in f.iterated_parameters() {
-        let param = names_to_params[&idx];
-        let arg = &names_to_args[&idx];
-
-        match &param.ty {
-            DSLType::Scalar(_) | DSLType::Array(..) | DSLType::SetBits(_) => {
-                let ih = &ihs[&idx];
-
-                if let Some(next_func) = generate_next_block::<64>(
-                    ctx,
-                    &module,
-                    &format!("next_block_{}", param.name),
-                    &arg.data_type(),
-                    ih,
-                ) {
-                    next_block_funcs.insert(param.name, next_func);
-                } else {
-                    continue;
-                }
-            }
+            DSLType::SetBits(_) => {}
             _ => return Err(ArrowKernelError::NonIterableType(param.ty.clone())),
         };
     }
@@ -447,17 +404,22 @@ pub fn compile_inner<'ctx, 'args>(
         writers.push(w);
     }
 
+    let value_sources = f
+        .params
+        .iter()
+        .map(|param| (param.name, param.name))
+        .collect();
+
     let mut dsl_ctx = DSLCompilationContext {
         ctx,
         module: &module,
         func: &func,
         b: &b,
         st,
+        iterator_holders: ihs,
+        value_sources,
         access_funcs,
-        next_funcs,
-        next_block_funcs,
         writer_funcs,
-        reset_funcs,
         output_specs,
         lengths,
         outputs: writers,
@@ -466,11 +428,6 @@ pub fn compile_inner<'ctx, 'args>(
 
     for stmt in f.body.iter() {
         compile_stmt(&mut dsl_ctx, stmt)?;
-    }
-
-    // flush all outputs
-    for w in dsl_ctx.outputs.iter() {
-        w.llvm_flush(ctx, &b);
     }
 
     b.build_return(Some(&ctx.i64_type().const_zero())).unwrap();
@@ -545,10 +502,36 @@ fn compile_stmt<'ctx, 'a>(
                         value.get_type(),
                     ));
                 }
-                let value = compile_expr(ctx, value)?;
-                ctx.outputs[idx as usize].llvm_ingest(ctx.ctx, ctx.b, value);
+                let compiled_value = compile_expr(ctx, value)?;
+                if matches!(accepted, DSLType::VarList(_)) {
+                    let source_name = match value {
+                        DSLExpr::At(value, _) => ctx.value_sources[&value.name],
+                        DSLExpr::Value(value) => ctx.value_sources[&value.name],
+                        _ => return Err(ArrowKernelError::InvalidAtSource(value.clone())),
+                    };
+                    ctx.outputs[idx as usize].llvm_ingest_from_iterator(
+                        ctx.ctx,
+                        ctx.module,
+                        ctx.b,
+                        &ctx.iterator_holders[&source_name],
+                        compiled_value,
+                    );
+                } else {
+                    ctx.outputs[idx as usize].llvm_ingest(
+                        ctx.ctx,
+                        ctx.module,
+                        ctx.b,
+                        compiled_value,
+                    );
+                }
                 return Ok(());
             } else {
+                if matches!(value.get_type(), DSLType::VarList(_)) {
+                    return Err(ArrowKernelError::DSLInvalidType(
+                        "dynamic emit does not support variable-size lists",
+                        value.get_type(),
+                    ));
+                }
                 for spec in ctx.output_specs.iter() {
                     let accepted = accepted_type(spec);
                     if value.get_type() != accepted {
@@ -576,7 +559,7 @@ fn compile_stmt<'ctx, 'a>(
                         .append_basic_block(*ctx.func, &format!("emit_block_{}", idx));
                     let b = ctx.ctx.create_builder();
                     b.position_at_end(emit_block);
-                    o.llvm_ingest(ctx.ctx, &b, value);
+                    o.llvm_ingest(ctx.ctx, ctx.module, &b, value);
                     b.build_unconditional_branch(emit_worked).unwrap();
 
                     (ctx.ctx.i32_type().const_int(idx as u64, false), emit_block)
@@ -605,11 +588,20 @@ fn compile_stmt<'ctx, 'a>(
                 )
             })?;
 
+            let value_type = value.get_type();
+            let DSLType::Block(_, logical_len) = value_type else {
+                return Err(ArrowKernelError::DSLInvalidType(
+                    "block emit requires a shaped block value",
+                    value.get_type(),
+                ));
+            };
             let value = compile_expr(ctx, value)?;
             ctx.outputs[index as usize].llvm_ingest_block(
                 ctx.ctx,
+                ctx.module,
                 ctx.b,
                 value.into_vector_value(),
+                logical_len as u32,
             );
         }
         DSLStmt::Set {
@@ -726,7 +718,7 @@ fn compile_stmt<'ctx, 'a>(
 
             let mut last_res = None;
             for (iter, buf_ptr) in floop.iterators.iter().zip(bufs.iter()) {
-                let next_func = ctx.next_funcs[&iter.name];
+                let next_func = ctx.iterator_holders[&iter.name].generate_next(ctx.ctx, ctx.module);
                 let iter_ptr = ctx.st[&iter.name];
                 let had_next = ctx
                     .b
@@ -771,6 +763,10 @@ fn compile_stmt<'ctx, 'a>(
 
                 ctx.st.insert(loop_var.name, val);
             }
+            for (loop_var, iterator) in floop.loop_vars.iter().zip(floop.iterators.iter()) {
+                let source = ctx.value_sources[&iterator.name];
+                ctx.value_sources.insert(loop_var.name, source);
+            }
             for stmt in floop.body.iter() {
                 compile_stmt(ctx, stmt)?;
             }
@@ -784,17 +780,18 @@ fn compile_stmt<'ctx, 'a>(
 
             ctx.b.position_at_end(loop_end);
             floop.iterators.iter().for_each(|itr| {
+                let reset = ctx.iterator_holders[&itr.name].generate_reset(ctx.ctx, ctx.module);
                 ctx.b
-                    .build_call(
-                        ctx.reset_funcs[&itr.name],
-                        &[ctx.st[&itr.name].into()],
-                        "reset",
-                    )
+                    .build_call(reset, &[ctx.st[&itr.name].into()], "reset")
                     .unwrap();
             });
         }
         DSLStmt::ForEachBlock(bfloop) => {
             *ctx.did_vectorize = true;
+            let block_rows = match &bfloop.loop_vars[0].ty {
+                DSLType::Block(_, rows) => *rows as u32,
+                ty => panic!("block loop requires shaped loop variables, got {ty:?}"),
+            };
 
             let bufs = bfloop
                 .loop_vars
@@ -815,7 +812,9 @@ fn compile_stmt<'ctx, 'a>(
 
             let mut last_res = None;
             for (iter, buf_ptr) in bfloop.iterators.iter().zip(bufs.iter()) {
-                let next_func = ctx.next_block_funcs[&iter.name];
+                let next_func = ctx.iterator_holders[&iter.name]
+                    .generate_next_block(ctx.ctx, ctx.module, block_rows)
+                    .expect("vectorized loop requires block-readable iterators");
                 let iter_ptr = ctx.st[&iter.name];
                 let had_next = ctx
                     .b
@@ -894,7 +893,7 @@ fn compile_stmt<'ctx, 'a>(
 
             let mut last_res = None;
             for (iter, buf_ptr) in dslred.iterators.iter().zip(bufs.iter()) {
-                let next_func = ctx.next_funcs[&iter.name];
+                let next_func = ctx.iterator_holders[&iter.name].generate_next(ctx.ctx, ctx.module);
                 let iter_ptr = ctx.st[&iter.name];
                 let had_next = ctx
                     .b
@@ -967,12 +966,9 @@ fn compile_stmt<'ctx, 'a>(
             let result = dslred.reduction_type.output_value(ctx, result)?;
             ctx.st.insert(dslred.result.name, result);
             dslred.iterators.iter().for_each(|itr| {
+                let reset = ctx.iterator_holders[&itr.name].generate_reset(ctx.ctx, ctx.module);
                 ctx.b
-                    .build_call(
-                        ctx.reset_funcs[&itr.name],
-                        &[ctx.st[&itr.name].into()],
-                        "reset",
-                    )
+                    .build_call(reset, &[ctx.st[&itr.name].into()], "reset")
                     .unwrap();
             });
         }
@@ -1037,56 +1033,34 @@ pub fn compile_compare_values<'ctx, 'a>(
     ctx: &DSLCompilationContext<'ctx, 'a>,
     op: DSLComparison,
     lhs_type: &DSLType,
-    lhs: BasicValueEnum<'a>,
-    rhs: BasicValueEnum<'a>,
-) -> Result<BasicValueEnum<'a>, ArrowKernelError> {
-    match lhs_type {
-        DSLType::Boolean => Ok(ctx
-            .b
-            .build_int_compare(
-                op.as_int_predicate(false),
-                lhs.into_int_value(),
-                rhs.into_int_value(),
-                "cmp",
-            )
-            .unwrap()
-            .as_basic_value_enum()),
+    lhs: BasicValueEnum<'ctx>,
+    rhs: BasicValueEnum<'ctx>,
+) -> Result<BasicValueEnum<'ctx>, ArrowKernelError> {
+    let (element_type, is_block) = match lhs_type {
+        DSLType::Block(element, _) => (element.as_ref(), true),
+        DSLType::Boolean | DSLType::Primitive(_) => (lhs_type, false),
+        _ => {
+            return Err(ArrowKernelError::DSLInvalidType(
+                "comparison requires boolean or primitive values",
+                lhs_type.clone(),
+            ))
+        }
+    };
+
+    match element_type {
+        DSLType::Boolean => build_integer_comparison(ctx, op, false, lhs, rhs, "boolean_cmp"),
         DSLType::Primitive(pt) => match pt.comparison_type() {
             ComparisonType::Float => {
-                let cvt = add_float_to_int(ctx.ctx, ctx.module, *pt);
-                let lhs = ctx
-                    .b
-                    .build_call(cvt, &[lhs.into()], "cvt_lhs_for_total_order")
-                    .unwrap()
-                    .try_as_basic_value()
-                    .unwrap_basic();
-                let rhs = ctx
-                    .b
-                    .build_call(cvt, &[rhs.into()], "cvt_rhs_for_total_order")
-                    .unwrap()
-                    .try_as_basic_value()
-                    .unwrap_basic();
-                Ok(ctx
-                    .b
-                    .build_int_compare(
-                        op.as_int_predicate(true),
-                        lhs.into_int_value(),
-                        rhs.into_int_value(),
-                        "cmp",
-                    )
-                    .unwrap()
-                    .as_basic_value_enum())
+                let (lhs, rhs) = float_total_order_keys(ctx, *pt, lhs, rhs)?;
+                build_integer_comparison(ctx, op, true, lhs, rhs, "float_cmp")
             }
-            ComparisonType::Int { signed } => Ok(ctx
-                .b
-                .build_int_compare(
-                    op.as_int_predicate(signed),
-                    lhs.into_int_value(),
-                    rhs.into_int_value(),
-                    "cmp",
-                )
-                .unwrap()
-                .as_basic_value_enum()),
+            ComparisonType::Int { signed } => {
+                build_integer_comparison(ctx, op, signed, lhs, rhs, "int_cmp")
+            }
+            ComparisonType::String if is_block => Err(ArrowKernelError::DSLInvalidType(
+                "block comparison requires numeric or boolean rows",
+                lhs_type.clone(),
+            )),
             ComparisonType::String => {
                 let memcmp = add_memcmp(ctx.ctx, ctx.module);
                 let memcmp_res = ctx
@@ -1096,18 +1070,19 @@ pub fn compile_compare_values<'ctx, 'a>(
                     .try_as_basic_value()
                     .unwrap_basic()
                     .into_int_value();
-
-                Ok(ctx
-                    .b
-                    .build_int_compare(
-                        op.as_int_predicate(true),
-                        memcmp_res,
-                        ctx.ctx.i64_type().const_zero(),
-                        "cmp",
-                    )
-                    .unwrap()
-                    .as_basic_value_enum())
+                build_integer_comparison(
+                    ctx,
+                    op,
+                    true,
+                    memcmp_res.as_basic_value_enum(),
+                    ctx.ctx.i64_type().const_zero().as_basic_value_enum(),
+                    "string_cmp",
+                )
             }
+            ComparisonType::List(_) if is_block => Err(ArrowKernelError::DSLInvalidType(
+                "fixed-size-list block comparison is not supported",
+                lhs_type.clone(),
+            )),
             ComparisonType::List(_) => compare_list_values(ctx, op, *pt, lhs, rhs),
         },
         _ => Err(ArrowKernelError::DSLInvalidType(
@@ -1117,58 +1092,89 @@ pub fn compile_compare_values<'ctx, 'a>(
     }
 }
 
+fn build_integer_comparison<'ctx>(
+    ctx: &DSLCompilationContext<'ctx, '_>,
+    op: DSLComparison,
+    signed: bool,
+    lhs: BasicValueEnum<'ctx>,
+    rhs: BasicValueEnum<'ctx>,
+    name: &str,
+) -> Result<BasicValueEnum<'ctx>, ArrowKernelError> {
+    let predicate = op.as_int_predicate(signed);
+    match (lhs, rhs) {
+        (BasicValueEnum::IntValue(lhs), BasicValueEnum::IntValue(rhs)) => Ok(ctx
+            .b
+            .build_int_compare(predicate, lhs, rhs, name)
+            .unwrap()
+            .as_basic_value_enum()),
+        (BasicValueEnum::VectorValue(lhs), BasicValueEnum::VectorValue(rhs)) => Ok(ctx
+            .b
+            .build_int_compare(predicate, lhs, rhs, name)
+            .unwrap()
+            .as_basic_value_enum()),
+        _ => Err(ArrowKernelError::InternalError(
+            "integer comparison operands have different shapes".into(),
+        )),
+    }
+}
+
+fn float_total_order_keys<'ctx>(
+    ctx: &DSLCompilationContext<'ctx, '_>,
+    pt: PrimitiveType,
+    lhs: BasicValueEnum<'ctx>,
+    rhs: BasicValueEnum<'ctx>,
+) -> Result<(BasicValueEnum<'ctx>, BasicValueEnum<'ctx>), ArrowKernelError> {
+    let cvt = match (lhs, rhs) {
+        (BasicValueEnum::VectorValue(lhs), BasicValueEnum::VectorValue(rhs)) => {
+            if lhs.get_type() != rhs.get_type() {
+                return Err(ArrowKernelError::InternalError(
+                    "float comparison operands have different vector types".into(),
+                ));
+            }
+            add_float_vec_to_int_vec(ctx.ctx, ctx.module, lhs.get_type().get_size(), pt)
+        }
+        (BasicValueEnum::FloatValue(_), BasicValueEnum::FloatValue(_)) => {
+            add_float_to_int(ctx.ctx, ctx.module, pt)
+        }
+        _ => {
+            return Err(ArrowKernelError::InternalError(
+                "float comparison operands have different shapes".into(),
+            ))
+        }
+    };
+    let convert = |value, name| {
+        ctx.b
+            .build_call(cvt, &[value], name)
+            .unwrap()
+            .try_as_basic_value()
+            .unwrap_basic()
+    };
+    Ok((
+        convert(lhs.into(), "cvt_lhs_for_total_order"),
+        convert(rhs.into(), "cvt_rhs_for_total_order"),
+    ))
+}
+
 fn compare_list_values<'ctx, 'a>(
     ctx: &DSLCompilationContext<'ctx, 'a>,
     op: DSLComparison,
     pt: PrimitiveType,
-    lhs: BasicValueEnum<'a>,
-    rhs: BasicValueEnum<'a>,
-) -> Result<BasicValueEnum<'a>, ArrowKernelError> {
+    lhs: BasicValueEnum<'ctx>,
+    rhs: BasicValueEnum<'ctx>,
+) -> Result<BasicValueEnum<'ctx>, ArrowKernelError> {
     let PrimitiveType::List(item, size) = pt else {
         unreachable!("compare_list_values called with non-list type");
     };
 
-    if lhs.is_vector_value() && rhs.is_vector_value() {
+    if item != ListItemType::Boolean && lhs.is_vector_value() && rhs.is_vector_value() {
         return match PrimitiveType::from(item).comparison_type() {
-            ComparisonType::Int { signed } => Ok(ctx
-                .b
-                .build_int_compare(
-                    op.as_int_predicate(signed),
-                    lhs.into_vector_value(),
-                    rhs.into_vector_value(),
-                    "cmpv",
-                )
-                .unwrap()
-                .as_basic_value_enum()),
+            ComparisonType::Int { signed } => {
+                build_integer_comparison(ctx, op, signed, lhs, rhs, "list_int_cmp")
+            }
             ComparisonType::Float => {
-                let cvt = add_float_vec_to_int_vec(
-                    ctx.ctx,
-                    ctx.module,
-                    size as u32,
-                    pt.list_type_into_inner(),
-                );
-                let lhs = ctx
-                    .b
-                    .build_call(cvt, &[lhs.into()], "cvt_lhs_for_total_order")
-                    .unwrap()
-                    .try_as_basic_value()
-                    .unwrap_basic();
-                let rhs = ctx
-                    .b
-                    .build_call(cvt, &[rhs.into()], "cvt_rhs_for_total_order")
-                    .unwrap()
-                    .try_as_basic_value()
-                    .unwrap_basic();
-                Ok(ctx
-                    .b
-                    .build_int_compare(
-                        op.as_int_predicate(true),
-                        lhs.into_vector_value(),
-                        rhs.into_vector_value(),
-                        "cmpfv",
-                    )
-                    .unwrap()
-                    .as_basic_value_enum())
+                let inner = pt.list_type_into_inner();
+                let (lhs, rhs) = float_total_order_keys(ctx, inner, lhs, rhs)?;
+                build_integer_comparison(ctx, op, true, lhs, rhs, "list_float_cmp")
             }
             ComparisonType::String | ComparisonType::List(_) => {
                 Err(ArrowKernelError::DSLInvalidType(
@@ -1225,43 +1231,20 @@ fn extract_list_compare_elements<'ctx, 'a>(
     ctx: &DSLCompilationContext<'ctx, 'a>,
     item: ListItemType,
     idx: usize,
-    lhs: BasicValueEnum<'a>,
-    rhs: BasicValueEnum<'a>,
-) -> (BasicValueEnum<'a>, BasicValueEnum<'a>, DSLType) {
+    lhs: BasicValueEnum<'ctx>,
+    rhs: BasicValueEnum<'ctx>,
+) -> (BasicValueEnum<'ctx>, BasicValueEnum<'ctx>, DSLType) {
     let i = ctx.ctx.i64_type().const_int(idx as u64, false);
     match item {
         ListItemType::Boolean => {
-            let chunk_idx = idx / 64;
-            let bit_idx = idx % 64;
             let lhs = ctx
                 .b
-                .build_extract_value(lhs.into_array_value(), chunk_idx as u32, "lhs_bool_chunk")
-                .unwrap()
-                .into_int_value();
-            let rhs = ctx
-                .b
-                .build_extract_value(rhs.into_array_value(), chunk_idx as u32, "rhs_bool_chunk")
-                .unwrap()
-                .into_int_value();
-            let shift = ctx.ctx.i64_type().const_int(bit_idx as u64, false);
-            let lhs = ctx
-                .b
-                .build_right_shift(lhs, shift, false, "lhs_bool_shifted")
+                .build_extract_element(lhs.into_vector_value(), i, "lhs_bool")
                 .unwrap();
             let rhs = ctx
                 .b
-                .build_right_shift(rhs, shift, false, "rhs_bool_shifted")
+                .build_extract_element(rhs.into_vector_value(), i, "rhs_bool")
                 .unwrap();
-            let lhs = ctx
-                .b
-                .build_int_truncate(lhs, ctx.ctx.bool_type(), "lhs_bool")
-                .unwrap()
-                .as_basic_value_enum();
-            let rhs = ctx
-                .b
-                .build_int_truncate(rhs, ctx.ctx.bool_type(), "rhs_bool")
-                .unwrap()
-                .as_basic_value_enum();
             (lhs, rhs, DSLType::Boolean)
         }
         ListItemType::P64x2 => {
@@ -1296,7 +1279,7 @@ fn extract_list_compare_elements<'ctx, 'a>(
 fn compile_expr<'ctx, 'a>(
     ctx: &DSLCompilationContext<'ctx, 'a>,
     expr: &DSLExpr,
-) -> Result<BasicValueEnum<'a>, ArrowKernelError> {
+) -> Result<BasicValueEnum<'ctx>, ArrowKernelError> {
     match expr {
         DSLExpr::StringPredicate(pred, lhs, rhs) => {
             let lhs = compile_expr(ctx, lhs)?;
@@ -1338,6 +1321,28 @@ fn compile_expr<'ctx, 'a>(
                         ));
                     }
                     let i = i.first().unwrap();
+                    if let DSLType::Block(_, rows) = i.get_type() {
+                        let source = &ctx.iterator_holders[&v.name];
+                        let gather = source
+                            .generate_gather_block(ctx.ctx, ctx.module, rows as u32)
+                            .ok_or_else(|| {
+                                ArrowKernelError::DSLInvalidType(
+                                    "source does not support shaped gather",
+                                    v.ty.clone(),
+                                )
+                            })?;
+                        let indices = compile_expr(ctx, i)?.into_vector_value();
+                        let output_type = expr.get_type().llvm_type(ctx.ctx).unwrap();
+                        let output = build_entry_alloca(ctx, output_type, "gather_block");
+                        ctx.b
+                            .build_call(
+                                gather,
+                                &[ctx.st[&v.name].into(), indices.into(), output.into()],
+                                "gather_block",
+                            )
+                            .unwrap();
+                        return Ok(ctx.b.build_load(output_type, output, "gathered").unwrap());
+                    }
                     let access_func = ctx.access_funcs[&v.name];
                     let iter_ptr = ctx.st[&v.name];
                     if i.get_type() != DSLType::Primitive(PrimitiveType::U64) {
@@ -1402,37 +1407,7 @@ fn compile_expr<'ctx, 'a>(
             }
         }
         DSLExpr::Value(v) => match &v.ty {
-            DSLType::ConstScalar(v) => {
-                let v = v.get().0;
-                match v.data_type() {
-                    DataType::UInt64 => Ok(ctx
-                        .ctx
-                        .i64_type()
-                        .const_int(v.as_primitive::<UInt64Type>().value(0), false)
-                        .as_basic_value_enum()),
-                    DataType::UInt32 => Ok(ctx
-                        .ctx
-                        .i32_type()
-                        .const_int(v.as_primitive::<UInt32Type>().value(0) as u64, false)
-                        .as_basic_value_enum()),
-                    DataType::UInt16 => Ok(ctx
-                        .ctx
-                        .i16_type()
-                        .const_int(v.as_primitive::<UInt16Type>().value(0) as u64, false)
-                        .as_basic_value_enum()),
-                    DataType::UInt8 => Ok(ctx
-                        .ctx
-                        .i8_type()
-                        .const_int(v.as_primitive::<UInt8Type>().value(0) as u64, false)
-                        .as_basic_value_enum()),
-                    DataType::Float32 => Ok(ctx
-                        .ctx
-                        .f32_type()
-                        .const_float(v.as_primitive::<Float32Type>().value(0) as f64)
-                        .as_basic_value_enum()),
-                    _ => todo!(),
-                }
-            }
+            DSLType::ConstScalar(v) => scalar_to_llvm(ctx, v.as_ref()),
             _ => Ok(ctx.st[&v.name]),
         },
         DSLExpr::Cast(val, tar_pt) => {
@@ -1442,6 +1417,47 @@ fn compile_expr<'ctx, 'a>(
             let val = compile_expr(ctx, val)?;
 
             match orig_type {
+                DSLType::Block(ref element, rows) => match element.as_ref() {
+                    DSLType::Boolean if tar_pt.is_int() => {
+                        let bools = val.into_vector_value();
+                        let target = tar_pt.llvm_vec_type(ctx.ctx, rows as u32).unwrap();
+                        Ok(ctx
+                            .b
+                            .build_int_z_extend(bools, target, "cast_boolean_block")
+                            .unwrap()
+                            .as_basic_value_enum())
+                    }
+                    DSLType::Primitive(orig_pt) => {
+                        let (orig_leaf, target_leaf) = match (orig_pt, tar_pt) {
+                            (
+                                PrimitiveType::List(orig, orig_len),
+                                PrimitiveType::List(tar, tar_len),
+                            ) if orig_len == tar_len => {
+                                (PrimitiveType::from(*orig), PrimitiveType::from(*tar))
+                            }
+                            (orig, tar)
+                                if !matches!(orig, PrimitiveType::List(_, _))
+                                    && !matches!(tar, PrimitiveType::List(_, _)) =>
+                            {
+                                (*orig, *tar)
+                            }
+                            _ => {
+                                return Err(ArrowKernelError::DSLTypeMismatch(
+                                    "cannot cast differently shaped blocks",
+                                    orig_type,
+                                    tar_type,
+                                ))
+                            }
+                        };
+                        let orig_numeric = orig_leaf.as_numeric_primitive_type().unwrap();
+                        let target_numeric = target_leaf.as_numeric_primitive_type().unwrap();
+                        cast_numeric(ctx, val, orig_numeric, target_numeric)
+                    }
+                    _ => Err(ArrowKernelError::DSLInvalidType(
+                        "unsupported block cast",
+                        orig_type,
+                    )),
+                },
                 DSLType::Boolean => {
                     if tar_pt.is_int() {
                         Ok(ctx
@@ -1498,13 +1514,7 @@ fn compile_expr<'ctx, 'a>(
                                 PrimitiveType::from(t_t).as_numeric_primitive_type(),
                             ) {
                                 (Some(orig_pt), Some(tar_pt)) => {
-                                    return Ok(cast_numeric_vec(
-                                        ctx,
-                                        val.into_vector_value(),
-                                        orig_pt,
-                                        tar_pt,
-                                    )?
-                                    .as_basic_value_enum())
+                                    return cast_numeric(ctx, val, orig_pt, tar_pt)
                                 }
                                 _ => Err(ArrowKernelError::DSLTypeMismatch(
                                     "cannot cast between string and non-string vectors",
@@ -1520,16 +1530,15 @@ fn compile_expr<'ctx, 'a>(
                         )),
                     }
                 }
-                DSLType::ConstScalar(ref s) => {
-                    let res = scalar_to_llvm(ctx, s.as_ref())?;
-                    if res.get_type() != tar_llvm_type {
+                DSLType::ConstScalar(_) => {
+                    if val.get_type() != tar_llvm_type {
                         return Err(ArrowKernelError::DSLTypeMismatch(
                             "const scalar type mismatch",
                             orig_type,
                             tar_type,
                         ));
                     }
-                    Ok(res)
+                    Ok(val)
                 }
                 _ => unimplemented!("invalid cast"),
             }
@@ -1537,6 +1546,41 @@ fn compile_expr<'ctx, 'a>(
         DSLExpr::CastToBool(v) => {
             let child = compile_expr(ctx, v)?;
             match v.get_type() {
+                DSLType::Block(element, _) => {
+                    let DSLType::Primitive(pt) = element.as_ref() else {
+                        return Err(ArrowKernelError::DSLInvalidType(
+                            "cannot cast this block to bool",
+                            v.get_type(),
+                        ));
+                    };
+                    let nt = pt.as_numeric_primitive_type().ok_or_else(|| {
+                        ArrowKernelError::DSLInvalidType(
+                            "cannot cast non-numeric block to bool",
+                            v.get_type(),
+                        )
+                    })?;
+                    let child = child.into_vector_value();
+                    let bools = if nt.is_integer() {
+                        ctx.b
+                            .build_int_compare(
+                                IntPredicate::NE,
+                                child,
+                                child.get_type().const_zero(),
+                                "block_ne_zero",
+                            )
+                            .unwrap()
+                    } else {
+                        ctx.b
+                            .build_float_compare(
+                                FloatPredicate::ONE,
+                                child,
+                                child.get_type().const_zero(),
+                                "block_ne_zero",
+                            )
+                            .unwrap()
+                    };
+                    Ok(bools.as_basic_value_enum())
+                }
                 DSLType::Boolean => Ok(child),
                 DSLType::Primitive(pt) => {
                     let nt = pt.as_numeric_primitive_type().ok_or_else(|| {
@@ -1576,11 +1620,17 @@ fn compile_expr<'ctx, 'a>(
             }
         }
         DSLExpr::BitCast(v, tar_pt) => {
+            let value_type = v.get_type();
             let v = compile_expr(ctx, v)?;
-            Ok(ctx
-                .b
-                .build_bit_cast(v, tar_pt.llvm_type(ctx.ctx), "bitcast")
-                .unwrap())
+            let target = match value_type {
+                DSLType::Block(_, rows) => {
+                    DSLType::Block(Box::new(DSLType::Primitive(*tar_pt)), rows)
+                        .llvm_type(ctx.ctx)
+                        .unwrap()
+                }
+                _ => tar_pt.llvm_type(ctx.ctx),
+            };
+            Ok(ctx.b.build_bit_cast(v, target, "bitcast").unwrap())
         }
         DSLExpr::FloatToTotalOrderSInt(v) => {
             let pt = v.get_type().as_primitive().unwrap();
@@ -1596,24 +1646,20 @@ fn compile_expr<'ctx, 'a>(
         }
         DSLExpr::Sqrt(v) => {
             let value = compile_expr(ctx, v)?;
-            let decl_tys = match v.get_type().as_primitive().unwrap() {
-                PrimitiveType::F16 => vec![ctx.ctx.f16_type().into()],
-                PrimitiveType::F32 => vec![ctx.ctx.f32_type().into()],
-                PrimitiveType::F64 => vec![ctx.ctx.f64_type().into()],
-                PrimitiveType::List(item, size) => {
-                    let inner = PrimitiveType::from(item);
-                    let vec_ty = inner.llvm_vec_type(ctx.ctx, size as u32).unwrap();
-                    vec![vec_ty.into()]
-                }
+            match v.get_type().as_primitive().unwrap() {
+                PrimitiveType::F16 | PrimitiveType::F32 | PrimitiveType::F64 => {}
+                PrimitiveType::List(item, _) if PrimitiveType::from(item).is_float() => {}
                 other => {
                     return Err(ArrowKernelError::DSLInvalidType(
                         "sqrt requires float inputs",
                         DSLType::Primitive(other),
                     ))
                 }
-            };
+            }
             let sqrt = Intrinsic::find("llvm.sqrt").unwrap();
-            let sqrt = sqrt.get_declaration(ctx.module, &decl_tys).unwrap();
+            let sqrt = sqrt
+                .get_declaration(ctx.module, &[value.get_type()])
+                .unwrap();
             let result = ctx
                 .b
                 .build_call(sqrt, &[value.into()], "sqrt")
@@ -1629,11 +1675,11 @@ fn compile_expr<'ctx, 'a>(
             Ok(result)
         }
         DSLExpr::VecSum(v) => {
-            let primitive = v.get_type().as_primitive().unwrap();
-            let PrimitiveType::List(item, _) = primitive else {
+            let value_type = v.get_type();
+            let DSLType::Primitive(PrimitiveType::List(item, _)) = value_type else {
                 return Err(ArrowKernelError::DSLInvalidType(
                     "vec_sum requires a fixed-size-list value",
-                    v.get_type(),
+                    value_type,
                 ));
             };
 
@@ -1719,24 +1765,26 @@ fn compile_expr<'ctx, 'a>(
         },
         DSLExpr::Splat(v, size) => {
             let pt = v.get_type().as_primitive().unwrap();
-            let vec_ty = pt.llvm_vec_type(ctx.ctx, *size as u32).ok_or_else(|| {
-                ArrowKernelError::DSLInvalidType("cannot splat this primitive type", v.get_type())
-            })?;
             let value = compile_expr(ctx, v)?;
-            let singleton = ctx
-                .b
-                .build_insert_element(
-                    vec_ty.const_zero(),
-                    value,
-                    ctx.ctx.i32_type().const_zero(),
-                    "splat_insert",
-                )
-                .unwrap();
-            Ok(ctx
-                .b
-                .build_shuffle_vector(singleton, vec_ty.get_poison(), vec_ty.const_zero(), "splat")
-                .unwrap()
-                .as_basic_value_enum())
+            let value = if value.is_vector_value() {
+                value.into_vector_value()
+            } else {
+                let vec_ty = pt.llvm_vec_type(ctx.ctx, 1).ok_or_else(|| {
+                    ArrowKernelError::DSLInvalidType(
+                        "cannot splat this primitive type",
+                        v.get_type(),
+                    )
+                })?;
+                ctx.b
+                    .build_insert_element(
+                        vec_ty.const_zero(),
+                        value,
+                        ctx.ctx.i32_type().const_zero(),
+                        "splat_insert",
+                    )
+                    .unwrap()
+            };
+            Ok(repeat_vector_lanes(ctx, value, *size, "splat").as_basic_value_enum())
         }
         DSLExpr::ArithBinOp(op, lhs, rhs) => {
             let lhs_v = compile_expr(ctx, lhs)?;
@@ -1750,123 +1798,50 @@ fn compile_expr<'ctx, 'a>(
                 ));
             }
 
-            let result = match lhs.get_type().as_primitive().ok_or_else(|| {
+            let pt = lhs.get_type().as_primitive().ok_or_else(|| {
                 ArrowKernelError::DSLInvalidType(
                     "arith operators require primitive values",
                     lhs.get_type(),
                 )
-            })? {
-                PrimitiveType::F16 | PrimitiveType::F32 | PrimitiveType::F64 => {
-                    let lhs_v = lhs_v.into_float_value();
-                    let rhs_v = rhs_v.into_float_value();
-                    match op {
-                        DSLArithBinOp::Add => ctx.b.build_float_add(lhs_v, rhs_v, "fadd").unwrap(),
-                        DSLArithBinOp::Sub => ctx.b.build_float_sub(lhs_v, rhs_v, "fsub").unwrap(),
-                        DSLArithBinOp::Mul => ctx.b.build_float_mul(lhs_v, rhs_v, "fmul").unwrap(),
-                        DSLArithBinOp::Div => ctx.b.build_float_div(lhs_v, rhs_v, "fdiv").unwrap(),
-                        DSLArithBinOp::Rem => ctx.b.build_float_rem(lhs_v, rhs_v, "frem").unwrap(),
-                    }
-                    .as_basic_value_enum()
+            })?;
+
+            if matches!(pt, PrimitiveType::List(ListItemType::Boolean, _)) {
+                return Err(ArrowKernelError::DSLInvalidType(
+                    "arith operators do not support boolean list elements",
+                    lhs.get_type(),
+                ));
+            }
+
+            let inner = pt.list_type_into_inner();
+            let opcode = if inner.is_float() {
+                match op {
+                    DSLArithBinOp::Add => InstructionOpcode::FAdd,
+                    DSLArithBinOp::Sub => InstructionOpcode::FSub,
+                    DSLArithBinOp::Mul => InstructionOpcode::FMul,
+                    DSLArithBinOp::Div => InstructionOpcode::FDiv,
+                    DSLArithBinOp::Rem => InstructionOpcode::FRem,
                 }
-                PrimitiveType::I8
-                | PrimitiveType::I16
-                | PrimitiveType::I32
-                | PrimitiveType::I64
-                | PrimitiveType::U8
-                | PrimitiveType::U16
-                | PrimitiveType::U32
-                | PrimitiveType::U64 => {
-                    let lhs_v = lhs_v.into_int_value();
-                    let rhs_v = rhs_v.into_int_value();
-                    match op {
-                        DSLArithBinOp::Add => ctx.b.build_int_add(lhs_v, rhs_v, "iadd").unwrap(),
-                        DSLArithBinOp::Sub => ctx.b.build_int_sub(lhs_v, rhs_v, "isub").unwrap(),
-                        DSLArithBinOp::Mul => ctx.b.build_int_mul(lhs_v, rhs_v, "imul").unwrap(),
-                        DSLArithBinOp::Div => {
-                            if lhs.get_type().is_signed().unwrap() {
-                                ctx.b.build_int_signed_div(lhs_v, rhs_v, "idiv").unwrap()
-                            } else {
-                                ctx.b.build_int_unsigned_div(lhs_v, rhs_v, "udiv").unwrap()
-                            }
-                        }
-                        DSLArithBinOp::Rem => {
-                            if lhs.get_type().is_signed().unwrap() {
-                                ctx.b.build_int_signed_rem(lhs_v, rhs_v, "irem").unwrap()
-                            } else {
-                                ctx.b.build_int_unsigned_rem(lhs_v, rhs_v, "urem").unwrap()
-                            }
-                        }
-                    }
-                    .as_basic_value_enum()
+            } else if inner.is_int() {
+                match op {
+                    DSLArithBinOp::Add => InstructionOpcode::Add,
+                    DSLArithBinOp::Sub => InstructionOpcode::Sub,
+                    DSLArithBinOp::Mul => InstructionOpcode::Mul,
+                    DSLArithBinOp::Div if inner.is_signed() => InstructionOpcode::SDiv,
+                    DSLArithBinOp::Div => InstructionOpcode::UDiv,
+                    DSLArithBinOp::Rem if inner.is_signed() => InstructionOpcode::SRem,
+                    DSLArithBinOp::Rem => InstructionOpcode::URem,
                 }
-                PrimitiveType::List(item, _) => {
-                    let inner = PrimitiveType::from(item);
-                    if inner.is_float() {
-                        let lhs_v = lhs_v.into_vector_value();
-                        let rhs_v = rhs_v.into_vector_value();
-                        match op {
-                            DSLArithBinOp::Add => {
-                                ctx.b.build_float_add(lhs_v, rhs_v, "vfadd").unwrap()
-                            }
-                            DSLArithBinOp::Sub => {
-                                ctx.b.build_float_sub(lhs_v, rhs_v, "vfsub").unwrap()
-                            }
-                            DSLArithBinOp::Mul => {
-                                ctx.b.build_float_mul(lhs_v, rhs_v, "vfmul").unwrap()
-                            }
-                            DSLArithBinOp::Div => {
-                                ctx.b.build_float_div(lhs_v, rhs_v, "vfdiv").unwrap()
-                            }
-                            DSLArithBinOp::Rem => {
-                                ctx.b.build_float_rem(lhs_v, rhs_v, "vfrem").unwrap()
-                            }
-                        }
-                        .as_basic_value_enum()
-                    } else if inner.is_int() {
-                        let lhs_v = lhs_v.into_vector_value();
-                        let rhs_v = rhs_v.into_vector_value();
-                        match op {
-                            DSLArithBinOp::Add => {
-                                ctx.b.build_int_add(lhs_v, rhs_v, "viadd").unwrap()
-                            }
-                            DSLArithBinOp::Sub => {
-                                ctx.b.build_int_sub(lhs_v, rhs_v, "visub").unwrap()
-                            }
-                            DSLArithBinOp::Mul => {
-                                ctx.b.build_int_mul(lhs_v, rhs_v, "vimul").unwrap()
-                            }
-                            DSLArithBinOp::Div => {
-                                if inner.is_signed() {
-                                    ctx.b.build_int_signed_div(lhs_v, rhs_v, "vidiv").unwrap()
-                                } else {
-                                    ctx.b.build_int_unsigned_div(lhs_v, rhs_v, "vudiv").unwrap()
-                                }
-                            }
-                            DSLArithBinOp::Rem => {
-                                if inner.is_signed() {
-                                    ctx.b.build_int_signed_rem(lhs_v, rhs_v, "virem").unwrap()
-                                } else {
-                                    ctx.b.build_int_unsigned_rem(lhs_v, rhs_v, "vurem").unwrap()
-                                }
-                            }
-                        }
-                        .as_basic_value_enum()
-                    } else {
-                        return Err(ArrowKernelError::DSLInvalidType(
-                            "arith operators require numeric vector elements",
-                            lhs.get_type(),
-                        ));
-                    }
-                }
-                PrimitiveType::P64x2 => {
-                    return Err(ArrowKernelError::DSLInvalidType(
-                        "arith operators do not support string values",
-                        lhs.get_type(),
-                    ))
-                }
+            } else {
+                return Err(ArrowKernelError::DSLInvalidType(
+                    "arith operators require numeric vector elements",
+                    lhs.get_type(),
+                ));
             };
 
-            Ok(result)
+            Ok(ctx
+                .b
+                .build_binop(opcode, lhs_v, rhs_v, "arith_binop")
+                .unwrap())
         }
         DSLExpr::BitwiseBinOp(op, lhs, rhs) => {
             let lhs_v = compile_expr(ctx, lhs)?;
@@ -1880,30 +1855,36 @@ fn compile_expr<'ctx, 'a>(
                 ));
             }
 
-            Ok(if lhs_v.get_type().is_int_type() {
-                let lhs_v = lhs_v.into_int_value();
-                let rhs_v = rhs_v.into_int_value();
-                match op {
-                    DSLBitwiseBinOp::And => ctx.b.build_and(lhs_v, rhs_v, "band").unwrap(),
-                    DSLBitwiseBinOp::Or => ctx.b.build_or(lhs_v, rhs_v, "bor").unwrap(),
-                    DSLBitwiseBinOp::Xor => ctx.b.build_xor(lhs_v, rhs_v, "bxor").unwrap(),
-                }
-                .as_basic_value_enum()
-            } else if lhs_v.is_vector_value() {
-                let lhs_v = lhs_v.into_vector_value();
-                let rhs_v = rhs_v.into_vector_value();
-                match op {
-                    DSLBitwiseBinOp::And => ctx.b.build_and(lhs_v, rhs_v, "band").unwrap(),
-                    DSLBitwiseBinOp::Or => ctx.b.build_or(lhs_v, rhs_v, "bor").unwrap(),
-                    DSLBitwiseBinOp::Xor => ctx.b.build_xor(lhs_v, rhs_v, "bxor").unwrap(),
-                }
-                .as_basic_value_enum()
-            } else {
+            let valid_primitive = |pt: PrimitiveType| match pt {
+                PrimitiveType::List(ListItemType::Boolean | ListItemType::P64x2, _) => false,
+                _ => pt.list_type_into_inner().is_int(),
+            };
+            let valid_type = match lhs.get_type() {
+                DSLType::Boolean => true,
+                DSLType::Primitive(pt) => valid_primitive(pt),
+                DSLType::Block(element, _) => match element.as_ref() {
+                    DSLType::Boolean => true,
+                    DSLType::Primitive(pt) => valid_primitive(*pt),
+                    _ => false,
+                },
+                _ => false,
+            };
+            if !valid_type {
                 return Err(ArrowKernelError::DSLInvalidType(
-                    "bitwise ops require int or vec",
+                    "bitwise operators require integer or boolean values",
                     lhs.get_type(),
                 ));
-            })
+            }
+
+            let opcode = match op {
+                DSLBitwiseBinOp::And => InstructionOpcode::And,
+                DSLBitwiseBinOp::Or => InstructionOpcode::Or,
+                DSLBitwiseBinOp::Xor => InstructionOpcode::Xor,
+            };
+            Ok(ctx
+                .b
+                .build_binop(opcode, lhs_v, rhs_v, "bitwise_binop")
+                .unwrap())
         }
         DSLExpr::Len(v) => ctx.lengths[&v.name]
             .ok_or_else(|| {
@@ -1934,53 +1915,73 @@ fn compile_expr<'ctx, 'a>(
         }
         DSLExpr::BitNot(v) => {
             let value = compile_expr(ctx, v)?;
-            match v.get_type() {
-                DSLType::Boolean => Ok(ctx
-                    .b
-                    .build_not(value.into_int_value(), "bit_not")
-                    .unwrap()
-                    .as_basic_value_enum()),
-                DSLType::Primitive(pt) if pt.is_int() => Ok(ctx
-                    .b
-                    .build_not(value.into_int_value(), "bit_not")
-                    .unwrap()
-                    .as_basic_value_enum()),
-                DSLType::Primitive(pt) if pt.is_float() => {
-                    let int_type = PrimitiveType::int_with_width(pt.width())
-                        .llvm_type(ctx.ctx)
-                        .into_int_type();
-                    let value_bits = ctx
-                        .b
-                        .build_bit_cast(value, int_type, "bit_not_bits")
-                        .unwrap()
-                        .into_int_value();
-                    let inverted_bits = ctx.b.build_not(value_bits, "bit_not").unwrap();
-                    Ok(ctx
-                        .b
-                        .build_bit_cast(inverted_bits, pt.llvm_type(ctx.ctx), "bit_not_float")
-                        .unwrap())
+            let leaf = match v.get_type() {
+                DSLType::Boolean => None,
+                DSLType::Primitive(pt) => Some(pt.list_type_into_inner()),
+                DSLType::Block(element, _) => match element.as_ref() {
+                    DSLType::Boolean => None,
+                    DSLType::Primitive(pt) => Some(pt.list_type_into_inner()),
+                    _ => {
+                        return Err(ArrowKernelError::DSLInvalidType(
+                            "invalid type for bit_not",
+                            v.get_type(),
+                        ))
+                    }
+                },
+                _ => {
+                    return Err(ArrowKernelError::DSLInvalidType(
+                        "invalid type for bit_not",
+                        v.get_type(),
+                    ))
                 }
-                DSLType::Primitive(pt) if matches!(pt, PrimitiveType::List(_, _)) => {
-                    let int_v_type =
-                        PrimitiveType::int_with_width(pt.list_type_into_inner().width())
-                            .llvm_vec_type(ctx.ctx, 64)
-                            .unwrap();
-
-                    let value_bits = ctx
-                        .b
-                        .build_bit_cast(value, int_v_type, "bit_not_bits")
-                        .unwrap()
-                        .into_vector_value();
-                    let inverted_bits = ctx.b.build_not(value_bits, "bit_not").unwrap();
-                    Ok(ctx
-                        .b
-                        .build_bit_cast(inverted_bits, pt.llvm_type(ctx.ctx), "bit_not_vec")
-                        .unwrap())
-                }
-                _ => Err(ArrowKernelError::DSLInvalidType(
+            };
+            if leaf.is_some_and(|pt| !pt.is_int() && !pt.is_float()) {
+                return Err(ArrowKernelError::DSLInvalidType(
                     "invalid type for bit_not",
                     v.get_type(),
-                )),
+                ));
+            }
+
+            let value_type = value.get_type();
+            let integer_type = if let Some(pt) = leaf.filter(PrimitiveType::is_float) {
+                let int_pt = PrimitiveType::int_with_width(pt.width());
+                if value.is_vector_value() {
+                    int_pt
+                        .llvm_vec_type(ctx.ctx, value_type.into_vector_type().get_size())
+                        .unwrap()
+                        .as_basic_type_enum()
+                } else {
+                    int_pt.llvm_type(ctx.ctx)
+                }
+            } else {
+                value_type
+            };
+            let bits = if integer_type == value_type {
+                value
+            } else {
+                ctx.b
+                    .build_bit_cast(value, integer_type, "bit_not_bits")
+                    .unwrap()
+            };
+            let inverted = if bits.is_int_value() {
+                ctx.b
+                    .build_not(bits.into_int_value(), "bit_not")
+                    .unwrap()
+                    .as_basic_value_enum()
+            } else {
+                ctx.b
+                    .build_not(bits.into_vector_value(), "bit_not")
+                    .unwrap()
+                    .as_basic_value_enum()
+            };
+
+            if integer_type == value_type {
+                Ok(inverted)
+            } else {
+                Ok(ctx
+                    .b
+                    .build_bit_cast(inverted, value_type, "bit_not_float")
+                    .unwrap())
             }
         }
 
@@ -2079,12 +2080,40 @@ fn compile_expr<'ctx, 'a>(
         }
 
         DSLExpr::Select(cond, v1, v2) => {
-            let cond_v = compile_expr(ctx, cond)?.into_int_value();
+            let cond_v = compile_expr(ctx, cond)?;
             let v1_v = compile_expr(ctx, v1)?;
             let v2_v = compile_expr(ctx, v2)?;
+            if let DSLType::Block(element, _) = v1.get_type() {
+                let lanes_per_row = match element.as_ref() {
+                    DSLType::Boolean => 1,
+                    DSLType::Primitive(PrimitiveType::List(ListItemType::Boolean, size)) => *size,
+                    DSLType::Primitive(PrimitiveType::List(ListItemType::P64x2, _))
+                    | DSLType::Primitive(PrimitiveType::P64x2) => {
+                        return Err(ArrowKernelError::DSLInvalidType(
+                            "cannot select this block type",
+                            v1.get_type(),
+                        ))
+                    }
+                    DSLType::Primitive(PrimitiveType::List(_, size)) => *size,
+                    DSLType::Primitive(_) => 1,
+                    _ => {
+                        return Err(ArrowKernelError::DSLInvalidType(
+                            "cannot select this block type",
+                            v1.get_type(),
+                        ))
+                    }
+                };
+                let row_mask = cond_v.into_vector_value();
+                let mask = if lanes_per_row == 1 {
+                    row_mask
+                } else {
+                    repeat_vector_lanes(ctx, row_mask, lanes_per_row, "select_mask")
+                };
+                return Ok(ctx.b.build_select(mask, v1_v, v2_v, "select").unwrap());
+            }
             Ok(ctx
                 .b
-                .build_select(cond_v, v1_v, v2_v, "select")
+                .build_select(cond_v.into_int_value(), v1_v, v2_v, "select")
                 .unwrap()
                 .as_basic_value_enum())
         }
@@ -2093,187 +2122,126 @@ fn compile_expr<'ctx, 'a>(
 
 fn cast_numeric<'ctx, 'a>(
     ctx: &DSLCompilationContext<'ctx, 'a>,
-    val: BasicValueEnum<'a>,
+    val: BasicValueEnum<'ctx>,
     orig_pt: NumericPrimitiveType,
     tar_pt: NumericPrimitiveType,
-) -> Result<BasicValueEnum<'a>, ArrowKernelError> {
-    let tar_type = PrimitiveType::from(tar_pt).llvm_type(ctx.ctx);
-    Ok(match (orig_pt.is_integer(), tar_pt.is_integer()) {
-        // int to int
-        (true, true) => match tar_pt.width().cmp(&orig_pt.width()) {
-            Ordering::Less => ctx
-                .b
-                .build_int_truncate(val.into_int_value(), tar_type.into_int_type(), "cast")
-                .unwrap()
-                .as_basic_value_enum(),
-            Ordering::Equal => val,
-            Ordering::Greater => if orig_pt.is_signed() {
-                ctx.b
-                    .build_int_s_extend(val.into_int_value(), tar_type.into_int_type(), "cast")
-            } else {
-                ctx.b
-                    .build_int_z_extend(val.into_int_value(), tar_type.into_int_type(), "cast")
-            }
+) -> Result<BasicValueEnum<'ctx>, ArrowKernelError> {
+    let target_primitive = PrimitiveType::from(tar_pt);
+    let target_type = if val.is_vector_value() {
+        target_primitive
+            .llvm_vec_type(ctx.ctx, val.get_type().into_vector_type().get_size())
             .unwrap()
-            .as_basic_value_enum(),
-        },
-        // int to float
-        (true, false) => if orig_pt.is_signed() {
-            ctx.b.build_signed_int_to_float(
-                val.into_int_value(),
-                tar_type.into_float_type(),
-                "cast",
-            )
-        } else {
-            ctx.b.build_unsigned_int_to_float(
-                val.into_int_value(),
-                tar_type.into_float_type(),
-                "cast",
-            )
-        }
-        .unwrap()
-        .as_basic_value_enum(),
-        // float to int
-        (false, true) => if orig_pt.is_signed() {
-            ctx.b.build_float_to_signed_int(
-                val.into_float_value(),
-                tar_type.into_int_type(),
-                "cast",
-            )
-        } else {
-            ctx.b.build_float_to_unsigned_int(
-                val.into_float_value(),
-                tar_type.into_int_type(),
-                "cast",
-            )
-        }
-        .unwrap()
-        .as_basic_value_enum(),
-        // float to float
-        (false, false) => ctx
-            .b
-            .build_float_cast(val.into_float_value(), tar_type.into_float_type(), "cast")
-            .unwrap()
-            .as_basic_value_enum(),
-    })
-}
+            .as_basic_type_enum()
+    } else {
+        target_primitive.llvm_type(ctx.ctx)
+    };
 
-fn cast_numeric_vec<'ctx, 'a>(
-    ctx: &DSLCompilationContext<'ctx, 'a>,
-    val: VectorValue<'a>,
-    orig_pt: NumericPrimitiveType,
-    tar_pt: NumericPrimitiveType,
-) -> Result<VectorValue<'a>, ArrowKernelError> {
-    let tar_type = PrimitiveType::from(tar_pt)
-        .llvm_vec_type(ctx.ctx, val.get_type().get_size())
-        .unwrap();
-    Ok(match (orig_pt.is_integer(), tar_pt.is_integer()) {
-        // int to int
+    let opcode = match (orig_pt.is_integer(), tar_pt.is_integer()) {
         (true, true) => match tar_pt.width().cmp(&orig_pt.width()) {
-            Ordering::Less => ctx.b.build_int_truncate(val, tar_type, "cast").unwrap(),
-            Ordering::Equal => val,
-            Ordering::Greater => if orig_pt.is_signed() {
-                ctx.b.build_int_s_extend(val, tar_type, "cast")
-            } else {
-                ctx.b.build_int_z_extend(val, tar_type, "cast")
-            }
-            .unwrap(),
+            Ordering::Less => InstructionOpcode::Trunc,
+            Ordering::Equal => return Ok(val),
+            Ordering::Greater if orig_pt.is_signed() => InstructionOpcode::SExt,
+            Ordering::Greater => InstructionOpcode::ZExt,
         },
-        // int to float
-        (true, false) => if orig_pt.is_signed() {
-            ctx.b.build_signed_int_to_float(val, tar_type, "cast")
-        } else {
-            ctx.b.build_unsigned_int_to_float(val, tar_type, "cast")
-        }
-        .unwrap(),
-        // float to int
-        (false, true) => if orig_pt.is_signed() {
-            ctx.b.build_float_to_signed_int(val, tar_type, "cast")
-        } else {
-            ctx.b.build_float_to_unsigned_int(val, tar_type, "cast")
-        }
-        .unwrap(),
-        // float to float
-        (false, false) => ctx.b.build_float_cast(val, tar_type, "cast").unwrap(),
-    })
+        (true, false) if orig_pt.is_signed() => InstructionOpcode::SIToFP,
+        (true, false) => InstructionOpcode::UIToFP,
+        (false, true) if tar_pt.is_signed() => InstructionOpcode::FPToSI,
+        (false, true) => InstructionOpcode::FPToUI,
+        (false, false) => match tar_pt.width().cmp(&orig_pt.width()) {
+            Ordering::Less => InstructionOpcode::FPTrunc,
+            Ordering::Equal => return Ok(val),
+            Ordering::Greater => InstructionOpcode::FPExt,
+        },
+    };
+
+    Ok(ctx.b.build_cast(opcode, val, target_type, "cast").unwrap())
 }
 
 fn scalar_to_llvm<'ctx, 'a>(
     ctx: &DSLCompilationContext<'ctx, 'a>,
     val: &dyn Datum,
-) -> Result<BasicValueEnum<'a>, ArrowKernelError> {
+) -> Result<BasicValueEnum<'ctx>, ArrowKernelError> {
     let (arr, is_scalar) = val.get();
     assert!(is_scalar, "scalar_to_llvm called with non-scalar value");
 
-    let res = match PrimitiveType::for_arrow_type(arr.data_type()) {
-        PrimitiveType::I8 => arr.as_primitive_opt::<Int8Type>().map(|x| {
+    let res = if arr.data_type() == &DataType::Boolean {
+        Some(
             ctx.ctx
-                .i8_type()
-                .const_int(x.value(0) as u64, true)
-                .as_basic_value_enum()
-        }),
-        PrimitiveType::I16 => arr.as_primitive_opt::<Int16Type>().map(|x| {
-            ctx.ctx
-                .i16_type()
-                .const_int(x.value(0) as u64, true)
-                .as_basic_value_enum()
-        }),
-        PrimitiveType::I32 => arr.as_primitive_opt::<Int32Type>().map(|x| {
-            ctx.ctx
-                .i32_type()
-                .const_int(x.value(0) as u64, true)
-                .as_basic_value_enum()
-        }),
-        PrimitiveType::I64 => arr.as_primitive_opt::<Int64Type>().map(|x| {
-            ctx.ctx
-                .i64_type()
-                .const_int(x.value(0) as u64, true)
-                .as_basic_value_enum()
-        }),
-        PrimitiveType::U8 => arr.as_primitive_opt::<UInt8Type>().map(|x| {
-            ctx.ctx
-                .i8_type()
-                .const_int(x.value(0) as u64, false)
-                .as_basic_value_enum()
-        }),
-        PrimitiveType::U16 => arr.as_primitive_opt::<UInt16Type>().map(|x| {
-            ctx.ctx
-                .i16_type()
-                .const_int(x.value(0) as u64, false)
-                .as_basic_value_enum()
-        }),
-        PrimitiveType::U32 => arr.as_primitive_opt::<UInt32Type>().map(|x| {
-            ctx.ctx
-                .i32_type()
-                .const_int(x.value(0) as u64, false)
-                .as_basic_value_enum()
-        }),
-        PrimitiveType::U64 => arr.as_primitive_opt::<UInt64Type>().map(|x| {
-            ctx.ctx
-                .i64_type()
-                .const_int(x.value(0), false)
-                .as_basic_value_enum()
-        }),
-        PrimitiveType::F16 => arr.as_primitive_opt::<Float16Type>().map(|x| {
-            ctx.ctx
-                .f16_type()
-                .const_float(x.value(0).to_f64())
-                .as_basic_value_enum()
-        }),
-        PrimitiveType::F32 => arr.as_primitive_opt::<Float32Type>().map(|x| {
-            ctx.ctx
-                .f32_type()
-                .const_float(x.value(0) as f64)
-                .as_basic_value_enum()
-        }),
-        PrimitiveType::F64 => arr.as_primitive_opt::<Float64Type>().map(|x| {
-            ctx.ctx
-                .f32_type()
-                .const_float(x.value(0))
-                .as_basic_value_enum()
-        }),
-        PrimitiveType::P64x2 => todo!(),
-        PrimitiveType::List(_, _) => todo!(),
+                .bool_type()
+                .const_int(arr.as_boolean().value(0) as u64, false)
+                .as_basic_value_enum(),
+        )
+    } else {
+        match PrimitiveType::for_arrow_type(arr.data_type()) {
+            PrimitiveType::I8 => arr.as_primitive_opt::<Int8Type>().map(|x| {
+                ctx.ctx
+                    .i8_type()
+                    .const_int(x.value(0) as u64, true)
+                    .as_basic_value_enum()
+            }),
+            PrimitiveType::I16 => arr.as_primitive_opt::<Int16Type>().map(|x| {
+                ctx.ctx
+                    .i16_type()
+                    .const_int(x.value(0) as u64, true)
+                    .as_basic_value_enum()
+            }),
+            PrimitiveType::I32 => arr.as_primitive_opt::<Int32Type>().map(|x| {
+                ctx.ctx
+                    .i32_type()
+                    .const_int(x.value(0) as u64, true)
+                    .as_basic_value_enum()
+            }),
+            PrimitiveType::I64 => arr.as_primitive_opt::<Int64Type>().map(|x| {
+                ctx.ctx
+                    .i64_type()
+                    .const_int(x.value(0) as u64, true)
+                    .as_basic_value_enum()
+            }),
+            PrimitiveType::U8 => arr.as_primitive_opt::<UInt8Type>().map(|x| {
+                ctx.ctx
+                    .i8_type()
+                    .const_int(x.value(0) as u64, false)
+                    .as_basic_value_enum()
+            }),
+            PrimitiveType::U16 => arr.as_primitive_opt::<UInt16Type>().map(|x| {
+                ctx.ctx
+                    .i16_type()
+                    .const_int(x.value(0) as u64, false)
+                    .as_basic_value_enum()
+            }),
+            PrimitiveType::U32 => arr.as_primitive_opt::<UInt32Type>().map(|x| {
+                ctx.ctx
+                    .i32_type()
+                    .const_int(x.value(0) as u64, false)
+                    .as_basic_value_enum()
+            }),
+            PrimitiveType::U64 => arr.as_primitive_opt::<UInt64Type>().map(|x| {
+                ctx.ctx
+                    .i64_type()
+                    .const_int(x.value(0), false)
+                    .as_basic_value_enum()
+            }),
+            PrimitiveType::F16 => arr.as_primitive_opt::<Float16Type>().map(|x| {
+                ctx.ctx
+                    .f16_type()
+                    .const_float(x.value(0).to_f64())
+                    .as_basic_value_enum()
+            }),
+            PrimitiveType::F32 => arr.as_primitive_opt::<Float32Type>().map(|x| {
+                ctx.ctx
+                    .f32_type()
+                    .const_float(x.value(0) as f64)
+                    .as_basic_value_enum()
+            }),
+            PrimitiveType::F64 => arr.as_primitive_opt::<Float64Type>().map(|x| {
+                ctx.ctx
+                    .f64_type()
+                    .const_float(x.value(0))
+                    .as_basic_value_enum()
+            }),
+            PrimitiveType::P64x2 => todo!(),
+            PrimitiveType::List(_, _) => todo!(),
+        }
     };
 
     Ok(res.expect("non-primitive const scalar in compilation"))

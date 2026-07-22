@@ -1,11 +1,139 @@
-use arrow_array::{make_array, ArrayRef, Datum};
+use arrow_array::{
+    cast::AsArray,
+    make_array,
+    types::{Int16Type, Int32Type, Int64Type, RunEndIndexType},
+    Array, ArrayRef, Datum, RunArray,
+};
 use arrow_buffer::NullBuffer;
+use arrow_schema::DataType;
 
 use crate::{logical_nulls, ArrowKernelError};
 
 pub fn replace_nulls(arr: ArrayRef, nulls: Option<NullBuffer>) -> ArrayRef {
     let data = arr.to_data().into_builder().nulls(nulls);
     make_array(unsafe { data.build_unchecked() })
+}
+
+pub fn has_any_nulls(arr: &dyn Array) -> bool {
+    if arr.is_nullable() {
+        return true;
+    }
+
+    match arr.data_type() {
+        DataType::List(_) => has_any_nulls(arr.as_list::<i32>().values().as_ref()),
+        DataType::LargeList(_) => has_any_nulls(arr.as_list::<i64>().values().as_ref()),
+        DataType::FixedSizeList(_, _) => has_any_nulls(arr.as_fixed_size_list().values().as_ref()),
+        DataType::RunEndEncoded(run_ends, _) => match run_ends.data_type() {
+            DataType::Int16 => has_any_nulls(arr.as_run::<Int16Type>().values().as_ref()),
+            DataType::Int32 => has_any_nulls(arr.as_run::<Int32Type>().values().as_ref()),
+            DataType::Int64 => has_any_nulls(arr.as_run::<Int64Type>().values().as_ref()),
+            _ => unreachable!("invalid run end type"),
+        },
+        _ => false,
+    }
+}
+
+pub fn copy_selected_nulls(
+    source: &dyn Array,
+    result: ArrayRef,
+    indices: &[usize],
+) -> Result<ArrayRef, ArrowKernelError> {
+    debug_assert_eq!(result.len(), indices.len());
+
+    let result = match (source.data_type(), result.data_type()) {
+        (DataType::RunEndEncoded(run_ends, _), _) => match run_ends.data_type() {
+            DataType::Int16 => {
+                copy_run_end_selected_nulls(source.as_run::<Int16Type>(), result, indices)?
+            }
+            DataType::Int32 => {
+                copy_run_end_selected_nulls(source.as_run::<Int32Type>(), result, indices)?
+            }
+            DataType::Int64 => {
+                copy_run_end_selected_nulls(source.as_run::<Int64Type>(), result, indices)?
+            }
+            _ => unreachable!("invalid run end type"),
+        },
+        (DataType::List(_), DataType::List(_)) => {
+            let source = source.as_list::<i32>();
+            let result_list = result.as_list::<i32>();
+            let offsets = source.value_offsets();
+            let child_indices = indices
+                .iter()
+                .flat_map(|&index| offsets[index] as usize..offsets[index + 1] as usize)
+                .collect::<Vec<_>>();
+            let child = copy_selected_nulls(
+                source.values().as_ref(),
+                result_list.values().clone(),
+                &child_indices,
+            )?;
+            let data = result
+                .to_data()
+                .into_builder()
+                .child_data(vec![child.to_data()]);
+            make_array(unsafe { data.build_unchecked() })
+        }
+        (DataType::LargeList(_), DataType::LargeList(_)) => {
+            let source = source.as_list::<i64>();
+            let result_list = result.as_list::<i64>();
+            let offsets = source.value_offsets();
+            let child_indices = indices
+                .iter()
+                .flat_map(|&index| offsets[index] as usize..offsets[index + 1] as usize)
+                .collect::<Vec<_>>();
+            let child = copy_selected_nulls(
+                source.values().as_ref(),
+                result_list.values().clone(),
+                &child_indices,
+            )?;
+            let data = result
+                .to_data()
+                .into_builder()
+                .child_data(vec![child.to_data()]);
+            make_array(unsafe { data.build_unchecked() })
+        }
+        (DataType::FixedSizeList(_, size), DataType::FixedSizeList(_, _)) => {
+            let source = source.as_fixed_size_list();
+            let result_list = result.as_fixed_size_list();
+            let child_indices = indices
+                .iter()
+                .flat_map(|&index| {
+                    let start = source.value_offset(index) as usize;
+                    start..start + *size as usize
+                })
+                .collect::<Vec<_>>();
+            let child = copy_selected_nulls(
+                source.values().as_ref(),
+                result_list.values().clone(),
+                &child_indices,
+            )?;
+            let data = result
+                .to_data()
+                .into_builder()
+                .child_data(vec![child.to_data()]);
+            make_array(unsafe { data.build_unchecked() })
+        }
+        _ => result,
+    };
+
+    let nulls = logical_nulls(source)?.map(|nulls| {
+        indices
+            .iter()
+            .map(|&index| nulls.is_valid(index))
+            .collect::<NullBuffer>()
+    });
+    Ok(replace_nulls(result, nulls))
+}
+
+fn copy_run_end_selected_nulls<R: RunEndIndexType>(
+    source: &RunArray<R>,
+    result: ArrayRef,
+    indices: &[usize],
+) -> Result<ArrayRef, ArrowKernelError> {
+    let physical_indices = indices
+        .iter()
+        .map(|&index| source.get_physical_index(index))
+        .collect::<Vec<_>>();
+    copy_selected_nulls(source.values().as_ref(), result, &physical_indices)
 }
 
 /// Given a list of arrays, intersect their null buffers and set `res`'s null
@@ -57,6 +185,7 @@ mod tests {
     use std::sync::Arc;
 
     use arrow_array::{
+        builder::{Int32Builder, ListBuilder},
         cast::AsArray,
         types::{Int16Type, Int32Type},
         DictionaryArray, Int16Array, Int32Array, RunArray, Scalar,
@@ -66,7 +195,25 @@ mod tests {
 
     use crate::compiled_kernels::null_utils::replace_nulls;
 
-    use super::intersect_and_copy_nulls;
+    use super::{has_any_nulls, intersect_and_copy_nulls};
+
+    #[test]
+    fn test_has_any_nulls_checks_list_children() {
+        let mut without_nulls = ListBuilder::new(Int32Builder::new());
+        without_nulls.values().append_slice(&[1, 2]);
+        without_nulls.append(true);
+        assert!(!has_any_nulls(&without_nulls.finish()));
+
+        let mut child_null = ListBuilder::new(Int32Builder::new());
+        child_null.values().append_value(1);
+        child_null.values().append_null();
+        child_null.append(true);
+        assert!(has_any_nulls(&child_null.finish()));
+
+        let mut parent_null = ListBuilder::new(Int32Builder::new());
+        parent_null.append(false);
+        assert!(has_any_nulls(&parent_null.finish()));
+    }
 
     #[test]
     fn test_intersect_and_copy_nulls_arrays() {

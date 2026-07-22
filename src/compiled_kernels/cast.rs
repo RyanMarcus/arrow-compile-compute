@@ -117,6 +117,36 @@ pub fn coalesce_type(res: ArrayRef, tar: &DataType) -> Result<ArrayRef, ArrowKer
                     .build_unchecked()
             }))
         }
+        (DataType::List(_), DataType::List(target_field)) => {
+            let arr = res.into_data();
+            let child = make_array(arr.child_data()[0].clone());
+            let child = coalesce_type(child, target_field.data_type())?;
+
+            Ok(make_array(unsafe {
+                ArrayDataBuilder::new(DataType::List(target_field.clone()))
+                    .len(arr.len())
+                    .offset(arr.offset())
+                    .nulls(arr.nulls().cloned())
+                    .add_buffer(arr.buffers()[0].clone())
+                    .add_child_data(child.into_data())
+                    .build_unchecked()
+            }))
+        }
+        (DataType::LargeList(_), DataType::LargeList(target_field)) => {
+            let arr = res.into_data();
+            let child = make_array(arr.child_data()[0].clone());
+            let child = coalesce_type(child, target_field.data_type())?;
+
+            Ok(make_array(unsafe {
+                ArrayDataBuilder::new(DataType::LargeList(target_field.clone()))
+                    .len(arr.len())
+                    .offset(arr.offset())
+                    .nulls(arr.nulls().cloned())
+                    .add_buffer(arr.buffers()[0].clone())
+                    .add_child_data(child.into_data())
+                    .build_unchecked()
+            }))
+        }
 
         _ => todo!("unable to coalesce {} into {}", res.data_type(), tar),
     }

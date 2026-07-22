@@ -2,6 +2,7 @@ use std::sync::Arc;
 
 use arrow_array::{Array, ArrayRef, ArrowPrimitiveType, BooleanArray, PrimitiveArray};
 use arrow_buffer::ToByteSlice;
+use arrow_schema::DataType;
 use half::f16;
 use inkwell::{
     builder::Builder,
@@ -30,6 +31,10 @@ pub struct ScalarPrimitiveIterator {
 
 impl ScalarPrimitiveIterator {
     pub fn new(val: u64, width: u8, ptype: PrimitiveType) -> Self {
+        assert!(
+            !matches!(ptype, PrimitiveType::P64x2 | PrimitiveType::List(_, _)),
+            "invalid primitive scalar type"
+        );
         Self { val, width, ptype }
     }
 
@@ -188,9 +193,21 @@ pub struct ScalarStringIterator {
     ptr1: *const u8,
     ptr2: *const u8,
     val: Box<str>,
+    pub(super) data_type: DataType,
 }
 
 impl ScalarStringIterator {
+    pub(super) fn new(val: Box<str>, data_type: DataType) -> Box<Self> {
+        let p1 = val.as_ptr();
+        let p2 = p1.wrapping_add(val.len());
+        Box::new(Self {
+            ptr1: p1,
+            ptr2: p2,
+            val,
+            data_type,
+        })
+    }
+
     pub fn llvm_val_ptr<'a>(
         &self,
         ctx: &'a Context,
@@ -205,13 +222,7 @@ impl ScalarStringIterator {
 
 impl From<Box<str>> for IteratorHolder {
     fn from(val: Box<str>) -> Self {
-        let p1 = val.as_ptr();
-        let p2 = p1.wrapping_add(val.len());
-        IteratorHolder::ScalarString(Box::new(ScalarStringIterator {
-            ptr1: p1,
-            ptr2: p2,
-            val,
-        }))
+        IteratorHolder::ScalarString(ScalarStringIterator::new(val, DataType::Utf8))
     }
 }
 
@@ -222,9 +233,21 @@ pub struct ScalarBinaryIterator {
     ptr1: *const u8,
     ptr2: *const u8,
     val: Box<[u8]>,
+    pub(super) data_type: DataType,
 }
 
 impl ScalarBinaryIterator {
+    pub(super) fn new(val: Box<[u8]>, data_type: DataType) -> Box<Self> {
+        let p1 = val.as_ptr();
+        let p2 = p1.wrapping_add(val.len());
+        Box::new(Self {
+            ptr1: p1,
+            ptr2: p2,
+            val,
+            data_type,
+        })
+    }
+
     pub fn llvm_val_ptr<'a>(
         &self,
         ctx: &'a Context,
@@ -239,13 +262,7 @@ impl ScalarBinaryIterator {
 
 impl From<Box<[u8]>> for IteratorHolder {
     fn from(val: Box<[u8]>) -> Self {
-        let p1 = val.as_ptr();
-        let p2 = p1.wrapping_add(val.len());
-        IteratorHolder::ScalarBinary(Box::new(ScalarBinaryIterator {
-            ptr1: p1,
-            ptr2: p2,
-            val,
-        }))
+        IteratorHolder::ScalarBinary(ScalarBinaryIterator::new(val, DataType::Binary))
     }
 }
 
@@ -258,10 +275,14 @@ pub struct ScalarVectorIterator {
     val: Box<[u8]>,
     #[allow(dead_code)]
     owner: Option<ArrayRef>,
+    pub(super) data_type: DataType,
 }
 
 impl ScalarVectorIterator {
-    pub fn from_primitive<K: ArrowPrimitiveType>(arr: &PrimitiveArray<K>) -> Box<Self> {
+    pub fn from_primitive<K: ArrowPrimitiveType>(
+        arr: &PrimitiveArray<K>,
+        data_type: DataType,
+    ) -> Box<Self> {
         let ptype = PrimitiveType::for_arrow_type(arr.data_type())
             .try_into()
             .unwrap();
@@ -277,10 +298,11 @@ impl ScalarVectorIterator {
             l,
             val,
             owner: None,
+            data_type,
         })
     }
 
-    pub fn from_boolean(arr: &BooleanArray) -> Box<Self> {
+    pub fn from_boolean(arr: &BooleanArray, data_type: DataType) -> Box<Self> {
         let l = arr.len();
         let val = arr.values().sliced().as_slice().to_vec().into_boxed_slice();
         Box::new(ScalarVectorIterator {
@@ -288,10 +310,16 @@ impl ScalarVectorIterator {
             l,
             val,
             owner: Some(Arc::new(arr.clone())),
+            data_type,
         })
     }
 
-    pub fn from_pointer_pairs(ptype: ListItemType, ptrs: Vec<u128>, owner: ArrayRef) -> Box<Self> {
+    pub fn from_pointer_pairs(
+        ptype: ListItemType,
+        ptrs: Vec<u128>,
+        owner: ArrayRef,
+        data_type: DataType,
+    ) -> Box<Self> {
         let l = ptrs.len();
         let val = bytemuck::cast_slice::<u128, u8>(&ptrs)
             .to_vec()
@@ -301,6 +329,7 @@ impl ScalarVectorIterator {
             l,
             val,
             owner: Some(owner),
+            data_type,
         })
     }
 
@@ -320,34 +349,32 @@ impl ScalarVectorIterator {
 
         match self.ptype {
             ListItemType::Boolean => {
-                let mut out = self.ptype().llvm_type(ctx).into_array_type().const_zero();
-                for chunk in 0..self.l.div_ceil(64) {
-                    let remaining_bits = self.l - chunk * 64;
-                    let bytes_in_chunk = remaining_bits.min(64).div_ceil(8);
-                    let mut chunk_value = ctx.i64_type().const_zero();
-                    for byte_idx in 0..bytes_in_chunk {
-                        let byte_ptr =
-                            increment_pointer!(ctx, builder, val_ptr, chunk * 8 + byte_idx);
-                        let byte = builder
-                            .build_load(ctx.i8_type(), byte_ptr, "bool_byte")
-                            .unwrap()
-                            .into_int_value();
-                        let byte = builder
-                            .build_int_z_extend(byte, ctx.i64_type(), "bool_byte_i64")
-                            .unwrap();
-                        let byte = builder
-                            .build_left_shift(
-                                byte,
-                                ctx.i64_type().const_int((byte_idx * 8) as u64, false),
-                                "bool_byte_shifted",
-                            )
-                            .unwrap();
-                        chunk_value = builder.build_or(chunk_value, byte, "bool_chunk").unwrap();
-                    }
-                    out = builder
-                        .build_insert_value(out, chunk_value, chunk as u32, "bool_insert")
+                let mut out = self.ptype().llvm_type(ctx).into_vector_type().const_zero();
+                for idx in 0..self.l {
+                    let byte_ptr = increment_pointer!(ctx, builder, val_ptr, idx / 8);
+                    let byte = builder
+                        .build_load(ctx.i8_type(), byte_ptr, "bool_byte")
                         .unwrap()
-                        .into_array_value();
+                        .into_int_value();
+                    let shifted = builder
+                        .build_right_shift(
+                            byte,
+                            ctx.i8_type().const_int((idx % 8) as u64, false),
+                            false,
+                            "bool_shifted",
+                        )
+                        .unwrap();
+                    let value = builder
+                        .build_int_truncate(shifted, ctx.bool_type(), "bool_value")
+                        .unwrap();
+                    out = builder
+                        .build_insert_element(
+                            out,
+                            value,
+                            ctx.i64_type().const_int(idx as u64, false),
+                            "bool_insert",
+                        )
+                        .unwrap();
                 }
                 out.as_basic_value_enum()
             }
@@ -388,11 +415,33 @@ impl ScalarVectorIterator {
 mod tests {
     use std::ffi::c_void;
 
-    use arrow_array::{BooleanArray, Float32Array, Int32Array, Scalar};
+    use arrow_array::{BooleanArray, Float32Array, Int32Array, LargeStringArray, Scalar};
     use arrow_schema::DataType;
     use inkwell::{context::Context, OptimizationLevel};
 
-    use crate::compiled_iter::{datum_to_iter, generate_next, generate_next_block};
+    use crate::compiled_iter::{datum_to_iter, IteratorHolder};
+
+    #[test]
+    fn data_type_preserves_scalar_string_offset_width() {
+        let scalar = Scalar::new(LargeStringArray::from(vec!["hello"]));
+        let iter = datum_to_iter(&scalar).unwrap();
+
+        assert_eq!(iter.data_type(), DataType::LargeUtf8);
+    }
+
+    #[test]
+    fn scalar_boolean_data_type_is_boolean() {
+        assert_eq!(IteratorHolder::from(true).data_type(), DataType::Boolean);
+    }
+
+    #[test]
+    fn scalar_primitive_data_type_comes_from_primitive_type() {
+        assert_eq!(IteratorHolder::from(42_i32).data_type(), DataType::Int32);
+        assert_eq!(
+            IteratorHolder::from(42.0_f64).data_type(),
+            DataType::Float64
+        );
+    }
 
     #[test]
     fn test_scalar_int() {
@@ -402,11 +451,8 @@ mod tests {
 
         let ctx = Context::create();
         let module = ctx.create_module("test_scalar_prim");
-        let func_block =
-            generate_next_block::<4>(&ctx, &module, "iter_prim_test", &DataType::Int32, &iter)
-                .unwrap();
-        let func_next =
-            generate_next(&ctx, &module, "iter_prim_test", &DataType::Int32, &iter).unwrap();
+        let func_block = iter.generate_next_block(&ctx, &module, 4).unwrap();
+        let func_next = iter.generate_next(&ctx, &module);
 
         let fname_block = func_block.get_name().to_str().unwrap();
         let fname_next = func_next.get_name().to_str().unwrap();
@@ -457,16 +503,8 @@ mod tests {
 
         let ctx = Context::create();
         let module = ctx.create_module("test_scalar_prim");
-        let func_block = generate_next_block::<4>(
-            &ctx,
-            &module,
-            "iter_block_prim_test",
-            &DataType::Float32,
-            &iter,
-        )
-        .unwrap();
-        let func_next =
-            generate_next(&ctx, &module, "iter_prim_test", &DataType::Float32, &iter).unwrap();
+        let func_block = iter.generate_next_block(&ctx, &module, 4).unwrap();
+        let func_next = iter.generate_next(&ctx, &module);
 
         let fname_block = func_block.get_name().to_str().unwrap();
         let fname_next = func_next.get_name().to_str().unwrap();
@@ -517,8 +555,7 @@ mod tests {
 
         let ctx = Context::create();
         let module = ctx.create_module("test_scalar_bool");
-        let func_next =
-            generate_next(&ctx, &module, "iter_prim_test", &DataType::Boolean, &iter).unwrap();
+        let func_next = iter.generate_next(&ctx, &module);
 
         let fname_next = func_next.get_name().to_str().unwrap();
 
