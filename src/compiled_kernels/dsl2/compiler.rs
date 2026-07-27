@@ -751,16 +751,6 @@ fn compile_stmt<'ctx, 'a>(
                     )
                     .unwrap();
 
-                // truncate to boolean if neeeded
-                let val = match loop_var.ty {
-                    DSLType::Boolean => ctx
-                        .b
-                        .build_int_truncate(val.into_int_value(), ctx.ctx.bool_type(), "to_bool")
-                        .unwrap()
-                        .as_basic_value_enum(),
-                    _ => val,
-                };
-
                 ctx.st.insert(loop_var.name, val);
             }
             for (loop_var, iterator) in floop.loop_vars.iter().zip(floop.iterators.iter()) {
@@ -925,16 +915,6 @@ fn compile_stmt<'ctx, 'a>(
                         &format!("load{}", loop_var.name),
                     )
                     .unwrap();
-
-                // truncate to boolean if neeeded
-                let val = match loop_var.ty {
-                    DSLType::Boolean => ctx
-                        .b
-                        .build_int_truncate(val.into_int_value(), ctx.ctx.bool_type(), "to_bool")
-                        .unwrap()
-                        .as_basic_value_enum(),
-                    _ => val,
-                };
 
                 ctx.st.insert(loop_var.name, val);
             }
@@ -1395,16 +1375,7 @@ fn compile_expr<'ctx, 'a>(
                 _ => todo!(),
             };
 
-            if let Some(DSLType::Boolean) = v.ty.iter_type() {
-                // truncate to boolean
-                let res = ctx
-                    .b
-                    .build_int_truncate(res.into_int_value(), ctx.ctx.bool_type(), "trunc_to_bool")
-                    .unwrap();
-                Ok(res.into())
-            } else {
-                Ok(res)
-            }
+            Ok(res)
         }
         DSLExpr::Value(v) => match &v.ty {
             DSLType::ConstScalar(v) => scalar_to_llvm(ctx, v.as_ref()),

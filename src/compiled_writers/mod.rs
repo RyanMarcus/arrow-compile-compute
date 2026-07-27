@@ -414,7 +414,7 @@ impl AnyWriter {
         codegen: WriterCodegen<'ctx, 'borrow>,
         runtime_ptr: PointerValue<'ctx>,
         source_iter: &IteratorHolder,
-        mut value: BasicValueEnum<'ctx>,
+        value: BasicValueEnum<'ctx>,
     ) -> Result<(), ArrowKernelError> {
         // Dictionary and run-end accessors already return decoded logical values,
         // so continue with the holder for their value iterator.
@@ -432,20 +432,6 @@ impl AnyWriter {
         // destination list, recursively handling nested lists.
         if let (AnyWriter::List(writer), IteratorHolder::List(source)) = (self, source_iter) {
             return writer.llvm_write_from_list(codegen, runtime_ptr, source.child(), value);
-        }
-
-        if source_iter.data_type() == DataType::Boolean
-            && value.into_int_value().get_type().get_bit_width() != 1
-        {
-            value = codegen
-                .builder
-                .build_int_truncate(
-                    value.into_int_value(),
-                    codegen.ctx.bool_type(),
-                    "list_child_bool",
-                )
-                .unwrap()
-                .into();
         }
 
         // Non-list values are recursion leaves and can use the ordinary scalar

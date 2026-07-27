@@ -93,9 +93,6 @@ fn build_fixed_size_list_value<'a>(
                     .try_as_basic_value()
                     .unwrap_basic()
                     .into_int_value();
-                let value = build
-                    .build_int_truncate(value, ctx.bool_type(), "fsl_bool_value_i1")
-                    .unwrap();
                 out = build
                     .build_insert_element(
                         out,
@@ -177,7 +174,7 @@ enum IteratorValueType {
 impl IteratorValueType {
     fn llvm_type<'a>(self, ctx: &'a Context) -> inkwell::types::BasicTypeEnum<'a> {
         match self {
-            IteratorValueType::Boolean => ctx.i8_type().into(),
+            IteratorValueType::Boolean => ctx.bool_type().into(),
             IteratorValueType::Primitive(ptype) => ptype.llvm_type(ctx),
             IteratorValueType::VariableList => list_value_llvm_type(ctx).into(),
         }
@@ -752,7 +749,7 @@ impl IteratorHolder {
                 }
             }
             IteratorHolder::ScalarBoolean(_) => IteratorCodegenInfo {
-                value_type: IteratorValueType::Primitive(PrimitiveType::U8),
+                value_type: IteratorValueType::Boolean,
                 random_access: false,
                 next_block: false,
             },
@@ -1319,9 +1316,6 @@ impl IteratorHolder {
                         .try_as_basic_value()
                         .unwrap_basic()
                         .into_int_value();
-                    let value = build
-                        .build_int_truncate(value, ctx.bool_type(), "gather_boolean_i1")
-                        .unwrap();
                     let value = build
                         .build_int_z_extend(value, output_int, "gather_boolean_wide")
                         .unwrap();
@@ -3021,7 +3015,10 @@ impl IteratorHolder {
                         "data_bit_i8",
                     )
                     .unwrap();
-                build.build_return(Some(&data_bit_i8)).unwrap();
+                let data_bit_i1 = build
+                    .build_int_truncate(data_bit_i8, ctx.bool_type(), "data_bit_i1")
+                    .unwrap();
+                build.build_return(Some(&data_bit_i1)).unwrap();
 
                 Some(access_f)
             }

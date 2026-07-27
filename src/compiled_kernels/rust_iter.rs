@@ -302,7 +302,11 @@ fn generate_call<'a>(
     let i64_type = ctx.i64_type();
     let input_prim_type = PrimitiveType::for_arrow_type(dt);
     let rust_expected_llvm_type = rust_expected_type.llvm_type(ctx);
-    let input_type = input_prim_type.llvm_type(ctx);
+    let input_type = if dt == &DataType::Boolean {
+        ctx.bool_type().into()
+    } else {
+        input_prim_type.llvm_type(ctx)
+    };
     let func = module.add_function(
         "call_rust",
         i64_type.fn_type(
@@ -395,6 +399,14 @@ fn generate_call<'a>(
         build.build_load(input_type, buf, "val").unwrap()
     };
 
+    let val = if dt == &DataType::Boolean {
+        build
+            .build_int_z_extend(val.into_int_value(), ctx.i8_type(), "boolean_u8")
+            .unwrap()
+            .into()
+    } else {
+        val
+    };
     let val = match rust_expected_type {
         PrimitiveType::P64x2 => val,
         _ => {
