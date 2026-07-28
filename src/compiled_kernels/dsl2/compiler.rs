@@ -1,4 +1,4 @@
-use std::{cmp::Ordering, collections::HashMap, ffi::c_void};
+use std::{collections::HashMap, ffi::c_void};
 
 use arrow_array::{
     cast::AsArray,
@@ -27,22 +27,25 @@ use itertools::Itertools;
 use ouroboros::self_referencing;
 
 use crate::{
-    compiled_iter::{array_to_setbit_iter, datum_to_iter, get_iterator_length, IteratorHolder},
+    compiled_iter::{
+        array_to_setbit_iter, datum_to_iter, get_iterator_length, IteratorHolder, IteratorSource,
+    },
     compiled_kernels::{
         cmp::{add_float_to_int, add_float_vec_to_int_vec, add_memcmp},
         dsl2::{
             add_str_endswith, add_str_startswith, buffer::DSLBuffer, runtime::RunnableDSLFunction,
             two_d, vectorize, writers::accepted_type, DSLArgument, DSLArgumentType, DSLArithBinOp,
-            DSLBitwiseBinOp, DSLComparison, DSLExpr, DSLFunction, DSLStmt, DSLStringPredicate,
-            DSLType, DSLValue,
+            DSLBitwiseBinOp, DSLComparison, DSLExpr, DSLFunction, DSLMapFunction, DSLStmt,
+            DSLStringPredicate, DSLType, DSLValue,
         },
         link_req_helpers,
         llvm_utils::llvm_add_save_ptrs_string_saver,
         optimize_module,
     },
     compiled_writers::{BoundWriter, WriterSpec},
-    increment_pointer, set_noalias_params, ArrowKernelError, ComparisonType, ListItemType,
-    NumericPrimitiveType, PrimitiveType,
+    increment_pointer,
+    llvm_cast::cast_numeric,
+    set_noalias_params, ArrowKernelError, ComparisonType, ListItemType, PrimitiveType,
 };
 
 pub enum KernelReturnCode {
@@ -504,26 +507,93 @@ fn compile_stmt<'ctx, 'a>(
                 }
                 let compiled_value = compile_expr(ctx, value)?;
                 if matches!(accepted, DSLType::VarList(_)) {
-                    let source_name = match value {
+                    let (source, map_function) = match value {
+                        DSLExpr::ListMap(source, map_function) => {
+                            (source.as_ref(), Some(map_function))
+                        }
+                        _ => (value, None),
+                    };
+                    let source_name = match source {
                         DSLExpr::At(value, _) => ctx.value_sources[&value.name],
                         DSLExpr::Value(value) => ctx.value_sources[&value.name],
                         _ => return Err(ArrowKernelError::InvalidAtSource(value.clone())),
                     };
-                    ctx.outputs[idx as usize].llvm_ingest_from_iterator(
-                        ctx.ctx,
-                        ctx.module,
-                        ctx.b,
-                        &ctx.iterator_holders[&source_name],
-                        compiled_value,
-                    );
-                } else {
-                    ctx.outputs[idx as usize].llvm_ingest(
-                        ctx.ctx,
-                        ctx.module,
-                        ctx.b,
-                        compiled_value,
-                    );
+                    if let Some(map_function) = map_function {
+                        let DSLMapFunction::Cast(target) = map_function;
+                        let source_type = source.get_type();
+
+                        // Descend through matching VarList nesting to validate the list shape and
+                        // find the leaf source and target types used to build the cast mapper.
+                        let mut source_leaf = &source_type;
+                        let mut target_leaf = target;
+                        loop {
+                            match (source_leaf, target_leaf) {
+                                (DSLType::VarList(source), DSLType::VarList(target)) => {
+                                    source_leaf = source;
+                                    target_leaf = target;
+                                }
+                                (DSLType::VarList(_), _) | (_, DSLType::VarList(_)) => {
+                                    return Err(ArrowKernelError::InvalidCast(
+                                        source_type,
+                                        target.clone(),
+                                    ));
+                                }
+                                _ => break,
+                            }
+                        }
+
+                        let source_llvm_type = source_leaf.llvm_type(ctx.ctx).unwrap();
+                        let target_llvm_type = target_leaf.llvm_type(ctx.ctx).unwrap();
+
+                        let mapper_type =
+                            target_llvm_type.fn_type(&[source_llvm_type.into()], false);
+                        let mapper_name =
+                            format!("list_map_cast_{source_leaf:?}_to_{target_leaf:?}");
+                        let mapper = if let Some(mapper) = ctx.module.get_function(&mapper_name) {
+                            debug_assert_eq!(mapper.get_type(), mapper_type);
+                            mapper
+                        } else {
+                            let mapper = ctx.module.add_function(
+                                &mapper_name,
+                                mapper_type,
+                                Some(Linkage::Private),
+                            );
+                            let builder = ctx.ctx.create_builder();
+                            let entry = ctx.ctx.append_basic_block(mapper, "entry");
+                            builder.position_at_end(entry);
+                            let value = mapper.get_nth_param(0).unwrap();
+                            let mapped =
+                                emit_cast(ctx.ctx, &builder, value, source_leaf, target_leaf)?;
+                            debug_assert_eq!(mapped.get_type(), target_llvm_type);
+                            builder.build_return(Some(&mapped)).unwrap();
+                            mapper
+                        };
+                        let map_target = target.iterator_map_type().unwrap();
+                        ctx.outputs[idx as usize].llvm_ingest_from_iterator_source(
+                            ctx.ctx,
+                            ctx.module,
+                            ctx.b,
+                            IteratorSource::map(
+                                &ctx.iterator_holders[&source_name],
+                                &map_target,
+                                mapper,
+                            ),
+                            compiled_value,
+                        )?;
+                    } else {
+                        ctx.outputs[idx as usize].llvm_ingest_from_iterator(
+                            ctx.ctx,
+                            ctx.module,
+                            ctx.b,
+                            &ctx.iterator_holders[&source_name],
+                            compiled_value,
+                        );
+                    }
+                    return Ok(());
                 }
+
+                // not a list -- just use normal ingest
+                ctx.outputs[idx as usize].llvm_ingest(ctx.ctx, ctx.module, ctx.b, compiled_value);
                 return Ok(());
             } else {
                 if matches!(value.get_type(), DSLType::VarList(_)) {
@@ -751,16 +821,6 @@ fn compile_stmt<'ctx, 'a>(
                     )
                     .unwrap();
 
-                // truncate to boolean if neeeded
-                let val = match loop_var.ty {
-                    DSLType::Boolean => ctx
-                        .b
-                        .build_int_truncate(val.into_int_value(), ctx.ctx.bool_type(), "to_bool")
-                        .unwrap()
-                        .as_basic_value_enum(),
-                    _ => val,
-                };
-
                 ctx.st.insert(loop_var.name, val);
             }
             for (loop_var, iterator) in floop.loop_vars.iter().zip(floop.iterators.iter()) {
@@ -925,16 +985,6 @@ fn compile_stmt<'ctx, 'a>(
                         &format!("load{}", loop_var.name),
                     )
                     .unwrap();
-
-                // truncate to boolean if neeeded
-                let val = match loop_var.ty {
-                    DSLType::Boolean => ctx
-                        .b
-                        .build_int_truncate(val.into_int_value(), ctx.ctx.bool_type(), "to_bool")
-                        .unwrap()
-                        .as_basic_value_enum(),
-                    _ => val,
-                };
 
                 ctx.st.insert(loop_var.name, val);
             }
@@ -1276,6 +1326,169 @@ fn extract_list_compare_elements<'ctx, 'a>(
     }
 }
 
+fn emit_cast<'ctx>(
+    ctx: &'ctx Context,
+    builder: &Builder<'ctx>,
+    value: BasicValueEnum<'ctx>,
+    source_type: &DSLType,
+    target_type: &DSLType,
+) -> Result<BasicValueEnum<'ctx>, ArrowKernelError> {
+    if source_type == target_type {
+        return Ok(value);
+    }
+
+    if matches!(source_type, DSLType::ConstScalar(_)) {
+        if target_type.llvm_type(ctx) == Some(value.get_type()) {
+            return Ok(value);
+        }
+        return Err(ArrowKernelError::InvalidCast(
+            source_type.clone(),
+            target_type.clone(),
+        ));
+    }
+
+    let (source_leaf, target_leaf) = match (source_type, target_type) {
+        (DSLType::Block(source, source_rows), DSLType::Block(target, target_rows))
+            if source_rows == target_rows =>
+        {
+            (source.as_ref(), target.as_ref())
+        }
+        (DSLType::Block(_, _), _) | (_, DSLType::Block(_, _)) => {
+            return Err(ArrowKernelError::InvalidCast(
+                source_type.clone(),
+                target_type.clone(),
+            ));
+        }
+        _ => (source_type, target_type),
+    };
+
+    let target_llvm_type = target_type
+        .llvm_type(ctx)
+        .ok_or_else(|| ArrowKernelError::InvalidCast(source_type.clone(), target_type.clone()))?;
+    let cast = match (source_leaf, target_leaf) {
+        (DSLType::Boolean, DSLType::Primitive(target)) if target.is_int() => {
+            if value.get_type() == target_llvm_type {
+                value
+            } else if value.is_vector_value() {
+                builder
+                    .build_int_z_extend(
+                        value.into_vector_value(),
+                        target_llvm_type.into_vector_type(),
+                        "cast_boolean",
+                    )
+                    .unwrap()
+                    .as_basic_value_enum()
+            } else {
+                builder
+                    .build_int_z_extend(
+                        value.into_int_value(),
+                        target_llvm_type.into_int_type(),
+                        "cast_boolean",
+                    )
+                    .unwrap()
+                    .as_basic_value_enum()
+            }
+        }
+        (DSLType::Primitive(source), DSLType::Boolean) => {
+            let Some(source) = source.as_numeric_primitive_type() else {
+                return Err(ArrowKernelError::InvalidCast(
+                    source_type.clone(),
+                    target_type.clone(),
+                ));
+            };
+            if value.is_vector_value() {
+                let value = value.into_vector_value();
+                if source.is_integer() {
+                    builder
+                        .build_int_compare(
+                            IntPredicate::NE,
+                            value,
+                            value.get_type().const_zero(),
+                            "cast_to_bool",
+                        )
+                        .unwrap()
+                        .as_basic_value_enum()
+                } else {
+                    builder
+                        .build_float_compare(
+                            FloatPredicate::ONE,
+                            value,
+                            value.get_type().const_zero(),
+                            "cast_to_bool",
+                        )
+                        .unwrap()
+                        .as_basic_value_enum()
+                }
+            } else if source.is_integer() {
+                let value = value.into_int_value();
+                builder
+                    .build_int_compare(
+                        IntPredicate::NE,
+                        value,
+                        value.get_type().const_zero(),
+                        "cast_to_bool",
+                    )
+                    .unwrap()
+                    .as_basic_value_enum()
+            } else {
+                let value = value.into_float_value();
+                builder
+                    .build_float_compare(
+                        FloatPredicate::ONE,
+                        value,
+                        value.get_type().const_zero(),
+                        "cast_to_bool",
+                    )
+                    .unwrap()
+                    .as_basic_value_enum()
+            }
+        }
+        (DSLType::Primitive(source), DSLType::Primitive(target)) => {
+            match (
+                source.as_numeric_primitive_type(),
+                target.as_numeric_primitive_type(),
+            ) {
+                (Some(source), Some(target)) => cast_numeric(ctx, builder, value, source, target),
+                _ => match (source, target) {
+                    (
+                        PrimitiveType::List(source_item, source_len),
+                        PrimitiveType::List(target_item, target_len),
+                    ) if source_len == target_len
+                        && source_item.is_numeric()
+                        && target_item.is_numeric() =>
+                    {
+                        cast_numeric(
+                            ctx,
+                            builder,
+                            value,
+                            PrimitiveType::from(*source_item)
+                                .as_numeric_primitive_type()
+                                .unwrap(),
+                            PrimitiveType::from(*target_item)
+                                .as_numeric_primitive_type()
+                                .unwrap(),
+                        )
+                    }
+                    _ => {
+                        return Err(ArrowKernelError::InvalidCast(
+                            source_type.clone(),
+                            target_type.clone(),
+                        ));
+                    }
+                },
+            }
+        }
+        _ => {
+            return Err(ArrowKernelError::InvalidCast(
+                source_type.clone(),
+                target_type.clone(),
+            ));
+        }
+    };
+    debug_assert_eq!(cast.get_type(), target_llvm_type);
+    Ok(cast)
+}
+
 fn compile_expr<'ctx, 'a>(
     ctx: &DSLCompilationContext<'ctx, 'a>,
     expr: &DSLExpr,
@@ -1395,229 +1608,31 @@ fn compile_expr<'ctx, 'a>(
                 _ => todo!(),
             };
 
-            if let Some(DSLType::Boolean) = v.ty.iter_type() {
-                // truncate to boolean
-                let res = ctx
-                    .b
-                    .build_int_truncate(res.into_int_value(), ctx.ctx.bool_type(), "trunc_to_bool")
-                    .unwrap();
-                Ok(res.into())
-            } else {
-                Ok(res)
-            }
+            Ok(res)
         }
         DSLExpr::Value(v) => match &v.ty {
             DSLType::ConstScalar(v) => scalar_to_llvm(ctx, v.as_ref()),
             _ => Ok(ctx.st[&v.name]),
         },
-        DSLExpr::Cast(val, tar_pt) => {
-            let orig_type = val.get_type();
-            let tar_type = DSLType::Primitive(*tar_pt);
-            let tar_llvm_type = tar_pt.llvm_type(ctx.ctx);
-            let val = compile_expr(ctx, val)?;
+        DSLExpr::Cast(val, target_type) => {
+            let source_type = val.get_type();
+            let value = compile_expr(ctx, val)?;
 
-            match orig_type {
-                DSLType::Block(ref element, rows) => match element.as_ref() {
-                    DSLType::Boolean if tar_pt.is_int() => {
-                        let bools = val.into_vector_value();
-                        let target = tar_pt.llvm_vec_type(ctx.ctx, rows as u32).unwrap();
-                        Ok(ctx
-                            .b
-                            .build_int_z_extend(bools, target, "cast_boolean_block")
-                            .unwrap()
-                            .as_basic_value_enum())
-                    }
-                    DSLType::Primitive(orig_pt) => {
-                        let (orig_leaf, target_leaf) = match (orig_pt, tar_pt) {
-                            (
-                                PrimitiveType::List(orig, orig_len),
-                                PrimitiveType::List(tar, tar_len),
-                            ) if orig_len == tar_len => {
-                                (PrimitiveType::from(*orig), PrimitiveType::from(*tar))
-                            }
-                            (orig, tar)
-                                if !matches!(orig, PrimitiveType::List(_, _))
-                                    && !matches!(tar, PrimitiveType::List(_, _)) =>
-                            {
-                                (*orig, *tar)
-                            }
-                            _ => {
-                                return Err(ArrowKernelError::DSLTypeMismatch(
-                                    "cannot cast differently shaped blocks",
-                                    orig_type,
-                                    tar_type,
-                                ))
-                            }
-                        };
-                        let orig_numeric = orig_leaf.as_numeric_primitive_type().unwrap();
-                        let target_numeric = target_leaf.as_numeric_primitive_type().unwrap();
-                        cast_numeric(ctx, val, orig_numeric, target_numeric)
-                    }
-                    _ => Err(ArrowKernelError::DSLInvalidType(
-                        "unsupported block cast",
-                        orig_type,
-                    )),
-                },
-                DSLType::Boolean => {
-                    if tar_pt.is_int() {
-                        Ok(ctx
-                            .b
-                            .build_int_cast(
-                                val.into_int_value(),
-                                tar_llvm_type.into_int_type(),
-                                "cast",
-                            )
-                            .unwrap()
-                            .as_basic_value_enum())
-                    } else {
-                        unimplemented!("invalid cast")
-                    }
-                }
-                DSLType::Primitive(orig_pt) => {
-                    match (
-                        orig_pt.as_numeric_primitive_type(),
-                        tar_pt.as_numeric_primitive_type(),
-                    ) {
-                        (None, None) => {}
-                        (None, Some(_)) | (Some(_), None) => {
-                            return Err(ArrowKernelError::DSLTypeMismatch(
-                                "cannot cast numeric type to non-numeric",
-                                orig_type,
-                                tar_type,
-                            ))
-                        }
-                        (Some(orig_pt), Some(tar_pt)) => {
-                            return cast_numeric(ctx, val, orig_pt, tar_pt)
-                        }
-                    }
-
-                    // neither type is numeric
-                    match (orig_pt, tar_pt) {
-                        (PrimitiveType::List(s_t, s_l), &PrimitiveType::List(t_t, t_l)) => {
-                            if s_l != t_l {
-                                return Err(ArrowKernelError::DSLTypeMismatch(
-                                    "cannot cast between vectors of different sizes",
-                                    orig_type,
-                                    tar_type,
-                                ));
-                            }
-                            if !s_t.is_numeric() || !t_t.is_numeric() {
-                                return Err(ArrowKernelError::DSLTypeMismatch(
-                                    "can only cast fixed-size-lists with numeric child types",
-                                    orig_type,
-                                    tar_type,
-                                ));
-                            }
-
-                            match (
-                                PrimitiveType::from(s_t).as_numeric_primitive_type(),
-                                PrimitiveType::from(t_t).as_numeric_primitive_type(),
-                            ) {
-                                (Some(orig_pt), Some(tar_pt)) => {
-                                    return cast_numeric(ctx, val, orig_pt, tar_pt)
-                                }
-                                _ => Err(ArrowKernelError::DSLTypeMismatch(
-                                    "cannot cast between string and non-string vectors",
-                                    orig_type,
-                                    tar_type,
-                                )),
-                            }
-                        }
-                        _ => Err(ArrowKernelError::DSLTypeMismatch(
-                            "unsupported primitive cast",
-                            orig_type,
-                            tar_type,
-                        )),
-                    }
-                }
-                DSLType::ConstScalar(_) => {
-                    if val.get_type() != tar_llvm_type {
-                        return Err(ArrowKernelError::DSLTypeMismatch(
-                            "const scalar type mismatch",
-                            orig_type,
-                            tar_type,
-                        ));
-                    }
-                    Ok(val)
-                }
-                _ => unimplemented!("invalid cast"),
-            }
+            let output_type = match &source_type {
+                DSLType::Block(_, rows) => DSLType::Block(Box::new(target_type.clone()), *rows),
+                _ => target_type.clone(),
+            };
+            emit_cast(ctx.ctx, ctx.b, value, &source_type, &output_type)
         }
+        DSLExpr::ListMap(value, _) => compile_expr(ctx, value),
         DSLExpr::CastToBool(v) => {
-            let child = compile_expr(ctx, v)?;
-            match v.get_type() {
-                DSLType::Block(element, _) => {
-                    let DSLType::Primitive(pt) = element.as_ref() else {
-                        return Err(ArrowKernelError::DSLInvalidType(
-                            "cannot cast this block to bool",
-                            v.get_type(),
-                        ));
-                    };
-                    let nt = pt.as_numeric_primitive_type().ok_or_else(|| {
-                        ArrowKernelError::DSLInvalidType(
-                            "cannot cast non-numeric block to bool",
-                            v.get_type(),
-                        )
-                    })?;
-                    let child = child.into_vector_value();
-                    let bools = if nt.is_integer() {
-                        ctx.b
-                            .build_int_compare(
-                                IntPredicate::NE,
-                                child,
-                                child.get_type().const_zero(),
-                                "block_ne_zero",
-                            )
-                            .unwrap()
-                    } else {
-                        ctx.b
-                            .build_float_compare(
-                                FloatPredicate::ONE,
-                                child,
-                                child.get_type().const_zero(),
-                                "block_ne_zero",
-                            )
-                            .unwrap()
-                    };
-                    Ok(bools.as_basic_value_enum())
-                }
-                DSLType::Boolean => Ok(child),
-                DSLType::Primitive(pt) => {
-                    let nt = pt.as_numeric_primitive_type().ok_or_else(|| {
-                        ArrowKernelError::DSLInvalidType(
-                            "cannot cast non-numeric type to bool",
-                            v.get_type(),
-                        )
-                    })?;
-
-                    let res = if nt.is_integer() {
-                        let child = child.into_int_value();
-                        ctx.b
-                            .build_int_compare(
-                                IntPredicate::NE,
-                                child,
-                                child.get_type().const_zero(),
-                                "ne_zero",
-                            )
-                            .unwrap()
-                    } else {
-                        let child = child.into_float_value();
-                        ctx.b
-                            .build_float_compare(
-                                FloatPredicate::ONE,
-                                child,
-                                child.get_type().const_zero(),
-                                "ne_zero",
-                            )
-                            .unwrap()
-                    };
-                    Ok(res.as_basic_value_enum())
-                }
-                _ => Err(ArrowKernelError::DSLInvalidType(
-                    "cannot cast type to bool",
-                    v.get_type(),
-                )),
-            }
+            let source_type = v.get_type();
+            let value = compile_expr(ctx, v)?;
+            let target_type = match &source_type {
+                DSLType::Block(_, rows) => DSLType::Block(Box::new(DSLType::Boolean), *rows),
+                _ => DSLType::Boolean,
+            };
+            emit_cast(ctx.ctx, ctx.b, value, &source_type, &target_type)
         }
         DSLExpr::BitCast(v, tar_pt) => {
             let value_type = v.get_type();
@@ -2126,43 +2141,6 @@ fn compile_expr<'ctx, 'a>(
                 .as_basic_value_enum())
         }
     }
-}
-
-fn cast_numeric<'ctx, 'a>(
-    ctx: &DSLCompilationContext<'ctx, 'a>,
-    val: BasicValueEnum<'ctx>,
-    orig_pt: NumericPrimitiveType,
-    tar_pt: NumericPrimitiveType,
-) -> Result<BasicValueEnum<'ctx>, ArrowKernelError> {
-    let target_primitive = PrimitiveType::from(tar_pt);
-    let target_type = if val.is_vector_value() {
-        target_primitive
-            .llvm_vec_type(ctx.ctx, val.get_type().into_vector_type().get_size())
-            .unwrap()
-            .as_basic_type_enum()
-    } else {
-        target_primitive.llvm_type(ctx.ctx)
-    };
-
-    let opcode = match (orig_pt.is_integer(), tar_pt.is_integer()) {
-        (true, true) => match tar_pt.width().cmp(&orig_pt.width()) {
-            Ordering::Less => InstructionOpcode::Trunc,
-            Ordering::Equal => return Ok(val),
-            Ordering::Greater if orig_pt.is_signed() => InstructionOpcode::SExt,
-            Ordering::Greater => InstructionOpcode::ZExt,
-        },
-        (true, false) if orig_pt.is_signed() => InstructionOpcode::SIToFP,
-        (true, false) => InstructionOpcode::UIToFP,
-        (false, true) if tar_pt.is_signed() => InstructionOpcode::FPToSI,
-        (false, true) => InstructionOpcode::FPToUI,
-        (false, false) => match tar_pt.width().cmp(&orig_pt.width()) {
-            Ordering::Less => InstructionOpcode::FPTrunc,
-            Ordering::Equal => return Ok(val),
-            Ordering::Greater => InstructionOpcode::FPExt,
-        },
-    };
-
-    Ok(ctx.b.build_cast(opcode, val, target_type, "cast").unwrap())
 }
 
 fn scalar_to_llvm<'ctx, 'a>(

@@ -46,7 +46,7 @@ pub fn generate_two_d_access<'ctx>(
         funcs.push(func);
     }
 
-    let ret_ty = witness_type.llvm_type(ctx);
+    let ret_ty = funcs[0].get_type().get_return_type().unwrap();
     let ptr_ty = ctx.ptr_type(AddressSpace::default());
     let i64_ty = ctx.i64_type();
     let func_ty = ret_ty.fn_type(&[ptr_ty.into(), i64_ty.into(), i64_ty.into()], false);

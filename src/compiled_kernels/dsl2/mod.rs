@@ -21,7 +21,7 @@ use inkwell::{FloatPredicate, IntPredicate};
 use itertools::Itertools;
 use strum_macros::EnumIter;
 
-use crate::compiled_iter::IteratorHolder;
+use crate::compiled_iter::{IteratorHolder, IteratorMapType};
 use crate::compiled_kernels::dsl2::reduce::DSLReduce;
 use crate::compiled_kernels::llvm_utils::StringSaver;
 use crate::{logical_arrow_type, ArrowKernelError, ListItemType, Predicate, PrimitiveType};
@@ -42,6 +42,7 @@ pub use compiler::compile;
 pub use reduce::DSLReductionType;
 pub use runtime::RunnableDSLFunction;
 pub(crate) use string_codegen::{add_str_endswith, add_str_startswith};
+pub(crate) use writers::accepted_type;
 pub use writers::{OutputSlot, WriterSpec};
 
 pub struct DSLContext {
@@ -378,6 +379,45 @@ impl Debug for DSLType {
 }
 
 impl DSLType {
+    pub(crate) fn iterator_map_type(&self) -> Option<IteratorMapType> {
+        match self {
+            DSLType::Boolean => Some(IteratorMapType::Boolean),
+            DSLType::Primitive(primitive) => Some(IteratorMapType::Primitive(*primitive)),
+            DSLType::VarList(child) => Some(IteratorMapType::VariableList(Box::new(
+                child.iterator_map_type()?,
+            ))),
+            _ => None,
+        }
+    }
+
+    fn can_cast_to(&self, target: &DSLType) -> bool {
+        match (self, target) {
+            (DSLType::VarList(source), DSLType::VarList(target)) => source.can_cast_to(target),
+            (DSLType::Boolean, DSLType::Primitive(target)) => target.is_int(),
+            (DSLType::Primitive(source), DSLType::Boolean) => {
+                source.as_numeric_primitive_type().is_some()
+            }
+            (DSLType::Primitive(source), DSLType::Primitive(target)) => match (source, target) {
+                (
+                    PrimitiveType::List(source_item, source_len),
+                    PrimitiveType::List(target_item, target_len),
+                ) => {
+                    source_len == target_len && source_item.is_numeric() && target_item.is_numeric()
+                }
+                _ => {
+                    matches!(
+                        (
+                            source.as_numeric_primitive_type(),
+                            target.as_numeric_primitive_type(),
+                        ),
+                        (Some(_), Some(_))
+                    ) || source == target
+                }
+            },
+            _ => false,
+        }
+    }
+
     pub fn iter_type(&self) -> Option<DSLType> {
         match self {
             DSLType::Array(ty, ..) => Some(*ty.clone()),
@@ -1221,12 +1261,26 @@ pub struct DSLForRange {
 }
 
 #[derive(Clone, Debug)]
+pub enum DSLMapFunction {
+    Cast(DSLType),
+}
+
+impl DSLMapFunction {
+    fn output_type(&self) -> DSLType {
+        match self {
+            Self::Cast(target) => target.clone(),
+        }
+    }
+}
+
+#[derive(Clone, Debug)]
 pub enum DSLExpr {
     Compare(DSLComparison, Box<DSLExpr>, Box<DSLExpr>),
     StringPredicate(DSLStringPredicate, Box<DSLExpr>, Box<DSLExpr>),
     At(Box<DSLValue>, Vec<DSLExpr>),
     Value(DSLValue),
-    Cast(Box<DSLExpr>, PrimitiveType),
+    Cast(Box<DSLExpr>, DSLType),
+    ListMap(Box<DSLExpr>, DSLMapFunction),
     CastToBool(Box<DSLExpr>),
     BitCast(Box<DSLExpr>, PrimitiveType),
     FloatToTotalOrderSInt(Box<DSLExpr>),
@@ -1310,13 +1364,33 @@ impl DSLExpr {
         }
 
         match self.get_type() {
-            DSLType::ConstScalar(_) | DSLType::Boolean | DSLType::Primitive(_) => {
-                Ok(DSLExpr::Cast(Box::new(self.clone()), ty))
-            }
+            DSLType::ConstScalar(_) | DSLType::Boolean | DSLType::Primitive(_) => Ok(
+                DSLExpr::Cast(Box::new(self.clone()), DSLType::Primitive(ty)),
+            ),
             _ => Err(ArrowKernelError::InvalidCast(
                 self.get_type(),
                 DSLType::Primitive(ty),
             )),
+        }
+    }
+
+    pub fn cast(&self, target: DSLType) -> Result<DSLExpr, ArrowKernelError> {
+        let source = self.get_type();
+        if source == target && !matches!(source, DSLType::VarList(_)) {
+            return Ok(self.clone());
+        }
+
+        if source.can_cast_to(&target) {
+            if matches!(source, DSLType::VarList(_)) {
+                Ok(DSLExpr::ListMap(
+                    Box::new(self.clone()),
+                    DSLMapFunction::Cast(target),
+                ))
+            } else {
+                Ok(DSLExpr::Cast(Box::new(self.clone()), target))
+            }
+        } else {
+            Err(ArrowKernelError::InvalidCast(source, target))
         }
     }
 
@@ -1633,7 +1707,12 @@ impl DSLExpr {
                     _ => list,
                 }
             }
-            DSLExpr::Cast(v, pt) | DSLExpr::BitCast(v, pt) => match v.get_type() {
+            DSLExpr::Cast(v, target) => match v.get_type() {
+                DSLType::Block(_, rows) => DSLType::Block(Box::new(target.clone()), rows),
+                _ => target.clone(),
+            },
+            DSLExpr::ListMap(_, map) => map.output_type(),
+            DSLExpr::BitCast(v, pt) => match v.get_type() {
                 DSLType::Block(_, rows) => DSLType::Block(Box::new(DSLType::Primitive(*pt)), rows),
                 _ => DSLType::Primitive(*pt),
             },
@@ -1666,6 +1745,7 @@ impl DSLExpr {
             }
             DSLExpr::Value(_) | DSLExpr::Len(_) => {}
             DSLExpr::Cast(val, _)
+            | DSLExpr::ListMap(val, _)
             | DSLExpr::BitCast(val, _)
             | DSLExpr::CastToBool(val)
             | DSLExpr::Bswap(val)

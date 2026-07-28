@@ -1,10 +1,13 @@
 use arrow_array::{
     cast::AsArray,
     make_array,
-    types::{Int16Type, Int32Type, Int64Type, RunEndIndexType},
-    Array, ArrayRef, Datum, RunArray,
+    types::{
+        ArrowDictionaryKeyType, Int16Type, Int32Type, Int64Type, Int8Type, RunEndIndexType,
+        UInt16Type, UInt32Type, UInt64Type, UInt8Type,
+    },
+    Array, ArrayRef, Datum, DictionaryArray, RunArray,
 };
-use arrow_buffer::NullBuffer;
+use arrow_buffer::{ArrowNativeType, NullBuffer};
 use arrow_schema::DataType;
 
 use crate::{logical_nulls, ArrowKernelError};
@@ -23,6 +26,17 @@ pub fn has_any_nulls(arr: &dyn Array) -> bool {
         DataType::List(_) => has_any_nulls(arr.as_list::<i32>().values().as_ref()),
         DataType::LargeList(_) => has_any_nulls(arr.as_list::<i64>().values().as_ref()),
         DataType::FixedSizeList(_, _) => has_any_nulls(arr.as_fixed_size_list().values().as_ref()),
+        DataType::Dictionary(key_type, _) => match key_type.as_ref() {
+            DataType::Int8 => has_any_nulls(arr.as_dictionary::<Int8Type>().values().as_ref()),
+            DataType::Int16 => has_any_nulls(arr.as_dictionary::<Int16Type>().values().as_ref()),
+            DataType::Int32 => has_any_nulls(arr.as_dictionary::<Int32Type>().values().as_ref()),
+            DataType::Int64 => has_any_nulls(arr.as_dictionary::<Int64Type>().values().as_ref()),
+            DataType::UInt8 => has_any_nulls(arr.as_dictionary::<UInt8Type>().values().as_ref()),
+            DataType::UInt16 => has_any_nulls(arr.as_dictionary::<UInt16Type>().values().as_ref()),
+            DataType::UInt32 => has_any_nulls(arr.as_dictionary::<UInt32Type>().values().as_ref()),
+            DataType::UInt64 => has_any_nulls(arr.as_dictionary::<UInt64Type>().values().as_ref()),
+            _ => unreachable!("invalid dictionary key type"),
+        },
         DataType::RunEndEncoded(run_ends, _) => match run_ends.data_type() {
             DataType::Int16 => has_any_nulls(arr.as_run::<Int16Type>().values().as_ref()),
             DataType::Int32 => has_any_nulls(arr.as_run::<Int32Type>().values().as_ref()),
@@ -41,6 +55,47 @@ pub fn copy_selected_nulls(
     debug_assert_eq!(result.len(), indices.len());
 
     let result = match (source.data_type(), result.data_type()) {
+        (DataType::Dictionary(key_type, _), _) => match key_type.as_ref() {
+            DataType::Int8 => {
+                copy_dictionary_selected_nulls(source.as_dictionary::<Int8Type>(), result, indices)?
+            }
+            DataType::Int16 => copy_dictionary_selected_nulls(
+                source.as_dictionary::<Int16Type>(),
+                result,
+                indices,
+            )?,
+            DataType::Int32 => copy_dictionary_selected_nulls(
+                source.as_dictionary::<Int32Type>(),
+                result,
+                indices,
+            )?,
+            DataType::Int64 => copy_dictionary_selected_nulls(
+                source.as_dictionary::<Int64Type>(),
+                result,
+                indices,
+            )?,
+            DataType::UInt8 => copy_dictionary_selected_nulls(
+                source.as_dictionary::<UInt8Type>(),
+                result,
+                indices,
+            )?,
+            DataType::UInt16 => copy_dictionary_selected_nulls(
+                source.as_dictionary::<UInt16Type>(),
+                result,
+                indices,
+            )?,
+            DataType::UInt32 => copy_dictionary_selected_nulls(
+                source.as_dictionary::<UInt32Type>(),
+                result,
+                indices,
+            )?,
+            DataType::UInt64 => copy_dictionary_selected_nulls(
+                source.as_dictionary::<UInt64Type>(),
+                result,
+                indices,
+            )?,
+            _ => unreachable!("invalid dictionary key type"),
+        },
         (DataType::RunEndEncoded(run_ends, _), _) => match run_ends.data_type() {
             DataType::Int16 => {
                 copy_run_end_selected_nulls(source.as_run::<Int16Type>(), result, indices)?
@@ -124,6 +179,18 @@ pub fn copy_selected_nulls(
     Ok(replace_nulls(result, nulls))
 }
 
+fn copy_dictionary_selected_nulls<K: ArrowDictionaryKeyType>(
+    source: &DictionaryArray<K>,
+    result: ArrayRef,
+    indices: &[usize],
+) -> Result<ArrayRef, ArrowKernelError> {
+    let physical_indices = indices
+        .iter()
+        .map(|&index| source.keys().value(index).as_usize())
+        .collect::<Vec<_>>();
+    copy_selected_nulls(source.values().as_ref(), result, &physical_indices)
+}
+
 fn copy_run_end_selected_nulls<R: RunEndIndexType>(
     source: &RunArray<R>,
     result: ArrayRef,
@@ -187,15 +254,15 @@ mod tests {
     use arrow_array::{
         builder::{Int32Builder, ListBuilder},
         cast::AsArray,
-        types::{Int16Type, Int32Type},
-        DictionaryArray, Int16Array, Int32Array, RunArray, Scalar,
+        types::{Int16Type, Int32Type, UInt32Type},
+        DictionaryArray, Int16Array, Int32Array, RunArray, Scalar, UInt32Array,
     };
     use arrow_buffer::NullBuffer;
     use itertools::Itertools;
 
     use crate::compiled_kernels::null_utils::replace_nulls;
 
-    use super::{has_any_nulls, intersect_and_copy_nulls};
+    use super::{copy_selected_nulls, has_any_nulls, intersect_and_copy_nulls};
 
     #[test]
     fn test_has_any_nulls_checks_list_children() {
@@ -213,6 +280,34 @@ mod tests {
         let mut parent_null = ListBuilder::new(Int32Builder::new());
         parent_null.append(false);
         assert!(has_any_nulls(&parent_null.finish()));
+    }
+
+    #[test]
+    fn test_copy_selected_nulls_follows_dictionary_keys_into_lists() {
+        let mut source = ListBuilder::new(Int32Builder::new());
+        source.values().append_value(1);
+        source.values().append_null();
+        source.append(true);
+        source.append(false);
+        source.values().append_value(3);
+        source.append(true);
+        let source = DictionaryArray::<UInt32Type>::new(
+            UInt32Array::from(vec![2, 0, 1]),
+            Arc::new(source.finish()),
+        );
+
+        let mut result = ListBuilder::new(Int32Builder::new());
+        result.values().append_value(3);
+        result.append(true);
+        result.values().append_slice(&[1, 0]);
+        result.append(true);
+        result.append(true);
+
+        let actual = copy_selected_nulls(&source, Arc::new(result.finish()), &[0, 1, 2]).unwrap();
+        let expected = arrow_cast::cast(&source, &source.value_type()).unwrap();
+
+        assert_eq!(&actual, &expected);
+        assert!(has_any_nulls(&source));
     }
 
     #[test]
