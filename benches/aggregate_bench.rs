@@ -80,6 +80,34 @@ pub fn criterion_benchmark(c: &mut Criterion) {
             b.iter(|| black_box(arrow_arith::aggregate::max(black_box(&data))))
         });
     }
+
+    // sum over a dictionary layout: the JIT folds through the encoding; stock
+    // arrow has no dictionary sum, so it must decode (cast) first.
+    {
+        use arrow_array::{types::Int8Type, DictionaryArray, Int8Array};
+        use arrow_schema::DataType;
+        use std::sync::Arc;
+
+        let keys = Int8Array::from((0..10_000_000).map(|_| rng.i8(0..100)).collect_vec());
+        let values = Int32Array::from((0..100).map(|_| rng.i32(-1000..1000)).collect_vec());
+        let data = DictionaryArray::<Int8Type>::new(keys, Arc::new(values));
+
+        let ours = arrow_compile_compute::compute::sum(&data).unwrap();
+        let ours = ours.as_primitive::<Int32Type>().value(0);
+        let decoded = arrow_cast::cast(&data, &DataType::Int32).unwrap();
+        let theirs = arrow_arith::aggregate::sum(decoded.as_primitive::<Int32Type>()).unwrap();
+        assert_eq!(ours, theirs);
+
+        c.bench_function("compute::sum(dictionary(i8, i32)) 10m rows/llvm warm", |b| {
+            b.iter(|| black_box(arrow_compile_compute::compute::sum(black_box(&data)).unwrap()))
+        });
+        c.bench_function("compute::sum(dictionary(i8, i32)) 10m rows/arrow", |b| {
+            b.iter(|| {
+                let decoded = arrow_cast::cast(black_box(&data), &DataType::Int32).unwrap();
+                black_box(arrow_arith::aggregate::sum(decoded.as_primitive::<Int32Type>()))
+            })
+        });
+    }
 }
 
 criterion_group!(benches, criterion_benchmark);

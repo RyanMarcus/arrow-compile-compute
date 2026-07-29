@@ -718,12 +718,11 @@ pub mod compute {
     use arrow_array::{cast::AsArray, Array, ArrayRef, Datum, UInt64Array};
 
     use crate::{
-        compiled_kernels::{HashFunction, HashKernel, KernelCache},
+        compiled_kernels::{
+            HashFunction, HashKernel, KernelCache, ReductionKernel, ReductionKernelType,
+        },
         ArrowKernelError,
     };
-    // Re-exported so benchmarks can drive `Kernel::compile`/`call` directly and
-    // separate compile time from execution time (see `cmp::ComparisonKernel`).
-    pub use crate::compiled_kernels::{ReductionKernel, ReductionKernelType};
 
     static HASH_PROGRAM_CACHE: LazyLock<KernelCache<HashKernel>> = LazyLock::new(KernelCache::new);
     static REDUCTION_PROGRAM_CACHE: LazyLock<KernelCache<ReductionKernel>> =
@@ -1041,12 +1040,9 @@ pub mod arith {
     use arrow_array::{ArrayRef, Datum};
 
     use crate::{
-        compiled_kernels::{BinOpKernel, DSLArithBinOp, KernelCache},
+        compiled_kernels::{BinOpKernel, DSLArithBinOp, DSLUnaryOp, KernelCache, UnaryOpKernel},
         ArrowKernelError,
     };
-    // Re-exported so benchmarks can drive `Kernel::compile`/`call` directly and
-    // separate compile time from execution time (see `cmp::ComparisonKernel`).
-    pub use crate::compiled_kernels::{DSLUnaryOp, UnaryOpKernel};
 
     static BINOP_PROGRAM_CACHE: LazyLock<KernelCache<BinOpKernel>> =
         LazyLock::new(KernelCache::new);

@@ -14,7 +14,7 @@ class ReportTests(unittest.TestCase):
     def tearDown(self):
         self.temp_dir.cleanup()
 
-    def write_estimate(self, name, point, lower=None, upper=None):
+    def write_estimate(self, name, point, lower=None, upper=None, full_id=None):
         path = self.criterion_dir / name / "new" / "estimates.json"
         path.parent.mkdir(parents=True)
         with path.open("w") as fh:
@@ -30,8 +30,11 @@ class ReportTests(unittest.TestCase):
                 },
                 fh,
             )
+        if full_id is not None:
+            with (path.parent / "benchmark.json").open("w") as fh:
+                json.dump({"full_id": full_id}, fh)
 
-    def test_collects_nested_criterion_groups(self):
+    def test_pairs_warm_llvm_with_arrow_and_assigns_family(self):
         self.write_estimate(
             "select__take(fixed_size_list(bool, 1024), array(u64))/llvm warm", 10
         )
@@ -39,27 +42,70 @@ class ReportTests(unittest.TestCase):
             "select__take(fixed_size_list(bool, 1024), array(u64))/arrow", 20
         )
 
-        matrix, other, unpaired = report.collect(self.criterion_dir)
+        results, unpaired = report.collect(self.criterion_dir)
 
-        self.assertEqual([], matrix)
+        self.assertEqual(1, len(results))
+        row = results[0]
         self.assertEqual(
-            "select::take(fixed_size_list(bool, 1024), array(u64))",
-            other[0]["name"],
+            "select::take(fixed_size_list(bool, 1024), array(u64))", row["name"]
         )
+        self.assertEqual("Selection", row["family"])
+        self.assertEqual("arrow", row["baseline_kind"])
+        self.assertEqual("llvm-win", row["classification"])
         self.assertEqual({}, unpaired)
 
-    def test_preserves_function_underscores_and_recognizes_direct_calls(self):
+    def test_pairs_rust_reference_baseline(self):
+        self.write_estimate("vec__norm(fixed_size_list(f32, 768))/llvm warm", 10)
+        self.write_estimate("vec__norm(fixed_size_list(f32, 768))_rust reference", 30)
+
+        results, unpaired = report.collect(self.criterion_dir)
+
+        self.assertEqual(1, len(results))
+        row = results[0]
+        self.assertEqual("vec::norm(fixed_size_list(f32, 768))", row["name"])
+        self.assertEqual("Vector ops", row["family"])
+        self.assertEqual("reference", row["baseline_kind"])
+        self.assertEqual({}, unpaired)
+
+    def test_pairs_truncated_directories_via_full_id(self):
+        # Criterion truncates directory names to ~64 chars; the full benchmark
+        # id must come from benchmark.json or long llvm/arrow pairs never match.
+        long_name = "cmp::lt(run_end_encoded(i32, dictionary(i8, i64)), scalar(i64)) 1m rows"
+        self.write_estimate(
+            "cmp__lt(run_end_encoded(i32, dictionary(i8, i64)), scalar(i64)) ",
+            10,
+            full_id=f"{long_name}/llvm warm",
+        )
+        self.write_estimate(
+            "cmp__lt(run_end_encoded(i32, dictionary(i8, i64)), scalar(i64))_2",
+            20,
+            full_id=f"{long_name}/arrow",
+        )
+
+        results, unpaired = report.collect(self.criterion_dir)
+
+        self.assertEqual(1, len(results))
+        self.assertEqual(long_name, results[0]["name"])
+        self.assertEqual({}, unpaired)
+
+    def test_compile_phase_entries_stay_unpaired(self):
         self.write_estimate("sort__sort_to_indices(array(u64))_llvm compile", 100)
-        self.write_estimate("sort__sort_to_indices(array(u64))_llvm direct", 10)
+        self.write_estimate("sort__sort_to_indices(array(u64))_llvm warm", 10)
         self.write_estimate("sort__sort_to_indices(array(u64))_arrow", 20)
 
-        matrix, other, unpaired = report.collect(self.criterion_dir)
+        results, unpaired = report.collect(self.criterion_dir)
 
-        self.assertEqual([], other)
-        self.assertEqual("sort::sort_to_indices(array(u64))", matrix[0]["name"])
-        self.assertEqual({}, unpaired)
+        self.assertEqual(1, len(results))
+        self.assertEqual("sort::sort_to_indices(array(u64))", results[0]["name"])
+        self.assertEqual(
+            ["sort__sort_to_indices(array(u64))_llvm compile"], list(unpaired)
+        )
 
-    def test_verdict_requires_non_overlapping_intervals(self):
+    def test_verdict_equal_band_and_interval_bounds(self):
+        equal = report.verdict(
+            {"point": 100, "lower": 99, "upper": 101},
+            {"point": 102, "lower": 101, "upper": 103},
+        )
         llvm_win = report.verdict(
             {"point": 10, "lower": 9, "upper": 11},
             {"point": 20, "lower": 18, "upper": 22},
@@ -70,16 +116,32 @@ class ReportTests(unittest.TestCase):
         )
         overlap = report.verdict(
             {"point": 10, "lower": 9, "upper": 11},
-            {"point": 10.5, "lower": 9.5, "upper": 11.5},
+            {"point": 11, "lower": 9.5, "upper": 12.5},
         )
 
+        self.assertEqual("equal", equal[1])
         self.assertEqual("llvm-win", llvm_win[1])
         self.assertEqual("arrow-win", arrow_win[1])
         self.assertEqual("inconclusive", overlap[1])
 
+    def test_sorts_by_family_order_then_speedup(self):
+        self.write_estimate("vec__dot(a)/llvm warm", 10)
+        self.write_estimate("vec__dot(a)_rust reference", 40)
+        self.write_estimate("cmp__lt(slow)/llvm warm", 20)
+        self.write_estimate("cmp__lt(slow)/arrow", 10)
+        self.write_estimate("cmp__lt(fast)/llvm warm", 10)
+        self.write_estimate("cmp__lt(fast)/arrow", 20)
+
+        results, _ = report.collect(self.criterion_dir)
+
+        self.assertEqual(
+            ["cmp::lt(fast)", "cmp::lt(slow)", "vec::dot(a)"],
+            [row["name"] for row in results],
+        )
+
     def test_builds_serializable_report_data(self):
-        self.write_estimate("filter_llvm", 10)
-        self.write_estimate("filter_arrow", 20)
+        self.write_estimate("cmp__lt(array(i32), scalar(i32))/llvm warm", 10)
+        self.write_estimate("cmp__lt(array(i32), scalar(i32))/arrow", 20)
         manifest = {
             "revision": "abc1234",
             "dirty": False,
@@ -90,16 +152,17 @@ class ReportTests(unittest.TestCase):
 
         data = report.build_report_data(self.criterion_dir, manifest)
 
-        self.assertEqual(1, data["schema_version"])
+        self.assertEqual(2, data["schema_version"])
         self.assertEqual("abc1234", data["run"]["revision"])
-        self.assertEqual("llvm-win", data["other"][0]["classification"])
+        self.assertEqual(report.EQUAL_MARGIN, data["equal_margin"])
+        self.assertEqual("llvm-win", data["results"][0]["classification"])
         json.dumps(data)
 
     def test_rejects_duplicate_normalized_phase(self):
-        self.write_estimate("filter_llvm execute", 10)
-        self.write_estimate("filter/llvm_execute", 11)
+        self.write_estimate("filter_llvm warm", 10)
+        self.write_estimate("filter/llvm_warm", 11)
 
-        with self.assertRaisesRegex(ValueError, "duplicate execute result"):
+        with self.assertRaisesRegex(ValueError, "duplicate llvm result"):
             report.collect(self.criterion_dir)
 
     def test_rejects_incomplete_run_manifest(self):

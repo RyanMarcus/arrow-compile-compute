@@ -29,6 +29,30 @@ MANIFEST_NAME = "manifest.json"
 IMPL_RE = re.compile(r"(?<![a-z])(llvm|arrow)(?![a-z])")
 COMPILE_RE = re.compile(r"llvm[ _]compile")
 EXECUTE_RE = re.compile(r"llvm[ _](?:execute|direct|warm)")
+REFERENCE_RE = re.compile(r"rust[ _]reference")
+
+# Ratios within this margin count as "equal": a 2-4% difference is treated as
+# the same performance, per the reporting thresholds agreed for this suite.
+EQUAL_MARGIN = 1.03
+
+# Section order and display names, keyed by the public-API module prefix.
+FAMILIES = {
+    "cmp": "Comparisons",
+    "arith": "Arithmetic",
+    "compute": "Aggregations",
+    "cast": "Casts",
+    "select": "Selection",
+    "sort": "Sorting",
+    "vec": "Vector ops",
+}
+OTHER_FAMILY = "Other"
+
+
+def family_of(name):
+    match = re.match(r"([a-z_]+)::", name)
+    if match and match.group(1) in FAMILIES:
+        return FAMILIES[match.group(1)]
+    return OTHER_FAMILY
 
 
 def read_estimate(path):
@@ -42,6 +66,17 @@ def read_estimate(path):
     }
 
 
+def read_benchmark_name(estimates_path, criterion_dir):
+    """Prefer Criterion's recorded full_id: directory names are truncated to
+    ~64 characters, which mangles long benchmark ids and breaks pairing."""
+    metadata_path = estimates_path.parent / "benchmark.json"
+    if metadata_path.is_file():
+        with metadata_path.open() as fh:
+            return json.load(fh)["full_id"]
+    relative = estimates_path.relative_to(criterion_dir)
+    return "/".join(relative.parts[:-2])
+
+
 def normalize(value):
     # Criterion sanitizes "::" in a bench name to "__" in its directory name.
     value = value.replace("__", "::")
@@ -49,28 +84,43 @@ def normalize(value):
 
 
 def phase_and_base(name):
-    """Return (phase, base) where execute includes direct and warm JIT calls."""
+    """Return (phase, base, baseline_kind).
+
+    phase is "llvm", "baseline", or None (unpaired). Compile-phase entries from
+    older runs are deliberately unpaired: the suite now measures only warm
+    public-API calls.
+    """
     if COMPILE_RE.search(name):
-        return "compile", normalize(COMPILE_RE.sub("", name))
+        return None, None, None
     if EXECUTE_RE.search(name):
-        return "execute", normalize(EXECUTE_RE.sub("", name))
+        return "llvm", normalize(EXECUTE_RE.sub("", name)), None
+    if REFERENCE_RE.search(name):
+        return "baseline", normalize(REFERENCE_RE.sub("", name)), "reference"
     match = IMPL_RE.search(name)
     if not match:
-        return None, None
-    phase = "execute" if match.group(1) == "llvm" else "arrow"
-    return phase, normalize(IMPL_RE.sub("", name))
+        return None, None, None
+    if match.group(1) == "llvm":
+        return "llvm", normalize(IMPL_RE.sub("", name)), None
+    return "baseline", normalize(IMPL_RE.sub("", name)), "arrow"
 
 
-def verdict(execute, arrow):
-    """Classify the ratio conservatively from the two median confidence intervals."""
-    values = (*execute.values(), *arrow.values())
+def verdict(llvm, baseline):
+    """Classify the ratio: near-parity is "equal", then conservative CI bounds.
+
+    A point ratio within EQUAL_MARGIN counts as equal even when statistically
+    distinguishable — a 2-4% gap is not a meaningful difference here. Beyond
+    the margin, a win requires the median confidence intervals to not overlap.
+    """
+    values = (*llvm.values(), *baseline.values())
     if any(value <= 0 for value in values):
         raise ValueError("benchmark estimates must be positive")
 
-    speedup = arrow["point"] / execute["point"]
-    lower = arrow["lower"] / execute["upper"]
-    upper = arrow["upper"] / execute["lower"]
+    speedup = baseline["point"] / llvm["point"]
+    if max(speedup, 1.0 / speedup) <= EQUAL_MARGIN:
+        return speedup, "equal"
 
+    lower = baseline["lower"] / llvm["upper"]
+    upper = baseline["upper"] / llvm["lower"]
     if lower > 1.0:
         return speedup, "llvm-win"
     if upper < 1.0:
@@ -81,13 +131,13 @@ def verdict(execute, arrow):
 def collect(criterion_dir):
     criterion_dir = Path(criterion_dir)
     bench = {}
+    kinds = {}
     sources = {}
     unpaired = {}
 
     for path in criterion_dir.rglob("new/estimates.json"):
-        relative = path.relative_to(criterion_dir)
-        name = "/".join(relative.parts[:-2])
-        phase, base = phase_and_base(name)
+        name = read_benchmark_name(path, criterion_dir)
+        phase, base, baseline_kind = phase_and_base(name)
         estimate = read_estimate(path)
 
         if phase is None:
@@ -103,35 +153,43 @@ def collect(criterion_dir):
             )
         sources[key] = path
         bench.setdefault(base, {})[phase] = estimate
+        if baseline_kind is not None:
+            kinds[base] = baseline_kind
 
-    matrix = []
-    other = []
+    results = []
     for base, phases in bench.items():
-        if "execute" not in phases or "arrow" not in phases:
+        if "llvm" not in phases or "baseline" not in phases:
             for phase, estimate in phases.items():
                 unpaired[f"{base} ({phase})"] = estimate
             continue
 
-        speedup, result_class = verdict(phases["execute"], phases["arrow"])
-        row = {
-            "name": base,
-            "compile": phases.get("compile"),
-            "execute": phases["execute"],
-            "arrow": phases["arrow"],
-            "speedup": speedup,
-            "classification": result_class,
-        }
-        (matrix if "compile" in phases else other).append(row)
+        speedup, result_class = verdict(phases["llvm"], phases["baseline"])
+        results.append(
+            {
+                "name": base,
+                "family": family_of(base),
+                "baseline_kind": kinds[base],
+                "llvm": phases["llvm"],
+                "baseline": phases["baseline"],
+                "speedup": speedup,
+                "classification": result_class,
+            }
+        )
 
-    matrix.sort(key=lambda row: row["speedup"], reverse=True)
-    other.sort(key=lambda row: row["speedup"], reverse=True)
-    return matrix, other, unpaired
+    family_order = {name: index for index, name in enumerate(FAMILIES.values())}
+    results.sort(
+        key=lambda row: (
+            family_order.get(row["family"], len(family_order)),
+            -row["speedup"],
+        )
+    )
+    return results, unpaired
 
 
 def build_report_data(criterion_dir, manifest):
-    matrix, other, unpaired = collect(criterion_dir)
+    results, unpaired = collect(criterion_dir)
     return {
-        "schema_version": 1,
+        "schema_version": 2,
         "run": {
             "revision": manifest["revision"],
             "dirty": manifest["dirty"],
@@ -139,8 +197,8 @@ def build_report_data(criterion_dir, manifest):
             "completed_at": manifest["completed_at"],
             "commands": manifest["commands"],
         },
-        "matrix": matrix,
-        "other": other,
+        "equal_margin": EQUAL_MARGIN,
+        "results": results,
         "unpaired": [
             {"name": name, "estimate": estimate}
             for name, estimate in sorted(unpaired.items())

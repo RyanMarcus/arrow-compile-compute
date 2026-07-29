@@ -11,8 +11,10 @@
     --llvm-fg: #116329;
     --arrow-bg: #ffebe9;
     --arrow-fg: #a40e26;
-    --neutral-bg: #f6f8fa;
-    --neutral-fg: #57606a;
+    --equal-bg: #f6f8fa;
+    --equal-fg: #57606a;
+    --unclear-bg: #fff8c5;
+    --unclear-fg: #9a6700;
   }
   @media (prefers-color-scheme: dark) {
     :root {
@@ -20,8 +22,10 @@
       --llvm-fg: #56d364;
       --arrow-bg: #4c1822;
       --arrow-fg: #ff7b72;
-      --neutral-bg: #25292e;
-      --neutral-fg: #b1bac4;
+      --equal-bg: #25292e;
+      --equal-fg: #b1bac4;
+      --unclear-bg: #3a3017;
+      --unclear-fg: #e3b341;
     }
   }
   body {
@@ -36,7 +40,6 @@
   .error { color: #b3261e; font-weight: 600; }
   h2 { margin-top: 2.4rem; border-bottom: 1px solid #8884; padding-bottom: .3rem; }
   .count { font-size: .7em; color: #888; font-weight: normal; }
-  .sub { color: #888; margin-top: .2rem; }
   table { border-collapse: collapse; width: 100%; margin-top: .5rem; }
   th, td { text-align: left; padding: .35rem .6rem; border-bottom: 1px solid #8883; }
   th { font-size: .78em; text-transform: uppercase; letter-spacing: 0; color: #888; }
@@ -47,15 +50,15 @@
     text-align: right;
   }
   td.name { font-family: ui-monospace, monospace; }
-  td.compile { color: #9a6700; }
-  td.total { color: #888; }
   .badge { font-weight: 700; }
   tr.llvm-win { background: var(--llvm-bg); }
   tr.llvm-win td.badge { color: var(--llvm-fg); }
   tr.arrow-win { background: var(--arrow-bg); }
   tr.arrow-win td.badge { color: var(--arrow-fg); }
-  tr.inconclusive { background: var(--neutral-bg); }
-  tr.inconclusive td.badge { color: var(--neutral-fg); }
+  tr.equal { background: var(--equal-bg); }
+  tr.equal td.badge { color: var(--equal-fg); }
+  tr.inconclusive { background: var(--unclear-bg); }
+  tr.inconclusive td.badge { color: var(--unclear-fg); }
   details { margin-top: 2rem; }
   summary { cursor: pointer; color: #888; }
 </style>
@@ -63,31 +66,18 @@
 <body>
 <h1>JIT vs Arrow::compute Benchmark Results</h1>
 <p id="meta" class="meta">Loading benchmark results...</p>
-<p class="classification"><b>Classification:</b> A result is inconclusive when the LLVM and
-Arrow median 95% confidence intervals overlap; otherwise the faster interval is the winner.</p>
-<p class="classification"><b>LLVM timing:</b> <b>Warm</b> calls the public API after its kernel
-has been cached, so it includes cache lookup and dispatch but excludes compilation.
-<b>Direct</b> calls an already-compiled kernel with <code>Kernel::call</code>, excluding both
-compilation and cache lookup.</p>
+<p class="classification"><b>Timing:</b> every LLVM number is a warm public-API call — the
+kernel is already compiled and cached, so the timed loop pays cache lookup + dispatch +
+execution, never compilation. Baselines are stock arrow-rs kernels, except vector ops, which
+compare against hand-written Rust (arrow has no equivalent kernels). Encoded inputs the
+baseline cannot process directly (run-end encoded) are decoded first on the baseline side,
+since that is what a stock-arrow user must do.</p>
+<p class="classification"><b>Verdict:</b> ratios within <span id="margin">3%</span> are
+labeled <b>equal</b>. Beyond that, a win requires the two median 95% confidence intervals to
+not overlap; otherwise the row is <b>inconclusive</b>.</p>
 <p id="error" class="error" role="alert" hidden>Benchmark data unavailable.</p>
 
-<h2>Input matrix: compile vs direct call <span id="matrix-count" class="count"></span></h2>
-<p class="sub">The JIT pays <b>compile</b> once per kernel shape (LLVM IR-gen + JIT), then every
-<b>direct call</b> invokes that precompiled kernel without a cache lookup. <b>compile + direct</b>
-estimates compilation followed by one call. The verdict compares <b>direct</b> vs Arrow using
-conservative bounds derived from
-each median's 95% confidence interval.</p>
-<table>
-<thead><tr><th>benchmark</th><th class="numeric">llvm compile</th><th class="numeric" title="Call an already-compiled kernel directly, without compilation or a cache lookup.">llvm direct</th><th class="numeric">compile + direct</th><th class="numeric">arrow</th><th class="numeric">direct vs arrow</th></tr></thead>
-<tbody id="matrix-body"></tbody>
-</table>
-
-<h2>Other benchmarks: warm call vs Arrow <span id="other-count" class="count"></span></h2>
-<p class="sub">Cached public API calls where compile time is not measured separately.</p>
-<table>
-<thead><tr><th>benchmark</th><th class="numeric" title="Call the public API with a cached kernel; includes cache lookup and dispatch, but not compilation.">llvm warm</th><th class="numeric">arrow</th><th class="numeric">result</th></tr></thead>
-<tbody id="other-body"></tbody>
-</table>
+<div id="families"></div>
 
 <details>
 <summary id="unpaired-summary">Unpaired benchmarks</summary>
@@ -98,10 +88,11 @@ each median's 95% confidence interval.</p>
 </details>
 
 <script>
-  const RESULT_CLASSES = new Set(["llvm-win", "arrow-win", "inconclusive"]);
+  const RESULT_CLASSES = new Set(["llvm-win", "arrow-win", "equal", "inconclusive"]);
+  const BASELINE_LABELS = { arrow: "arrow", reference: "rust reference" };
 
   function formatTime(ns) {
-    const units = [["s", 1e9], ["ms", 1e6], ["\u00b5s", 1e3], ["ns", 1]];
+    const units = [["s", 1e9], ["ms", 1e6], ["µs", 1e3], ["ns", 1]];
     for (const [unit, scale] of units) {
       if (ns >= scale) {
         return `${Number((ns / scale).toPrecision(3))} ${unit}`;
@@ -119,36 +110,67 @@ each median's 95% confidence interval.</p>
 
   function resultText(result) {
     if (result.classification === "llvm-win") {
-      return `LLVM ${result.speedup.toFixed(2)}\u00d7 faster`;
+      return `LLVM ${result.speedup.toFixed(2)}× faster`;
     }
     if (result.classification === "arrow-win") {
-      return `Arrow ${(1 / result.speedup).toFixed(2)}\u00d7 faster`;
+      return `Baseline ${(1 / result.speedup).toFixed(2)}× faster`;
+    }
+    if (result.classification === "equal") {
+      return "Equal";
     }
     return "Inconclusive";
   }
 
-  function addResultRow(body, result, matrix) {
-    const row = document.createElement("tr");
-    if (!RESULT_CLASSES.has(result.classification)) {
-      throw new Error(`Unknown result classification: ${result.classification}`);
+  function renderFamily(container, family, rows) {
+    const kinds = new Set(rows.map((row) => row.baseline_kind));
+    const baselineLabel = kinds.size === 1
+      ? BASELINE_LABELS[[...kinds][0]]
+      : "baseline";
+
+    const heading = document.createElement("h2");
+    heading.textContent = `${family} `;
+    const count = document.createElement("span");
+    count.className = "count";
+    count.textContent = rows.length;
+    heading.appendChild(count);
+    container.appendChild(heading);
+
+    const table = document.createElement("table");
+    const thead = document.createElement("thead");
+    const headRow = document.createElement("tr");
+    for (const [label, cls] of [
+      ["benchmark", ""],
+      ["llvm warm", "numeric"],
+      [baselineLabel, "numeric"],
+      ["result", "numeric"],
+    ]) {
+      const th = document.createElement("th");
+      th.textContent = label;
+      if (cls) th.className = cls;
+      headRow.appendChild(th);
     }
-    row.className = result.classification;
-    addCell(row, result.name, ["name"]);
-    if (matrix) {
-      const compile = result.compile.point;
-      addCell(row, formatTime(compile), ["num", "compile"]);
-      addCell(row, formatTime(result.execute.point), ["num"]);
-      addCell(row, formatTime(compile + result.execute.point), ["num", "total"]);
-    } else {
-      addCell(row, formatTime(result.execute.point), ["num"]);
-    }
-    addCell(row, formatTime(result.arrow.point), ["num"]);
-    addCell(row, resultText(result), ["num", "badge"]);
-    body.appendChild(row);
+    thead.appendChild(headRow);
+    table.appendChild(thead);
+
+    const tbody = document.createElement("tbody");
+    rows.forEach((result) => {
+      if (!RESULT_CLASSES.has(result.classification)) {
+        throw new Error(`Unknown result classification: ${result.classification}`);
+      }
+      const row = document.createElement("tr");
+      row.className = result.classification;
+      addCell(row, result.name, ["name"]);
+      addCell(row, formatTime(result.llvm.point), ["num"]);
+      addCell(row, formatTime(result.baseline.point), ["num"]);
+      addCell(row, resultText(result), ["num", "badge"]);
+      tbody.appendChild(row);
+    });
+    table.appendChild(tbody);
+    container.appendChild(table);
   }
 
   function render(data) {
-    if (data.schema_version !== 1) {
+    if (data.schema_version !== 2) {
       throw new Error(`Unsupported report schema: ${data.schema_version}`);
     }
 
@@ -156,16 +178,22 @@ each median's 95% confidence interval.</p>
     document.getElementById("meta").textContent =
       `Criterion medians from revision ${data.run.revision}${dirty}. ` +
       `Run completed ${data.run.completed_at}. Lower is better.`;
+    document.getElementById("margin").textContent =
+      `${Math.round((data.equal_margin - 1) * 100)}%`;
 
-    document.getElementById("matrix-count").textContent = data.matrix.length;
-    document.getElementById("other-count").textContent = data.other.length;
-    const matrixBody = document.getElementById("matrix-body");
-    const otherBody = document.getElementById("other-body");
-    data.matrix.forEach((result) => addResultRow(matrixBody, result, true));
-    data.other.forEach((result) => addResultRow(otherBody, result, false));
+    const families = new Map();
+    data.results.forEach((result) => {
+      if (!families.has(result.family)) {
+        families.set(result.family, []);
+      }
+      families.get(result.family).push(result);
+    });
+
+    const container = document.getElementById("families");
+    families.forEach((rows, family) => renderFamily(container, family, rows));
 
     document.getElementById("unpaired-summary").textContent =
-      `Unpaired benchmarks (${data.unpaired.length}) - no Arrow comparison or incomplete pair`;
+      `Unpaired benchmarks (${data.unpaired.length}) - no baseline comparison or incomplete pair`;
     const unpairedBody = document.getElementById("unpaired-body");
     data.unpaired.forEach((result) => {
       const row = document.createElement("tr");
