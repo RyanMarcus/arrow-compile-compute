@@ -35,10 +35,10 @@ pub fn criterion_benchmark(c: &mut Criterion) {
         our_res.as_primitive::<Int32Type>()
     );
 
-    c.bench_function("concat i32/arrow", |b| {
+    c.bench_function("select::concat(array(i32) x10)/arrow", |b| {
         b.iter(|| black_box(arrow_select::concat::concat(&to_concat_refs).unwrap()));
     });
-    c.bench_function("concat i32/llvm", |b| {
+    c.bench_function("select::concat(array(i32) x10)/llvm warm", |b| {
         b.iter(|| black_box(arrow_compile_compute::select::concat(&to_concat_refs).unwrap()));
     });
 
@@ -61,19 +61,37 @@ pub fn criterion_benchmark(c: &mut Criterion) {
     }
     let to_concat_refs = to_concat.iter().map(|x| x as &dyn Array).collect_vec();
 
-    c.bench_function("concat cast i32/arrow", |b| {
-        b.iter(|| {
-            let arrs = to_concat
-                .iter()
-                .map(|x| arrow_cast::cast(x, &DataType::Int32).unwrap())
-                .collect_vec();
-            let refs = arrs.iter().map(|x| x as &dyn Array).collect_vec();
-            black_box(arrow_select::concat::concat(&refs).unwrap());
-        });
-    });
-    c.bench_function("concat cast i32/llvm", |b| {
-        b.iter(|| black_box(arrow_compile_compute::select::concat(&to_concat_refs).unwrap()));
-    });
+    let arrow_inputs = to_concat
+        .iter()
+        .map(|x| arrow_cast::cast(x, &DataType::Int32).unwrap())
+        .collect_vec();
+    let arrow_input_refs = arrow_inputs.iter().map(|x| x as &dyn Array).collect_vec();
+    let arrow_res = arrow_select::concat::concat(&arrow_input_refs).unwrap();
+    let our_res = arrow_compile_compute::select::concat(&to_concat_refs).unwrap();
+    assert_eq!(
+        arrow_res.as_primitive::<Int32Type>(),
+        our_res.as_primitive::<Int32Type>()
+    );
+
+    c.bench_function(
+        "select::concat(array(i32) x5, dictionary(i8, i32) x5)/arrow",
+        |b| {
+            b.iter(|| {
+                let arrs = to_concat
+                    .iter()
+                    .map(|x| arrow_cast::cast(x, &DataType::Int32).unwrap())
+                    .collect_vec();
+                let refs = arrs.iter().map(|x| x as &dyn Array).collect_vec();
+                black_box(arrow_select::concat::concat(&refs).unwrap());
+            });
+        },
+    );
+    c.bench_function(
+        "select::concat(array(i32) x5, dictionary(i8, i32) x5)/llvm warm",
+        |b| {
+            b.iter(|| black_box(arrow_compile_compute::select::concat(&to_concat_refs).unwrap()));
+        },
+    );
 
     let list_size = 8;
     let rows_per_array = 1_000_000;
@@ -92,12 +110,15 @@ pub fn criterion_benchmark(c: &mut Criterion) {
         our_res.as_fixed_size_list().values().as_boolean()
     );
 
-    c.bench_function("concat fixed bool[8]/arrow", |b| {
+    c.bench_function("select::concat(fixed_size_list(bool, 8) x2)/arrow", |b| {
         b.iter(|| black_box(arrow_select::concat::concat(&to_concat_refs).unwrap()));
     });
-    c.bench_function("concat fixed bool[8]/llvm", |b| {
-        b.iter(|| black_box(arrow_compile_compute::select::concat(&to_concat_refs).unwrap()));
-    });
+    c.bench_function(
+        "select::concat(fixed_size_list(bool, 8) x2)/llvm warm",
+        |b| {
+            b.iter(|| black_box(arrow_compile_compute::select::concat(&to_concat_refs).unwrap()));
+        },
+    );
 
     let bools = (0..to_concat
         .iter()
@@ -105,7 +126,7 @@ pub fn criterion_benchmark(c: &mut Criterion) {
         .sum::<usize>())
         .map(|idx| idx % 3 == 0)
         .collect_vec();
-    c.bench_function("boolean array from Vec<bool>", |b| {
+    c.bench_function("BooleanArray::from(Vec(bool))/rust batched", |b| {
         b.iter_batched(
             || black_box(bools.clone()),
             |bools| black_box(BooleanArray::from(bools)),
@@ -117,7 +138,7 @@ pub fn criterion_benchmark(c: &mut Criterion) {
         .iter()
         .map(|value| if *value { 1_u8 } else { 0_u8 })
         .collect_vec();
-    c.bench_function("fixed bool writer byte materialize", |b| {
+    c.bench_function("BooleanArray::from(Vec(u8) mapped to bool)/rust", |b| {
         b.iter(|| {
             let bools = black_box(&bytes)
                 .iter()

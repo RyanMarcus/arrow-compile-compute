@@ -4,7 +4,7 @@ use arrow_array::{
     types::Float32Type,
     Datum, Float32Array, Scalar,
 };
-use criterion::{black_box, criterion_group, criterion_main, BenchmarkId, Criterion};
+use criterion::{black_box, criterion_group, criterion_main, Criterion};
 
 const NN_VALUES: usize = 256;
 const NN_DIMS: usize = 8;
@@ -16,6 +16,62 @@ fn make_vec_array(values: &[[f32; NN_DIMS]]) -> arrow_array::FixedSizeListArray 
         builder.append(true);
     }
     builder.finish()
+}
+
+fn dot_reference(
+    query: &Scalar<arrow_array::FixedSizeListArray>,
+    values: &arrow_array::FixedSizeListArray,
+) -> Float32Array {
+    let query = query.get().0;
+    let query = query.as_fixed_size_list().value(0);
+    let query = query.as_primitive::<Float32Type>();
+    Float32Array::from(
+        values
+            .iter()
+            .map(|value| {
+                value.map(|value| {
+                    value
+                        .as_primitive::<Float32Type>()
+                        .values()
+                        .iter()
+                        .zip(query.values().iter())
+                        .map(|(a, b)| a * b)
+                        .sum::<f32>()
+                })
+            })
+            .collect::<Vec<_>>(),
+    )
+}
+
+fn norm_reference(values: &arrow_array::FixedSizeListArray) -> arrow_array::FixedSizeListArray {
+    let mut builder = FixedSizeListBuilder::new(Float32Builder::new(), values.value_length());
+    for value in values.iter() {
+        match value {
+            Some(value) => {
+                let value = value.as_primitive::<Float32Type>();
+                let norm = value.values().iter().map(|x| x.powi(2)).sum::<f32>().sqrt();
+                value
+                    .values()
+                    .iter()
+                    .map(|x| x / norm)
+                    .for_each(|x| builder.values().append_value(x));
+                builder.append(true);
+            }
+            None => builder.append(false),
+        }
+    }
+    builder.finish()
+}
+
+fn assert_f32_close(actual: &Float32Array, expected: &Float32Array) {
+    assert_eq!(actual.len(), expected.len());
+    for (idx, (actual, expected)) in actual.values().iter().zip(expected.values()).enumerate() {
+        let tolerance = 1e-3 * expected.abs().max(1.0);
+        assert!(
+            (actual - expected).abs() <= tolerance,
+            "value {idx} differs: actual={actual}, expected={expected}"
+        );
+    }
 }
 
 fn make_query(query: [f32; NN_DIMS]) -> Scalar<arrow_array::FixedSizeListArray> {
@@ -95,11 +151,11 @@ pub fn criterion_benchmark(c: &mut Criterion) {
         }
         let vecs = vecs.finish();
 
-        c.bench_with_input(
-            BenchmarkId::new("norm/llvm-short", format!("16384x{dims}")),
-            &vecs,
-            |b, vecs| b.iter(|| arrow_compile_compute::vec::norm(vecs).unwrap()),
-        );
+        let benchmark_name =
+            format!("vec::norm(fixed_size_list(f32, {dims})) 16384 rows/llvm warm");
+        c.bench_function(&benchmark_name, |b| {
+            b.iter(|| arrow_compile_compute::vec::norm(&vecs).unwrap())
+        });
     }
 
     {
@@ -119,60 +175,44 @@ pub fn criterion_benchmark(c: &mut Criterion) {
         q.append(true);
         let q = Scalar::new(q.finish());
 
-        c.bench_function("dot/llvm", |b| {
+        let dot_ours = arrow_compile_compute::vec::dot(&q, &vecs).unwrap();
+        let dot_expected = dot_reference(&q, &vecs);
+        assert_f32_close(dot_ours.as_primitive::<Float32Type>(), &dot_expected);
+
+        let norm_ours = arrow_compile_compute::vec::norm(&vecs).unwrap();
+        let (norm_ours, is_scalar) = norm_ours.get();
+        assert!(!is_scalar);
+        let norm_ours = norm_ours
+            .as_fixed_size_list()
+            .values()
+            .as_primitive::<Float32Type>();
+        let norm_expected = norm_reference(&vecs);
+        assert_f32_close(
+            norm_ours,
+            norm_expected.values().as_primitive::<Float32Type>(),
+        );
+
+        c.bench_function(
+            "vec::dot(scalar(fixed_size_list(f32, 768)), fixed_size_list(f32, 768)) 16384 rows/llvm warm",
+            |b| {
             b.iter(|| arrow_compile_compute::vec::dot(&q, &vecs).unwrap())
-        });
+            },
+        );
 
-        c.bench_function("dot/arrow", |b| {
-            b.iter(|| {
-                let q = q.get().0;
-                let q = q.as_fixed_size_list().value(0);
-                let q_v = q.as_primitive::<Float32Type>();
-                let mut f32b = Float32Builder::new();
-                for el in vecs.iter() {
-                    match el {
-                        Some(v) => {
-                            let res: f32 = v
-                                .as_primitive::<Float32Type>()
-                                .values()
-                                .iter()
-                                .zip(q_v.values().iter())
-                                .map(|(a, b)| a * b)
-                                .sum();
-                            f32b.append_value(res);
-                        }
-                        None => f32b.append_null(),
-                    }
-                }
-                f32b.finish()
-            })
-        });
+        c.bench_function(
+            "vec::dot(scalar(fixed_size_list(f32, 768)), fixed_size_list(f32, 768)) 16384 rows/rust reference",
+            |b| b.iter(|| dot_reference(&q, &vecs)),
+        );
 
-        c.bench_function("norm/llvm", |b| {
-            b.iter(|| arrow_compile_compute::vec::norm(&vecs).unwrap())
-        });
+        c.bench_function(
+            "vec::norm(fixed_size_list(f32, 768)) 16384 rows/llvm warm",
+            |b| b.iter(|| arrow_compile_compute::vec::norm(&vecs).unwrap()),
+        );
 
-        c.bench_function("norm/arrow", |b| {
-            b.iter(|| {
-                let mut b = FixedSizeListBuilder::new(Float32Builder::new(), vecs.value_length());
-                for el in vecs.iter() {
-                    match el {
-                        Some(v) => {
-                            let v = v.as_primitive::<Float32Type>();
-                            let norm = v.values().iter().map(|x| x.powi(2)).sum::<f32>().sqrt();
-                            v.values()
-                                .iter()
-                                .map(|x| x / norm)
-                                .for_each(|x| b.values().append_value(x));
-
-                            b.append(true);
-                        }
-                        None => b.append(false),
-                    }
-                }
-                b.finish()
-            })
-        });
+        c.bench_function(
+            "vec::norm(fixed_size_list(f32, 768)) 16384 rows/rust reference",
+            |b| b.iter(|| norm_reference(&vecs)),
+        );
     }
 
     {
@@ -211,7 +251,9 @@ pub fn criterion_benchmark(c: &mut Criterion) {
             assert_eq!(expected, avx512_expected);
         }
 
-        c.bench_function("nearest_neighbor 256x8/llvm-dsl", |b| {
+        c.bench_function(
+            "vec::nearest_neighbor(scalar(fixed_size_list(f32, 8)), fixed_size_list(f32, 8), array(f32)) 256 rows/llvm warm",
+            |b| {
             b.iter(|| {
                 black_box(
                     arrow_compile_compute::vec::nearest_neighbor(
@@ -222,11 +264,14 @@ pub fn criterion_benchmark(c: &mut Criterion) {
                     .unwrap(),
                 )
             })
-        });
+            },
+        );
 
         #[cfg(target_arch = "x86_64")]
         if std::arch::is_x86_feature_detected!("avx512f") {
-            c.bench_function("nearest_neighbor 256x8/manual-avx512", |b| {
+            c.bench_function(
+                "nearest_neighbor_avx512_f32x8_256(fixed_array(f32, 8), slice(f32), slice(f32))/manual avx512",
+                |b| {
                 b.iter(|| unsafe {
                     black_box(nearest_neighbor_avx512_f32x8_256(
                         black_box(&query),
@@ -234,7 +279,8 @@ pub fn criterion_benchmark(c: &mut Criterion) {
                         black_box(value_squared_norms.values()),
                     ))
                 })
-            });
+                },
+            );
         }
     }
 }

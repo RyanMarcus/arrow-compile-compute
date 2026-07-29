@@ -1,14 +1,14 @@
-//! Input-combination matrix, with the JIT cost split into compile vs execute.
+//! Input-combination matrix, with the JIT cost split into compile vs direct call.
 //!
 //! For every (operator, input layout) we emit three Criterion benchmarks:
 //!   * `<name>/llvm compile` — `Kernel::compile`, the one-time LLVM IR-gen + JIT
 //!     cost (paid once per kernel shape, then cached forever).
-//!   * `<name>/llvm execute` — `Kernel::call` on an already-compiled kernel: the
+//!   * `<name>/llvm direct`  — `Kernel::call` on an already-compiled kernel: the
 //!     warm, steady-state cost.
 //!   * `<name>/arrow`        — the equivalent stock arrow-rs kernel.
 //!
-//! Benchmark names use arrow-rs function names (`cmp::lt`, `numeric::neg_wrapping`,
-//! `aggregate::sum`) plus the input layout, e.g. `cmp::lt i32 dict-scalar`.
+//! Benchmark names use this crate's public function names plus argument types, e.g.
+//! `cmp::lt(dictionary(i32, i32), scalar(i32))`.
 //!
 //! For dictionary inputs the JIT reads the encoding directly; the arrow path must
 //! first decode (`arrow_cast::cast` to a primitive), which is the honest arrow way
@@ -17,7 +17,7 @@
 use std::sync::Arc;
 
 use arrow_array::{
-    cast::AsArray, types::Int32Type, Array, DictionaryArray, Datum, Int32Array, StringArray,
+    cast::AsArray, types::Int32Type, Array, Datum, DictionaryArray, Int32Array, StringArray,
 };
 use arrow_compile_compute::{
     arith::{DSLUnaryOp, UnaryOpKernel},
@@ -60,14 +60,18 @@ pub fn criterion_benchmark(c: &mut Criterion) {
             arrow_compile_compute::cmp::lt(da, db).unwrap(),
             arrow_ord::cmp::lt(da, db).unwrap()
         );
-        c.bench_function("cmp::lt i32 array-array/llvm compile", |be| {
-            be.iter(|| black_box(ComparisonKernel::compile(&(da, db), Predicate::Lt).unwrap()))
-        });
+        c.bench_function(
+            "cmp::lt(array(i32), array(i32)) 1m rows/llvm compile",
+            |be| {
+                be.iter(|| black_box(ComparisonKernel::compile(&(da, db), Predicate::Lt).unwrap()))
+            },
+        );
         let k = ComparisonKernel::compile(&(da, db), Predicate::Lt).unwrap();
-        c.bench_function("cmp::lt i32 array-array/llvm execute", |be| {
-            be.iter(|| black_box(k.call((da, db)).unwrap()))
-        });
-        c.bench_function("cmp::lt i32 array-array/arrow", |be| {
+        c.bench_function(
+            "cmp::lt(array(i32), array(i32)) 1m rows/llvm direct",
+            |be| be.iter(|| black_box(k.call((da, db)).unwrap())),
+        );
+        c.bench_function("cmp::lt(array(i32), array(i32)) 1m rows/arrow", |be| {
             be.iter(|| black_box(arrow_ord::cmp::lt(da, db).unwrap()))
         });
     }
@@ -77,14 +81,18 @@ pub fn criterion_benchmark(c: &mut Criterion) {
             arrow_compile_compute::cmp::lt(da, ds).unwrap(),
             arrow_ord::cmp::lt(da, ds).unwrap()
         );
-        c.bench_function("cmp::lt i32 array-scalar/llvm compile", |be| {
-            be.iter(|| black_box(ComparisonKernel::compile(&(da, ds), Predicate::Lt).unwrap()))
-        });
+        c.bench_function(
+            "cmp::lt(array(i32), scalar(i32)) 1m rows/llvm compile",
+            |be| {
+                be.iter(|| black_box(ComparisonKernel::compile(&(da, ds), Predicate::Lt).unwrap()))
+            },
+        );
         let k = ComparisonKernel::compile(&(da, ds), Predicate::Lt).unwrap();
-        c.bench_function("cmp::lt i32 array-scalar/llvm execute", |be| {
-            be.iter(|| black_box(k.call((da, ds)).unwrap()))
-        });
-        c.bench_function("cmp::lt i32 array-scalar/arrow", |be| {
+        c.bench_function(
+            "cmp::lt(array(i32), scalar(i32)) 1m rows/llvm direct",
+            |be| be.iter(|| black_box(k.call((da, ds)).unwrap())),
+        );
+        c.bench_function("cmp::lt(array(i32), scalar(i32)) 1m rows/arrow", |be| {
             be.iter(|| black_box(arrow_ord::cmp::lt(da, ds).unwrap()))
         });
     }
@@ -94,16 +102,21 @@ pub fn criterion_benchmark(c: &mut Criterion) {
             arrow_compile_compute::cmp::lt(dd, ds).unwrap(),
             arrow_ord::cmp::lt(dd, ds).unwrap()
         );
-        c.bench_function("cmp::lt i32 dict-scalar/llvm compile", |be| {
-            be.iter(|| black_box(ComparisonKernel::compile(&(dd, ds), Predicate::Lt).unwrap()))
-        });
+        c.bench_function(
+            "cmp::lt(dictionary(i32, i32), scalar(i32)) 1m rows/llvm compile",
+            |be| {
+                be.iter(|| black_box(ComparisonKernel::compile(&(dd, ds), Predicate::Lt).unwrap()))
+            },
+        );
         let k = ComparisonKernel::compile(&(dd, ds), Predicate::Lt).unwrap();
-        c.bench_function("cmp::lt i32 dict-scalar/llvm execute", |be| {
-            be.iter(|| black_box(k.call((dd, ds)).unwrap()))
-        });
-        c.bench_function("cmp::lt i32 dict-scalar/arrow", |be| {
-            be.iter(|| black_box(arrow_ord::cmp::lt(dd, ds).unwrap()))
-        });
+        c.bench_function(
+            "cmp::lt(dictionary(i32, i32), scalar(i32)) 1m rows/llvm direct",
+            |be| be.iter(|| black_box(k.call((dd, ds)).unwrap())),
+        );
+        c.bench_function(
+            "cmp::lt(dictionary(i32, i32), scalar(i32)) 1m rows/arrow",
+            |be| be.iter(|| black_box(arrow_ord::cmp::lt(dd, ds).unwrap())),
+        );
     }
     {
         let (dsa, dsb): (&dyn Datum, &dyn Datum) = (&sa, &sb);
@@ -111,14 +124,20 @@ pub fn criterion_benchmark(c: &mut Criterion) {
             arrow_compile_compute::cmp::lt(dsa, dsb).unwrap(),
             arrow_ord::cmp::lt(dsa, dsb).unwrap()
         );
-        c.bench_function("cmp::lt utf8 array-array/llvm compile", |be| {
-            be.iter(|| black_box(ComparisonKernel::compile(&(dsa, dsb), Predicate::Lt).unwrap()))
-        });
+        c.bench_function(
+            "cmp::lt(array(utf8), array(utf8)) 1m rows/llvm compile",
+            |be| {
+                be.iter(|| {
+                    black_box(ComparisonKernel::compile(&(dsa, dsb), Predicate::Lt).unwrap())
+                })
+            },
+        );
         let k = ComparisonKernel::compile(&(dsa, dsb), Predicate::Lt).unwrap();
-        c.bench_function("cmp::lt utf8 array-array/llvm execute", |be| {
-            be.iter(|| black_box(k.call((dsa, dsb)).unwrap()))
-        });
-        c.bench_function("cmp::lt utf8 array-array/arrow", |be| {
+        c.bench_function(
+            "cmp::lt(array(utf8), array(utf8)) 1m rows/llvm direct",
+            |be| be.iter(|| black_box(k.call((dsa, dsb)).unwrap())),
+        );
+        c.bench_function("cmp::lt(array(utf8), array(utf8)) 1m rows/arrow", |be| {
             be.iter(|| black_box(arrow_ord::cmp::lt(dsa, dsb).unwrap()))
         });
     }
@@ -130,14 +149,16 @@ pub fn criterion_benchmark(c: &mut Criterion) {
             &arrow_compile_compute::arith::neg_wrapping(d).unwrap(),
             &arrow_arith::numeric::neg_wrapping(&a).unwrap(),
         );
-        c.bench_function("numeric::neg_wrapping i32 array/llvm compile", |be| {
-            be.iter(|| black_box(UnaryOpKernel::compile(&d, DSLUnaryOp::Neg).unwrap()))
-        });
+        c.bench_function(
+            "arith::neg_wrapping(array(i32)) 1m rows/llvm compile",
+            |be| be.iter(|| black_box(UnaryOpKernel::compile(&d, DSLUnaryOp::Neg).unwrap())),
+        );
         let k = UnaryOpKernel::compile(&d, DSLUnaryOp::Neg).unwrap();
-        c.bench_function("numeric::neg_wrapping i32 array/llvm execute", |be| {
-            be.iter(|| black_box(k.call(d).unwrap()))
-        });
-        c.bench_function("numeric::neg_wrapping i32 array/arrow", |be| {
+        c.bench_function(
+            "arith::neg_wrapping(array(i32)) 1m rows/llvm direct",
+            |be| be.iter(|| black_box(k.call(d).unwrap())),
+        );
+        c.bench_function("arith::neg_wrapping(array(i32)) 1m rows/arrow", |be| {
             be.iter(|| black_box(arrow_arith::numeric::neg_wrapping(&a).unwrap()))
         });
     }
@@ -149,19 +170,24 @@ pub fn criterion_benchmark(c: &mut Criterion) {
             &arrow_compile_compute::arith::neg_wrapping(d).unwrap(),
             &arrow_arith::numeric::neg_wrapping(&decoded).unwrap(),
         );
-        c.bench_function("numeric::neg_wrapping i32 dict/llvm compile", |be| {
-            be.iter(|| black_box(UnaryOpKernel::compile(&d, DSLUnaryOp::Neg).unwrap()))
-        });
+        c.bench_function(
+            "arith::neg_wrapping(dictionary(i32, i32)) 1m rows/llvm compile",
+            |be| be.iter(|| black_box(UnaryOpKernel::compile(&d, DSLUnaryOp::Neg).unwrap())),
+        );
         let k = UnaryOpKernel::compile(&d, DSLUnaryOp::Neg).unwrap();
-        c.bench_function("numeric::neg_wrapping i32 dict/llvm execute", |be| {
-            be.iter(|| black_box(k.call(d).unwrap()))
-        });
-        c.bench_function("numeric::neg_wrapping i32 dict/arrow", |be| {
-            be.iter(|| {
-                let decoded = arrow_cast::cast(&dict, &DataType::Int32).unwrap();
-                black_box(arrow_arith::numeric::neg_wrapping(&decoded).unwrap())
-            })
-        });
+        c.bench_function(
+            "arith::neg_wrapping(dictionary(i32, i32)) 1m rows/llvm direct",
+            |be| be.iter(|| black_box(k.call(d).unwrap())),
+        );
+        c.bench_function(
+            "arith::neg_wrapping(dictionary(i32, i32)) 1m rows/arrow",
+            |be| {
+                be.iter(|| {
+                    let decoded = arrow_cast::cast(&dict, &DataType::Int32).unwrap();
+                    black_box(arrow_arith::numeric::neg_wrapping(&decoded).unwrap())
+                })
+            },
+        );
     }
 
     // ---- aggregate::sum ----------------------------------------------------
@@ -171,14 +197,14 @@ pub fn criterion_benchmark(c: &mut Criterion) {
             &arrow_compile_compute::compute::sum(d).unwrap(),
             &Int32Array::from(vec![arrow_arith::aggregate::sum(&a).unwrap()]),
         );
-        c.bench_function("aggregate::sum i32 array/llvm compile", |be| {
+        c.bench_function("compute::sum(array(i32)) 1m rows/llvm compile", |be| {
             be.iter(|| black_box(ReductionKernel::compile(&d, ReductionKernelType::Sum).unwrap()))
         });
         let k = ReductionKernel::compile(&d, ReductionKernelType::Sum).unwrap();
-        c.bench_function("aggregate::sum i32 array/llvm execute", |be| {
+        c.bench_function("compute::sum(array(i32)) 1m rows/llvm direct", |be| {
             be.iter(|| black_box(k.call(d).unwrap()))
         });
-        c.bench_function("aggregate::sum i32 array/arrow", |be| {
+        c.bench_function("compute::sum(array(i32)) 1m rows/arrow", |be| {
             be.iter(|| black_box(arrow_arith::aggregate::sum(&a).unwrap()))
         });
     }
@@ -191,14 +217,20 @@ pub fn criterion_benchmark(c: &mut Criterion) {
             &arrow_compile_compute::compute::sum(d).unwrap(),
             &Int32Array::from(vec![arrow_arith::aggregate::sum(decoded_i32).unwrap()]),
         );
-        c.bench_function("aggregate::sum i32 dict/llvm compile", |be| {
-            be.iter(|| black_box(ReductionKernel::compile(&d, ReductionKernelType::Sum).unwrap()))
-        });
+        c.bench_function(
+            "compute::sum(dictionary(i32, i32)) 1m rows/llvm compile",
+            |be| {
+                be.iter(|| {
+                    black_box(ReductionKernel::compile(&d, ReductionKernelType::Sum).unwrap())
+                })
+            },
+        );
         let k = ReductionKernel::compile(&d, ReductionKernelType::Sum).unwrap();
-        c.bench_function("aggregate::sum i32 dict/llvm execute", |be| {
-            be.iter(|| black_box(k.call(d).unwrap()))
-        });
-        c.bench_function("aggregate::sum i32 dict/arrow", |be| {
+        c.bench_function(
+            "compute::sum(dictionary(i32, i32)) 1m rows/llvm direct",
+            |be| be.iter(|| black_box(k.call(d).unwrap())),
+        );
+        c.bench_function("compute::sum(dictionary(i32, i32)) 1m rows/arrow", |be| {
             be.iter(|| {
                 let decoded = arrow_cast::cast(&dict, &DataType::Int32).unwrap();
                 let decoded = decoded.as_primitive::<Int32Type>();

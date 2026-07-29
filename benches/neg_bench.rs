@@ -15,11 +15,11 @@ pub fn criterion_benchmark(c: &mut Criterion) {
             our_res.len()
         );
 
-        c.bench_function("neg i32/llvm", |b| {
+        c.bench_function("arith::neg_wrapping(array(i32)) 10m rows/llvm warm", |b| {
             b.iter(|| arrow_compile_compute::arith::neg_wrapping(black_box(&data)).unwrap())
         });
 
-        c.bench_function("neg i32/arrow", |b| {
+        c.bench_function("arith::neg_wrapping(array(i32)) 10m rows/arrow", |b| {
             b.iter(|| arrow_arith::numeric::neg_wrapping(black_box(&data)).unwrap())
         });
     }
@@ -34,11 +34,11 @@ pub fn criterion_benchmark(c: &mut Criterion) {
             our_res.len()
         );
 
-        c.bench_function("neg f64/llvm", |b| {
+        c.bench_function("arith::neg_wrapping(array(f64)) 10m rows/llvm warm", |b| {
             b.iter(|| arrow_compile_compute::arith::neg_wrapping(black_box(&data)).unwrap())
         });
 
-        c.bench_function("neg f64/arrow", |b| {
+        c.bench_function("arith::neg_wrapping(array(f64)) 10m rows/arrow", |b| {
             b.iter(|| arrow_arith::numeric::neg_wrapping(black_box(&data)).unwrap())
         });
     }

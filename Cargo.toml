@@ -108,3 +108,7 @@ harness = false
 [[bench]]
 name = "matrix_bench"
 harness = false
+
+[[bench]]
+name = "string_proto"
+harness = false

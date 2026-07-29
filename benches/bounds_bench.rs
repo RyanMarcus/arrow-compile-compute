@@ -21,28 +21,35 @@ pub fn criterion_benchmark(c: &mut Criterion) {
     };
     assert_eq!(llvm_scalar, arrow_scalar);
 
-    c.bench_function("bounds scalar llvm/i32", |b| {
-        b.iter(|| {
-            black_box(
-                arrow_compile_compute::cmp::bounds(
-                    black_box(&values_array),
-                    black_box(&lb_scalar),
-                    black_box(&ub_scalar),
+    c.bench_function(
+        "cmp::bounds(array(i32), scalar(i32), scalar(i32))/llvm warm",
+        |b| {
+            b.iter(|| {
+                black_box(
+                    arrow_compile_compute::cmp::bounds(
+                        black_box(&values_array),
+                        black_box(&lb_scalar),
+                        black_box(&ub_scalar),
+                    )
+                    .unwrap(),
                 )
-                .unwrap(),
-            )
-        })
-    });
+            })
+        },
+    );
 
-    c.bench_function("bounds scalar arrow/i32", |b| {
-        b.iter(|| {
-            let gte =
-                arrow_ord::cmp::gt_eq(black_box(&values_array), black_box(&lb_scalar)).unwrap();
-            let lt = arrow_ord::cmp::lt(black_box(&values_array), black_box(&ub_scalar)).unwrap();
-            let combined = arrow_arith::boolean::and(&gte, &lt).unwrap();
-            black_box(combined.true_count() == combined.len())
-        })
-    });
+    c.bench_function(
+        "cmp::bounds(array(i32), scalar(i32), scalar(i32))/arrow",
+        |b| {
+            b.iter(|| {
+                let gte =
+                    arrow_ord::cmp::gt_eq(black_box(&values_array), black_box(&lb_scalar)).unwrap();
+                let lt =
+                    arrow_ord::cmp::lt(black_box(&values_array), black_box(&ub_scalar)).unwrap();
+                let combined = arrow_arith::boolean::and(&gte, &lt).unwrap();
+                black_box(combined.true_count() == combined.len())
+            })
+        },
+    );
 }
 
 criterion_group!(benches, criterion_benchmark);

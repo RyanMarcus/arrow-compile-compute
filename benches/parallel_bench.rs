@@ -12,21 +12,27 @@ pub fn criterion_benchmark(c: &mut Criterion) {
     let data2 = Int64Array::from(data2);
 
     let _r = arrow_compile_compute::cmp::lt(&data1, &data2).unwrap();
-    c.bench_function("parallel/serial", |b| {
-        b.iter(|| {
-            for _ in 0..1000 {
-                black_box(arrow_compile_compute::cmp::lt(&data1, &data2).unwrap());
-            }
-        });
-    });
-
-    c.bench_function("parallel/rayon", |b| {
-        b.iter(|| {
-            (0..1000).into_par_iter().for_each(|_| {
-                black_box(arrow_compile_compute::cmp::lt(&data1, &data2).unwrap());
+    c.bench_function(
+        "cmp::lt(array(i32), array(i64)) x1000 serial/llvm warm",
+        |b| {
+            b.iter(|| {
+                for _ in 0..1000 {
+                    black_box(arrow_compile_compute::cmp::lt(&data1, &data2).unwrap());
+                }
             });
-        });
-    });
+        },
+    );
+
+    c.bench_function(
+        "cmp::lt(array(i32), array(i64)) x1000 rayon/llvm warm",
+        |b| {
+            b.iter(|| {
+                (0..1000).into_par_iter().for_each(|_| {
+                    black_box(arrow_compile_compute::cmp::lt(&data1, &data2).unwrap());
+                });
+            });
+        },
+    );
 }
 
 criterion_group!(benches, criterion_benchmark);

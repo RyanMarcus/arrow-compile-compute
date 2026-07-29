@@ -20,11 +20,18 @@ pub fn criterion_benchmark(c: &mut Criterion) {
 
     let prefix = StringArray::new_scalar(&"abcd");
 
-    c.bench_function("starts_with/custom", |b| {
+    let custom = starts_with(&bytes, "abcd".as_bytes());
+    let arrow = arrow_string::like::starts_with(&bytes, &prefix).unwrap();
+    for (idx, expected) in arrow.iter().enumerate() {
+        let actual = custom[idx / 8] & (1 << (idx % 8)) != 0;
+        assert_eq!(Some(actual), expected);
+    }
+
+    c.bench_function("starts_with(array(utf8), scalar(utf8))/custom", |b| {
         b.iter(|| starts_with(&bytes, "abcd".as_bytes()))
     });
 
-    c.bench_function("starts_with/arrow", |b| {
+    c.bench_function("starts_with(array(utf8), scalar(utf8))/arrow", |b| {
         b.iter(|| arrow_string::like::starts_with(&bytes, &prefix).unwrap())
     });
 }

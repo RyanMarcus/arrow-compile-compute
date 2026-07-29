@@ -24,10 +24,10 @@ pub fn criterion_benchmark(c: &mut Criterion) {
         let arr = arrow_arith::aggregate::sum(&data).unwrap();
         assert_eq!(our, arr);
 
-        c.bench_function("sum i32/llvm", |b| {
+        c.bench_function("compute::sum(array(i32)) 10m rows/llvm warm", |b| {
             b.iter(|| black_box(arrow_compile_compute::compute::sum(black_box(&data)).unwrap()))
         });
-        c.bench_function("sum i32/arrow", |b| {
+        c.bench_function("compute::sum(array(i32)) 10m rows/arrow", |b| {
             b.iter(|| black_box(arrow_arith::aggregate::sum(black_box(&data))))
         });
     }
@@ -36,7 +36,9 @@ pub fn criterion_benchmark(c: &mut Criterion) {
     // exactly regardless of overflow policy; per-element multiply cost is the same.
     {
         let data = Int32Array::from(
-            (0..10_000_000).map(|_| if rng.bool() { 1i32 } else { -1 }).collect_vec(),
+            (0..10_000_000)
+                .map(|_| if rng.bool() { 1i32 } else { -1 })
+                .collect_vec(),
         );
 
         let our = arrow_compile_compute::compute::product(&data).unwrap();
@@ -44,10 +46,10 @@ pub fn criterion_benchmark(c: &mut Criterion) {
         let arr = arrow_arith::aggregate::product(&data).unwrap();
         assert_eq!(our, arr);
 
-        c.bench_function("product i32/llvm", |b| {
+        c.bench_function("compute::product(array(i32)) 10m rows/llvm warm", |b| {
             b.iter(|| black_box(arrow_compile_compute::compute::product(black_box(&data)).unwrap()))
         });
-        c.bench_function("product i32/arrow", |b| {
+        c.bench_function("compute::product(array(i32)) 10m rows/arrow", |b| {
             b.iter(|| black_box(arrow_arith::aggregate::product(black_box(&data))))
         });
     }
@@ -64,17 +66,17 @@ pub fn criterion_benchmark(c: &mut Criterion) {
         let our_max = our_max.as_primitive::<Int32Type>().value(0);
         assert_eq!(our_max, arrow_arith::aggregate::max(&data).unwrap());
 
-        c.bench_function("min i32/llvm", |b| {
+        c.bench_function("compute::min(array(i32)) 10m rows/llvm warm", |b| {
             b.iter(|| black_box(arrow_compile_compute::compute::min(black_box(&data)).unwrap()))
         });
-        c.bench_function("min i32/arrow", |b| {
+        c.bench_function("compute::min(array(i32)) 10m rows/arrow", |b| {
             b.iter(|| black_box(arrow_arith::aggregate::min(black_box(&data))))
         });
 
-        c.bench_function("max i32/llvm", |b| {
+        c.bench_function("compute::max(array(i32)) 10m rows/llvm warm", |b| {
             b.iter(|| black_box(arrow_compile_compute::compute::max(black_box(&data)).unwrap()))
         });
-        c.bench_function("max i32/arrow", |b| {
+        c.bench_function("compute::max(array(i32)) 10m rows/arrow", |b| {
             b.iter(|| black_box(arrow_arith::aggregate::max(black_box(&data))))
         });
     }

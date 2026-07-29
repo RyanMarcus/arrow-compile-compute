@@ -40,11 +40,11 @@ pub fn criterion_benchmark(c: &mut Criterion) {
             our_res.len()
         );
 
-        c.bench_function("convert prim i32 to i64/llvm", |b| {
+        c.bench_function("cast::cast(array(i32) to array(i64))/llvm warm", |b| {
             b.iter(|| arrow_compile_compute::cast::cast(&data, &DataType::Int64).unwrap())
         });
 
-        c.bench_function("convert prim i32 to i64/arrow", |b| {
+        c.bench_function("cast::cast(array(i32) to array(i64))/arrow", |b| {
             b.iter(|| arrow_cast::cast::cast(&data, &DataType::Int64).unwrap())
         });
     }
@@ -61,11 +61,11 @@ pub fn criterion_benchmark(c: &mut Criterion) {
             our_res.len()
         );
 
-        c.bench_function("convert prim i8 to i16/llvm", |b| {
+        c.bench_function("cast::cast(array(i8) to array(i16))/llvm warm", |b| {
             b.iter(|| arrow_compile_compute::cast::cast(&data, &DataType::Int16).unwrap())
         });
 
-        c.bench_function("convert prim i8 to i16/arrow", |b| {
+        c.bench_function("cast::cast(array(i8) to array(i16))/arrow", |b| {
             b.iter(|| arrow_cast::cast::cast(&data, &DataType::Int16).unwrap())
         });
     }
@@ -87,11 +87,12 @@ pub fn criterion_benchmark(c: &mut Criterion) {
             our_prim.len()
         );
 
-        c.bench_function("convert dict i64 to i64/llvm", |b| {
-            b.iter(|| arrow_compile_compute::cast::cast(&data, &DataType::Int64).unwrap())
-        });
+        c.bench_function(
+            "cast::cast(dictionary(i8, i64) to array(i64))/llvm warm",
+            |b| b.iter(|| arrow_compile_compute::cast::cast(&data, &DataType::Int64).unwrap()),
+        );
 
-        c.bench_function("convert dict i64 to i64/arrow", |b| {
+        c.bench_function("cast::cast(dictionary(i8, i64) to array(i64))/arrow", |b| {
             b.iter(|| arrow_cast::cast::cast(&data, &DataType::Int64).unwrap())
         });
     }
@@ -105,13 +106,15 @@ pub fn criterion_benchmark(c: &mut Criterion) {
             .clone();
         assert_eq!(prim_data, our_prim);
 
-        c.bench_function("convert ree i64 to i64/llvm", |b| {
-            b.iter(|| arrow_compile_compute::cast::cast(&data, &DataType::Int64).unwrap())
-        });
+        c.bench_function(
+            "cast::cast(run_end_encoded(i64, i64) to array(i64))/llvm warm",
+            |b| b.iter(|| arrow_compile_compute::cast::cast(&data, &DataType::Int64).unwrap()),
+        );
 
-        c.bench_function("convert ree i64 to i64/arrow", |b| {
-            b.iter(|| Int64Array::from_iter(data.downcast::<Int64Array>().unwrap()))
-        });
+        c.bench_function(
+            "cast::cast(run_end_encoded(i64, i64) to array(i64))/arrow",
+            |b| b.iter(|| Int64Array::from_iter(data.downcast::<Int64Array>().unwrap())),
+        );
     }
 
     {
@@ -133,25 +136,31 @@ pub fn criterion_benchmark(c: &mut Criterion) {
         let our_dict = our_dict.as_dictionary::<Int16Type>();
         assert_eq!(arrow_dict, our_dict);
 
-        c.bench_function("convert u64 to dict/llvm", |b| {
-            b.iter(|| {
-                arrow_compile_compute::cast::cast(
-                    &data,
-                    &dictionary_data_type(DataType::Int16, DataType::UInt64),
-                )
-                .unwrap()
-            })
-        });
+        c.bench_function(
+            "cast::cast(array(u64) to dictionary(i16, u64))/llvm warm",
+            |b| {
+                b.iter(|| {
+                    arrow_compile_compute::cast::cast(
+                        &data,
+                        &dictionary_data_type(DataType::Int16, DataType::UInt64),
+                    )
+                    .unwrap()
+                })
+            },
+        );
 
-        c.bench_function("convert u64 to dict/arrow", |b| {
-            b.iter(|| {
-                arrow_cast::cast(
-                    &data,
-                    &dictionary_data_type(DataType::Int16, DataType::UInt64),
-                )
-                .unwrap()
-            })
-        });
+        c.bench_function(
+            "cast::cast(array(u64) to dictionary(i16, u64))/arrow",
+            |b| {
+                b.iter(|| {
+                    arrow_cast::cast(
+                        &data,
+                        &dictionary_data_type(DataType::Int16, DataType::UInt64),
+                    )
+                    .unwrap()
+                })
+            },
+        );
     }
 
     {
@@ -183,25 +192,31 @@ pub fn criterion_benchmark(c: &mut Criterion) {
             our_dict.as_dictionary::<Int32Type>()
         );
 
-        c.bench_function("convert str to dict/llvm", |b| {
-            b.iter(|| {
-                arrow_compile_compute::cast::cast(
-                    &data,
-                    &dictionary_data_type(DataType::Int32, DataType::Utf8),
-                )
-                .unwrap()
-            })
-        });
+        c.bench_function(
+            "cast::cast(array(utf8) to dictionary(i32, utf8))/llvm warm",
+            |b| {
+                b.iter(|| {
+                    arrow_compile_compute::cast::cast(
+                        &data,
+                        &dictionary_data_type(DataType::Int32, DataType::Utf8),
+                    )
+                    .unwrap()
+                })
+            },
+        );
 
-        c.bench_function("convert str to dict/arrow", |b| {
-            b.iter(|| {
-                arrow_cast::cast(
-                    &data,
-                    &dictionary_data_type(DataType::Int32, DataType::Utf8),
-                )
-                .unwrap()
-            })
-        });
+        c.bench_function(
+            "cast::cast(array(utf8) to dictionary(i32, utf8))/arrow",
+            |b| {
+                b.iter(|| {
+                    arrow_cast::cast(
+                        &data,
+                        &dictionary_data_type(DataType::Int32, DataType::Utf8),
+                    )
+                    .unwrap()
+                })
+            },
+        );
     }
 
     {
@@ -223,15 +238,19 @@ pub fn criterion_benchmark(c: &mut Criterion) {
         .unwrap();
 
         let ours = arrow_compile_compute::cast::cast(&data, &DataType::Utf8).unwrap();
-        assert_eq!(ours.len(), orig_data.len());
+        let arrow = arrow_cast::cast(&data, &DataType::Utf8).unwrap();
+        assert_eq!(ours.as_string::<i32>(), &orig_data);
+        assert_eq!(ours.as_string::<i32>(), arrow.as_string::<i32>());
 
-        c.bench_function("convert dict to str/llvm", |b| {
-            b.iter(|| arrow_compile_compute::cast::cast(&data, &DataType::Utf8).unwrap())
-        });
+        c.bench_function(
+            "cast::cast(dictionary(i32, utf8) to array(utf8))/llvm warm",
+            |b| b.iter(|| arrow_compile_compute::cast::cast(&data, &DataType::Utf8).unwrap()),
+        );
 
-        c.bench_function("convert dict to str/arrow", |b| {
-            b.iter(|| arrow_cast::cast(&data, &DataType::Utf8).unwrap())
-        });
+        c.bench_function(
+            "cast::cast(dictionary(i32, utf8) to array(utf8))/arrow",
+            |b| b.iter(|| arrow_cast::cast(&data, &DataType::Utf8).unwrap()),
+        );
     }
 }
 

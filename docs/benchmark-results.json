@@ -1,0 +1,965 @@
+{
+  "schema_version": 1,
+  "run": {
+    "revision": "503391e",
+    "dirty": true,
+    "started_at": "2026-07-29T15:54:00.372909+00:00",
+    "completed_at": "2026-07-29T16:17:05.458745+00:00",
+    "commands": [
+      [
+        "cargo",
+        "bench"
+      ]
+    ]
+  },
+  "matrix": [
+    {
+      "name": "cmp::lt(dictionary(i32, i32), scalar(i32)) 1m rows",
+      "compile": {
+        "point": 25090479.25,
+        "lower": 25044646.0,
+        "upper": 25123729.0
+      },
+      "execute": {
+        "point": 190935.89804171986,
+        "lower": 190875.3074074074,
+        "upper": 190981.4316390859
+      },
+      "arrow": {
+        "point": 508887.8282763896,
+        "lower": 508634.16833333333,
+        "upper": 508972.8602678571
+      },
+      "speedup": 2.6652286631044975,
+      "classification": "llvm-win"
+    },
+    {
+      "name": "cmp::lt(array(i32), scalar(i32)) 1m rows",
+      "compile": {
+        "point": 8296399.333333333,
+        "lower": 8283375.0,
+        "upper": 8304996.583333333
+      },
+      "execute": {
+        "point": 44215.23528554779,
+        "lower": 44190.63223296312,
+        "upper": 44225.59090909091
+      },
+      "arrow": {
+        "point": 110752.1138047138,
+        "lower": 110738.9576539855,
+        "upper": 110777.18787878788
+      },
+      "speedup": 2.504840539453474,
+      "classification": "llvm-win"
+    },
+    {
+      "name": "cmp::lt(array(i32), array(i32)) 1m rows",
+      "compile": {
+        "point": 8412229.166666668,
+        "lower": 8390572.916666668,
+        "upper": 8425718.75
+      },
+      "execute": {
+        "point": 75968.61570341517,
+        "lower": 75922.40015330457,
+        "upper": 75990.90802348337
+      },
+      "arrow": {
+        "point": 112339.37563856962,
+        "lower": 112104.05,
+        "upper": 113454.16875
+      },
+      "speedup": 1.47876033541466,
+      "classification": "llvm-win"
+    },
+    {
+      "name": "cmp::lt(array(utf8), array(utf8)) 1m rows",
+      "compile": {
+        "point": 4823001.909090908,
+        "lower": 4805956.409090909,
+        "upper": 4834233.0
+      },
+      "execute": {
+        "point": 1751615.5303030303,
+        "lower": 1749398.7142857143,
+        "upper": 1754966.9677419355
+      },
+      "arrow": {
+        "point": 1810567.8104575165,
+        "lower": 1810099.2236842106,
+        "upper": 1810952.9569892474
+      },
+      "speedup": 1.0336559474009044,
+      "classification": "llvm-win"
+    },
+    {
+      "name": "compute::sum(dictionary(i32, i32)) 1m rows",
+      "compile": {
+        "point": 2523644.8,
+        "lower": 2499364.6,
+        "upper": 2535837.5250000004
+      },
+      "execute": {
+        "point": 330839.8249828415,
+        "lower": 320737.6373626374,
+        "upper": 335054.4370107962
+      },
+      "arrow": {
+        "point": 289237.53969139606,
+        "lower": 289062.902734375,
+        "upper": 289473.95
+      },
+      "speedup": 0.8742524867022793,
+      "classification": "arrow-win"
+    },
+    {
+      "name": "arith::neg_wrapping(array(i32)) 1m rows",
+      "compile": {
+        "point": 4185348.9583333335,
+        "lower": 4176225.75,
+        "upper": 4190902.833333333
+      },
+      "execute": {
+        "point": 91438.26333965661,
+        "lower": 91146.21818181819,
+        "upper": 92005.49304170228
+      },
+      "arrow": {
+        "point": 66098.4619047619,
+        "lower": 66080.53333333334,
+        "upper": 66115.99291747888
+      },
+      "speedup": 0.7228752984867236,
+      "classification": "arrow-win"
+    },
+    {
+      "name": "compute::sum(array(i32)) 1m rows",
+      "compile": {
+        "point": 3590339.2857142854,
+        "lower": 3563075.8928571427,
+        "upper": 3596232.1428571427
+      },
+      "execute": {
+        "point": 62991.91855053192,
+        "lower": 62744.00068681319,
+        "upper": 63544.48518041237
+      },
+      "arrow": {
+        "point": 34852.49425287357,
+        "lower": 34795.73563218391,
+        "upper": 35465.89481017067
+      },
+      "speedup": 0.553285168238129,
+      "classification": "arrow-win"
+    },
+    {
+      "name": "arith::neg_wrapping(dictionary(i32, i32)) 1m rows",
+      "compile": {
+        "point": 2152531.2291666665,
+        "lower": 2148045.125,
+        "upper": 2160347.2083333335
+      },
+      "execute": {
+        "point": 1069939.7628737541,
+        "lower": 1068280.2608428807,
+        "upper": 1071770.8482142857
+      },
+      "arrow": {
+        "point": 319113.41849747475,
+        "lower": 318677.90143369173,
+        "upper": 319338.2631578947
+      },
+      "speedup": 0.29825363031687613,
+      "classification": "arrow-win"
+    }
+  ],
+  "other": [
+    {
+      "name": "select::take(fixed_size_list(bool, 1024), array(u64))",
+      "compile": null,
+      "execute": {
+        "point": 25120.862964942142,
+        "lower": 24932.171230873435,
+        "upper": 25299.602711970074
+      },
+      "arrow": {
+        "point": 2536725.979166667,
+        "lower": 2494768.5185185187,
+        "upper": 2589095.5358796297
+      },
+      "speedup": 100.98084539161091,
+      "classification": "llvm-win"
+    },
+    {
+      "name": "logical_nulls(dictionary(i32, i32))",
+      "compile": null,
+      "execute": {
+        "point": 51593229.5,
+        "lower": 51577334.0,
+        "upper": 51607750.0
+      },
+      "arrow": {
+        "point": 394289604.0,
+        "lower": 394211271.0,
+        "upper": 394510042.0
+      },
+      "speedup": 7.642274147618536,
+      "classification": "llvm-win"
+    },
+    {
+      "name": "cast::cast(array(u64) to dictionary(i16, u64))",
+      "compile": null,
+      "execute": {
+        "point": 21134298.666666664,
+        "lower": 20953888.833333336,
+        "upper": 21247875.166666664
+      },
+      "arrow": {
+        "point": 130856208.5,
+        "lower": 127252146.0,
+        "upper": 133853625.0
+      },
+      "speedup": 6.191651332456487,
+      "classification": "llvm-win"
+    },
+    {
+      "name": "cmp::bounds(array(i32), scalar(i32), scalar(i32))",
+      "compile": null,
+      "execute": {
+        "point": 64001.74649874582,
+        "lower": 63959.232954545456,
+        "upper": 64074.30063291139
+      },
+      "arrow": {
+        "point": 229517.94894957985,
+        "lower": 229270.27027027027,
+        "upper": 229810.17392031208
+      },
+      "speedup": 3.586120090552177,
+      "classification": "llvm-win"
+    },
+    {
+      "name": "cmp::lt(array(utf8), scalar(utf8))",
+      "compile": null,
+      "execute": {
+        "point": 1003733.5543293718,
+        "lower": 996399.7252747252,
+        "upper": 1008961.2068965518
+      },
+      "arrow": {
+        "point": 3442673.5999999996,
+        "lower": 3440727.8,
+        "upper": 3446433.3666666667
+      },
+      "speedup": 3.429868001473923,
+      "classification": "llvm-win"
+    },
+    {
+      "name": "cast::cast(run_end_encoded(i64, i64) to array(i64))",
+      "compile": null,
+      "execute": {
+        "point": 1482650.7816985645,
+        "lower": 1478836.0543478262,
+        "upper": 1487282.6923076923
+      },
+      "arrow": {
+        "point": 4593310.636363637,
+        "lower": 4585598.454545454,
+        "upper": 4601219.7272727275
+      },
+      "speedup": 3.0980394662466755,
+      "classification": "llvm-win"
+    },
+    {
+      "name": "cmp::eq(dictionary(i8, i32), array(i32))",
+      "compile": null,
+      "execute": {
+        "point": 2239578.804347826,
+        "lower": 2236884.086956522,
+        "upper": 2240574.2608695654
+      },
+      "arrow": {
+        "point": 6351612.0,
+        "lower": 6347299.5,
+        "upper": 6356494.75
+      },
+      "speedup": 2.836074349189786,
+      "classification": "llvm-win"
+    },
+    {
+      "name": "cmp::eq(array(i32), array(i64))",
+      "compile": null,
+      "execute": {
+        "point": 1678319.3571428573,
+        "lower": 1673829.40625,
+        "upper": 1679526.1553911206
+      },
+      "arrow": {
+        "point": 4147509.653846154,
+        "lower": 4139413.5,
+        "upper": 4152931.076923077
+      },
+      "speedup": 2.4712279198798046,
+      "classification": "llvm-win"
+    },
+    {
+      "name": "select::concat(fixed_size_list(bool, 8) x2)",
+      "compile": null,
+      "execute": {
+        "point": 90849.7668997669,
+        "lower": 90777.47558441559,
+        "upper": 90934.45059288538
+      },
+      "arrow": {
+        "point": 201156.69923076924,
+        "lower": 201062.05357142858,
+        "upper": 201250.99047619046
+      },
+      "speedup": 2.2141685784697964,
+      "classification": "llvm-win"
+    },
+    {
+      "name": "cmp::gt_eq(array(i32), scalar(i32))",
+      "compile": null,
+      "execute": {
+        "point": 576750.4425,
+        "lower": 576412.5656046718,
+        "upper": 577322.45
+      },
+      "arrow": {
+        "point": 1106778.1985294118,
+        "lower": 1106506.898434517,
+        "upper": 1107013.888888889
+      },
+      "speedup": 1.9189897691832491,
+      "classification": "llvm-win"
+    },
+    {
+      "name": "cast::cast(array(utf8) to dictionary(i32, utf8))",
+      "compile": null,
+      "execute": {
+        "point": 30833218.75,
+        "lower": 30688437.5,
+        "upper": 31002531.5
+      },
+      "arrow": {
+        "point": 53971104.0,
+        "lower": 53770750.0,
+        "upper": 54157875.0
+      },
+      "speedup": 1.7504206887255325,
+      "classification": "llvm-win"
+    },
+    {
+      "name": "cmp::eq(dictionary(i8, i32), dictionary(i8, i32))",
+      "compile": null,
+      "execute": {
+        "point": 4652257.590909092,
+        "lower": 4648310.636363637,
+        "upper": 4656020.818181818
+      },
+      "arrow": {
+        "point": 7082955.357142857,
+        "lower": 7076351.214285715,
+        "upper": 7087610.142857143
+      },
+      "speedup": 1.5224770380263457,
+      "classification": "llvm-win"
+    },
+    {
+      "name": "cmp::lt(array(f32), array(f32))",
+      "compile": null,
+      "execute": {
+        "point": 1376348.2032679738,
+        "lower": 1375954.0705128205,
+        "upper": 1376591.6
+      },
+      "arrow": {
+        "point": 2045297.5,
+        "lower": 2044943.32,
+        "upper": 2045896.6800000002
+      },
+      "speedup": 1.4860320194727512,
+      "classification": "llvm-win"
+    },
+    {
+      "name": "select::take(array(bool), array(u64))",
+      "compile": null,
+      "execute": {
+        "point": 697509.1423160173,
+        "lower": 695487.8051470588,
+        "upper": 698030.3291139241
+      },
+      "arrow": {
+        "point": 780916.6666666667,
+        "lower": 768401.5,
+        "upper": 785491.66875
+      },
+      "speedup": 1.1195791127177233,
+      "classification": "llvm-win"
+    },
+    {
+      "name": "select::concat(array(i32) x5, dictionary(i8, i32) x5)",
+      "compile": null,
+      "execute": {
+        "point": 2289179.9318181816,
+        "lower": 2286630.6818181816,
+        "upper": 2293933.727272727
+      },
+      "arrow": {
+        "point": 2462660.7142857146,
+        "lower": 2459226.1904761903,
+        "upper": 2464536.6904761903
+      },
+      "speedup": 1.0757829387092983,
+      "classification": "llvm-win"
+    },
+    {
+      "name": "cmp::eq(array(i32), array(i32))",
+      "compile": null,
+      "execute": {
+        "point": 1080838.8853861191,
+        "lower": 1074083.7142857143,
+        "upper": 1084906.5317829456
+      },
+      "arrow": {
+        "point": 1132753.7070393376,
+        "lower": 1131610.9440559442,
+        "upper": 1133572.537037037
+      },
+      "speedup": 1.0480319706805075,
+      "classification": "llvm-win"
+    },
+    {
+      "name": "cast::cast(dictionary(i8, i64) to array(i64))",
+      "compile": null,
+      "execute": {
+        "point": 3427687.5,
+        "lower": 3411806.9333333336,
+        "upper": 3451258.3
+      },
+      "arrow": {
+        "point": 3503385.428571428,
+        "lower": 3483357.1428571427,
+        "upper": 3527434.5
+      },
+      "speedup": 1.022084256097275,
+      "classification": "llvm-win"
+    },
+    {
+      "name": "select::take(array(i32), array(u64))",
+      "compile": null,
+      "execute": {
+        "point": 2042138.5652173911,
+        "lower": 2039373.1956521738,
+        "upper": 2045757.2608695652
+      },
+      "arrow": {
+        "point": 2053640.6458333335,
+        "lower": 2049378.4583333333,
+        "upper": 2060559.875
+      },
+      "speedup": 1.0056323703062324,
+      "classification": "llvm-win"
+    },
+    {
+      "name": "select::filter(array(i32), array(bool))",
+      "compile": null,
+      "execute": {
+        "point": 3786848.2142857146,
+        "lower": 3785610.1428571427,
+        "upper": 3788355.6428571427
+      },
+      "arrow": {
+        "point": 3568362.533333333,
+        "lower": 3567138.933333333,
+        "upper": 3569319.466666667
+      },
+      "speedup": 0.9423040828179609,
+      "classification": "arrow-win"
+    },
+    {
+      "name": "sort::sort_to_indices(array(u64))",
+      "compile": null,
+      "execute": {
+        "point": 16183802.0,
+        "lower": 16170729.25,
+        "upper": 16190994.75
+      },
+      "arrow": {
+        "point": 13612520.75,
+        "lower": 13606380.25,
+        "upper": 13626739.75
+      },
+      "speedup": 0.8411200748748656,
+      "classification": "arrow-win"
+    },
+    {
+      "name": "cast::cast(array(i8) to array(i16))",
+      "compile": null,
+      "execute": {
+        "point": 568468.5041666667,
+        "lower": 549728.0728291317,
+        "upper": 593699.6329113924
+      },
+      "arrow": {
+        "point": 471066.1538676236,
+        "lower": 461229.1666666667,
+        "upper": 475283.23412698414
+      },
+      "speedup": 0.82865831688982,
+      "classification": "arrow-win"
+    },
+    {
+      "name": "cast::cast(dictionary(i32, utf8) to array(utf8))",
+      "compile": null,
+      "execute": {
+        "point": 13310354.125,
+        "lower": 13293697.875,
+        "upper": 13337072.875
+      },
+      "arrow": {
+        "point": 10753791.7,
+        "lower": 10743400.0,
+        "upper": 10763787.399999999
+      },
+      "speedup": 0.8079267913542457,
+      "classification": "arrow-win"
+    },
+    {
+      "name": "arith::neg_wrapping(array(f64)) 10m rows",
+      "compile": null,
+      "execute": {
+        "point": 2489705.2,
+        "lower": 2485525.0,
+        "upper": 2496818.75
+      },
+      "arrow": {
+        "point": 1788024.2678894927,
+        "lower": 1785943.0204081633,
+        "upper": 1790604.2381578947
+      },
+      "speedup": 0.7181670616623577,
+      "classification": "arrow-win"
+    },
+    {
+      "name": "arith::neg_wrapping(array(i32)) 10m rows",
+      "compile": null,
+      "execute": {
+        "point": 1242585.0416666665,
+        "lower": 1239802.8665413535,
+        "upper": 1245680.1623348338
+      },
+      "arrow": {
+        "point": 854793.5708333333,
+        "lower": 854197.5323529412,
+        "upper": 855246.3886338798
+      },
+      "speedup": 0.6879155487714608,
+      "classification": "arrow-win"
+    },
+    {
+      "name": "sort::sort_to_indices(array(nullable u64))",
+      "compile": null,
+      "execute": {
+        "point": 11030704.2,
+        "lower": 11026949.899999999,
+        "upper": 11044575.0
+      },
+      "arrow": {
+        "point": 7223654.785714285,
+        "lower": 7219583.357142857,
+        "upper": 7226910.714285715
+      },
+      "speedup": 0.6548679626196744,
+      "classification": "arrow-win"
+    },
+    {
+      "name": "cast::cast(array(i32) to array(i64))",
+      "compile": null,
+      "execute": {
+        "point": 3150900.321428572,
+        "lower": 3126589.25,
+        "upper": 3184239.571428572
+      },
+      "arrow": {
+        "point": 2054119.3181818181,
+        "lower": 2031644.8863636362,
+        "upper": 2096325.7272727273
+      },
+      "speedup": 0.6519150428886022,
+      "classification": "arrow-win"
+    },
+    {
+      "name": "select::take(run_end_encoded(i64, i32), array(u64))",
+      "compile": null,
+      "execute": {
+        "point": 2712592.078947368,
+        "lower": 2711387.0526315793,
+        "upper": 2714006.5789473685
+      },
+      "arrow": {
+        "point": 1626955.7692307692,
+        "lower": 1623710.9664634145,
+        "upper": 1629252.2476190475
+      },
+      "speedup": 0.5997790017370086,
+      "classification": "arrow-win"
+    },
+    {
+      "name": "compute::sum(array(i32)) 10m rows",
+      "compile": null,
+      "execute": {
+        "point": 1021518.6704545454,
+        "lower": 1018913.2702380952,
+        "upper": 1024055.3057926829
+      },
+      "arrow": {
+        "point": 604216.9642857143,
+        "lower": 591687.5,
+        "upper": 611403.0172413794
+      },
+      "speedup": 0.5914889093675163,
+      "classification": "arrow-win"
+    },
+    {
+      "name": "compute::max(array(i32)) 10m rows",
+      "compile": null,
+      "execute": {
+        "point": 968148.2675836643,
+        "lower": 954074.5797101449,
+        "upper": 990775.0
+      },
+      "arrow": {
+        "point": 553943.1584613068,
+        "lower": 552546.875,
+        "upper": 555067.7563364055
+      },
+      "speedup": 0.5721676906408727,
+      "classification": "arrow-win"
+    },
+    {
+      "name": "compute::product(array(i32)) 10m rows",
+      "compile": null,
+      "execute": {
+        "point": 988152.7486413043,
+        "lower": 981391.25,
+        "upper": 997993.1818181818
+      },
+      "arrow": {
+        "point": 560344.0614067505,
+        "lower": 553450.9705882353,
+        "upper": 568697.317669173
+      },
+      "speedup": 0.5670621897041883,
+      "classification": "arrow-win"
+    },
+    {
+      "name": "compute::min(array(i32)) 10m rows",
+      "compile": null,
+      "execute": {
+        "point": 976136.9642857143,
+        "lower": 952403.9607142857,
+        "upper": 989362.5979591836
+      },
+      "arrow": {
+        "point": 552754.8181818181,
+        "lower": 551107.03125,
+        "upper": 554482.1270833333
+      },
+      "speedup": 0.5662676841525974,
+      "classification": "arrow-win"
+    },
+    {
+      "name": "select::concat(array(i32) x10)",
+      "compile": null,
+      "execute": {
+        "point": 1946741.0511684124,
+        "lower": 1943346.7741935484,
+        "upper": 1949266.5191599731
+      },
+      "arrow": {
+        "point": 871435.0735294118,
+        "lower": 868949.6318681319,
+        "upper": 874566.6118421053
+      },
+      "speedup": 0.4476378987366533,
+      "classification": "arrow-win"
+    },
+    {
+      "name": "select::filter(run_end_encoded(i64, i32), array(bool))",
+      "compile": null,
+      "execute": {
+        "point": 82690958.5,
+        "lower": 82614583.0,
+        "upper": 82816937.5
+      },
+      "arrow": {
+        "point": 33507000.25,
+        "lower": 33467312.5,
+        "upper": 33537666.5
+      },
+      "speedup": 0.4052075445467233,
+      "classification": "arrow-win"
+    },
+    {
+      "name": "logical_nulls(run_end_encoded(i32, i32))",
+      "compile": null,
+      "execute": {
+        "point": 7738.826282521011,
+        "lower": 7731.640207689862,
+        "upper": 7749.403645833333
+      },
+      "arrow": {
+        "point": 1299.4073148337075,
+        "lower": 1297.7567913655905,
+        "upper": 1303.4713768989632
+      },
+      "speedup": 0.16790754403785513,
+      "classification": "arrow-win"
+    },
+    {
+      "name": "cmp::lt(array(i32), array(i32)) 1 row",
+      "compile": null,
+      "execute": {
+        "point": 435.6771532650702,
+        "lower": 435.02341203355445,
+        "upper": 436.07886441662185
+      },
+      "arrow": {
+        "point": 54.75149513835312,
+        "lower": 54.680075270684966,
+        "upper": 54.82495940070198
+      },
+      "speedup": 0.12566987901025367,
+      "classification": "arrow-win"
+    }
+  ],
+  "unpaired": [
+    {
+      "name": "BooleanArray__from(Vec(bool))_rust batched",
+      "estimate": {
+        "point": 6155674.4375,
+        "lower": 6153661.375,
+        "upper": 6157583.25
+      }
+    },
+    {
+      "name": "BooleanArray__from(Vec(u8) mapped to bool)_rust",
+      "estimate": {
+        "point": 6473614.5625,
+        "lower": 6468822.875,
+        "upper": 6476669.25
+      }
+    },
+    {
+      "name": "cast__cast + cmp__eq(dictionary(i32, i32), run_end_encoded(i32, ",
+      "estimate": {
+        "point": 1928723.001082251,
+        "lower": 1928174.0,
+        "upper": 1929303.1609195403
+      }
+    },
+    {
+      "name": "cmp::ComparisonKernel::call(array(i32), array(i32)) 1 row_ d (execute)",
+      "estimate": {
+        "point": 402.77547133449787,
+        "lower": 402.2033801682244,
+        "upper": 403.4465495608532
+      }
+    },
+    {
+      "name": "cmp::eq(dictionary(i32, i32), run_end_encoded(i32, i32))_ wa (execute)",
+      "estimate": {
+        "point": 1812942.9824561402,
+        "lower": 1811396.4285714286,
+        "upper": 1814275.6583250249
+      }
+    },
+    {
+      "name": "cmp::eq(run_end_encoded(i64, i64), scalar(i64)) (execute)",
+      "estimate": {
+        "point": 1488488.8412698414,
+        "lower": 1488147.4545454546,
+        "upper": 1489018.1818181819
+      }
+    },
+    {
+      "name": "cmp::lt(array(i32), array(i64)) x1000 rayon (execute)",
+      "estimate": {
+        "point": 2329322.9318181816,
+        "lower": 2323660.0227272725,
+        "upper": 2336102.272727273
+      }
+    },
+    {
+      "name": "cmp::lt(array(i32), array(i64)) x1000 serial (execute)",
+      "estimate": {
+        "point": 12427870.8,
+        "lower": 12418183.4,
+        "upper": 12435816.6
+      }
+    },
+    {
+      "name": "cmp__ComparisonKernel__compile(array(i32), array(i32)) 1 row_llv",
+      "estimate": {
+        "point": 8823444.5,
+        "lower": 8793770.833333334,
+        "upper": 8846298.666666666
+      }
+    },
+    {
+      "name": "cmp__eq(dictionary(i32, i32), run_end_encoded(i32, i32)) predeco",
+      "estimate": {
+        "point": 100343.17714460785,
+        "lower": 100314.84375,
+        "upper": 100360.67073170732
+      }
+    },
+    {
+      "name": "compute::hash(array(i32)) (execute)",
+      "estimate": {
+        "point": 28799875.0,
+        "lower": 28771833.5,
+        "upper": 28841573.0
+      }
+    },
+    {
+      "name": "compute::hash(array(i64)) (execute)",
+      "estimate": {
+        "point": 54258417.0,
+        "lower": 54221687.5,
+        "upper": 54312416.0
+      }
+    },
+    {
+      "name": "compute::hash_unchained(array(i32)) (execute)",
+      "estimate": {
+        "point": 81320458.0,
+        "lower": 81305416.5,
+        "upper": 81349521.0
+      }
+    },
+    {
+      "name": "compute::hash_unchained(array(i64)) (execute)",
+      "estimate": {
+        "point": 81415666.5,
+        "lower": 81348458.0,
+        "upper": 81476625.0
+      }
+    },
+    {
+      "name": "iter::iter_nonnull_i64(dictionary(i32, i32)) (execute)",
+      "estimate": {
+        "point": 245110771.0,
+        "lower": 243504750.0,
+        "upper": 245699687.5
+      }
+    },
+    {
+      "name": "sort__multicol_sort_to_indices(array(i8), array(i32), array(null",
+      "estimate": {
+        "point": 66806312.5,
+        "lower": 66727167.0,
+        "upper": 66868375.0
+      }
+    },
+    {
+      "name": "sort__multicol_sort_to_indices(array(i8), array(i32), array(null_2",
+      "estimate": {
+        "point": 109229708.5,
+        "lower": 108927271.0,
+        "upper": 109364084.0
+      }
+    },
+    {
+      "name": "starts_with(array(utf8), scalar(utf8)) (arrow)",
+      "estimate": {
+        "point": 4209968.75,
+        "lower": 4200836.75,
+        "upper": 4218118.083333333
+      }
+    },
+    {
+      "name": "starts_with(array(utf8), scalar(utf8))_custom",
+      "estimate": {
+        "point": 3544556.966666667,
+        "lower": 3522294.466666667,
+        "upper": 3550901.4
+      }
+    },
+    {
+      "name": "vec::norm(fixed_size_list(f32, 3)) 16384 rows (execute)",
+      "estimate": {
+        "point": 19406.24873737374,
+        "lower": 19229.25116713352,
+        "upper": 19430.4107719037
+      }
+    },
+    {
+      "name": "vec::norm(fixed_size_list(f32, 32)) 16384 rows (execute)",
+      "estimate": {
+        "point": 55060.97704081633,
+        "lower": 55035.931262183236,
+        "upper": 55078.501826778425
+      }
+    },
+    {
+      "name": "vec::norm(fixed_size_list(f32, 64)) 16384 rows (execute)",
+      "estimate": {
+        "point": 108391.01962365591,
+        "lower": 108347.571875,
+        "upper": 108468.05555555556
+      }
+    },
+    {
+      "name": "vec::norm(fixed_size_list(f32, 768)) 16384 rows (execute)",
+      "estimate": {
+        "point": 2536777.075,
+        "lower": 2533595.85,
+        "upper": 2541443.75
+      }
+    },
+    {
+      "name": "vec::norm(fixed_size_list(f32, 8)) 16384 rows (execute)",
+      "estimate": {
+        "point": 29312.599789915967,
+        "lower": 29241.42156862745,
+        "upper": 29523.916824794433
+      }
+    },
+    {
+      "name": "vec__dot(scalar(fixed_size_list(f32, 768)), fixed_size_list(f32,",
+      "estimate": {
+        "point": 981183.8076923077,
+        "lower": 980118.8152920962,
+        "upper": 981968.6642125479
+      }
+    },
+    {
+      "name": "vec__dot(scalar(fixed_size_list(f32, 768)), fixed_size_list(f32,_2",
+      "estimate": {
+        "point": 5728456.0,
+        "lower": 5715152.777777778,
+        "upper": 5745643.555555556
+      }
+    },
+    {
+      "name": "vec__nearest_neighbor(scalar(fixed_size_list(f32, 8)), fixed_siz",
+      "estimate": {
+        "point": 888.3139341624036,
+        "lower": 887.5194337615579,
+        "upper": 889.3483098309831
+      }
+    },
+    {
+      "name": "vec__norm(fixed_size_list(f32, 768)) 16384 rows_rust reference",
+      "estimate": {
+        "point": 19120083.333333336,
+        "lower": 19109875.0,
+        "upper": 19148562.5
+      }
+    }
+  ]
+}

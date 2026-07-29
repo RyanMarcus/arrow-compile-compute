@@ -35,10 +35,10 @@ pub fn criterion_benchmark(c: &mut Criterion) {
         let llvm_answer = arrow_compile_compute::cmp::eq(&data1, &data2).unwrap();
         assert_eq!(arrow_answer, llvm_answer);
 
-        c.bench_function("cmpi32/execute arrow", |b| {
+        c.bench_function("cmp::eq(array(i32), array(i32))/arrow", |b| {
             b.iter(|| arrow_ord::cmp::eq(&data1, &data2).unwrap())
         });
-        c.bench_function("cmpi32/execute llvm", |b| {
+        c.bench_function("cmp::eq(array(i32), array(i32))/llvm warm", |b| {
             b.iter(|| arrow_compile_compute::cmp::eq(&data1, &data2).unwrap());
         });
     }
@@ -52,11 +52,11 @@ pub fn criterion_benchmark(c: &mut Criterion) {
             arrow_ord::cmp::eq(&arrow_cast::cast(&data1, &DataType::Int64).unwrap(), &data2)
                 .unwrap();
         assert_eq!(arrow_answer, llvm_answer_kernel);
-        c.bench_function("cast_eq/execute llvm", |b| {
+        c.bench_function("cmp::eq(array(i32), array(i64))/llvm warm", |b| {
             b.iter(|| arrow_compile_compute::cmp::eq(&data1, &data2).unwrap())
         });
 
-        c.bench_function("cast_eq/execute arrow", |b| {
+        c.bench_function("cmp::eq(array(i32), array(i64))/arrow", |b| {
             b.iter(|| {
                 arrow_ord::cmp::eq(&arrow_cast::cast(&data1, &DataType::Int64).unwrap(), &data2)
                     .unwrap()
@@ -76,12 +76,16 @@ pub fn criterion_benchmark(c: &mut Criterion) {
         let arrow_answer = arrow_ord::cmp::eq(&data1, &data2).unwrap();
         assert_eq!(llvm_answer, arrow_answer);
 
-        c.bench_function("dict_i32/execute arrow", |b| {
-            b.iter(|| arrow_ord::cmp::eq(&data1, &data2).unwrap())
-        });
-        c.bench_function("dict_i32/execute llvm", |b| {
-            b.iter(|| arrow_compile_compute::cmp::eq(&data1, &data2).unwrap());
-        });
+        c.bench_function(
+            "cmp::eq(dictionary(i8, i32), dictionary(i8, i32))/arrow",
+            |b| b.iter(|| arrow_ord::cmp::eq(&data1, &data2).unwrap()),
+        );
+        c.bench_function(
+            "cmp::eq(dictionary(i8, i32), dictionary(i8, i32))/llvm warm",
+            |b| {
+                b.iter(|| arrow_compile_compute::cmp::eq(&data1, &data2).unwrap());
+            },
+        );
     }
 
     {
@@ -95,10 +99,10 @@ pub fn criterion_benchmark(c: &mut Criterion) {
         let arrow_answer = arrow_ord::cmp::eq(&data1, &data2).unwrap();
         assert_eq!(llvm_answer, arrow_answer);
 
-        c.bench_function("dict_prim_i32/execute arrow", |b| {
+        c.bench_function("cmp::eq(dictionary(i8, i32), array(i32))/arrow", |b| {
             b.iter(|| arrow_ord::cmp::eq(&data1, &data2).unwrap())
         });
-        c.bench_function("dict_prim_i32/execute llvm", |b| {
+        c.bench_function("cmp::eq(dictionary(i8, i32), array(i32))/llvm warm", |b| {
             b.iter(|| arrow_compile_compute::cmp::eq(&data1, &data2).unwrap());
         });
     }
@@ -111,11 +115,11 @@ pub fn criterion_benchmark(c: &mut Criterion) {
         let llvm_answer = arrow_compile_compute::cmp::gt_eq(&data1, &data2).unwrap();
         assert_eq!(arrow_answer, llvm_answer);
 
-        c.bench_function("i32scalar/execute arrow", |b| {
+        c.bench_function("cmp::gt_eq(array(i32), scalar(i32))/arrow", |b| {
             b.iter(|| arrow_ord::cmp::gt_eq(&data1, &data2).unwrap())
         });
 
-        c.bench_function("i32scalar/execute llvm", |b| {
+        c.bench_function("cmp::gt_eq(array(i32), scalar(i32))/llvm warm", |b| {
             b.iter(|| arrow_compile_compute::cmp::gt_eq(&data1, &data2).unwrap())
         });
     }
@@ -128,10 +132,10 @@ pub fn criterion_benchmark(c: &mut Criterion) {
         let llvm_answer = arrow_compile_compute::cmp::lt(&data1, &data2).unwrap();
         assert_eq!(arrow_answer, llvm_answer);
 
-        c.bench_function("f32_lt/execute arrow", |b| {
+        c.bench_function("cmp::lt(array(f32), array(f32))/arrow", |b| {
             b.iter(|| arrow_ord::cmp::lt(&data1, &data2).unwrap())
         });
-        c.bench_function("f32_lt/execute llvm", |b| {
+        c.bench_function("cmp::lt(array(f32), array(f32))/llvm warm", |b| {
             b.iter(|| arrow_compile_compute::cmp::lt(&data1, &data2).unwrap())
         });
     }
@@ -150,10 +154,10 @@ pub fn criterion_benchmark(c: &mut Criterion) {
         let llvm_answer = arrow_compile_compute::cmp::lt(&data, &scalar).unwrap();
         assert_eq!(arrow_answer, llvm_answer);
 
-        c.bench_function("strlt/execute arrow", |b| {
+        c.bench_function("cmp::lt(array(utf8), scalar(utf8))/arrow", |b| {
             b.iter(|| arrow_ord::cmp::lt(&data, &scalar).unwrap())
         });
-        c.bench_function("strlt/execute llvm", |b| {
+        c.bench_function("cmp::lt(array(utf8), scalar(utf8))/llvm warm", |b| {
             b.iter(|| arrow_compile_compute::cmp::lt(&data, &scalar).unwrap())
         });
     }
@@ -197,28 +201,36 @@ pub fn criterion_benchmark(c: &mut Criterion) {
         let arrow_answer = arrow_ord::cmp::eq(&dict_as_primitive, &ree_as_primitive).unwrap();
         assert_eq!(arrow_answer, llvm_answer);
 
-        c.bench_function("dict_eq_ree_cast_i32/execute llvm", |b| {
-            b.iter(|| {
-                let lhs = arrow_compile_compute::cast::cast(&dict_array, &DataType::Int32).unwrap();
-                let rhs = arrow_compile_compute::cast::cast(&ree_array, &DataType::Int32).unwrap();
-                arrow_compile_compute::cmp::eq(&lhs, &rhs).unwrap()
-            })
-        });
-        c.bench_function("dict_eq_ree_i32/execute arrow", |b| {
-            b.iter(|| arrow_ord::cmp::eq(&dict_as_primitive, &ree_as_primitive).unwrap())
-        });
-        c.bench_function("dict_eq_ree_i32/execute llvm", |b| {
-            b.iter(|| arrow_compile_compute::cmp::eq(&dict_array, &ree_array).unwrap())
-        });
+        c.bench_function(
+            "cast::cast + cmp::eq(dictionary(i32, i32), run_end_encoded(i32, i32))/llvm warm",
+            |b| {
+                b.iter(|| {
+                    let lhs =
+                        arrow_compile_compute::cast::cast(&dict_array, &DataType::Int32).unwrap();
+                    let rhs =
+                        arrow_compile_compute::cast::cast(&ree_array, &DataType::Int32).unwrap();
+                    arrow_compile_compute::cmp::eq(&lhs, &rhs).unwrap()
+                })
+            },
+        );
+        c.bench_function(
+            "cmp::eq(dictionary(i32, i32), run_end_encoded(i32, i32)) predecoded/arrow",
+            |b| b.iter(|| arrow_ord::cmp::eq(&dict_as_primitive, &ree_as_primitive).unwrap()),
+        );
+        c.bench_function(
+            "cmp::eq(dictionary(i32, i32), run_end_encoded(i32, i32))/llvm warm",
+            |b| b.iter(|| arrow_compile_compute::cmp::eq(&dict_array, &ree_array).unwrap()),
+        );
     }
 
     {
         let arr = generate_random_ree_array(100_000);
         let sca = Int64Array::new_scalar(0);
 
-        c.bench_function("ree_eq/execute llvm", |b| {
-            b.iter(|| arrow_compile_compute::cmp::eq(&arr, &sca).unwrap())
-        });
+        c.bench_function(
+            "cmp::eq(run_end_encoded(i64, i64), scalar(i64))/llvm warm",
+            |b| b.iter(|| arrow_compile_compute::cmp::eq(&arr, &sca).unwrap()),
+        );
     }
 }
 

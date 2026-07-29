@@ -39,20 +39,34 @@ pub fn criterion_benchmark(c: &mut Criterion) {
 
         let dict = DictionaryArray::<Int32Type>::new(keys, Arc::new(values));
 
-        c.bench_function("dict/arrow", |b| b.iter(|| dict.logical_nulls()));
-        c.bench_function("dict/llvm", |b| b.iter(|| logical_nulls(&dict).unwrap()));
+        assert_eq!(logical_nulls(&dict).unwrap(), dict.logical_nulls());
+        assert_eq!(logical_nulls(&data).unwrap(), data.logical_nulls());
 
-        c.bench_function("ree/arrow", |b| b.iter(|| data.logical_nulls()));
-        c.bench_function("ree/llvm", |b| b.iter(|| logical_nulls(&data).unwrap()));
-
-        c.bench_function("iter_dict", |b| {
-            b.iter(|| {
-                arrow_compile_compute::iter::iter_nonnull_i64(&dict)
-                    .unwrap()
-                    .indexed()
-                    .collect_vec()
-            })
+        c.bench_function("logical_nulls(dictionary(i32, i32))/arrow", |b| {
+            b.iter(|| dict.logical_nulls())
         });
+        c.bench_function("logical_nulls(dictionary(i32, i32))/llvm warm", |b| {
+            b.iter(|| logical_nulls(&dict).unwrap())
+        });
+
+        c.bench_function("logical_nulls(run_end_encoded(i32, i32))/arrow", |b| {
+            b.iter(|| data.logical_nulls())
+        });
+        c.bench_function("logical_nulls(run_end_encoded(i32, i32))/llvm warm", |b| {
+            b.iter(|| logical_nulls(&data).unwrap())
+        });
+
+        c.bench_function(
+            "iter::iter_nonnull_i64(dictionary(i32, i32))/llvm warm",
+            |b| {
+                b.iter(|| {
+                    arrow_compile_compute::iter::iter_nonnull_i64(&dict)
+                        .unwrap()
+                        .indexed()
+                        .collect_vec()
+                })
+            },
+        );
     }
 }
 
