@@ -1011,8 +1011,15 @@ pub mod aggregate {
 
     pub use crate::compiled_kernels::{
         Aggregator, CountAggregator, MaxAggregator, MinAggregator, MostRecentAggregator,
+        SumAggregator,
     };
     use crate::ArrowKernelError;
+
+    /// Creates a new grouped sum aggregator. Final results are 64-bit versions
+    /// of their inputs (for example, `f32` is summed to `f64`).
+    pub fn sum(ty: &DataType) -> Result<Box<SumAggregator>, ArrowKernelError> {
+        SumAggregator::create(&[ty])
+    }
 
     /// Creates a new min aggregator. Final results will match the input type.
     pub fn min(ty: &DataType) -> Result<Box<MinAggregator>, ArrowKernelError> {
