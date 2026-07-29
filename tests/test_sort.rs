@@ -1,11 +1,40 @@
-use std::collections::HashSet;
+use std::{cmp::Ordering, collections::HashSet, sync::Arc};
 
 use arrow_array::{
     Array, Float16Array, Float32Array, Float64Array, Int32Array, Int64Array, StringArray,
+    UInt64Array,
 };
 use arrow_compile_compute::SortOptions;
 use itertools::Itertools;
 use proptest::{prelude::any, proptest};
+
+fn compare_nullable<T: Ord>(lhs: Option<T>, rhs: Option<T>, options: SortOptions) -> Ordering {
+    match (lhs, rhs) {
+        (None, None) => Ordering::Equal,
+        (None, Some(_)) => {
+            if options.nulls_first {
+                Ordering::Less
+            } else {
+                Ordering::Greater
+            }
+        }
+        (Some(_), None) => {
+            if options.nulls_first {
+                Ordering::Greater
+            } else {
+                Ordering::Less
+            }
+        }
+        (Some(lhs), Some(rhs)) => {
+            let ordering = lhs.cmp(&rhs);
+            if options.descending {
+                ordering.reverse()
+            } else {
+                ordering
+            }
+        }
+    }
+}
 
 proptest! {
     #[test]
@@ -98,6 +127,52 @@ proptest! {
         let res = res.into_iter().map(|x| x.unwrap()).collect_vec();
 
         assert_eq!(res, p);
+    }
+
+    #[test]
+    fn test_multicol_numeric_matches_stable_order(
+        rows: Vec<(Option<i32>, Option<u64>)>,
+        first_descending: bool,
+        first_nulls_first: bool,
+        second_descending: bool,
+        second_nulls_first: bool,
+    ) {
+        let (first, second): (Vec<_>, Vec<_>) = rows.into_iter().unzip();
+        let first = Arc::new(Int32Array::from(first)) as Arc<dyn Array>;
+        let second = Arc::new(UInt64Array::from(second)) as Arc<dyn Array>;
+        let options = [
+            SortOptions {
+                descending: first_descending,
+                nulls_first: first_nulls_first,
+            },
+            SortOptions {
+                descending: second_descending,
+                nulls_first: second_nulls_first,
+            },
+        ];
+        let first_values = first.as_any().downcast_ref::<Int32Array>().unwrap();
+        let second_values = second.as_any().downcast_ref::<UInt64Array>().unwrap();
+        let mut expected = (0..first.len() as u32).collect_vec();
+        expected.sort_by(|lhs, rhs| {
+            compare_nullable(
+                first_values.iter().nth(*lhs as usize).unwrap(),
+                first_values.iter().nth(*rhs as usize).unwrap(),
+                options[0],
+            )
+                .then_with(|| {
+                    compare_nullable(
+                        second_values.iter().nth(*lhs as usize).unwrap(),
+                        second_values.iter().nth(*rhs as usize).unwrap(),
+                        options[1],
+                    )
+                })
+                .then_with(|| lhs.cmp(rhs))
+        });
+        let inputs: [&dyn Array; 2] = [first.as_ref(), second.as_ref()];
+        let actual = arrow_compile_compute::sort::multicol_sort_to_indices(&inputs, &options)
+            .unwrap();
+
+        proptest::prop_assert_eq!(actual.values(), expected.as_slice());
     }
 
     #[test]

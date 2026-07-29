@@ -1,11 +1,63 @@
 use std::collections::HashMap;
 
-use arrow_array::{cast::AsArray, types::Int32Type, Array, Int32Array, UInt64Array};
+use arrow_array::{
+    cast::AsArray,
+    types::{Int32Type, Int64Type},
+    Array, Int32Array, UInt64Array,
+};
 use arrow_compile_compute::aggregate;
 use arrow_compile_compute::aggregate::Aggregator;
 use proptest::proptest;
 
+#[test]
+fn test_grouped_sum_merge() {
+    let mut left = aggregate::sum(&arrow_schema::DataType::Int32).unwrap();
+    left.ingest(
+        &[&Int32Array::from(vec![10, 20, 30])],
+        &UInt64Array::from(vec![0, 1, 0]),
+    )
+    .unwrap();
+
+    let mut right = aggregate::sum(&arrow_schema::DataType::Int32).unwrap();
+    right
+        .ingest(
+            &[&Int32Array::from(vec![5, 7, 11])],
+            &UInt64Array::from(vec![1, 2, 2]),
+        )
+        .unwrap();
+
+    left.merge(*right).unwrap();
+    let result = left.finish().unwrap();
+    assert_eq!(result.as_primitive::<Int64Type>().values(), &[40, 25, 18]);
+}
+
 proptest! {
+    #[test]
+    fn test_grouped_sum(arr: Vec<Option<i32>>) {
+        let mut ticket_ht = HashMap::new();
+        let mut tickets = Vec::with_capacity(arr.len());
+        for value in &arr {
+            let group = value.unwrap_or_default() % 7;
+            let next_ticket = ticket_ht.len();
+            tickets.push(*ticket_ht.entry(group).or_insert(next_ticket) as u64);
+        }
+
+        let mut expected = vec![0_i64; ticket_ht.len()];
+        for (value, &ticket) in arr.iter().zip(&tickets) {
+            if let Some(value) = value {
+                expected[ticket as usize] += i64::from(*value);
+            }
+        }
+
+        let data = Int32Array::from(arr);
+        let mut agg = aggregate::sum(data.data_type()).unwrap();
+        agg.ingest(&[&data], &UInt64Array::from(tickets)).unwrap();
+        let result = agg.finish().unwrap();
+        let result = result.as_primitive::<Int64Type>();
+
+        assert_eq!(result.values(), expected.as_slice());
+    }
+
     #[test]
     fn test_ungrouped_min(arr: Vec<i32>) {
         let min = arr.iter().copied().min();

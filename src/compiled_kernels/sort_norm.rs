@@ -1,4 +1,7 @@
-use std::sync::{Arc, LazyLock};
+use std::{
+    mem::size_of,
+    sync::{Arc, LazyLock},
+};
 
 use arrow_array::{
     builder::BinaryBuilder,
@@ -12,8 +15,8 @@ use arrow_schema::DataType;
 use crate::{
     compiled_kernels::{
         dsl2::{
-            compile, DSLArgument, DSLBitwiseBinOp, DSLContext, DSLFunction, DSLStmt, DSLType,
-            DSLValue, RunnableDSLFunction,
+            compile, DSLArgument, DSLArithBinOp, DSLBitwiseBinOp, DSLBuffer, DSLContext, DSLExpr,
+            DSLFunction, DSLStmt, DSLType, DSLValue, RunnableDSLFunction,
         },
         KernelCache,
     },
@@ -27,6 +30,289 @@ enum NormalizedColumn {
     UInt32(UInt32Array),
     UInt64(UInt64Array),
     Binary(BinaryArray),
+}
+
+const MAX_FIXED_SORT_WORDS: usize = 8;
+
+static FIXED_NORM_CACHE: LazyLock<KernelCache<NormalizeFixedWidth>> =
+    LazyLock::new(KernelCache::new);
+
+struct NormalizeFixedWidth {
+    function: RunnableDSLFunction,
+    nullable: Vec<bool>,
+    words: usize,
+}
+unsafe impl Send for NormalizeFixedWidth {}
+unsafe impl Sync for NormalizeFixedWidth {}
+
+impl Kernel for NormalizeFixedWidth {
+    type Key = Vec<(DataType, bool, SortOptions)>;
+
+    type Input<'a> = &'a [(&'a dyn Datum, SortOptions)];
+
+    type Params = usize;
+
+    type Output = DSLBuffer;
+
+    fn call(&self, inp: Self::Input<'_>) -> Result<Self::Output, ArrowKernelError> {
+        let len = inp[0].0.get().0.len();
+        let buffer_len = len.checked_mul(self.words).ok_or_else(|| {
+            ArrowKernelError::UnsupportedArguments("sort key buffer size overflowed".to_string())
+        })?;
+        let validities = inp
+            .iter()
+            .zip(&self.nullable)
+            .filter_map(|((datum, _), nullable)| {
+                nullable.then(|| BooleanArray::from(datum.get().0.nulls().unwrap().inner().clone()))
+            })
+            .collect::<Vec<_>>();
+        let mut output = DSLBuffer::new(PrimitiveType::U64, buffer_len);
+
+        {
+            let mut arguments = inp
+                .iter()
+                .map(|(datum, _)| DSLArgument::Datum(*datum))
+                .collect::<Vec<_>>();
+            arguments.extend(validities.iter().map(DSLArgument::datum));
+            arguments.push(DSLArgument::buffer(&mut output));
+            self.function.run(&arguments)?;
+        }
+
+        Ok(output)
+    }
+
+    fn compile(inp: &Self::Input<'_>, words: Self::Params) -> Result<Self, ArrowKernelError> {
+        let nullable = inp
+            .iter()
+            .map(|(datum, _)| datum.get().0.nulls().is_some())
+            .collect::<Vec<_>>();
+        let mut ctx = DSLContext::new();
+        let mut function = DSLFunction::new("normalize_fixed_sort_keys");
+        let value_args = inp
+            .iter()
+            .map(|(datum, _)| function.add_arg(&mut ctx, DSLType::array_like(*datum, "n")))
+            .collect::<Vec<_>>();
+        let validity_args = nullable
+            .iter()
+            .map(|nullable| {
+                nullable.then(|| {
+                    function.add_arg(
+                        &mut ctx,
+                        DSLType::Array(Box::new(DSLType::Boolean), "n".to_string()),
+                    )
+                })
+            })
+            .collect::<Vec<_>>();
+        let output_arg = function.add_arg(&mut ctx, DSLType::buffer_of(PrimitiveType::U64, "m"));
+        let payload_words = words - 1;
+
+        function.add_body(DSLStmt::for_range(
+            &mut ctx,
+            DSLValue::u64(0).expr().primitive_cast(PrimitiveType::U64)?,
+            value_args[0].expr().len()?,
+            |row_index| {
+                let mut fields = Vec::new();
+                for (column_index, ((datum, options), value_arg)) in
+                    inp.iter().zip(&value_args).enumerate()
+                {
+                    let pt = PrimitiveType::for_arrow_type(datum.get().0.data_type());
+                    let value = value_arg.expr().at(&row_index.expr())?;
+                    let is_valid = validity_args[column_index]
+                        .as_ref()
+                        .map(|validity| validity.expr().at(&row_index.expr()))
+                        .transpose()?;
+
+                    if let Some(is_valid) = &is_valid {
+                        let valid_tag = u8::from(options.nulls_first);
+                        let null_tag = u8::from(!options.nulls_first);
+                        fields.push((
+                            is_valid.select(
+                                DSLValue::u8(valid_tag)
+                                    .expr()
+                                    .primitive_cast(PrimitiveType::U8)?,
+                                DSLValue::u8(null_tag)
+                                    .expr()
+                                    .primitive_cast(PrimitiveType::U8)?,
+                            )?,
+                            8,
+                        ));
+                    }
+
+                    fields.push((
+                        normalize_numeric_expr(pt, value, is_valid, options.descending)?,
+                        pt.width() * 8,
+                    ));
+                }
+
+                let zero = DSLValue::u64(0).expr().primitive_cast(PrimitiveType::U64)?;
+                let mut packed = vec![zero; payload_words];
+                let mut bit_offset = 0usize;
+                // Concatenate the order-preserving column encodings from the
+                // most-significant bit down. Numeric u64 comparison of these
+                // words is therefore lexicographic row comparison.
+                for (field, field_bits) in fields {
+                    let field = field.primitive_cast(PrimitiveType::U64)?;
+                    let word_index = bit_offset / 64;
+                    let offset_in_word = bit_offset % 64;
+                    let available = 64 - offset_in_word;
+
+                    if field_bits <= available {
+                        let shift = available - field_bits;
+                        let field = if shift == 0 {
+                            field
+                        } else {
+                            field.arith(
+                                DSLArithBinOp::Mul,
+                                DSLValue::u64(1_u64 << shift)
+                                    .expr()
+                                    .primitive_cast(PrimitiveType::U64)?,
+                            )?
+                        };
+                        packed[word_index] =
+                            packed[word_index].bitwise(DSLBitwiseBinOp::Or, field)?;
+                    } else {
+                        let low_bits = field_bits - available;
+                        let high = field.clone().arith(
+                            DSLArithBinOp::Div,
+                            DSLValue::u64(1_u64 << low_bits)
+                                .expr()
+                                .primitive_cast(PrimitiveType::U64)?,
+                        )?;
+                        packed[word_index] =
+                            packed[word_index].bitwise(DSLBitwiseBinOp::Or, high)?;
+
+                        let low = field.bitwise(
+                            DSLBitwiseBinOp::And,
+                            DSLValue::u64((1_u64 << low_bits) - 1)
+                                .expr()
+                                .primitive_cast(PrimitiveType::U64)?,
+                        )?;
+                        let low = low.arith(
+                            DSLArithBinOp::Mul,
+                            DSLValue::u64(1_u64 << (64 - low_bits))
+                                .expr()
+                                .primitive_cast(PrimitiveType::U64)?,
+                        )?;
+                        packed[word_index + 1] =
+                            packed[word_index + 1].bitwise(DSLBitwiseBinOp::Or, low)?;
+                    }
+                    bit_offset += field_bits;
+                }
+
+                let row_start = row_index.expr().arith(
+                    DSLArithBinOp::Mul,
+                    DSLValue::u64(words as u64)
+                        .expr()
+                        .primitive_cast(PrimitiveType::U64)?,
+                )?;
+                packed
+                    .into_iter()
+                    // The final word makes ties deterministic and keeps index
+                    // extraction independent of the payload width.
+                    .chain(std::iter::once(row_index.expr()))
+                    .enumerate()
+                    .map(|(word_index, word)| {
+                        let output_index = row_start.clone().arith(
+                            DSLArithBinOp::Add,
+                            DSLValue::u64(word_index as u64)
+                                .expr()
+                                .primitive_cast(PrimitiveType::U64)?,
+                        )?;
+                        DSLStmt::set(&output_arg, &output_index, &word)
+                    })
+                    .collect::<Result<Vec<_>, _>>()
+            },
+        )?);
+
+        let validities = inp
+            .iter()
+            .zip(&nullable)
+            .filter_map(|((datum, _), nullable)| {
+                nullable.then(|| BooleanArray::from(datum.get().0.nulls().unwrap().inner().clone()))
+            })
+            .collect::<Vec<_>>();
+        let buffer_len = inp[0].0.get().0.len().checked_mul(words).ok_or_else(|| {
+            ArrowKernelError::UnsupportedArguments("sort key buffer size overflowed".to_string())
+        })?;
+        let mut output = DSLBuffer::new(PrimitiveType::U64, buffer_len);
+        let compiled = {
+            let mut arguments = inp
+                .iter()
+                .map(|(datum, _)| DSLArgument::Datum(*datum))
+                .collect::<Vec<_>>();
+            arguments.extend(validities.iter().map(DSLArgument::datum));
+            arguments.push(DSLArgument::buffer(&mut output));
+            compile(function, arguments)?
+        };
+
+        Ok(Self {
+            function: compiled,
+            nullable,
+            words,
+        })
+    }
+
+    fn get_key_for_input(
+        inp: &Self::Input<'_>,
+        _words: &Self::Params,
+    ) -> Result<Self::Key, ArrowKernelError> {
+        Ok(inp
+            .iter()
+            .map(|(datum, options)| {
+                let arr = datum.get().0;
+                (arr.data_type().clone(), arr.nulls().is_some(), *options)
+            })
+            .collect())
+    }
+}
+
+/// Fast path for sorting a few fixed-width columns, returning Ok(None) if the
+/// fast path criteria do not apply
+pub(crate) fn normalize_fixed_width_columns(
+    arrs: &[(&dyn Datum, SortOptions)],
+) -> Result<Option<(DSLBuffer, usize)>, ArrowKernelError> {
+    let Some((first, _)) = arrs.first() else {
+        return Ok(None);
+    };
+    let witness_len = first.get().0.len();
+    if !arrs
+        .iter()
+        .all(|(arr, _)| !arr.get().1 && arr.get().0.len() == witness_len)
+    {
+        return Err(ArrowKernelError::SizeMismatch);
+    }
+
+    let mut payload_bytes = 0usize;
+    for (arr, _) in arrs {
+        let arr = arr.get().0;
+        let pt = match arr.data_type() {
+            DataType::Int8
+            | DataType::Int16
+            | DataType::Int32
+            | DataType::Int64
+            | DataType::UInt8
+            | DataType::UInt16
+            | DataType::UInt32
+            | DataType::UInt64
+            | DataType::Float16
+            | DataType::Float32
+            | DataType::Float64 => PrimitiveType::for_arrow_type(arr.data_type()),
+            _ => return Ok(None),
+        };
+        payload_bytes = payload_bytes
+            .checked_add(pt.width())
+            .and_then(|bytes| bytes.checked_add(usize::from(arr.nulls().is_some())))
+            .ok_or_else(|| {
+                ArrowKernelError::UnsupportedArguments("sort key width overflowed".to_string())
+            })?;
+    }
+
+    let words = payload_bytes.div_ceil(size_of::<u64>()) + 1;
+    if words > MAX_FIXED_SORT_WORDS {
+        return Ok(None);
+    }
+
+    Ok(Some((FIXED_NORM_CACHE.get(arrs, words)?, words)))
 }
 
 impl TryFrom<ArrayRef> for NormalizedColumn {
@@ -198,38 +484,16 @@ fn normalize_numeric(
 
     func.add_body(
         DSLStmt::for_each(&mut ctx, &[arr_arg, nul_arg], |loop_vars| {
-            let mut itm = loop_vars[0].expr();
-            let is_valid = loop_vars[1].expr();
-
-            if inp_pt.is_float() {
-                itm = itm.float_to_total_order_sint()?;
-            }
-
-            if inp_pt.is_signed() {
-                let last_bit = match PrimitiveType::for_arrow_type(arr.get().0.data_type()).width()
-                {
-                    1 => DSLValue::u8(1 << 7),
-                    2 => DSLValue::u16(1 << 15),
-                    4 => DSLValue::u32(1 << 31),
-                    8 => DSLValue::u64(1 << 63),
-                    _ => unreachable!(),
-                }
-                .expr()
-                .primitive_cast(itm.get_type().as_primitive().unwrap())?;
-                itm = itm.bitwise(DSLBitwiseBinOp::Xor, last_bit)?;
-            }
+            let mut itm = normalize_numeric_expr(
+                inp_pt,
+                loop_vars[0].expr(),
+                Some(loop_vars[1].expr()),
+                invert,
+            )?;
             #[cfg(target_endian = "little")]
             {
                 itm = itm.bswap()?;
             }
-            itm = itm.bit_cast(out_type)?;
-
-            if invert {
-                itm = itm.bit_not()?;
-            }
-
-            let zero = DSLValue::zero_like(&itm).as_primitive_expr()?;
-            itm = is_valid.select(itm, zero)?;
             DSLStmt::emit(0, itm)
         })
         .unwrap(),
@@ -240,6 +504,53 @@ fn normalize_numeric(
         [DSLArgument::Datum(arr), DSLArgument::Datum(nul.as_ref())],
     )?;
     Ok(func)
+}
+
+fn normalize_numeric_expr(
+    inp_pt: PrimitiveType,
+    mut value: DSLExpr,
+    is_valid: Option<DSLExpr>,
+    invert: bool,
+) -> Result<DSLExpr, ArrowKernelError> {
+    if inp_pt.is_float() {
+        value = value.float_to_total_order_sint()?;
+    }
+
+    if inp_pt.is_signed() {
+        let last_bit = match inp_pt.width() {
+            1 => DSLValue::u8(1 << 7),
+            2 => DSLValue::u16(1 << 15),
+            4 => DSLValue::u32(1 << 31),
+            8 => DSLValue::u64(1 << 63),
+            _ => unreachable!(),
+        }
+        .expr()
+        .primitive_cast(value.get_type().as_primitive().unwrap())?;
+        value = value.bitwise(DSLBitwiseBinOp::Xor, last_bit)?;
+    }
+
+    let out_type = match inp_pt {
+        PrimitiveType::I8 => PrimitiveType::U8,
+        PrimitiveType::I16 => PrimitiveType::U16,
+        PrimitiveType::I32 => PrimitiveType::U32,
+        PrimitiveType::I64 => PrimitiveType::U64,
+        PrimitiveType::F16 => PrimitiveType::U16,
+        PrimitiveType::F32 => PrimitiveType::U32,
+        PrimitiveType::F64 => PrimitiveType::U64,
+        _ => inp_pt,
+    };
+    value = value.bit_cast(out_type)?;
+
+    if invert {
+        value = value.bit_not()?;
+    }
+
+    if let Some(is_valid) = is_valid {
+        let zero = DSLValue::zero_like(&value).as_primitive_expr()?;
+        is_valid.select(value, zero)
+    } else {
+        Ok(value)
+    }
 }
 
 fn normalize_bytes(arr: &dyn Datum, invert: bool) -> Result<ArrayRef, ArrowKernelError> {
@@ -294,7 +605,7 @@ mod tests {
     use arrow_buffer::NullBuffer;
     use itertools::Itertools;
 
-    use super::{normalize_columns, normalize_numeric};
+    use super::{normalize_columns, normalize_fixed_width_columns, normalize_numeric};
     use crate::{compiled_kernels::dsl2::DSLArgument, sort, SortOptions};
 
     fn lexicographic_sort_indices(arr: &BinaryArray) -> Vec<u32> {
@@ -445,5 +756,40 @@ mod tests {
                 SortOptions::default(),
             ],
         );
+    }
+
+    #[test]
+    fn test_fixed_width_keys_match_normalized_byte_order() {
+        let ints = Int32Array::from(vec![Some(-1), None, Some(0), Some(-1), Some(i32::MIN)]);
+        let floats =
+            Float32Array::from(vec![f32::NAN, 0.0, -0.0, f32::NEG_INFINITY, f32::INFINITY]);
+        let inputs = [
+            (
+                &ints as &dyn Datum,
+                SortOptions {
+                    descending: false,
+                    nulls_first: true,
+                },
+            ),
+            (
+                &floats as &dyn Datum,
+                SortOptions {
+                    descending: true,
+                    nulls_first: false,
+                },
+            ),
+        ];
+
+        let normalized = normalize_columns(&inputs).unwrap();
+        let (fixed, words) = normalize_fixed_width_columns(&inputs).unwrap().unwrap();
+        let fixed = bytemuck::cast_slice::<u8, u64>(fixed.buf.as_slice());
+        let mut fixed_order = (0..ints.len() as u32).collect_vec();
+        fixed_order.sort_by(|lhs, rhs| {
+            let lhs = *lhs as usize * words;
+            let rhs = *rhs as usize * words;
+            fixed[lhs..lhs + words].cmp(&fixed[rhs..rhs + words])
+        });
+
+        assert_eq!(fixed_order, lexicographic_sort_indices(&normalized));
     }
 }

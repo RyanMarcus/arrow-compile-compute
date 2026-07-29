@@ -54,7 +54,7 @@ use run_end_writer::{RunEndWriter, RunEndWriterEmitter, RunEndWriterRuntime};
 use view_writer::{StringViewWriter, StringViewWriterEmitter, StringViewWriterRuntime};
 
 use crate::{
-    compiled_iter::IteratorHolder,
+    compiled_iter::{IteratorHolder, IteratorSource},
     compiled_writers::string_writer::{StringWriter, StringWriterEmitter, StringWriterRuntime},
     normalized_base_type, ArrowKernelError, ListItemType, PrimitiveType,
 };
@@ -413,39 +413,13 @@ impl AnyWriter {
         &'borrow self,
         codegen: WriterCodegen<'ctx, 'borrow>,
         runtime_ptr: PointerValue<'ctx>,
-        source_iter: &IteratorHolder,
-        mut value: BasicValueEnum<'ctx>,
+        source_iter: IteratorSource<'_, 'ctx>,
+        value: BasicValueEnum<'ctx>,
     ) -> Result<(), ArrowKernelError> {
-        // Dictionary and run-end accessors already return decoded logical values,
-        // so continue with the holder for their value iterator.
-        match source_iter {
-            IteratorHolder::Dictionary { values, .. } => {
-                return self.llvm_write_from_iterator(codegen, runtime_ptr, values, value);
-            }
-            IteratorHolder::RunEnd { values, .. } => {
-                return self.llvm_write_from_iterator(codegen, runtime_ptr, values, value);
-            }
-            _ => {}
-        }
-
         // A list value is a row descriptor; copy its child range into the
         // destination list, recursively handling nested lists.
-        if let (AnyWriter::List(writer), IteratorHolder::List(source)) = (self, source_iter) {
-            return writer.llvm_write_from_list(codegen, runtime_ptr, source.child(), value);
-        }
-
-        if source_iter.data_type() == DataType::Boolean
-            && value.into_int_value().get_type().get_bit_width() != 1
-        {
-            value = codegen
-                .builder
-                .build_int_truncate(
-                    value.into_int_value(),
-                    codegen.ctx.bool_type(),
-                    "list_child_bool",
-                )
-                .unwrap()
-                .into();
+        if let (AnyWriter::List(writer), Some(source_child)) = (self, source_iter.list_child()) {
+            return writer.llvm_write_from_list(codegen, runtime_ptr, source_child, value);
         }
 
         // Non-list values are recursion leaves and can use the ordinary scalar
@@ -719,10 +693,30 @@ impl<'ctx> BoundWriter<'ctx> {
                     builder,
                 },
                 self.runtime_ptr,
-                source_iter,
+                IteratorSource::physical(source_iter),
                 value,
             )
             .unwrap();
+    }
+
+    pub fn llvm_ingest_from_iterator_source<'call>(
+        &'call self,
+        ctx: &'ctx Context,
+        module: &'call Module<'ctx>,
+        builder: &'call Builder<'ctx>,
+        source_iter: IteratorSource<'call, 'ctx>,
+        value: BasicValueEnum<'ctx>,
+    ) -> Result<(), ArrowKernelError> {
+        self.writer.llvm_write_from_iterator(
+            WriterCodegen {
+                ctx,
+                module,
+                builder,
+            },
+            self.runtime_ptr,
+            source_iter,
+            value,
+        )
     }
 
     pub fn llvm_ingest_block<'call>(

@@ -1,9 +1,11 @@
 use std::sync::Arc;
 
 use super::{ArrowKernelError, Kernel};
+use crate::compiled_kernels::null_utils::{copy_selected_nulls, has_any_nulls};
 use crate::{
     compiled_kernels::dsl2::{
-        compile, DSLArgument, DSLContext, DSLFunction, DSLStmt, DSLType, RunnableDSLFunction,
+        accepted_type, compile, DSLArgument, DSLContext, DSLFunction, DSLStmt, DSLType,
+        RunnableDSLFunction,
     },
     compiled_writers::WriterSpec,
     intersect_and_copy_nulls, logical_arrow_type, PrimitiveType,
@@ -16,6 +18,19 @@ use arrow_array::{
 };
 use arrow_data::ArrayDataBuilder;
 use arrow_schema::DataType;
+
+fn matching_var_list_shape(source: &DataType, target: &DataType) -> bool {
+    let source = logical_arrow_type(source);
+    match (&source, target) {
+        (DataType::List(source), DataType::List(target))
+        | (DataType::LargeList(source), DataType::LargeList(target)) => {
+            matching_var_list_shape(source.data_type(), target.data_type())
+        }
+        (DataType::List(_), _) | (DataType::LargeList(_), _) => false,
+        (_, DataType::List(_)) | (_, DataType::LargeList(_)) => false,
+        _ => true,
+    }
+}
 
 pub fn coalesce_type(res: ArrayRef, tar: &DataType) -> Result<ArrayRef, ArrowKernelError> {
     if res.data_type() == tar {
@@ -183,7 +198,13 @@ impl Kernel for CastKernel {
             inp.len(),
             res.len()
         );
-        let res = intersect_and_copy_nulls(&[&inp], res)?;
+        let res = if matches!(self.tar, DataType::List(_) | DataType::LargeList(_))
+            && has_any_nulls(inp)
+        {
+            copy_selected_nulls(inp, res, &(0..inp.len()).collect::<Vec<_>>())?
+        } else {
+            intersect_and_copy_nulls(&[&inp], res)?
+        };
         coalesce_type(res, &self.tar)
     }
 
@@ -191,6 +212,15 @@ impl Kernel for CastKernel {
         let tar = params;
 
         let w = WriterSpec::for_data_type(&tar);
+        let target_type = accepted_type(&w);
+        if matches!(target_type, DSLType::VarList(_))
+            && !matching_var_list_shape(arr.data_type(), &tar)
+        {
+            return Err(ArrowKernelError::InvalidCast(
+                DSLType::array_like(arr, "").iter_type().unwrap(),
+                target_type,
+            ));
+        }
 
         let mut ctx = DSLContext::new();
         let mut func = DSLFunction::new("cast");
@@ -198,7 +228,9 @@ impl Kernel for CastKernel {
         func.add_ret(w, "n");
         func.add_body(DSLStmt::for_each(&mut ctx, &[arg1], |loop_vars| {
             let v = &loop_vars[0].expr();
-            let v = if logical_arrow_type(&tar) == DataType::Boolean {
+            let v = if matches!(target_type, DSLType::VarList(_)) {
+                v.cast(target_type.clone())?
+            } else if logical_arrow_type(&tar) == DataType::Boolean {
                 v.cast_to_bool()?
             } else {
                 v.primitive_cast(PrimitiveType::for_arrow_type(&tar))?
@@ -223,10 +255,11 @@ mod tests {
     use std::sync::Arc;
 
     use arrow_array::{
+        builder::{BooleanBuilder, FixedSizeListBuilder, Int32Builder, ListBuilder, StringBuilder},
         cast::AsArray,
-        types::{Int16Type, Int32Type, Int8Type},
-        Array, ArrayRef, DictionaryArray, Int16Array, Int32Array, Int64Array, RunArray,
-        StringArray, UInt8Array,
+        types::{Int16Type, Int32Type, Int8Type, UInt32Type},
+        Array, ArrayRef, DictionaryArray, Int16Array, Int32Array, Int64Array, ListArray, RunArray,
+        StringArray, UInt32Array, UInt8Array,
     };
     use arrow_schema::{DataType, Field};
     use itertools::Itertools;
@@ -327,6 +360,184 @@ mod tests {
             res.as_primitive::<Int32Type>().values(),
             &[-100, -100, -100, -200, -200, -200, -300, -300, -300, -400, -500, -500, -600, -600]
         );
+    }
+
+    #[test]
+    fn test_dict_list_i32_to_list_i32() {
+        let values = ListArray::from_iter_primitive::<Int32Type, _, _>([
+            Some(vec![Some(10), Some(11)]),
+            Some(vec![Some(20)]),
+            Some(vec![Some(30), Some(31), Some(32)]),
+        ]);
+        let data = DictionaryArray::<UInt32Type>::new(
+            UInt32Array::from(vec![2, 0, 2, 1, 0]),
+            Arc::new(values),
+        );
+        let target = DataType::List(Arc::new(Field::new_list_field(DataType::Int32, true)));
+        let expected = arrow_cast::cast(&data, &target).unwrap();
+
+        let kernel = CastKernel::compile(&(&data as &dyn Array), target).unwrap();
+        let actual = kernel.call(&data).unwrap();
+
+        assert_eq!(&actual, &expected);
+    }
+
+    #[test]
+    fn test_dict_list_i32_to_list_i64_preserves_recursive_nulls() {
+        let mut values = ListBuilder::new(Int32Builder::new());
+        values.values().append_value(1);
+        values.values().append_null();
+        values.append(true);
+        values.append(true);
+        values.append(false);
+        values.values().append_slice(&[-2, 3]);
+        values.append(true);
+        let data = DictionaryArray::<UInt32Type>::new(
+            UInt32Array::from(vec![Some(3), None, Some(0), Some(2), Some(1), Some(3)]),
+            Arc::new(values.finish()),
+        );
+        let target = DataType::List(Arc::new(Field::new_list_field(DataType::Int64, true)));
+        let expected = arrow_cast::cast(&data, &target).unwrap();
+
+        let kernel = CastKernel::compile(&(&data as &dyn Array), target).unwrap();
+        let actual = kernel.call(&data).unwrap();
+
+        assert_eq!(&actual, &expected);
+    }
+
+    #[test]
+    fn test_dict_nested_list_i32_to_nested_list_i64() {
+        let mut values = ListBuilder::new(ListBuilder::new(Int32Builder::new()));
+        values.values().values().append_value(1);
+        values.values().values().append_null();
+        values.values().append(true);
+        values.values().append(false);
+        values.append(true);
+        values.append(true);
+        values.values().values().append_value(3);
+        values.values().append(true);
+        values.append(true);
+        let data = DictionaryArray::<UInt32Type>::new(
+            UInt32Array::from(vec![2, 0, 1, 0]),
+            Arc::new(values.finish()),
+        );
+        let target = DataType::List(Arc::new(Field::new_list_field(
+            DataType::List(Arc::new(Field::new_list_field(DataType::Int64, true))),
+            true,
+        )));
+        let expected = arrow_cast::cast(&data, &target).unwrap();
+
+        let kernel = CastKernel::compile(&(&data as &dyn Array), target).unwrap();
+        let actual = kernel.call(&data).unwrap();
+
+        assert_eq!(&actual, &expected);
+    }
+
+    #[test]
+    fn test_run_end_list_i32_to_list_i64() {
+        let values = ListArray::from_iter_primitive::<Int32Type, _, _>([
+            Some(vec![Some(1), None]),
+            None,
+            Some(vec![]),
+        ]);
+        let run_ends = Int16Array::from(vec![2, 5, 7]);
+        let data = RunArray::<Int16Type>::try_new(&run_ends, &values).unwrap();
+        let target = DataType::List(Arc::new(Field::new_list_field(DataType::Int64, true)));
+        let expected = arrow_cast::cast(&data, &target).unwrap();
+
+        let kernel = CastKernel::compile(&(&data as &dyn Array), target).unwrap();
+        let actual = kernel.call(&data).unwrap();
+
+        assert_eq!(&actual, &expected);
+    }
+
+    #[test]
+    fn test_variable_list_map_casts_boolean_leaves() {
+        let mut values = ListBuilder::new(BooleanBuilder::new());
+        values.values().append_slice(&[true, false, true]);
+        values.append(true);
+        values.append(true);
+        let data = values.finish();
+        let target = DataType::List(Arc::new(Field::new_list_field(DataType::Int32, true)));
+        let expected = arrow_cast::cast(&data, &target).unwrap();
+
+        let kernel = CastKernel::compile(&(&data as &dyn Array), target).unwrap();
+        let actual = kernel.call(&data).unwrap();
+
+        assert_eq!(&actual, &expected);
+    }
+
+    #[test]
+    fn test_variable_list_map_casts_fixed_size_list_leaves() {
+        let mut values = ListBuilder::new(FixedSizeListBuilder::new(Int32Builder::new(), 2));
+        values.values().values().append_slice(&[1, 2]);
+        values.values().append(true);
+        values.values().values().append_slice(&[3, 4]);
+        values.values().append(true);
+        values.append(true);
+        values.append(true);
+        let data = values.finish();
+        let target = DataType::List(Arc::new(Field::new_list_field(
+            DataType::FixedSizeList(Arc::new(Field::new_list_field(DataType::Int64, true)), 2),
+            true,
+        )));
+        let expected = arrow_cast::cast(&data, &target).unwrap();
+
+        let kernel = CastKernel::compile(&(&data as &dyn Array), target).unwrap();
+        let actual = kernel.call(&data).unwrap();
+
+        assert_eq!(&actual, &expected);
+    }
+
+    #[test]
+    fn test_dict_list_cast_handles_empty_and_sliced_inputs() {
+        let values = ListArray::from_iter_primitive::<Int32Type, _, _>([
+            Some(vec![Some(10)]),
+            Some(vec![Some(20), Some(21)]),
+            Some(vec![]),
+        ]);
+        let data = DictionaryArray::<UInt32Type>::new(
+            UInt32Array::from(vec![2, 1, 0, 1, 2]),
+            Arc::new(values),
+        );
+        let target = DataType::List(Arc::new(Field::new_list_field(DataType::Int64, true)));
+
+        for input in [data.slice(0, 0), data.slice(1, 3)] {
+            let expected = arrow_cast::cast(&input, &target).unwrap();
+            let kernel = CastKernel::compile(&(&input as &dyn Array), target.clone()).unwrap();
+            let actual = kernel.call(&input).unwrap();
+            assert_eq!(&actual, &expected);
+        }
+    }
+
+    #[test]
+    fn test_variable_list_cast_rejects_shape_and_leaf_changes() {
+        let ints = ListArray::from_iter_primitive::<Int32Type, _, _>([Some(vec![Some(1)])]);
+        let large_target =
+            DataType::LargeList(Arc::new(Field::new_list_field(DataType::Int64, true)));
+        assert!(matches!(
+            CastKernel::compile(&(&ints as &dyn Array), large_target),
+            Err(crate::ArrowKernelError::InvalidCast(_, _))
+        ));
+
+        let nested_target = DataType::List(Arc::new(Field::new_list_field(
+            DataType::List(Arc::new(Field::new_list_field(DataType::Int64, true))),
+            true,
+        )));
+        assert!(matches!(
+            CastKernel::compile(&(&ints as &dyn Array), nested_target),
+            Err(crate::ArrowKernelError::InvalidCast(_, _))
+        ));
+
+        let mut strings = ListBuilder::new(StringBuilder::new());
+        strings.values().append_value("one");
+        strings.append(true);
+        let strings = strings.finish();
+        let numeric_target = DataType::List(Arc::new(Field::new_list_field(DataType::Int64, true)));
+        assert!(matches!(
+            CastKernel::compile(&(&strings as &dyn Array), numeric_target),
+            Err(crate::ArrowKernelError::InvalidCast(_, _))
+        ));
     }
 
     #[test]

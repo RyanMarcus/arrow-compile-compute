@@ -11,7 +11,11 @@ use arrow_array::{
 use itertools::Itertools;
 
 use crate::{
-    compiled_kernels::{sort_norm::normalize_columns, ArrowKernelError},
+    compiled_kernels::{
+        dsl2::DSLBuffer,
+        sort_norm::{normalize_columns, normalize_fixed_width_columns},
+        ArrowKernelError,
+    },
     PrimitiveType,
 };
 
@@ -22,8 +26,47 @@ pub fn sort_multi_col(data: &[(&dyn Datum, SortOptions)]) -> Result<UInt32Array,
         ));
     }
 
+    // try the fast path
+    if let Some((keys, words)) = normalize_fixed_width_columns(data)? {
+        return match words {
+            2 => sort_fixed_width_records::<2>(keys),
+            3 => sort_fixed_width_records::<3>(keys),
+            4 => sort_fixed_width_records::<4>(keys),
+            5 => sort_fixed_width_records::<5>(keys),
+            6 => sort_fixed_width_records::<6>(keys),
+            7 => sort_fixed_width_records::<7>(keys),
+            8 => sort_fixed_width_records::<8>(keys),
+            _ => Err(ArrowKernelError::InternalError(format!(
+                "unsupported fixed sort key width {words}"
+            ))),
+        };
+    }
+
+    // fall back to the slow path
     let normalized = normalize_columns(data)?;
     Ok(sort_indices_from_normalized(&normalized))
+}
+
+fn sort_fixed_width_records<const N: usize>(
+    mut keys: DSLBuffer,
+) -> Result<UInt32Array, ArrowKernelError>
+where
+    [u64; N]: bytemuck::Pod,
+{
+    let records =
+        bytemuck::try_cast_slice_mut::<u8, [u64; N]>(keys.buf.as_slice_mut()).map_err(|error| {
+            ArrowKernelError::InternalError(format!(
+                "could not view fixed sort keys as {N}-word records: {error}"
+            ))
+        })?;
+
+    records.sort_unstable();
+    Ok(UInt32Array::from(
+        records
+            .iter()
+            .map(|record| record[N - 1] as u32)
+            .collect_vec(),
+    ))
 }
 
 pub fn sort_col(data: &dyn Datum, opts: SortOptions) -> Result<UInt32Array, ArrowKernelError> {
@@ -236,13 +279,35 @@ impl SortOptions {
 
 #[cfg(test)]
 mod test {
-    use crate::{sort, SortOptions};
+    use crate::{sort, ArrowKernelError, SortOptions};
     use arrow_array::{
-        cast::AsArray, types::Int32Type, Array, ArrayRef, Float32Array, Int32Array, Int64Array,
-        StringArray, UInt32Array,
+        cast::AsArray, types::Int32Type, Array, ArrayRef, Float16Array, Float32Array, Float64Array,
+        Int16Array, Int32Array, Int64Array, Int8Array, StringArray, UInt16Array, UInt32Array,
+        UInt64Array, UInt8Array,
     };
+    use arrow_ord::sort::SortColumn;
+    use arrow_schema::SortOptions as ArrowSortOptions;
+    use half::f16;
     use itertools::Itertools;
     use std::sync::Arc;
+
+    fn assert_multicol_sort_matches_arrow(columns: &[ArrayRef], options: &[SortOptions]) {
+        let arrow_columns = columns
+            .iter()
+            .zip(options)
+            .map(|(values, options)| SortColumn {
+                values: values.clone(),
+                options: Some(ArrowSortOptions {
+                    descending: options.descending,
+                    nulls_first: options.nulls_first,
+                }),
+            })
+            .collect_vec();
+        let expected = arrow_ord::sort::lexsort_to_indices(&arrow_columns, None).unwrap();
+        let inputs = columns.iter().map(|column| column.as_ref()).collect_vec();
+        let actual = sort::multicol_sort_to_indices(&inputs, options).unwrap();
+        assert_eq!(actual, expected);
+    }
 
     #[test]
     fn test_sort_i32_nonnull_fwd() {
@@ -368,6 +433,186 @@ mod test {
         let input = [&arr1 as &dyn Array, &arr2 as &dyn Array];
         let our_res = sort::multicol_sort_to_indices(&input, &[SortOptions::default(); 2]).unwrap();
         assert_eq!(our_res, UInt32Array::from(perm));
+    }
+
+    #[test]
+    fn test_sort_fixed_width_three_columns() {
+        let first = Int8Array::from(vec![i8::MIN, -1, -1, -1, -1, -1, i8::MAX]);
+        let second = Int32Array::from(vec![0, i32::MIN, -1, -1, -1, -1, i32::MAX]);
+        let third = Int64Array::from(vec![
+            Some(0),
+            Some(i64::MAX),
+            None,
+            Some(i64::MIN),
+            Some(-1),
+            Some(-1),
+            Some(0),
+        ]);
+        let input = [
+            &first as &dyn Array,
+            &second as &dyn Array,
+            &third as &dyn Array,
+        ];
+
+        let result = sort::multicol_sort_to_indices(&input, &[SortOptions::default(); 3]).unwrap();
+
+        assert_eq!(result, UInt32Array::from(vec![0, 1, 3, 4, 5, 2, 6]));
+    }
+
+    #[test]
+    fn test_sort_fixed_width_all_numeric_types_and_options() {
+        let columns: Vec<ArrayRef> = vec![
+            Arc::new(Int8Array::from(vec![Some(0), None, Some(-1), Some(1)])),
+            Arc::new(UInt8Array::from(vec![Some(2), Some(1), None, Some(0)])),
+            Arc::new(Int16Array::from(vec![Some(-2), Some(2), Some(0), None])),
+            Arc::new(UInt16Array::from(vec![None, Some(3), Some(1), Some(2)])),
+            Arc::new(Int32Array::from(vec![
+                Some(i32::MIN),
+                Some(0),
+                None,
+                Some(i32::MAX),
+            ])),
+            Arc::new(UInt32Array::from(vec![
+                Some(u32::MAX),
+                None,
+                Some(0),
+                Some(1),
+            ])),
+            Arc::new(Int64Array::from(vec![
+                Some(i64::MAX),
+                Some(-1),
+                Some(i64::MIN),
+                None,
+            ])),
+            Arc::new(UInt64Array::from(vec![
+                None,
+                Some(0),
+                Some(u64::MAX),
+                Some(1),
+            ])),
+            Arc::new(Float16Array::from(vec![
+                Some(f16::NEG_ZERO),
+                Some(f16::INFINITY),
+                None,
+                Some(f16::NAN),
+            ])),
+            Arc::new(Float32Array::from(vec![
+                Some(f32::NEG_INFINITY),
+                None,
+                Some(-0.0),
+                Some(f32::from_bits(0x7fc0_0001)),
+            ])),
+            Arc::new(Float64Array::from(vec![
+                Some(f64::from_bits(0xfff8_0000_0000_0001)),
+                Some(0.0),
+                Some(f64::INFINITY),
+                None,
+            ])),
+        ];
+        let options = (0..columns.len())
+            .map(|index| SortOptions {
+                descending: index % 2 == 0,
+                nulls_first: index % 3 == 0,
+            })
+            .collect_vec();
+
+        assert_multicol_sort_matches_arrow(&columns, &options);
+    }
+
+    #[test]
+    fn test_sort_fixed_width_float_total_order_and_ties() {
+        let columns: Vec<ArrayRef> = vec![
+            Arc::new(Int8Array::from(vec![0; 10])),
+            Arc::new(Float64Array::from(vec![
+                Some(f64::from_bits(0xfff8_0000_0000_0002)),
+                Some(f64::NEG_INFINITY),
+                Some(-0.0),
+                Some(0.0),
+                Some(f64::INFINITY),
+                Some(f64::from_bits(0x7ff8_0000_0000_0001)),
+                Some(f64::from_bits(0x7ff8_0000_0000_0002)),
+                None,
+                Some(1.0),
+                Some(1.0),
+            ])),
+        ];
+
+        for options in [
+            SortOptions::default(),
+            SortOptions {
+                descending: true,
+                nulls_first: false,
+            },
+            SortOptions {
+                descending: false,
+                nulls_first: true,
+            },
+            SortOptions {
+                descending: true,
+                nulls_first: true,
+            },
+        ] {
+            assert_multicol_sort_matches_arrow(&columns, &[SortOptions::default(), options]);
+        }
+    }
+
+    #[test]
+    fn test_sort_fixed_width_sliced_arrays() {
+        let first = Int32Array::from(vec![Some(99), None, Some(-1), Some(0), Some(-1), Some(99)]);
+        let second = UInt64Array::from(vec![100, 4, 3, 2, 1, 0]);
+        let columns = vec![
+            Arc::new(first.slice(1, 4)) as ArrayRef,
+            Arc::new(second.slice(1, 4)) as ArrayRef,
+        ];
+        let options = [
+            SortOptions {
+                descending: false,
+                nulls_first: true,
+            },
+            SortOptions {
+                descending: true,
+                nulls_first: false,
+            },
+        ];
+
+        assert_multicol_sort_matches_arrow(&columns, &options);
+    }
+
+    #[test]
+    fn test_sort_wide_numeric_and_mixed_string_fallbacks() {
+        let wide = (0..8)
+            .map(|column| {
+                Arc::new(UInt64Array::from(vec![column, 10 - column, column, 5])) as ArrayRef
+            })
+            .collect_vec();
+        assert_multicol_sort_matches_arrow(&wide, &[SortOptions::default(); 8]);
+
+        let mixed: Vec<ArrayRef> = vec![
+            Arc::new(Int32Array::from(vec![1, 1, 0, 1])),
+            Arc::new(StringArray::from(vec!["b", "a", "z", "a"])),
+        ];
+        assert_multicol_sort_matches_arrow(&mixed, &[SortOptions::default(); 2]);
+    }
+
+    #[test]
+    fn test_sort_fixed_width_empty_and_mismatched_lengths() {
+        let empty_first = Int32Array::from(Vec::<i32>::new());
+        let empty_second = UInt64Array::from(Vec::<u64>::new());
+        let result = sort::multicol_sort_to_indices(
+            &[&empty_first as &dyn Array, &empty_second as &dyn Array],
+            &[SortOptions::default(); 2],
+        )
+        .unwrap();
+        assert!(result.is_empty());
+
+        let short = Int32Array::from(vec![1]);
+        let long = Int32Array::from(vec![1, 2]);
+        let error = sort::multicol_sort_to_indices(
+            &[&short as &dyn Array, &long as &dyn Array],
+            &[SortOptions::default(); 2],
+        )
+        .unwrap_err();
+        assert!(matches!(error, ArrowKernelError::SizeMismatch));
     }
 
     #[test]
