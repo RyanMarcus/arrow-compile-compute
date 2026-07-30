@@ -35,10 +35,10 @@ pub fn criterion_benchmark(c: &mut Criterion) {
         our_res.as_primitive::<Int32Type>()
     );
 
-    c.bench_function("select::concat(array(i32) x10)/arrow", |b| {
+    c.bench_function("select::concat(array(i32) x10) 10m rows/arrow", |b| {
         b.iter(|| black_box(arrow_select::concat::concat(&to_concat_refs).unwrap()));
     });
-    c.bench_function("select::concat(array(i32) x10)/llvm warm", |b| {
+    c.bench_function("select::concat(array(i32) x10) 10m rows/llvm warm", |b| {
         b.iter(|| black_box(arrow_compile_compute::select::concat(&to_concat_refs).unwrap()));
     });
 
@@ -74,7 +74,7 @@ pub fn criterion_benchmark(c: &mut Criterion) {
     );
 
     c.bench_function(
-        "select::concat(array(i32) x5, dictionary(i8, i32) x5)/arrow",
+        "select::concat(array(i32) x5, dictionary(i8, i32) x5) 10m rows/arrow",
         |b| {
             b.iter(|| {
                 let arrs = to_concat
@@ -87,7 +87,7 @@ pub fn criterion_benchmark(c: &mut Criterion) {
         },
     );
     c.bench_function(
-        "select::concat(array(i32) x5, dictionary(i8, i32) x5)/llvm warm",
+        "select::concat(array(i32) x5, dictionary(i8, i32) x5) 10m rows/llvm warm",
         |b| {
             b.iter(|| black_box(arrow_compile_compute::select::concat(&to_concat_refs).unwrap()));
         },
@@ -110,11 +110,14 @@ pub fn criterion_benchmark(c: &mut Criterion) {
         our_res.as_fixed_size_list().values().as_boolean()
     );
 
-    c.bench_function("select::concat(fixed_size_list(bool, 8) x2)/arrow", |b| {
-        b.iter(|| black_box(arrow_select::concat::concat(&to_concat_refs).unwrap()));
-    });
     c.bench_function(
-        "select::concat(fixed_size_list(bool, 8) x2)/llvm warm",
+        "select::concat(fixed_size_list(bool, 8) x2) 2m rows/arrow",
+        |b| {
+            b.iter(|| black_box(arrow_select::concat::concat(&to_concat_refs).unwrap()));
+        },
+    );
+    c.bench_function(
+        "select::concat(fixed_size_list(bool, 8) x2) 2m rows/llvm warm",
         |b| {
             b.iter(|| black_box(arrow_compile_compute::select::concat(&to_concat_refs).unwrap()));
         },
@@ -126,7 +129,7 @@ pub fn criterion_benchmark(c: &mut Criterion) {
         .sum::<usize>())
         .map(|idx| idx % 3 == 0)
         .collect_vec();
-    c.bench_function("BooleanArray::from(Vec(bool))/rust batched", |b| {
+    c.bench_function("BooleanArray::from(Vec(bool)) 16m rows/rust batched", |b| {
         b.iter_batched(
             || black_box(bools.clone()),
             |bools| black_box(BooleanArray::from(bools)),
@@ -138,15 +141,18 @@ pub fn criterion_benchmark(c: &mut Criterion) {
         .iter()
         .map(|value| if *value { 1_u8 } else { 0_u8 })
         .collect_vec();
-    c.bench_function("BooleanArray::from(Vec(u8) mapped to bool)/rust", |b| {
-        b.iter(|| {
-            let bools = black_box(&bytes)
-                .iter()
-                .map(|value| *value != 0)
-                .collect_vec();
-            black_box(BooleanArray::from(bools));
-        });
-    });
+    c.bench_function(
+        "BooleanArray::from(Vec(u8) mapped to bool) 16m rows/rust",
+        |b| {
+            b.iter(|| {
+                let bools = black_box(&bytes)
+                    .iter()
+                    .map(|value| *value != 0)
+                    .collect_vec();
+                black_box(BooleanArray::from(bools));
+            });
+        },
+    );
 }
 
 criterion_group!(benches, criterion_benchmark);

@@ -13,8 +13,6 @@
     --arrow-fg: #a40e26;
     --equal-bg: #f6f8fa;
     --equal-fg: #57606a;
-    --unclear-bg: #fff8c5;
-    --unclear-fg: #9a6700;
   }
   @media (prefers-color-scheme: dark) {
     :root {
@@ -24,8 +22,6 @@
       --arrow-fg: #ff7b72;
       --equal-bg: #25292e;
       --equal-fg: #b1bac4;
-      --unclear-bg: #3a3017;
-      --unclear-fg: #e3b341;
     }
   }
   body {
@@ -57,8 +53,6 @@
   tr.arrow-win td.badge { color: var(--arrow-fg); }
   tr.equal { background: var(--equal-bg); }
   tr.equal td.badge { color: var(--equal-fg); }
-  tr.inconclusive { background: var(--unclear-bg); }
-  tr.inconclusive td.badge { color: var(--unclear-fg); }
   details { margin-top: 2rem; }
   summary { cursor: pointer; color: #888; }
 </style>
@@ -66,15 +60,18 @@
 <body>
 <h1>JIT vs Arrow::compute Benchmark Results</h1>
 <p id="meta" class="meta">Loading benchmark results...</p>
+<p id="host" class="meta" hidden></p>
 <p class="classification"><b>Timing:</b> every LLVM number is a warm public-API call — the
 kernel is already compiled and cached, so the timed loop pays cache lookup + dispatch +
 execution, never compilation. Baselines are stock arrow-rs kernels, except vector ops, which
 compare against hand-written Rust (arrow has no equivalent kernels). Encoded inputs the
 baseline cannot process directly (run-end encoded) are decoded first on the baseline side,
 since that is what a stock-arrow user must do.</p>
-<p class="classification"><b>Verdict:</b> ratios within <span id="margin">3%</span> are
+<p class="classification"><b>Verdict:</b> ratios within <span id="margin">3.5%</span> are
 labeled <b>equal</b>. Beyond that, a win requires the two median 95% confidence intervals to
-not overlap; otherwise the row is <b>inconclusive</b>.</p>
+not overlap; when they overlap, the measurement cannot separate the two sides and the row is
+also labeled <b>equal</b>.
+See <a href="#reproduce">how to reproduce these results</a>.</p>
 <p id="error" class="error" role="alert" hidden>Benchmark data unavailable.</p>
 
 <div id="families"></div>
@@ -87,8 +84,21 @@ not overlap; otherwise the row is <b>inconclusive</b>.</p>
 </table>
 </details>
 
+<h2 id="reproduce">Reproducing these results</h2>
+<p class="classification">From the repository root (requires Rust, LLVM 21 via inkwell, and Python 3):</p>
+<pre>
+python3 benches/report.py --run          # run the full suite into an isolated
+                                         # Criterion dir and write
+                                         # docs/benchmark-results.json
+python3 -m http.server -d docs 8321      # view this page at localhost:8321
+</pre>
+<p class="classification">Each run records its git revision, machine specs, and timestamps in a
+manifest; <code>--run --bench NAME</code> restricts to one Cargo bench target, and
+<code>--results DIR</code> re-exports a previously completed run directory without
+re-benchmarking. Tests: <code>python3 -m pytest benches/test_report.py</code>.</p>
+
 <script>
-  const RESULT_CLASSES = new Set(["llvm-win", "arrow-win", "equal", "inconclusive"]);
+  const RESULT_CLASSES = new Set(["llvm-win", "arrow-win", "equal"]);
   const BASELINE_LABELS = { arrow: "arrow", reference: "rust reference" };
 
   function formatTime(ns) {
@@ -115,10 +125,7 @@ not overlap; otherwise the row is <b>inconclusive</b>.</p>
     if (result.classification === "arrow-win") {
       return `Baseline ${(1 / result.speedup).toFixed(2)}× faster`;
     }
-    if (result.classification === "equal") {
-      return "Equal";
-    }
-    return "Inconclusive";
+    return "Equal";
   }
 
   function renderFamily(container, family, rows) {
@@ -140,7 +147,7 @@ not overlap; otherwise the row is <b>inconclusive</b>.</p>
     const headRow = document.createElement("tr");
     for (const [label, cls] of [
       ["benchmark", ""],
-      ["llvm warm", "numeric"],
+      ["llvm", "numeric"],
       [baselineLabel, "numeric"],
       ["result", "numeric"],
     ]) {
@@ -178,8 +185,23 @@ not overlap; otherwise the row is <b>inconclusive</b>.</p>
     document.getElementById("meta").textContent =
       `Criterion medians from revision ${data.run.revision}${dirty}. ` +
       `Run completed ${data.run.completed_at}. Lower is better.`;
+
+    const host = data.run.host;
+    if (host) {
+      const parts = [];
+      if (host.cpu) parts.push(host.cpu);
+      if (host.cores) parts.push(`${host.cores} cores`);
+      if (host.memory_gb) parts.push(`${host.memory_gb} GB RAM`);
+      if (host.os) parts.push(`${host.os} (${host.arch})`);
+      const hostLine = document.getElementById("host");
+      hostLine.textContent = "Machine: ";
+      const specs = document.createElement("b");
+      specs.textContent = `${parts.join(", ")}.`;
+      hostLine.appendChild(specs);
+      hostLine.hidden = false;
+    }
     document.getElementById("margin").textContent =
-      `${Math.round((data.equal_margin - 1) * 100)}%`;
+      `${Number(((data.equal_margin - 1) * 100).toFixed(1))}%`;
 
     const families = new Map();
     data.results.forEach((result) => {

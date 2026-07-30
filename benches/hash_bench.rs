@@ -9,26 +9,28 @@ pub fn criterion_benchmark(c: &mut Criterion) {
         let data = (0..100_000_000).map(|_| rng.i32(..)).collect_vec();
         let data = Int32Array::from(data);
 
-        c.bench_function("compute::hash(array(i32))/llvm warm", |b| {
+        c.bench_function("compute::hash(array(i32)) 100m rows/llvm warm", |b| {
             b.iter(|| arrow_compile_compute::compute::hash(&data).unwrap())
         });
 
-        c.bench_function("compute::hash_unchained(array(i32))/llvm warm", |b| {
-            b.iter(|| arrow_compile_compute::compute::hash_unchained(&data).unwrap())
-        });
+        c.bench_function(
+            "compute::hash_unchained(array(i32)) 100m rows/llvm warm",
+            |b| b.iter(|| arrow_compile_compute::compute::hash_unchained(&data).unwrap()),
+        );
     }
 
     {
         let data = (0..100_000_000).map(|_| rng.i64(..)).collect_vec();
         let data = Int64Array::from(data);
 
-        c.bench_function("compute::hash(array(i64))/llvm warm", |b| {
+        c.bench_function("compute::hash(array(i64)) 100m rows/llvm warm", |b| {
             b.iter(|| arrow_compile_compute::compute::hash(&data).unwrap())
         });
 
-        c.bench_function("compute::hash_unchained(array(i64))/llvm warm", |b| {
-            b.iter(|| arrow_compile_compute::compute::hash_unchained(&data).unwrap())
-        });
+        c.bench_function(
+            "compute::hash_unchained(array(i64)) 100m rows/llvm warm",
+            |b| b.iter(|| arrow_compile_compute::compute::hash_unchained(&data).unwrap()),
+        );
     }
 }
 

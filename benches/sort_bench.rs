@@ -63,12 +63,12 @@ pub fn criterion_benchmark(c: &mut Criterion) {
     let our_perm = arrow_compile_compute::sort::sort_to_indices(&data, llvm_options).unwrap();
     assert_eq!(arrow_perm, our_perm);
 
-    c.bench_function("sort::sort_to_indices(array(u64))/arrow", |b| {
+    c.bench_function("sort::sort_to_indices(array(u64)) 1m rows/arrow", |b| {
         b.iter(|| {
             black_box(arrow_ord::sort::sort_to_indices(&data, Some(arrow_options), None).unwrap())
         });
     });
-    c.bench_function("sort::sort_to_indices(array(u64))/llvm warm", |b| {
+    c.bench_function("sort::sort_to_indices(array(u64)) 1m rows/llvm warm", |b| {
         b.iter(|| {
             black_box(arrow_compile_compute::sort::sort_to_indices(&data, llvm_options).unwrap())
         });
@@ -85,13 +85,18 @@ pub fn criterion_benchmark(c: &mut Criterion) {
     let our_sorted = arrow_select::take::take(&data, &our_perm, None).unwrap();
     assert_eq!(arrow_sorted.as_ref(), our_sorted.as_ref());
 
-    c.bench_function("sort::sort_to_indices(array(nullable u64))/arrow", |b| {
-        b.iter(|| {
-            black_box(arrow_ord::sort::sort_to_indices(&data, Some(arrow_options), None).unwrap())
-        });
-    });
     c.bench_function(
-        "sort::sort_to_indices(array(nullable u64))/llvm warm",
+        "sort::sort_to_indices(array(nullable u64)) 1m rows/arrow",
+        |b| {
+            b.iter(|| {
+                black_box(
+                    arrow_ord::sort::sort_to_indices(&data, Some(arrow_options), None).unwrap(),
+                )
+            });
+        },
+    );
+    c.bench_function(
+        "sort::sort_to_indices(array(nullable u64)) 1m rows/llvm warm",
         |b| {
             b.iter(|| {
                 black_box(
@@ -112,7 +117,7 @@ pub fn criterion_benchmark(c: &mut Criterion) {
 
     bench_multicol_case(
         c,
-        "sort::multicol_sort_to_indices(array(i8), array(i32), array(nullable i64))",
+        "sort::multicol_sort_to_indices(array(i8), array(i32), array(nullable i64)) 1m rows",
         &[c1.clone(), c2.clone(), c3],
     );
 
@@ -121,7 +126,7 @@ pub fn criterion_benchmark(c: &mut Criterion) {
     ));
     bench_multicol_case(
         c,
-        "sort::multicol_sort_to_indices(array(i8), array(i32)) 2 word key",
+        "sort::multicol_sort_to_indices(array(i8), array(i32)) 2 word key 1m rows",
         &[c1, high_cardinality_i32],
     );
 
@@ -136,7 +141,7 @@ pub fn criterion_benchmark(c: &mut Criterion) {
         .collect_vec();
     bench_multicol_case(
         c,
-        "sort::multicol_sort_to_indices(array(u64) x3) 4 word key",
+        "sort::multicol_sort_to_indices(array(u64) x3) 4 word key 1m rows",
         &four_word_columns,
     );
 
@@ -151,7 +156,7 @@ pub fn criterion_benchmark(c: &mut Criterion) {
         .collect_vec();
     bench_multicol_case(
         c,
-        "sort::multicol_sort_to_indices(array(u64) x7) 8 word key",
+        "sort::multicol_sort_to_indices(array(u64) x7) 8 word key 1m rows",
         &eight_word_columns,
     );
 }

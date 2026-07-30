@@ -22,7 +22,7 @@ pub fn criterion_benchmark(c: &mut Criterion) {
     assert_eq!(llvm_scalar, arrow_scalar);
 
     c.bench_function(
-        "cmp::bounds(array(i32), scalar(i32), scalar(i32))/llvm warm",
+        "cmp::bounds(array(i32), scalar(i32), scalar(i32)) 1m rows/llvm warm",
         |b| {
             b.iter(|| {
                 black_box(
@@ -38,7 +38,7 @@ pub fn criterion_benchmark(c: &mut Criterion) {
     );
 
     c.bench_function(
-        "cmp::bounds(array(i32), scalar(i32), scalar(i32))/arrow",
+        "cmp::bounds(array(i32), scalar(i32), scalar(i32)) 1m rows/arrow",
         |b| {
             b.iter(|| {
                 let gte =

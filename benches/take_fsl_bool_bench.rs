@@ -38,7 +38,8 @@ pub fn criterion_benchmark(c: &mut Criterion) {
     let our_res = select::take(&data, &idxes).unwrap();
     assert_eq!(our_res.as_ref(), arrow_res.as_ref());
 
-    let mut group = c.benchmark_group("select::take(fixed_size_list(bool, 1024), array(u64))");
+    let mut group =
+        c.benchmark_group("select::take(fixed_size_list(bool, 1024), array(u64)) 4096 rows");
     group.sample_size(10);
 
     group.bench_function("llvm warm", |b| {

@@ -106,6 +106,13 @@ class ReportTests(unittest.TestCase):
             {"point": 100, "lower": 99, "upper": 101},
             {"point": 102, "lower": 101, "upper": 103},
         )
+        # 3.3% apart with non-overlapping intervals still counts as equal: the
+        # band is 3.5% so a ratio displayed as "1.03x" can never be a win.
+        boundary = report.verdict(
+            {"point": 100, "lower": 99.5, "upper": 100.5},
+            {"point": 103.3, "lower": 102.8, "upper": 103.8},
+        )
+        self.assertEqual("equal", boundary[1])
         llvm_win = report.verdict(
             {"point": 10, "lower": 9, "upper": 11},
             {"point": 20, "lower": 18, "upper": 22},
@@ -114,6 +121,9 @@ class ReportTests(unittest.TestCase):
             {"point": 20, "lower": 18, "upper": 22},
             {"point": 10, "lower": 9, "upper": 11},
         )
+        # Beyond the margin but with overlapping intervals: the measurement
+        # cannot separate the sides, so it is reported as equal (there is no
+        # separate "inconclusive" class).
         overlap = report.verdict(
             {"point": 10, "lower": 9, "upper": 11},
             {"point": 11, "lower": 9.5, "upper": 12.5},
@@ -122,7 +132,7 @@ class ReportTests(unittest.TestCase):
         self.assertEqual("equal", equal[1])
         self.assertEqual("llvm-win", llvm_win[1])
         self.assertEqual("arrow-win", arrow_win[1])
-        self.assertEqual("inconclusive", overlap[1])
+        self.assertEqual("equal", overlap[1])
 
     def test_sorts_by_family_order_then_speedup(self):
         self.write_estimate("vec__dot(a)/llvm warm", 10)
@@ -134,8 +144,9 @@ class ReportTests(unittest.TestCase):
 
         results, _ = report.collect(self.criterion_dir)
 
+        # Within a family the worst LLVM results come first (ascending speedup).
         self.assertEqual(
-            ["cmp::lt(fast)", "cmp::lt(slow)", "vec::dot(a)"],
+            ["cmp::lt(slow)", "cmp::lt(fast)", "vec::dot(a)"],
             [row["name"] for row in results],
         )
 

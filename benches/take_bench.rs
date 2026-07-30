@@ -26,11 +26,12 @@ pub fn criterion_benchmark(c: &mut Criterion) {
             our_res.len()
         );
 
-        c.bench_function("select::take(array(i32), array(u64))/llvm warm", |b| {
-            b.iter(|| arrow_compile_compute::select::take(&data, &idxes).unwrap())
-        });
+        c.bench_function(
+            "select::take(array(i32), array(u64)) 1m rows/llvm warm",
+            |b| b.iter(|| arrow_compile_compute::select::take(&data, &idxes).unwrap()),
+        );
 
-        c.bench_function("select::take(array(i32), array(u64))/arrow", |b| {
+        c.bench_function("select::take(array(i32), array(u64)) 1m rows/arrow", |b| {
             b.iter(|| arrow_select::take::take(&data, &idxes, None).unwrap())
         });
     }
@@ -61,12 +62,12 @@ pub fn criterion_benchmark(c: &mut Criterion) {
         );
 
         c.bench_function(
-            "select::take(run_end_encoded(i64, i32), array(u64))/llvm warm",
+            "select::take(run_end_encoded(i64, i32), array(u64)) 100k rows/llvm warm",
             |b| b.iter(|| arrow_compile_compute::select::take(&data, &idxes).unwrap()),
         );
 
         c.bench_function(
-            "select::take(run_end_encoded(i64, i32), array(u64))/arrow",
+            "select::take(run_end_encoded(i64, i32), array(u64)) 100k rows/arrow",
             |b| {
                 b.iter(|| {
                     let taken = arrow_select::take::take(&data, &idxes, None).unwrap();
@@ -92,11 +93,12 @@ pub fn criterion_benchmark(c: &mut Criterion) {
             our_res.len()
         );
 
-        c.bench_function("select::take(array(bool), array(u64))/llvm warm", |b| {
-            b.iter(|| arrow_compile_compute::select::take(&data, &idxes).unwrap())
-        });
+        c.bench_function(
+            "select::take(array(bool), array(u64)) 1m rows/llvm warm",
+            |b| b.iter(|| arrow_compile_compute::select::take(&data, &idxes).unwrap()),
+        );
 
-        c.bench_function("select::take(array(bool), array(u64))/arrow", |b| {
+        c.bench_function("select::take(array(bool), array(u64)) 1m rows/arrow", |b| {
             b.iter(|| arrow_select::take::take(&data, &idxes, None).unwrap())
         });
     }

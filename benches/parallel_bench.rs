@@ -13,7 +13,7 @@ pub fn criterion_benchmark(c: &mut Criterion) {
 
     let _r = arrow_compile_compute::cmp::lt(&data1, &data2).unwrap();
     c.bench_function(
-        "cmp::lt(array(i32), array(i64)) x1000 serial/llvm warm",
+        "cmp::lt(array(i32), array(i64)) x1000 serial 100k rows/llvm warm",
         |b| {
             b.iter(|| {
                 for _ in 0..1000 {
@@ -24,7 +24,7 @@ pub fn criterion_benchmark(c: &mut Criterion) {
     );
 
     c.bench_function(
-        "cmp::lt(array(i32), array(i64)) x1000 rayon/llvm warm",
+        "cmp::lt(array(i32), array(i64)) x1000 rayon 100k rows/llvm warm",
         |b| {
             b.iter(|| {
                 (0..1000).into_par_iter().for_each(|_| {

@@ -40,11 +40,12 @@ pub fn criterion_benchmark(c: &mut Criterion) {
             our_res.len()
         );
 
-        c.bench_function("cast::cast(array(i32) to array(i64))/llvm warm", |b| {
-            b.iter(|| arrow_compile_compute::cast::cast(&data, &DataType::Int64).unwrap())
-        });
+        c.bench_function(
+            "cast::cast(array(i32) to array(i64)) 10m rows/llvm warm",
+            |b| b.iter(|| arrow_compile_compute::cast::cast(&data, &DataType::Int64).unwrap()),
+        );
 
-        c.bench_function("cast::cast(array(i32) to array(i64))/arrow", |b| {
+        c.bench_function("cast::cast(array(i32) to array(i64)) 10m rows/arrow", |b| {
             b.iter(|| arrow_cast::cast::cast(&data, &DataType::Int64).unwrap())
         });
     }
@@ -61,11 +62,12 @@ pub fn criterion_benchmark(c: &mut Criterion) {
             our_res.len()
         );
 
-        c.bench_function("cast::cast(array(i8) to array(i16))/llvm warm", |b| {
-            b.iter(|| arrow_compile_compute::cast::cast(&data, &DataType::Int16).unwrap())
-        });
+        c.bench_function(
+            "cast::cast(array(i8) to array(i16)) 10m rows/llvm warm",
+            |b| b.iter(|| arrow_compile_compute::cast::cast(&data, &DataType::Int16).unwrap()),
+        );
 
-        c.bench_function("cast::cast(array(i8) to array(i16))/arrow", |b| {
+        c.bench_function("cast::cast(array(i8) to array(i16)) 10m rows/arrow", |b| {
             b.iter(|| arrow_cast::cast::cast(&data, &DataType::Int16).unwrap())
         });
     }
@@ -88,13 +90,14 @@ pub fn criterion_benchmark(c: &mut Criterion) {
         );
 
         c.bench_function(
-            "cast::cast(dictionary(i8, i64) to array(i64))/llvm warm",
+            "cast::cast(dictionary(i8, i64) to array(i64)) 10m rows/llvm warm",
             |b| b.iter(|| arrow_compile_compute::cast::cast(&data, &DataType::Int64).unwrap()),
         );
 
-        c.bench_function("cast::cast(dictionary(i8, i64) to array(i64))/arrow", |b| {
-            b.iter(|| arrow_cast::cast::cast(&data, &DataType::Int64).unwrap())
-        });
+        c.bench_function(
+            "cast::cast(dictionary(i8, i64) to array(i64)) 10m rows/arrow",
+            |b| b.iter(|| arrow_cast::cast::cast(&data, &DataType::Int64).unwrap()),
+        );
     }
 
     {
@@ -107,12 +110,12 @@ pub fn criterion_benchmark(c: &mut Criterion) {
         assert_eq!(prim_data, our_prim);
 
         c.bench_function(
-            "cast::cast(run_end_encoded(i64, i64) to array(i64))/llvm warm",
+            "cast::cast(run_end_encoded(i64, i64) to array(i64)) 100k runs/llvm warm",
             |b| b.iter(|| arrow_compile_compute::cast::cast(&data, &DataType::Int64).unwrap()),
         );
 
         c.bench_function(
-            "cast::cast(run_end_encoded(i64, i64) to array(i64))/arrow",
+            "cast::cast(run_end_encoded(i64, i64) to array(i64)) 100k runs/arrow",
             |b| b.iter(|| Int64Array::from_iter(data.downcast::<Int64Array>().unwrap())),
         );
     }
@@ -137,7 +140,7 @@ pub fn criterion_benchmark(c: &mut Criterion) {
         assert_eq!(arrow_dict, our_dict);
 
         c.bench_function(
-            "cast::cast(array(u64) to dictionary(i16, u64))/llvm warm",
+            "cast::cast(array(u64) to dictionary(i16, u64)) 10m rows/llvm warm",
             |b| {
                 b.iter(|| {
                     arrow_compile_compute::cast::cast(
@@ -150,7 +153,7 @@ pub fn criterion_benchmark(c: &mut Criterion) {
         );
 
         c.bench_function(
-            "cast::cast(array(u64) to dictionary(i16, u64))/arrow",
+            "cast::cast(array(u64) to dictionary(i16, u64)) 10m rows/arrow",
             |b| {
                 b.iter(|| {
                     arrow_cast::cast(
@@ -193,7 +196,7 @@ pub fn criterion_benchmark(c: &mut Criterion) {
         );
 
         c.bench_function(
-            "cast::cast(array(utf8) to dictionary(i32, utf8))/llvm warm",
+            "cast::cast(array(utf8) to dictionary(i32, utf8)) 1m rows/llvm warm",
             |b| {
                 b.iter(|| {
                     arrow_compile_compute::cast::cast(
@@ -206,7 +209,7 @@ pub fn criterion_benchmark(c: &mut Criterion) {
         );
 
         c.bench_function(
-            "cast::cast(array(utf8) to dictionary(i32, utf8))/arrow",
+            "cast::cast(array(utf8) to dictionary(i32, utf8)) 1m rows/arrow",
             |b| {
                 b.iter(|| {
                     arrow_cast::cast(
@@ -243,12 +246,12 @@ pub fn criterion_benchmark(c: &mut Criterion) {
         assert_eq!(ours.as_string::<i32>(), arrow.as_string::<i32>());
 
         c.bench_function(
-            "cast::cast(dictionary(i32, utf8) to array(utf8))/llvm warm",
+            "cast::cast(dictionary(i32, utf8) to array(utf8)) 1m rows/llvm warm",
             |b| b.iter(|| arrow_compile_compute::cast::cast(&data, &DataType::Utf8).unwrap()),
         );
 
         c.bench_function(
-            "cast::cast(dictionary(i32, utf8) to array(utf8))/arrow",
+            "cast::cast(dictionary(i32, utf8) to array(utf8)) 1m rows/arrow",
             |b| b.iter(|| arrow_cast::cast(&data, &DataType::Utf8).unwrap()),
         );
     }

@@ -24,13 +24,15 @@ pub fn criterion_benchmark(c: &mut Criterion) {
             our_res.len()
         );
 
-        c.bench_function("select::filter(array(i32), array(bool))/llvm warm", |b| {
-            b.iter(|| arrow_compile_compute::select::filter(&data, &mask).unwrap())
-        });
+        c.bench_function(
+            "select::filter(array(i32), array(bool)) 10m rows/llvm warm",
+            |b| b.iter(|| arrow_compile_compute::select::filter(&data, &mask).unwrap()),
+        );
 
-        c.bench_function("select::filter(array(i32), array(bool))/arrow", |b| {
-            b.iter(|| arrow_select::filter::filter(&data, &mask).unwrap())
-        });
+        c.bench_function(
+            "select::filter(array(i32), array(bool)) 10m rows/arrow",
+            |b| b.iter(|| arrow_select::filter::filter(&data, &mask).unwrap()),
+        );
     }
 
     {
@@ -57,12 +59,12 @@ pub fn criterion_benchmark(c: &mut Criterion) {
         );
 
         c.bench_function(
-            "select::filter(run_end_encoded(i64, i32), array(bool))/llvm warm",
+            "select::filter(run_end_encoded(i64, i32), array(bool)) 1m runs/llvm warm",
             |b| b.iter(|| arrow_compile_compute::select::filter(&data, &mask).unwrap()),
         );
 
         c.bench_function(
-            "select::filter(run_end_encoded(i64, i32), array(bool))/arrow",
+            "select::filter(run_end_encoded(i64, i32), array(bool)) 1m runs/arrow",
             |b| {
                 b.iter(|| {
                     let filtered = arrow_select::filter::filter(&data, &mask).unwrap();

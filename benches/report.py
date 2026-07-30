@@ -16,6 +16,7 @@ results left by older or renamed benchmarks from entering the report.
 import argparse
 import json
 import os
+import platform
 import re
 import subprocess
 from datetime import datetime, timezone
@@ -33,7 +34,9 @@ REFERENCE_RE = re.compile(r"rust[ _]reference")
 
 # Ratios within this margin count as "equal": a 2-4% difference is treated as
 # the same performance, per the reporting thresholds agreed for this suite.
-EQUAL_MARGIN = 1.03
+# 3.5% specifically so the verdict can never contradict the page's two-decimal
+# ratio display: anything rendering as "1.03x" or less is always "equal".
+EQUAL_MARGIN = 1.035
 
 # Section order and display names, keyed by the public-API module prefix.
 FAMILIES = {
@@ -105,11 +108,13 @@ def phase_and_base(name):
 
 
 def verdict(llvm, baseline):
-    """Classify the ratio: near-parity is "equal", then conservative CI bounds.
+    """Classify the ratio: every result is a win for one side or "equal".
 
     A point ratio within EQUAL_MARGIN counts as equal even when statistically
     distinguishable — a 2-4% gap is not a meaningful difference here. Beyond
-    the margin, a win requires the median confidence intervals to not overlap.
+    the margin, a win requires the median confidence intervals to not overlap;
+    when they do overlap, the measurement cannot separate the two sides, so
+    the result is also reported as equal.
     """
     values = (*llvm.values(), *baseline.values())
     if any(value <= 0 for value in values):
@@ -125,7 +130,7 @@ def verdict(llvm, baseline):
         return speedup, "llvm-win"
     if upper < 1.0:
         return speedup, "arrow-win"
-    return speedup, "inconclusive"
+    return speedup, "equal"
 
 
 def collect(criterion_dir):
@@ -177,10 +182,12 @@ def collect(criterion_dir):
         )
 
     family_order = {name: index for index, name in enumerate(FAMILIES.values())}
+    # Ascending speedup within each family: the results that most need
+    # attention (LLVM losses) come first.
     results.sort(
         key=lambda row: (
             family_order.get(row["family"], len(family_order)),
-            -row["speedup"],
+            row["speedup"],
         )
     )
     return results, unpaired
@@ -196,6 +203,7 @@ def build_report_data(criterion_dir, manifest):
             "started_at": manifest["started_at"],
             "completed_at": manifest["completed_at"],
             "commands": manifest["commands"],
+            "host": manifest.get("host"),
         },
         "equal_margin": EQUAL_MARGIN,
         "results": results,
@@ -227,6 +235,39 @@ def write_manifest(run_dir, manifest):
     with (run_dir / MANIFEST_NAME).open("w") as fh:
         json.dump(manifest, fh, indent=2)
         fh.write("\n")
+
+
+def host_info():
+    """Best-effort description of the machine the run executed on."""
+    info = {
+        "os": f"{platform.system()} {platform.release()}",
+        "arch": platform.machine(),
+        "cpu": platform.processor() or None,
+        "cores": os.cpu_count(),
+        "memory_gb": None,
+    }
+    if platform.system() == "Darwin":
+        for key, sysctl_name in [("cpu", "machdep.cpu.brand_string"), ("memory_gb", "hw.memsize")]:
+            try:
+                value = subprocess.run(
+                    ["sysctl", "-n", sysctl_name], check=True, capture_output=True, text=True
+                ).stdout.strip()
+                info[key] = round(int(value) / 2**30) if key == "memory_gb" else value
+            except (subprocess.CalledProcessError, FileNotFoundError, ValueError):
+                pass
+    elif platform.system() == "Linux":
+        try:
+            cpuinfo = Path("/proc/cpuinfo").read_text()
+            match = re.search(r"model name\s*:\s*(.+)", cpuinfo)
+            if match:
+                info["cpu"] = match.group(1).strip()
+            meminfo = Path("/proc/meminfo").read_text()
+            match = re.search(r"MemTotal:\s*(\d+) kB", meminfo)
+            if match:
+                info["memory_gb"] = round(int(match.group(1)) / 2**20)
+        except OSError:
+            pass
+    return info
 
 
 def run_benchmarks(bench_names, runs_dir=DEFAULT_RUNS_DIR):
@@ -267,6 +308,7 @@ def run_benchmarks(bench_names, runs_dir=DEFAULT_RUNS_DIR):
         "completed_at": None,
         "criterion_dir": "criterion",
         "commands": commands,
+        "host": host_info(),
     }
     write_manifest(run_dir, manifest)
 
