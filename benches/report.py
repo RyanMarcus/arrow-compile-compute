@@ -58,6 +58,87 @@ def family_of(name):
     return OTHER_FAMILY
 
 
+def split_top_level(text, separator=","):
+    """Split on a separator, ignoring separators nested inside parentheses."""
+    parts, depth, start = [], 0, 0
+    i = 0
+    while i < len(text):
+        char = text[i]
+        if char == "(":
+            depth += 1
+        elif char == ")":
+            depth -= 1
+        elif depth == 0 and text.startswith(separator, i):
+            parts.append(text[start:i])
+            i += len(separator)
+            start = i
+            continue
+        i += 1
+    parts.append(text[start:])
+    return [part.strip() for part in parts]
+
+
+def display_type(text):
+    """Render a benchmark type expression without constructor parentheses.
+
+    array(i32) -> i32; scalar(i32) -> i32 scalar; dictionary(i8, i32) ->
+    dict i8→i32; run_end_encoded(i32, dictionary(i8, i32)) -> ree i32→dict
+    i8→i32; fixed_size_list(f32, 768) -> f32[768]. Unknown constructors are
+    left untouched.
+    """
+    text = text.strip()
+    match = re.match(r"^([a-z_]+)\((.*)\)(.*)$", text)
+    if not match:
+        return text
+    constructor, inner, suffix = match.groups()
+    if constructor == "array":
+        rendered = display_type(inner)
+    elif constructor == "scalar":
+        rendered = f"{display_type(inner)} scalar"
+    elif constructor in ("dictionary", "run_end_encoded"):
+        parts = split_top_level(inner)
+        if len(parts) != 2:
+            return text
+        short = "dict" if constructor == "dictionary" else "ree"
+        rendered = f"{short} {display_type(parts[0])}→{display_type(parts[1])}"
+    elif constructor == "fixed_size_list":
+        parts = split_top_level(inner)
+        if len(parts) != 2:
+            return text
+        rendered = f"{display_type(parts[0])}[{parts[1]}]"
+    else:
+        return text
+    return rendered + suffix
+
+
+def op_inputs_size(name):
+    """Split a benchmark name into (operator, display inputs, size note)."""
+    open_paren = name.find("(")
+    if open_paren == -1:
+        return name, "", ""
+    depth = 0
+    close_paren = None
+    for index in range(open_paren, len(name)):
+        if name[index] == "(":
+            depth += 1
+        elif name[index] == ")":
+            depth -= 1
+            if depth == 0:
+                close_paren = index
+                break
+    if close_paren is None:
+        return name, "", ""
+    operator = name[:open_paren]
+    arguments = name[open_paren + 1 : close_paren]
+    size = name[close_paren + 1 :].strip()
+
+    rendered = []
+    for part in split_top_level(arguments):
+        halves = split_top_level(part, " to ")
+        rendered.append(" to ".join(display_type(half) for half in halves))
+    return operator, ", ".join(rendered), size
+
+
 def read_estimate(path):
     with path.open() as fh:
         median = json.load(fh)["median"]
@@ -169,9 +250,13 @@ def collect(criterion_dir):
             continue
 
         speedup, result_class = verdict(phases["llvm"], phases["baseline"])
+        operator, inputs, size = op_inputs_size(base)
         results.append(
             {
                 "name": base,
+                "op": operator,
+                "inputs": inputs,
+                "size": size,
                 "family": family_of(base),
                 "baseline_kind": kinds[base],
                 "llvm": phases["llvm"],

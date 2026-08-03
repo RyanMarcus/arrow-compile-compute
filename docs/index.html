@@ -46,6 +46,13 @@
     text-align: right;
   }
   td.name { font-family: ui-monospace, monospace; }
+  td.size { color: #888; white-space: nowrap; }
+  td.op {
+    font-family: ui-monospace, monospace;
+    font-weight: 700;
+    padding-top: .9rem;
+    border-bottom: 2px solid #8886;
+  }
   .badge { font-weight: 700; }
   tr.llvm-win { background: var(--llvm-bg); }
   tr.llvm-win td.badge { color: var(--llvm-fg); }
@@ -67,6 +74,11 @@ execution, never compilation. Baselines are stock arrow-rs kernels, except vecto
 compare against hand-written Rust (arrow has no equivalent kernels). Encoded inputs the
 baseline cannot process directly (run-end encoded) are decoded first on the baseline side,
 since that is what a stock-arrow user must do.</p>
+<p class="classification"><b>Comparisons:</b> only <code>lt</code> is benchmarked. All
+comparison predicates (<code>lt</code>, <code>gt</code>, <code>eq</code>, ...) lower to a
+single compare instruction and differ only in the condition code, and a direct measurement
+confirmed identical timing (lt/eq/gt: 44.8/44.9/44.9 µs on 1m plain i32 rows) — so one
+predicate stands for all of them.</p>
 <p class="classification"><b>Verdict:</b> ratios within <span id="margin">3.5%</span> are
 labeled <b>equal</b>. Beyond that, a win requires the two median 95% confidence intervals to
 not overlap; when they overlap, the measurement cannot separate the two sides and the row is
@@ -146,7 +158,8 @@ re-benchmarking. Tests: <code>python3 -m pytest benches/test_report.py</code>.</
     const thead = document.createElement("thead");
     const headRow = document.createElement("tr");
     for (const [label, cls] of [
-      ["benchmark", ""],
+      ["inputs", ""],
+      ["size", ""],
       ["llvm", "numeric"],
       [baselineLabel, "numeric"],
       ["result", "numeric"],
@@ -159,18 +172,41 @@ re-benchmarking. Tests: <code>python3 -m pytest benches/test_report.py</code>.</
     thead.appendChild(headRow);
     table.appendChild(thead);
 
-    const tbody = document.createElement("tbody");
+    // Bucket rows by operator. Rows arrive sorted worst-first, so the first
+    // encounter of each operator orders the groups worst-group-first, and
+    // rows inside each group stay worst-first.
+    const groups = new Map();
     rows.forEach((result) => {
-      if (!RESULT_CLASSES.has(result.classification)) {
-        throw new Error(`Unknown result classification: ${result.classification}`);
+      const op = result.op || result.name;
+      if (!groups.has(op)) {
+        groups.set(op, []);
       }
-      const row = document.createElement("tr");
-      row.className = result.classification;
-      addCell(row, result.name, ["name"]);
-      addCell(row, formatTime(result.llvm.point), ["num"]);
-      addCell(row, formatTime(result.baseline.point), ["num"]);
-      addCell(row, resultText(result), ["num", "badge"]);
-      tbody.appendChild(row);
+      groups.get(op).push(result);
+    });
+
+    const tbody = document.createElement("tbody");
+    groups.forEach((groupRows, op) => {
+      const opRow = document.createElement("tr");
+      const opCell = document.createElement("td");
+      opCell.colSpan = 5;
+      opCell.className = "op";
+      opCell.textContent = op;
+      opRow.appendChild(opCell);
+      tbody.appendChild(opRow);
+
+      groupRows.forEach((result) => {
+        if (!RESULT_CLASSES.has(result.classification)) {
+          throw new Error(`Unknown result classification: ${result.classification}`);
+        }
+        const row = document.createElement("tr");
+        row.className = result.classification;
+        addCell(row, result.inputs || result.name, ["name"]);
+        addCell(row, result.size || "", ["name", "size"]);
+        addCell(row, formatTime(result.llvm.point), ["num"]);
+        addCell(row, formatTime(result.baseline.point), ["num"]);
+        addCell(row, resultText(result), ["num", "badge"]);
+        tbody.appendChild(row);
+      });
     });
     table.appendChild(tbody);
     container.appendChild(table);

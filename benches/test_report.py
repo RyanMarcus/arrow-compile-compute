@@ -169,6 +169,36 @@ class ReportTests(unittest.TestCase):
         self.assertEqual("llvm-win", data["results"][0]["classification"])
         json.dumps(data)
 
+    def test_op_inputs_size_rendering(self):
+        cases = [
+            (
+                "cmp::lt(array(i32), scalar(i32)) 1m rows",
+                ("cmp::lt", "i32, i32 scalar", "1m rows"),
+            ),
+            (
+                "cmp::lt(run_end_encoded(i32, dictionary(i8, i32)), scalar(i32)) 1m rows",
+                ("cmp::lt", "ree i32→dict i8→i32, i32 scalar", "1m rows"),
+            ),
+            (
+                "cast::cast(array(u64) to dictionary(i16, u64)) 10m rows",
+                ("cast::cast", "u64 to dict i16→u64", "10m rows"),
+            ),
+            (
+                "vec::norm(fixed_size_list(f32, 768)) 16384 rows",
+                ("vec::norm", "f32[768]", "16384 rows"),
+            ),
+            (
+                "sort::multicol_sort_to_indices(array(u64) x7) 8 word key 1m rows",
+                ("sort::multicol_sort_to_indices", "u64 x7", "8 word key 1m rows"),
+            ),
+            (
+                "sort::sort_to_indices(array(nullable u64)) 1m rows",
+                ("sort::sort_to_indices", "nullable u64", "1m rows"),
+            ),
+        ]
+        for name, expected in cases:
+            self.assertEqual(expected, report.op_inputs_size(name), name)
+
     def test_rejects_duplicate_normalized_phase(self):
         self.write_estimate("filter_llvm warm", 10)
         self.write_estimate("filter/llvm_warm", 11)
