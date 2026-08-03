@@ -1,6 +1,10 @@
-use arrow_array::{types::Int64Type, Array, BooleanArray, Int32Array, Int64Array, RunArray};
+use arrow_array::{
+    cast::AsArray,
+    types::{Int32Type, Int64Type},
+    Array, BooleanArray, Int32Array, Int64Array, RunArray,
+};
 use arrow_schema::DataType;
-use criterion::{criterion_group, criterion_main, Criterion};
+use criterion::{black_box, criterion_group, criterion_main, Criterion};
 use itertools::Itertools;
 
 pub fn criterion_benchmark(c: &mut Criterion) {
@@ -20,13 +24,15 @@ pub fn criterion_benchmark(c: &mut Criterion) {
             our_res.len()
         );
 
-        c.bench_function("filter i32/llvm", |b| {
-            b.iter(|| arrow_compile_compute::select::filter(&data, &mask).unwrap())
-        });
+        c.bench_function(
+            "select::filter(array(i32), array(bool)) 10m rows/llvm warm",
+            |b| b.iter(|| arrow_compile_compute::select::filter(&data, &mask).unwrap()),
+        );
 
-        c.bench_function("filter i32/arrow", |b| {
-            b.iter(|| arrow_select::filter::filter(&data, &mask).unwrap())
-        });
+        c.bench_function(
+            "select::filter(array(i32), array(bool)) 10m rows/arrow",
+            |b| b.iter(|| arrow_select::filter::filter(&data, &mask).unwrap()),
+        );
     }
 
     {
@@ -45,21 +51,27 @@ pub fn criterion_benchmark(c: &mut Criterion) {
         let mask = BooleanArray::from(mask);
 
         let arr_res = arrow_select::filter::filter(&data, &mask).unwrap();
-        let arr_res = arrow_compile_compute::cast::cast(&arr_res, &DataType::Int32).unwrap();
+        let arr_res = arrow_cast::cast(&arr_res, &DataType::Int32).unwrap();
         let our_res = arrow_compile_compute::select::filter(&data, &mask).unwrap();
-        assert_eq!(our_res.len(), arr_res.len());
         assert_eq!(
-            arrow_ord::cmp::eq(&our_res, &arr_res).unwrap().true_count(),
-            our_res.len()
+            our_res.as_primitive::<Int32Type>(),
+            arr_res.as_primitive::<Int32Type>()
         );
 
-        c.bench_function("take ree i32/llvm", |b| {
-            b.iter(|| arrow_compile_compute::select::filter(&data, &mask).unwrap())
-        });
+        c.bench_function(
+            "select::filter(run_end_encoded(i64, i32), array(bool)) 1m runs/llvm warm",
+            |b| b.iter(|| arrow_compile_compute::select::filter(&data, &mask).unwrap()),
+        );
 
-        c.bench_function("take ree i32/arrow", |b| {
-            b.iter(|| arrow_select::filter::filter(&data, &mask).unwrap())
-        });
+        c.bench_function(
+            "select::filter(run_end_encoded(i64, i32), array(bool)) 1m runs/arrow",
+            |b| {
+                b.iter(|| {
+                    let filtered = arrow_select::filter::filter(&data, &mask).unwrap();
+                    black_box(arrow_cast::cast(&filtered, &DataType::Int32).unwrap())
+                })
+            },
+        );
     }
 }
 

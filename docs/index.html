@@ -1,0 +1,286 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>arrow-compile-compute benchmarks</title>
+<style>
+  :root {
+    color-scheme: light dark;
+    --llvm-bg: #dafbe1;
+    --llvm-fg: #116329;
+    --arrow-bg: #ffebe9;
+    --arrow-fg: #a40e26;
+    --equal-bg: #f6f8fa;
+    --equal-fg: #57606a;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root {
+      --llvm-bg: #123820;
+      --llvm-fg: #56d364;
+      --arrow-bg: #4c1822;
+      --arrow-fg: #ff7b72;
+      --equal-bg: #25292e;
+      --equal-fg: #b1bac4;
+    }
+  }
+  body {
+    font: 15px/1.5 -apple-system, system-ui, sans-serif;
+    max-width: 1100px;
+    margin: 2rem auto;
+    padding: 0 1rem;
+  }
+  h1 { margin-bottom: .2rem; }
+  .meta { color: #888; margin-top: 0; margin-bottom: .2rem; }
+  .classification { color: #666; margin-top: 0; }
+  .error { color: #b3261e; font-weight: 600; }
+  h2 { margin-top: 2.4rem; margin-bottom: 0; border-bottom: 1px solid #8884; padding-bottom: .3rem; }
+  .count { font-size: .7em; color: #888; font-weight: normal; }
+  table { border-collapse: collapse; width: 100%; margin-top: 0; }
+  th, td { text-align: left; padding: .35rem .6rem; border-bottom: 1px solid #8883; }
+  th { font-size: .78em; text-transform: uppercase; letter-spacing: 0; color: #888; }
+  th.numeric { text-align: right; }
+  .num {
+    font-variant-numeric: tabular-nums;
+    font-family: ui-monospace, monospace;
+    text-align: right;
+  }
+  td.name { font-family: ui-monospace, monospace; }
+  td.size { color: #888; white-space: nowrap; }
+  tbody th { padding-top: 1.6rem; border-bottom: 2px solid #8886; }
+  tbody tr:first-child th { padding-top: .4rem; }
+  th.op {
+    font-family: ui-monospace, monospace;
+    font-weight: 700;
+    font-size: 1em;
+    text-transform: none;
+    letter-spacing: normal;
+    color: inherit;
+  }
+  .badge { font-weight: 700; }
+  tr.llvm-win { background: var(--llvm-bg); }
+  tr.llvm-win td.badge { color: var(--llvm-fg); }
+  tr.arrow-win { background: var(--arrow-bg); }
+  tr.arrow-win td.badge { color: var(--arrow-fg); }
+  tr.equal { background: var(--equal-bg); }
+  tr.equal td.badge { color: var(--equal-fg); }
+  details { margin-top: 2rem; }
+  summary { cursor: pointer; color: #888; }
+</style>
+</head>
+<body>
+<h1>JIT vs Arrow::compute Benchmark Results</h1>
+<p id="meta" class="meta">Loading benchmark results...</p>
+<p id="host" class="meta" hidden></p>
+<p class="classification"><b>Timing:</b> every LLVM number is a warm public-API call — the
+kernel is already compiled and cached, so the timed loop pays cache lookup + dispatch +
+execution, never compilation. Baselines are stock arrow-rs kernels, except vector ops, which
+compare against hand-written Rust (arrow has no equivalent kernels). Encoded inputs the
+baseline cannot process directly (run-end encoded) are decoded first on the baseline side,
+since that is what a stock-arrow user must do.</p>
+<p class="classification"><b>Verdict:</b> ratios within <span id="margin">3.5%</span> are
+labeled <b>equal</b>. Beyond that, a win requires the two median 95% confidence intervals to
+not overlap; when they overlap, the measurement cannot separate the two sides and the row is
+also labeled <b>equal</b>.
+See <a href="#reproduce">how to reproduce these results</a>.</p>
+<p id="error" class="error" role="alert" hidden>Benchmark data unavailable.</p>
+
+<div id="families"></div>
+
+<details>
+<summary id="unpaired-summary">Unpaired benchmarks</summary>
+<table>
+<thead><tr><th>benchmark</th><th class="numeric">median</th></tr></thead>
+<tbody id="unpaired-body"></tbody>
+</table>
+</details>
+
+<h2 id="reproduce">Reproducing these results</h2>
+<p class="classification">From the repository root (requires Rust, LLVM 21 via inkwell, and Python 3):</p>
+<pre>
+python3 benches/report.py --run          # run the full suite into an isolated
+                                         # Criterion dir and write
+                                         # docs/benchmark-results.json
+python3 -m http.server -d docs 8321      # view this page at localhost:8321
+</pre>
+<p class="classification">Each run records its git revision, machine specs, and timestamps in a
+manifest; <code>--run --bench NAME</code> restricts to one Cargo bench target, and
+<code>--results DIR</code> re-exports a previously completed run directory without
+re-benchmarking. Tests: <code>python3 -m pytest benches/test_report.py</code>.</p>
+
+<script>
+  const RESULT_CLASSES = new Set(["llvm-win", "arrow-win", "equal"]);
+  const BASELINE_LABELS = { arrow: "arrow", reference: "rust reference" };
+
+  function formatTime(ns) {
+    const units = [["s", 1e9], ["ms", 1e6], ["µs", 1e3], ["ns", 1]];
+    for (const [unit, scale] of units) {
+      if (ns >= scale) {
+        return `${Number((ns / scale).toPrecision(3))} ${unit}`;
+      }
+    }
+    return `${Number(ns.toPrecision(3))} ns`;
+  }
+
+  function addCell(row, value, classNames = []) {
+    const cell = document.createElement("td");
+    cell.textContent = value;
+    cell.classList.add(...classNames);
+    row.appendChild(cell);
+  }
+
+  function resultText(result) {
+    if (result.classification === "llvm-win") {
+      return `LLVM ${result.speedup.toFixed(2)}× faster`;
+    }
+    if (result.classification === "arrow-win") {
+      return `Baseline ${(1 / result.speedup).toFixed(2)}× faster`;
+    }
+    return "Equal";
+  }
+
+  function renderFamily(container, family, rows) {
+    const kinds = new Set(rows.map((row) => row.baseline_kind));
+    const baselineLabel = kinds.size === 1
+      ? BASELINE_LABELS[[...kinds][0]]
+      : "baseline";
+
+    const heading = document.createElement("h2");
+    heading.textContent = `${family} `;
+    const count = document.createElement("span");
+    count.className = "count";
+    count.textContent = rows.length;
+    heading.appendChild(count);
+    container.appendChild(heading);
+
+    if (family === "Comparisons") {
+      const note = document.createElement("p");
+      note.className = "classification";
+      note.innerHTML =
+        "<b>Why only <code>lt</code>:</b> all comparison predicates " +
+        "(<code>lt</code>, <code>gt</code>, <code>eq</code>, ...) lower to a single " +
+        "compare instruction and differ only in the condition code, and a direct " +
+        "measurement confirmed identical timing (lt/eq/gt: 44.8/44.9/44.9 µs on 1m " +
+        "plain i32 rows) — so one predicate stands for all of them. " +
+        "<code>starts_with</code> and <code>bounds</code> are distinct operations " +
+        "that also live in the <code>cmp</code> module.";
+      note.style.margin = ".5rem 0 0";
+      container.appendChild(note);
+    }
+
+    const table = document.createElement("table");
+
+    // Bucket rows by operator. Rows arrive sorted worst-first, so the first
+    // encounter of each operator orders the groups worst-group-first, and
+    // rows inside each group stay worst-first.
+    const groups = new Map();
+    rows.forEach((result) => {
+      const op = result.op || result.name;
+      if (!groups.has(op)) {
+        groups.set(op, []);
+      }
+      groups.get(op).push(result);
+    });
+
+    const tbody = document.createElement("tbody");
+    groups.forEach((groupRows, op) => {
+      // Each operator group carries its own header row: the operator name
+      // sits where an "inputs" header would be, followed by the column labels.
+      const opRow = document.createElement("tr");
+      for (const [label, cls] of [
+        [op, "op"],
+        ["size", ""],
+        ["llvm", "numeric"],
+        [baselineLabel, "numeric"],
+        ["result", "numeric"],
+      ]) {
+        const th = document.createElement("th");
+        th.textContent = label;
+        if (cls) th.className = cls;
+        opRow.appendChild(th);
+      }
+      tbody.appendChild(opRow);
+
+      groupRows.forEach((result) => {
+        if (!RESULT_CLASSES.has(result.classification)) {
+          throw new Error(`Unknown result classification: ${result.classification}`);
+        }
+        const row = document.createElement("tr");
+        row.className = result.classification;
+        addCell(row, result.inputs || result.name, ["name"]);
+        addCell(row, result.size || "", ["name", "size"]);
+        addCell(row, formatTime(result.llvm.point), ["num"]);
+        addCell(row, formatTime(result.baseline.point), ["num"]);
+        addCell(row, resultText(result), ["num", "badge"]);
+        tbody.appendChild(row);
+      });
+    });
+    table.appendChild(tbody);
+    container.appendChild(table);
+  }
+
+  function render(data) {
+    if (data.schema_version !== 2) {
+      throw new Error(`Unsupported report schema: ${data.schema_version}`);
+    }
+
+    const dirty = data.run.dirty ? " with uncommitted changes" : "";
+    document.getElementById("meta").textContent =
+      `Criterion medians from revision ${data.run.revision}${dirty}. ` +
+      `Run completed ${data.run.completed_at}. Lower is better.`;
+
+    const host = data.run.host;
+    if (host) {
+      const parts = [];
+      if (host.cpu) parts.push(host.cpu);
+      if (host.cores) parts.push(`${host.cores} cores`);
+      if (host.memory_gb) parts.push(`${host.memory_gb} GB RAM`);
+      if (host.os) parts.push(`${host.os} (${host.arch})`);
+      const hostLine = document.getElementById("host");
+      hostLine.textContent = "Machine: ";
+      const specs = document.createElement("b");
+      specs.textContent = `${parts.join(", ")}.`;
+      hostLine.appendChild(specs);
+      hostLine.hidden = false;
+    }
+    document.getElementById("margin").textContent =
+      `${Number(((data.equal_margin - 1) * 100).toFixed(1))}%`;
+
+    const families = new Map();
+    data.results.forEach((result) => {
+      if (!families.has(result.family)) {
+        families.set(result.family, []);
+      }
+      families.get(result.family).push(result);
+    });
+
+    const container = document.getElementById("families");
+    families.forEach((rows, family) => renderFamily(container, family, rows));
+
+    document.getElementById("unpaired-summary").textContent =
+      `Unpaired benchmarks (${data.unpaired.length}) - no baseline comparison or incomplete pair`;
+    const unpairedBody = document.getElementById("unpaired-body");
+    data.unpaired.forEach((result) => {
+      const row = document.createElement("tr");
+      addCell(row, result.name, ["name"]);
+      addCell(row, formatTime(result.estimate.point), ["num"]);
+      unpairedBody.appendChild(row);
+    });
+  }
+
+  fetch("./benchmark-results.json", { cache: "no-cache" })
+    .then((response) => {
+      if (!response.ok) {
+        throw new Error(`HTTP ${response.status}`);
+      }
+      return response.json();
+    })
+    .then(render)
+    .catch((error) => {
+      document.getElementById("meta").textContent = "Benchmark results could not be loaded.";
+      document.getElementById("error").hidden = false;
+      console.error(error);
+    });
+</script>
+</body>
+</html>

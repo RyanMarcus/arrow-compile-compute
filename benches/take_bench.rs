@@ -1,8 +1,10 @@
 use arrow_array::{
-    types::Int64Type, Array, BooleanArray, Int32Array, Int64Array, RunArray, UInt64Array,
+    cast::AsArray,
+    types::{Int32Type, Int64Type},
+    Array, BooleanArray, Int32Array, Int64Array, RunArray, UInt64Array,
 };
 use arrow_schema::DataType;
-use criterion::{criterion_group, criterion_main, Criterion};
+use criterion::{black_box, criterion_group, criterion_main, Criterion};
 use itertools::Itertools;
 
 pub fn criterion_benchmark(c: &mut Criterion) {
@@ -24,11 +26,12 @@ pub fn criterion_benchmark(c: &mut Criterion) {
             our_res.len()
         );
 
-        c.bench_function("take i32/llvm", |b| {
-            b.iter(|| arrow_compile_compute::select::take(&data, &idxes).unwrap())
-        });
+        c.bench_function(
+            "select::take(array(i32), array(u64)) 1m rows/llvm warm",
+            |b| b.iter(|| arrow_compile_compute::select::take(&data, &idxes).unwrap()),
+        );
 
-        c.bench_function("take i32/arrow", |b| {
+        c.bench_function("select::take(array(i32), array(u64)) 1m rows/arrow", |b| {
             b.iter(|| arrow_select::take::take(&data, &idxes, None).unwrap())
         });
     }
@@ -51,21 +54,27 @@ pub fn criterion_benchmark(c: &mut Criterion) {
         let idxes = UInt64Array::from(idxes);
 
         let arr_res = arrow_select::take::take(&data, &idxes, None).unwrap();
-        let arr_res = arrow_compile_compute::cast::cast(&arr_res, &DataType::Int32).unwrap();
+        let arr_res = arrow_cast::cast(&arr_res, &DataType::Int32).unwrap();
         let our_res = arrow_compile_compute::select::take(&data, &idxes).unwrap();
-        assert_eq!(our_res.len(), arr_res.len());
         assert_eq!(
-            arrow_ord::cmp::eq(&our_res, &arr_res).unwrap().true_count(),
-            our_res.len()
+            our_res.as_primitive::<Int32Type>(),
+            arr_res.as_primitive::<Int32Type>()
         );
 
-        c.bench_function("take ree i32/llvm", |b| {
-            b.iter(|| arrow_compile_compute::select::take(&data, &idxes).unwrap())
-        });
+        c.bench_function(
+            "select::take(run_end_encoded(i64, i32), array(u64)) 100k rows/llvm warm",
+            |b| b.iter(|| arrow_compile_compute::select::take(&data, &idxes).unwrap()),
+        );
 
-        c.bench_function("take ree i32/arrow", |b| {
-            b.iter(|| arrow_select::take::take(&data, &idxes, None).unwrap())
-        });
+        c.bench_function(
+            "select::take(run_end_encoded(i64, i32), array(u64)) 100k rows/arrow",
+            |b| {
+                b.iter(|| {
+                    let taken = arrow_select::take::take(&data, &idxes, None).unwrap();
+                    black_box(arrow_cast::cast(&taken, &DataType::Int32).unwrap())
+                })
+            },
+        );
     }
 
     {
@@ -84,11 +93,12 @@ pub fn criterion_benchmark(c: &mut Criterion) {
             our_res.len()
         );
 
-        c.bench_function("take bool/llvm", |b| {
-            b.iter(|| arrow_compile_compute::select::take(&data, &idxes).unwrap())
-        });
+        c.bench_function(
+            "select::take(array(bool), array(u64)) 1m rows/llvm warm",
+            |b| b.iter(|| arrow_compile_compute::select::take(&data, &idxes).unwrap()),
+        );
 
-        c.bench_function("take bool/arrow", |b| {
+        c.bench_function("select::take(array(bool), array(u64)) 1m rows/arrow", |b| {
             b.iter(|| arrow_select::take::take(&data, &idxes, None).unwrap())
         });
     }
