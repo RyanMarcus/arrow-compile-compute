@@ -34,9 +34,9 @@
   .meta { color: #888; margin-top: 0; margin-bottom: .2rem; }
   .classification { color: #666; margin-top: 0; }
   .error { color: #b3261e; font-weight: 600; }
-  h2 { margin-top: 2.4rem; border-bottom: 1px solid #8884; padding-bottom: .3rem; }
+  h2 { margin-top: 2.4rem; margin-bottom: 0; border-bottom: 1px solid #8884; padding-bottom: .3rem; }
   .count { font-size: .7em; color: #888; font-weight: normal; }
-  table { border-collapse: collapse; width: 100%; margin-top: .5rem; }
+  table { border-collapse: collapse; width: 100%; margin-top: 0; }
   th, td { text-align: left; padding: .35rem .6rem; border-bottom: 1px solid #8883; }
   th { font-size: .78em; text-transform: uppercase; letter-spacing: 0; color: #888; }
   th.numeric { text-align: right; }
@@ -47,11 +47,15 @@
   }
   td.name { font-family: ui-monospace, monospace; }
   td.size { color: #888; white-space: nowrap; }
-  td.op {
+  tbody th { padding-top: 1.6rem; border-bottom: 2px solid #8886; }
+  tbody tr:first-child th { padding-top: .4rem; }
+  th.op {
     font-family: ui-monospace, monospace;
     font-weight: 700;
-    padding-top: .9rem;
-    border-bottom: 2px solid #8886;
+    font-size: 1em;
+    text-transform: none;
+    letter-spacing: normal;
+    color: inherit;
   }
   .badge { font-weight: 700; }
   tr.llvm-win { background: var(--llvm-bg); }
@@ -74,11 +78,6 @@ execution, never compilation. Baselines are stock arrow-rs kernels, except vecto
 compare against hand-written Rust (arrow has no equivalent kernels). Encoded inputs the
 baseline cannot process directly (run-end encoded) are decoded first on the baseline side,
 since that is what a stock-arrow user must do.</p>
-<p class="classification"><b>Comparisons:</b> only <code>lt</code> is benchmarked. All
-comparison predicates (<code>lt</code>, <code>gt</code>, <code>eq</code>, ...) lower to a
-single compare instruction and differ only in the condition code, and a direct measurement
-confirmed identical timing (lt/eq/gt: 44.8/44.9/44.9 µs on 1m plain i32 rows) — so one
-predicate stands for all of them.</p>
 <p class="classification"><b>Verdict:</b> ratios within <span id="margin">3.5%</span> are
 labeled <b>equal</b>. Beyond that, a win requires the two median 95% confidence intervals to
 not overlap; when they overlap, the measurement cannot separate the two sides and the row is
@@ -154,23 +153,22 @@ re-benchmarking. Tests: <code>python3 -m pytest benches/test_report.py</code>.</
     heading.appendChild(count);
     container.appendChild(heading);
 
-    const table = document.createElement("table");
-    const thead = document.createElement("thead");
-    const headRow = document.createElement("tr");
-    for (const [label, cls] of [
-      ["inputs", ""],
-      ["size", ""],
-      ["llvm", "numeric"],
-      [baselineLabel, "numeric"],
-      ["result", "numeric"],
-    ]) {
-      const th = document.createElement("th");
-      th.textContent = label;
-      if (cls) th.className = cls;
-      headRow.appendChild(th);
+    if (family === "Comparisons") {
+      const note = document.createElement("p");
+      note.className = "classification";
+      note.innerHTML =
+        "<b>Why only <code>lt</code>:</b> all comparison predicates " +
+        "(<code>lt</code>, <code>gt</code>, <code>eq</code>, ...) lower to a single " +
+        "compare instruction and differ only in the condition code, and a direct " +
+        "measurement confirmed identical timing (lt/eq/gt: 44.8/44.9/44.9 µs on 1m " +
+        "plain i32 rows) — so one predicate stands for all of them. " +
+        "<code>starts_with</code> and <code>bounds</code> are distinct operations " +
+        "that also live in the <code>cmp</code> module.";
+      note.style.margin = ".5rem 0 0";
+      container.appendChild(note);
     }
-    thead.appendChild(headRow);
-    table.appendChild(thead);
+
+    const table = document.createElement("table");
 
     // Bucket rows by operator. Rows arrive sorted worst-first, so the first
     // encounter of each operator orders the groups worst-group-first, and
@@ -186,12 +184,21 @@ re-benchmarking. Tests: <code>python3 -m pytest benches/test_report.py</code>.</
 
     const tbody = document.createElement("tbody");
     groups.forEach((groupRows, op) => {
+      // Each operator group carries its own header row: the operator name
+      // sits where an "inputs" header would be, followed by the column labels.
       const opRow = document.createElement("tr");
-      const opCell = document.createElement("td");
-      opCell.colSpan = 5;
-      opCell.className = "op";
-      opCell.textContent = op;
-      opRow.appendChild(opCell);
+      for (const [label, cls] of [
+        [op, "op"],
+        ["size", ""],
+        ["llvm", "numeric"],
+        [baselineLabel, "numeric"],
+        ["result", "numeric"],
+      ]) {
+        const th = document.createElement("th");
+        th.textContent = label;
+        if (cls) th.className = cls;
+        opRow.appendChild(th);
+      }
       tbody.appendChild(opRow);
 
       groupRows.forEach((result) => {
