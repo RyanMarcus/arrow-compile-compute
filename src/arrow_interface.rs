@@ -1016,17 +1016,19 @@ pub mod aggregate {
     use crate::ArrowKernelError;
 
     /// Creates a new grouped sum aggregator. Final results are 64-bit versions
-    /// of their inputs (for example, `f32` is summed to `f64`).
+    /// of numeric inputs (for example, `f32` is summed to `f64`).
     pub fn sum(ty: &DataType) -> Result<Box<SumAggregator>, ArrowKernelError> {
         SumAggregator::create(&[ty])
     }
 
-    /// Creates a new min aggregator. Final results will match the input type.
+    /// Creates a new min aggregator. Final results preserve the decoded input
+    /// type, including the exact string or binary representation.
     pub fn min(ty: &DataType) -> Result<Box<MinAggregator>, ArrowKernelError> {
         MinAggregator::create(&[ty])
     }
 
-    /// Creates a new max aggregator. Final results will match the input type.
+    /// Creates a new max aggregator. Final results preserve the decoded input
+    /// type, including the exact string or binary representation.
     pub fn max(ty: &DataType) -> Result<Box<MaxAggregator>, ArrowKernelError> {
         MaxAggregator::create(&[ty])
     }
@@ -1036,7 +1038,8 @@ pub mod aggregate {
         CountAggregator::create(&[])
     }
 
-    /// Creates a new most recent aggregator. Final result will match the input type.
+    /// Creates a new most recent aggregator. Final results preserve the decoded
+    /// input type, including the exact string or binary representation.
     pub fn most_recent(ty: &DataType) -> Result<Box<MostRecentAggregator>, ArrowKernelError> {
         MostRecentAggregator::create(&[ty])
     }

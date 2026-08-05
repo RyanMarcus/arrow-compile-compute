@@ -12,7 +12,7 @@ use crate::{
         },
         DSLArithBinOp, KernelCache,
     },
-    logical_nulls, ArrowKernelError, Kernel, PrimitiveType,
+    logical_arrow_type, logical_nulls, ArrowKernelError, Kernel, PrimitiveType,
 };
 
 fn sum_primitive_type(pt: PrimitiveType) -> Result<PrimitiveType, ArrowKernelError> {
@@ -216,15 +216,24 @@ impl SumAggregator {
 }
 
 impl Aggregator for SumAggregator {
-    fn create(types: &[&DataType]) -> Result<Box<Self>, ArrowKernelError> {
+    fn output_type(types: &[&DataType]) -> Result<DataType, ArrowKernelError> {
         if types.len() != 1 {
             return Err(ArrowKernelError::ArgumentMismatch(
-                "sum create takes exactly one input".to_string(),
+                "sum takes exactly one input type".to_string(),
             ));
         }
-        Ok(Box::new(Self::new(PrimitiveType::for_arrow_type(
-            types[0],
-        ))?))
+
+        let pt = sum_primitive_type(PrimitiveType::for_arrow_type(&logical_arrow_type(
+            &types[0],
+        )))?;
+        Ok(pt.as_arrow_type())
+    }
+
+    fn create(types: &[&DataType]) -> Result<Box<Self>, ArrowKernelError> {
+        let output_type = Self::output_type(types)?;
+        Ok(Box::new(Self {
+            buffer: DSLBuffer::new(PrimitiveType::for_arrow_type(&output_type), 0),
+        }))
     }
 
     fn ensure_capacity(&mut self, capacity: usize) {

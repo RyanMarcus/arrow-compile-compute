@@ -461,6 +461,7 @@ impl PrimitiveType {
             DataType::Utf8 => PrimitiveType::P64x2, // string
             DataType::Binary => PrimitiveType::P64x2, // binary
             DataType::LargeBinary => PrimitiveType::P64x2, // binary
+            DataType::BinaryView => PrimitiveType::P64x2, // binary view
             DataType::LargeUtf8 => PrimitiveType::P64x2, // string view
             DataType::Utf8View => PrimitiveType::P64x2, // string view
             DataType::FixedSizeList(f, l) => {
