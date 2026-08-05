@@ -38,14 +38,15 @@ pub fn criterion_benchmark(c: &mut Criterion) {
     let our_res = select::take(&data, &idxes).unwrap();
     assert_eq!(our_res.as_ref(), arrow_res.as_ref());
 
-    let mut group = c.benchmark_group("take fixed bool[1024]");
+    let mut group =
+        c.benchmark_group("select::take(fixed_size_list(bool, 1024), array(u64)) 4096 rows");
     group.sample_size(10);
 
-    group.bench_function("execute/llvm", |b| {
+    group.bench_function("llvm warm", |b| {
         b.iter(|| select::take(black_box(&data), black_box(&idxes)).unwrap())
     });
 
-    group.bench_function("execute/arrow", |b| {
+    group.bench_function("arrow", |b| {
         b.iter(|| arrow_select::take::take(black_box(&data), black_box(&idxes), None).unwrap())
     });
 

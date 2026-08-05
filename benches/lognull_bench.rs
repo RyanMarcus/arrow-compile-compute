@@ -1,6 +1,6 @@
 use std::sync::Arc;
 
-use arrow_array::{types::Int32Type, Array, DictionaryArray, Int32Array, RunArray};
+use arrow_array::{types::Int8Type, Array, DictionaryArray, Int32Array, Int8Array, RunArray};
 use arrow_compile_compute::logical_nulls;
 use criterion::{criterion_group, criterion_main, Criterion};
 use itertools::Itertools;
@@ -24,7 +24,7 @@ pub fn criterion_benchmark(c: &mut Criterion) {
         }
         let data = RunArray::try_new(&Int32Array::from(run_ends), &values).unwrap();
 
-        let keys = Int32Array::from((0..100_000_000).map(|_| rng.i32(0..100)).collect_vec());
+        let keys = Int8Array::from((0..100_000_000).map(|_| rng.i8(0..100)).collect_vec());
         let values = Int32Array::from(
             (0..100)
                 .map(|x| {
@@ -37,22 +37,39 @@ pub fn criterion_benchmark(c: &mut Criterion) {
                 .collect_vec(),
         );
 
-        let dict = DictionaryArray::<Int32Type>::new(keys, Arc::new(values));
+        let dict = DictionaryArray::<Int8Type>::new(keys, Arc::new(values));
 
-        c.bench_function("dict/arrow", |b| b.iter(|| dict.logical_nulls()));
-        c.bench_function("dict/llvm", |b| b.iter(|| logical_nulls(&dict).unwrap()));
+        assert_eq!(logical_nulls(&dict).unwrap(), dict.logical_nulls());
+        assert_eq!(logical_nulls(&data).unwrap(), data.logical_nulls());
 
-        c.bench_function("ree/arrow", |b| b.iter(|| data.logical_nulls()));
-        c.bench_function("ree/llvm", |b| b.iter(|| logical_nulls(&data).unwrap()));
-
-        c.bench_function("iter_dict", |b| {
-            b.iter(|| {
-                arrow_compile_compute::iter::iter_nonnull_i64(&dict)
-                    .unwrap()
-                    .indexed()
-                    .collect_vec()
-            })
+        c.bench_function("logical_nulls(dictionary(i8, i32)) 100m rows/arrow", |b| {
+            b.iter(|| dict.logical_nulls())
         });
+        c.bench_function(
+            "logical_nulls(dictionary(i8, i32)) 100m rows/llvm warm",
+            |b| b.iter(|| logical_nulls(&dict).unwrap()),
+        );
+
+        c.bench_function(
+            "logical_nulls(run_end_encoded(i32, i32)) 1000 runs/arrow",
+            |b| b.iter(|| data.logical_nulls()),
+        );
+        c.bench_function(
+            "logical_nulls(run_end_encoded(i32, i32)) 1000 runs/llvm warm",
+            |b| b.iter(|| logical_nulls(&data).unwrap()),
+        );
+
+        c.bench_function(
+            "iter::iter_nonnull_i64(dictionary(i8, i32)) 100m rows/llvm warm",
+            |b| {
+                b.iter(|| {
+                    arrow_compile_compute::iter::iter_nonnull_i64(&dict)
+                        .unwrap()
+                        .indexed()
+                        .collect_vec()
+                })
+            },
+        );
     }
 }
 
