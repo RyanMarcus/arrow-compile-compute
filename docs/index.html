@@ -70,6 +70,9 @@
 </head>
 <body>
 <h1>JIT vs Arrow::compute Benchmark Results</h1>
+<p id="machine-picker" class="meta" hidden>
+  <label for="machine">Machine:&nbsp;</label><select id="machine"></select>
+</p>
 <p id="meta" class="meta">Loading benchmark results...</p>
 <p id="host" class="meta" hidden></p>
 <p class="classification"><b>Timing:</b> every LLVM number is a warm public-API call — the
@@ -224,6 +227,11 @@ re-benchmarking. Tests: <code>python3 -m pytest benches/test_report.py</code>.</
       throw new Error(`Unsupported report schema: ${data.schema_version}`);
     }
 
+    // Re-rendering (machine switch) replaces the previous run's content.
+    document.getElementById("families").replaceChildren();
+    document.getElementById("unpaired-body").replaceChildren();
+    document.getElementById("host").hidden = true;
+
     const dirty = data.run.dirty ? " with uncommitted changes" : "";
     document.getElementById("meta").textContent =
       `Criterion medians from revision ${data.run.revision}${dirty}. ` +
@@ -268,19 +276,49 @@ re-benchmarking. Tests: <code>python3 -m pytest benches/test_report.py</code>.</
     });
   }
 
-  fetch("./benchmark-results.json", { cache: "no-cache" })
-    .then((response) => {
+  function fetchJson(file) {
+    return fetch(file, { cache: "no-cache" }).then((response) => {
       if (!response.ok) {
-        throw new Error(`HTTP ${response.status}`);
+        throw new Error(`HTTP ${response.status} for ${file}`);
       }
       return response.json();
-    })
-    .then(render)
-    .catch((error) => {
-      document.getElementById("meta").textContent = "Benchmark results could not be loaded.";
-      document.getElementById("error").hidden = false;
-      console.error(error);
     });
+  }
+
+  function loadRun(file) {
+    fetchJson(file)
+      .then(render)
+      .catch((error) => {
+        document.getElementById("meta").textContent = "Benchmark results could not be loaded.";
+        document.getElementById("error").hidden = false;
+        console.error(error);
+      });
+  }
+
+  // runs.json lists one entry per benchmarked machine; with more than one,
+  // a selector appears. If the manifest is missing, fall back to the single
+  // default results file.
+  fetchJson("./runs.json")
+    .then((runs) => {
+      if (!Array.isArray(runs) || runs.length === 0) {
+        throw new Error("empty runs manifest");
+      }
+      const picker = document.getElementById("machine-picker");
+      const select = document.getElementById("machine");
+      runs.forEach((run, index) => {
+        const option = document.createElement("option");
+        option.value = run.file;
+        option.textContent = run.label;
+        if (index === 0) option.selected = true;
+        select.appendChild(option);
+      });
+      if (runs.length > 1) {
+        picker.hidden = false;
+      }
+      select.addEventListener("change", () => loadRun(select.value));
+      loadRun(runs[0].file);
+    })
+    .catch(() => loadRun("./benchmark-results.json"));
 </script>
 </body>
 </html>

@@ -267,11 +267,16 @@ def collect(criterion_dir):
         )
 
     family_order = {name: index for index, name in enumerate(FAMILIES.values())}
-    # Ascending speedup within each family: the results that most need
+    # Fixed group order within each family: the family's primary operator
+    # first, remaining operators alphabetically — stable across runs. Rows
+    # inside a group sort ascending by speedup, so the results that most need
     # attention (LLVM losses) come first.
+    primary_ops = {"cmp::lt": 0}
     results.sort(
         key=lambda row: (
             family_order.get(row["family"], len(family_order)),
+            primary_ops.get(row["op"], 1),
+            row["op"],
             row["speedup"],
         )
     )

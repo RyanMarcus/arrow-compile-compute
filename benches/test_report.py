@@ -134,19 +134,24 @@ class ReportTests(unittest.TestCase):
         self.assertEqual("arrow-win", arrow_win[1])
         self.assertEqual("equal", overlap[1])
 
-    def test_sorts_by_family_order_then_speedup(self):
+    def test_sorts_by_family_then_fixed_group_then_speedup(self):
         self.write_estimate("vec__dot(a)/llvm warm", 10)
         self.write_estimate("vec__dot(a)_rust reference", 40)
         self.write_estimate("cmp__lt(slow)/llvm warm", 20)
         self.write_estimate("cmp__lt(slow)/arrow", 10)
         self.write_estimate("cmp__lt(fast)/llvm warm", 10)
         self.write_estimate("cmp__lt(fast)/arrow", 20)
+        # bounds loses worse than any lt row, but group order is fixed:
+        # the primary operator (cmp::lt) stays first regardless of results.
+        self.write_estimate("cmp__bounds(b)/llvm warm", 100)
+        self.write_estimate("cmp__bounds(b)/arrow", 10)
 
         results, _ = report.collect(self.criterion_dir)
 
-        # Within a family the worst LLVM results come first (ascending speedup).
+        # Families in fixed order; groups fixed (primary first, then
+        # alphabetical); rows inside a group worst-first (ascending speedup).
         self.assertEqual(
-            ["cmp::lt(slow)", "cmp::lt(fast)", "vec::dot(a)"],
+            ["cmp::lt(slow)", "cmp::lt(fast)", "cmp::bounds(b)", "vec::dot(a)"],
             [row["name"] for row in results],
         )
 

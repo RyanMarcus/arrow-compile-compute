@@ -22,46 +22,6 @@
   "equal_margin": 1.035,
   "results": [
     {
-      "name": "cmp::lt(array(i32), array(i32)) 1 row",
-      "op": "cmp::lt",
-      "inputs": "i32, i32",
-      "size": "1 row",
-      "family": "Comparisons",
-      "baseline_kind": "arrow",
-      "llvm": {
-        "point": 424.323026301996,
-        "lower": 423.76265514927877,
-        "upper": 425.3015514026108
-      },
-      "baseline": {
-        "point": 55.12485453809707,
-        "lower": 55.02310103954678,
-        "upper": 55.318627717876936
-      },
-      "speedup": 0.129912474980474,
-      "classification": "arrow-win"
-    },
-    {
-      "name": "cmp::starts_with(array(utf8), scalar(utf8)) 1m rows",
-      "op": "cmp::starts_with",
-      "inputs": "utf8, utf8 scalar",
-      "size": "1m rows",
-      "family": "Comparisons",
-      "baseline_kind": "arrow",
-      "llvm": {
-        "point": 7158091.1875,
-        "lower": 6871539.125,
-        "upper": 7495838.5
-      },
-      "baseline": {
-        "point": 5111775.5,
-        "lower": 5090013.888888889,
-        "upper": 5125963.0
-      },
-      "speedup": 0.7141255072199372,
-      "classification": "arrow-win"
-    },
-    {
       "name": "cmp::lt(array(i32), array(i32)) 10m rows",
       "op": "cmp::lt",
       "inputs": "i32, i32",
@@ -382,26 +342,6 @@
       "classification": "llvm-win"
     },
     {
-      "name": "cmp::bounds(array(i32), scalar(i32), scalar(i32)) 1m rows",
-      "op": "cmp::bounds",
-      "inputs": "i32, i32 scalar, i32 scalar",
-      "size": "1m rows",
-      "family": "Comparisons",
-      "baseline_kind": "arrow",
-      "llvm": {
-        "point": 66160.3970760234,
-        "lower": 65737.35548245614,
-        "upper": 66800.10933333333
-      },
-      "baseline": {
-        "point": 231220.02217391305,
-        "lower": 230288.63636363635,
-        "upper": 238904.53529411764
-      },
-      "speedup": 3.4948403031533113,
-      "classification": "llvm-win"
-    },
-    {
       "name": "cmp::lt(run_end_encoded(i32, i32), scalar(i32)) 1m rows",
       "op": "cmp::lt",
       "inputs": "ree i32\u2192i32, i32 scalar",
@@ -440,6 +380,46 @@
       },
       "speedup": 4.66159340868898,
       "classification": "llvm-win"
+    },
+    {
+      "name": "cmp::bounds(array(i32), scalar(i32), scalar(i32)) 1m rows",
+      "op": "cmp::bounds",
+      "inputs": "i32, i32 scalar, i32 scalar",
+      "size": "1m rows",
+      "family": "Comparisons",
+      "baseline_kind": "arrow",
+      "llvm": {
+        "point": 66160.3970760234,
+        "lower": 65737.35548245614,
+        "upper": 66800.10933333333
+      },
+      "baseline": {
+        "point": 231220.02217391305,
+        "lower": 230288.63636363635,
+        "upper": 238904.53529411764
+      },
+      "speedup": 3.4948403031533113,
+      "classification": "llvm-win"
+    },
+    {
+      "name": "cmp::starts_with(array(utf8), scalar(utf8)) 1m rows",
+      "op": "cmp::starts_with",
+      "inputs": "utf8, utf8 scalar",
+      "size": "1m rows",
+      "family": "Comparisons",
+      "baseline_kind": "arrow",
+      "llvm": {
+        "point": 7158091.1875,
+        "lower": 6871539.125,
+        "upper": 7495838.5
+      },
+      "baseline": {
+        "point": 5111775.5,
+        "lower": 5090013.888888889,
+        "upper": 5125963.0
+      },
+      "speedup": 0.7141255072199372,
+      "classification": "arrow-win"
     },
     {
       "name": "arith::neg_wrapping(dictionary(i8, i32)) 10m rows",
@@ -502,43 +482,23 @@
       "classification": "arrow-win"
     },
     {
-      "name": "compute::sum(array(i32)) 10m rows",
-      "op": "compute::sum",
+      "name": "compute::max(array(i32)) 10m rows",
+      "op": "compute::max",
       "inputs": "i32",
       "size": "10m rows",
       "family": "Aggregations",
       "baseline_kind": "arrow",
       "llvm": {
-        "point": 1106614.2475328948,
-        "lower": 1078148.9787878788,
-        "upper": 1124100.5294117648
+        "point": 1001150.6885869566,
+        "lower": 990657.4074074074,
+        "upper": 1012647.8174603174
       },
       "baseline": {
-        "point": 572468.5078125,
-        "lower": 566363.4615384615,
-        "upper": 579118.9794050343
+        "point": 572867.1742877493,
+        "lower": 566038.6822916667,
+        "upper": 578033.3
       },
-      "speedup": 0.5173153238255981,
-      "classification": "arrow-win"
-    },
-    {
-      "name": "compute::product(array(i32)) 10m rows",
-      "op": "compute::product",
-      "inputs": "i32",
-      "size": "10m rows",
-      "family": "Aggregations",
-      "baseline_kind": "arrow",
-      "llvm": {
-        "point": 1002620.8089887641,
-        "lower": 987605.5333333333,
-        "upper": 1017691.3363636364
-      },
-      "baseline": {
-        "point": 559789.7960687961,
-        "lower": 554649.1935483871,
-        "upper": 566662.349078341
-      },
-      "speedup": 0.5583265288832334,
+      "speedup": 0.5722087402210202,
       "classification": "arrow-win"
     },
     {
@@ -562,23 +522,43 @@
       "classification": "arrow-win"
     },
     {
-      "name": "compute::max(array(i32)) 10m rows",
-      "op": "compute::max",
+      "name": "compute::product(array(i32)) 10m rows",
+      "op": "compute::product",
       "inputs": "i32",
       "size": "10m rows",
       "family": "Aggregations",
       "baseline_kind": "arrow",
       "llvm": {
-        "point": 1001150.6885869566,
-        "lower": 990657.4074074074,
-        "upper": 1012647.8174603174
+        "point": 1002620.8089887641,
+        "lower": 987605.5333333333,
+        "upper": 1017691.3363636364
       },
       "baseline": {
-        "point": 572867.1742877493,
-        "lower": 566038.6822916667,
-        "upper": 578033.3
+        "point": 559789.7960687961,
+        "lower": 554649.1935483871,
+        "upper": 566662.349078341
       },
-      "speedup": 0.5722087402210202,
+      "speedup": 0.5583265288832334,
+      "classification": "arrow-win"
+    },
+    {
+      "name": "compute::sum(array(i32)) 10m rows",
+      "op": "compute::sum",
+      "inputs": "i32",
+      "size": "10m rows",
+      "family": "Aggregations",
+      "baseline_kind": "arrow",
+      "llvm": {
+        "point": 1106614.2475328948,
+        "lower": 1078148.9787878788,
+        "upper": 1124100.5294117648
+      },
+      "baseline": {
+        "point": 572468.5078125,
+        "lower": 566363.4615384615,
+        "upper": 579118.9794050343
+      },
+      "speedup": 0.5173153238255981,
       "classification": "arrow-win"
     },
     {
@@ -762,46 +742,6 @@
       "classification": "arrow-win"
     },
     {
-      "name": "select::filter(run_end_encoded(i64, i32), array(bool)) 1m runs",
-      "op": "select::filter",
-      "inputs": "ree i64\u2192i32, bool",
-      "size": "1m runs",
-      "family": "Selection",
-      "baseline_kind": "arrow",
-      "llvm": {
-        "point": 85484000.0,
-        "lower": 84990958.0,
-        "upper": 86560792.0
-      },
-      "baseline": {
-        "point": 38077520.75,
-        "lower": 37696562.5,
-        "upper": 38561354.25
-      },
-      "speedup": 0.4454344760423003,
-      "classification": "arrow-win"
-    },
-    {
-      "name": "select::take(run_end_encoded(i64, i32), array(u64)) 100k rows",
-      "op": "select::take",
-      "inputs": "ree i64\u2192i32, u64",
-      "size": "100k rows",
-      "family": "Selection",
-      "baseline_kind": "arrow",
-      "llvm": {
-        "point": 2943044.117647059,
-        "lower": 2879360.294117647,
-        "upper": 2984536.7647058824
-      },
-      "baseline": {
-        "point": 1820634.1242624088,
-        "lower": 1812467.5555555555,
-        "upper": 1834624.011904762
-      },
-      "speedup": 0.6186227767859599,
-      "classification": "arrow-win"
-    },
-    {
       "name": "select::concat(array(i32) x5, dictionary(i8, i32) x5) 10m rows",
       "op": "select::concat",
       "inputs": "i32 x5, dict i8\u2192i32 x5",
@@ -822,6 +762,46 @@
       "classification": "arrow-win"
     },
     {
+      "name": "select::concat(fixed_size_list(bool, 8) x2) 2m rows",
+      "op": "select::concat",
+      "inputs": "bool[8] x2",
+      "size": "2m rows",
+      "family": "Selection",
+      "baseline_kind": "arrow",
+      "llvm": {
+        "point": 91855.9220389805,
+        "lower": 90843.95492957746,
+        "upper": 92503.56688077078
+      },
+      "baseline": {
+        "point": 200960.4020078687,
+        "lower": 200682.78783783782,
+        "upper": 201525.0
+      },
+      "speedup": 2.1877783984639336,
+      "classification": "llvm-win"
+    },
+    {
+      "name": "select::filter(run_end_encoded(i64, i32), array(bool)) 1m runs",
+      "op": "select::filter",
+      "inputs": "ree i64\u2192i32, bool",
+      "size": "1m runs",
+      "family": "Selection",
+      "baseline_kind": "arrow",
+      "llvm": {
+        "point": 85484000.0,
+        "lower": 84990958.0,
+        "upper": 86560792.0
+      },
+      "baseline": {
+        "point": 38077520.75,
+        "lower": 37696562.5,
+        "upper": 38561354.25
+      },
+      "speedup": 0.4454344760423003,
+      "classification": "arrow-win"
+    },
+    {
       "name": "select::filter(array(i32), array(bool)) 10m rows",
       "op": "select::filter",
       "inputs": "i32, bool",
@@ -839,6 +819,26 @@
         "upper": 3831743.0416666665
       },
       "speedup": 0.9168802080919147,
+      "classification": "arrow-win"
+    },
+    {
+      "name": "select::take(run_end_encoded(i64, i32), array(u64)) 100k rows",
+      "op": "select::take",
+      "inputs": "ree i64\u2192i32, u64",
+      "size": "100k rows",
+      "family": "Selection",
+      "baseline_kind": "arrow",
+      "llvm": {
+        "point": 2943044.117647059,
+        "lower": 2879360.294117647,
+        "upper": 2984536.7647058824
+      },
+      "baseline": {
+        "point": 1820634.1242624088,
+        "lower": 1812467.5555555555,
+        "upper": 1834624.011904762
+      },
+      "speedup": 0.6186227767859599,
       "classification": "arrow-win"
     },
     {
@@ -882,26 +882,6 @@
       "classification": "llvm-win"
     },
     {
-      "name": "select::concat(fixed_size_list(bool, 8) x2) 2m rows",
-      "op": "select::concat",
-      "inputs": "bool[8] x2",
-      "size": "2m rows",
-      "family": "Selection",
-      "baseline_kind": "arrow",
-      "llvm": {
-        "point": 91855.9220389805,
-        "lower": 90843.95492957746,
-        "upper": 92503.56688077078
-      },
-      "baseline": {
-        "point": 200960.4020078687,
-        "lower": 200682.78783783782,
-        "upper": 201525.0
-      },
-      "speedup": 2.1877783984639336,
-      "classification": "llvm-win"
-    },
-    {
       "name": "select::take(fixed_size_list(bool, 1024), array(u64)) 4096 rows",
       "op": "select::take",
       "inputs": "bool[1024], u64",
@@ -920,46 +900,6 @@
       },
       "speedup": 103.56229448481133,
       "classification": "llvm-win"
-    },
-    {
-      "name": "sort::sort_to_indices(array(nullable u64)) 1m rows",
-      "op": "sort::sort_to_indices",
-      "inputs": "nullable u64",
-      "size": "1m rows",
-      "family": "Sorting",
-      "baseline_kind": "arrow",
-      "llvm": {
-        "point": 11384424.899999999,
-        "lower": 11312858.4,
-        "upper": 11454433.4
-      },
-      "baseline": {
-        "point": 7439776.714285715,
-        "lower": 7405889.857142857,
-        "upper": 7494220.285714285
-      },
-      "speedup": 0.653504834863087,
-      "classification": "arrow-win"
-    },
-    {
-      "name": "sort::sort_to_indices(array(u64)) 1m rows",
-      "op": "sort::sort_to_indices",
-      "inputs": "u64",
-      "size": "1m rows",
-      "family": "Sorting",
-      "baseline_kind": "arrow",
-      "llvm": {
-        "point": 16795604.166666664,
-        "lower": 16673500.0,
-        "upper": 16930958.333333332
-      },
-      "baseline": {
-        "point": 14053848.875,
-        "lower": 13989552.0,
-        "upper": 14134073.0
-      },
-      "speedup": 0.8367575667740444,
-      "classification": "arrow-win"
     },
     {
       "name": "sort::multicol_sort_to_indices(array(u64) x7) 8 word key 1m rows",
@@ -1040,6 +980,46 @@
       },
       "speedup": 3.9339799538089197,
       "classification": "llvm-win"
+    },
+    {
+      "name": "sort::sort_to_indices(array(nullable u64)) 1m rows",
+      "op": "sort::sort_to_indices",
+      "inputs": "nullable u64",
+      "size": "1m rows",
+      "family": "Sorting",
+      "baseline_kind": "arrow",
+      "llvm": {
+        "point": 11384424.899999999,
+        "lower": 11312858.4,
+        "upper": 11454433.4
+      },
+      "baseline": {
+        "point": 7439776.714285715,
+        "lower": 7405889.857142857,
+        "upper": 7494220.285714285
+      },
+      "speedup": 0.653504834863087,
+      "classification": "arrow-win"
+    },
+    {
+      "name": "sort::sort_to_indices(array(u64)) 1m rows",
+      "op": "sort::sort_to_indices",
+      "inputs": "u64",
+      "size": "1m rows",
+      "family": "Sorting",
+      "baseline_kind": "arrow",
+      "llvm": {
+        "point": 16795604.166666664,
+        "lower": 16673500.0,
+        "upper": 16930958.333333332
+      },
+      "baseline": {
+        "point": 14053848.875,
+        "lower": 13989552.0,
+        "upper": 14134073.0
+      },
+      "speedup": 0.8367575667740444,
+      "classification": "arrow-win"
     },
     {
       "name": "vec::dot(scalar(fixed_size_list(f32, 768)), fixed_size_list(f32, 768)) 16384 rows",

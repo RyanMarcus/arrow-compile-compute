@@ -20,10 +20,6 @@ pub fn criterion_benchmark(c: &mut Criterion) {
         },
     );
 
-    c.bench_function("cmp::lt(array(i32), array(i32)) 1 row/arrow", |b| {
-        b.iter(|| black_box(arrow_ord::cmp::lt(&data1, &data2)));
-    });
-
     let k = ComparisonKernel::compile(&(&data1, &data2), Predicate::Lt).unwrap();
     c.bench_function(
         "cmp::ComparisonKernel::call(array(i32), array(i32)) 1 row/llvm direct",
@@ -31,11 +27,6 @@ pub fn criterion_benchmark(c: &mut Criterion) {
             b.iter(|| black_box(k.call((&data1, &data2))));
         },
     );
-
-    arrow_compile_compute::cmp::lt(&data1, &data2).unwrap();
-    c.bench_function("cmp::lt(array(i32), array(i32)) 1 row/llvm warm", |b| {
-        b.iter(|| black_box(arrow_compile_compute::cmp::lt(&data1, &data2).unwrap()));
-    });
 }
 
 criterion_group!(benches, criterion_benchmark);
