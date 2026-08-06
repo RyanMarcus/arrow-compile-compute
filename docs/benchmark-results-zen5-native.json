@@ -1,0 +1,1371 @@
+{
+  "schema_version": 2,
+  "run": {
+    "revision": "107db50",
+    "dirty": false,
+    "started_at": "2026-08-06T17:42:23.587044+00:00",
+    "completed_at": "2026-08-06T18:09:25.317589+00:00",
+    "commands": [
+      [
+        "cargo",
+        "bench"
+      ]
+    ],
+    "host": {
+      "os": "Linux 7.1.4-arch1-1",
+      "arch": "x86_64",
+      "cpu": "AMD Ryzen 7 9700X 8-Core Processor",
+      "cores": 16,
+      "memory_gb": 123
+    }
+  },
+  "equal_margin": 1.035,
+  "results": [
+    {
+      "name": "cmp::lt(array(i32), array(i32)) 10m rows",
+      "op": "cmp::lt",
+      "inputs": "i32, i32",
+      "size": "10m rows",
+      "family": "Comparisons",
+      "baseline_kind": "arrow",
+      "llvm": {
+        "point": 1498591.3229166665,
+        "lower": 1474394.2236842106,
+        "upper": 1540534.3333333333
+      },
+      "baseline": {
+        "point": 1473019.9388698628,
+        "lower": 1465516.4411764706,
+        "upper": 1487112.0185185184
+      },
+      "speedup": 0.982936385887358,
+      "classification": "equal"
+    },
+    {
+      "name": "cmp::lt(array(f32), array(f32)) 10m rows",
+      "op": "cmp::lt",
+      "inputs": "f32, f32",
+      "size": "10m rows",
+      "family": "Comparisons",
+      "baseline_kind": "arrow",
+      "llvm": {
+        "point": 1483503.2399858208,
+        "lower": 1474301.4605297665,
+        "upper": 1486330.653846154
+      },
+      "baseline": {
+        "point": 1485080.7582846005,
+        "lower": 1483991.1141598916,
+        "upper": 1486334.4375
+      },
+      "speedup": 1.0010633736794499,
+      "classification": "equal"
+    },
+    {
+      "name": "cmp::lt(array(i64), scalar(i64)) 1m rows",
+      "op": "cmp::lt",
+      "inputs": "i64, i64 scalar",
+      "size": "1m rows",
+      "family": "Comparisons",
+      "baseline_kind": "arrow",
+      "llvm": {
+        "point": 51065.75220006592,
+        "lower": 51043.69696969697,
+        "upper": 51094.85240963855
+      },
+      "baseline": {
+        "point": 54719.777784015765,
+        "lower": 54702.10858585859,
+        "upper": 54775.71256038648
+      },
+      "speedup": 1.0715553071583879,
+      "classification": "llvm-win"
+    },
+    {
+      "name": "cmp::lt(array(i32), scalar(i32)) 10m rows",
+      "op": "cmp::lt",
+      "inputs": "i32, i32 scalar",
+      "size": "10m rows",
+      "family": "Comparisons",
+      "baseline_kind": "arrow",
+      "llvm": {
+        "point": 598947.8161650737,
+        "lower": 595966.2605633803,
+        "upper": 600772.0097402597
+      },
+      "baseline": {
+        "point": 663839.6742788461,
+        "lower": 636959.4857142858,
+        "upper": 668275.7326007326
+      },
+      "speedup": 1.1083430916056431,
+      "classification": "llvm-win"
+    },
+    {
+      "name": "cmp::lt(array(i32), scalar(i32)) 1m rows",
+      "op": "cmp::lt",
+      "inputs": "i32, i32 scalar",
+      "size": "1m rows",
+      "family": "Comparisons",
+      "baseline_kind": "arrow",
+      "llvm": {
+        "point": 27533.15763546798,
+        "lower": 27523.691816979317,
+        "upper": 27538.06002690725
+      },
+      "baseline": {
+        "point": 32532.351531550652,
+        "lower": 32500.33309264816,
+        "upper": 34135.41583009671
+      },
+      "speedup": 1.1815699442203735,
+      "classification": "llvm-win"
+    },
+    {
+      "name": "cmp::lt(array(utf8), scalar(utf8)) 1m rows",
+      "op": "cmp::lt",
+      "inputs": "utf8, utf8 scalar",
+      "size": "1m rows",
+      "family": "Comparisons",
+      "baseline_kind": "arrow",
+      "llvm": {
+        "point": 812930.1634366924,
+        "lower": 812029.3426966292,
+        "upper": 813886.1825810185
+      },
+      "baseline": {
+        "point": 1420819.1510416665,
+        "lower": 1419952.71875,
+        "upper": 1421826.3281853283
+      },
+      "speedup": 1.747775165624438,
+      "classification": "llvm-win"
+    },
+    {
+      "name": "cmp::lt(dictionary(i8, i64), scalar(i64)) 1m rows",
+      "op": "cmp::lt",
+      "inputs": "dict i8\u2192i64, i64 scalar",
+      "size": "1m rows",
+      "family": "Comparisons",
+      "baseline_kind": "arrow",
+      "llvm": {
+        "point": 206519.0194353519,
+        "lower": 206480.76623376625,
+        "upper": 206556.85128205127
+      },
+      "baseline": {
+        "point": 441637.4475768872,
+        "lower": 441600.31746031746,
+        "upper": 441701.44444444444
+      },
+      "speedup": 2.1384831711112016,
+      "classification": "llvm-win"
+    },
+    {
+      "name": "cmp::lt(dictionary(i8, i32), scalar(i32)) 1m rows",
+      "op": "cmp::lt",
+      "inputs": "dict i8\u2192i32, i32 scalar",
+      "size": "1m rows",
+      "family": "Comparisons",
+      "baseline_kind": "arrow",
+      "llvm": {
+        "point": 172132.31666666668,
+        "lower": 172117.5288650393,
+        "upper": 172160.0
+      },
+      "baseline": {
+        "point": 442017.118627451,
+        "lower": 441968.9582007993,
+        "upper": 442075.9555555555
+      },
+      "speedup": 2.5678915336009496,
+      "classification": "llvm-win"
+    },
+    {
+      "name": "cmp::lt(dictionary(i8, i32), dictionary(i8, i32)) 10m rows",
+      "op": "cmp::lt",
+      "inputs": "dict i8\u2192i32, dict i8\u2192i32",
+      "size": "10m rows",
+      "family": "Comparisons",
+      "baseline_kind": "arrow",
+      "llvm": {
+        "point": 4222920.041666667,
+        "lower": 4219290.791666666,
+        "upper": 4229793.333333333
+      },
+      "baseline": {
+        "point": 14628920.625,
+        "lower": 14610990.75,
+        "upper": 14684415.5
+      },
+      "speedup": 3.4641718243915363,
+      "classification": "llvm-win"
+    },
+    {
+      "name": "cmp::lt(dictionary(i16, i32), run_end_encoded(i32, i32)) 200k runs",
+      "op": "cmp::lt",
+      "inputs": "dict i16\u2192i32, ree i32\u2192i32",
+      "size": "200k runs",
+      "family": "Comparisons",
+      "baseline_kind": "arrow",
+      "llvm": {
+        "point": 463606.61937762506,
+        "lower": 463308.3478236731,
+        "upper": 464011.2248062015
+      },
+      "baseline": {
+        "point": 2096995.8541666665,
+        "lower": 2096125.0833333335,
+        "upper": 2098178.708333333
+      },
+      "speedup": 4.523222418570742,
+      "classification": "llvm-win"
+    },
+    {
+      "name": "cmp::lt(array(i32), array(i64)) 10m rows",
+      "op": "cmp::lt",
+      "inputs": "i32, i64",
+      "size": "10m rows",
+      "family": "Comparisons",
+      "baseline_kind": "arrow",
+      "llvm": {
+        "point": 2626946.175,
+        "lower": 2444138.6,
+        "upper": 2804688.8
+      },
+      "baseline": {
+        "point": 12101432.375,
+        "lower": 12077454.875,
+        "upper": 12132249.875
+      },
+      "speedup": 4.606654102838632,
+      "classification": "llvm-win"
+    },
+    {
+      "name": "cmp::lt(dictionary(i8, i32), array(i32)) 10m rows",
+      "op": "cmp::lt",
+      "inputs": "dict i8\u2192i32, i32",
+      "size": "10m rows",
+      "family": "Comparisons",
+      "baseline_kind": "arrow",
+      "llvm": {
+        "point": 2383390.925,
+        "lower": 2362034.95,
+        "upper": 2385248.9
+      },
+      "baseline": {
+        "point": 15791322.0,
+        "lower": 15783469.75,
+        "upper": 15800703.25
+      },
+      "speedup": 6.625569408006369,
+      "classification": "llvm-win"
+    },
+    {
+      "name": "cmp::lt(dictionary(i8, i32), run_end_encoded(i32, i32)) 1m rows",
+      "op": "cmp::lt",
+      "inputs": "dict i8\u2192i32, ree i32\u2192i32",
+      "size": "1m rows",
+      "family": "Comparisons",
+      "baseline_kind": "arrow",
+      "llvm": {
+        "point": 279045.0256313131,
+        "lower": 277041.9587912088,
+        "upper": 280768.0888813406
+      },
+      "baseline": {
+        "point": 2540768.272727273,
+        "lower": 2513507.0454545454,
+        "upper": 2542038.1818181816
+      },
+      "speedup": 9.105226896551995,
+      "classification": "llvm-win"
+    },
+    {
+      "name": "cmp::lt(run_end_encoded(i64, i64), scalar(i64)) 100k runs",
+      "op": "cmp::lt",
+      "inputs": "ree i64\u2192i64, i64 scalar",
+      "size": "100k runs",
+      "family": "Comparisons",
+      "baseline_kind": "arrow",
+      "llvm": {
+        "point": 293634.15183423914,
+        "lower": 293484.73146645026,
+        "upper": 293792.86687784275
+      },
+      "baseline": {
+        "point": 3980958.9615384615,
+        "lower": 3978479.346153846,
+        "upper": 3984029.346153846
+      },
+      "speedup": 13.55754750144245,
+      "classification": "llvm-win"
+    },
+    {
+      "name": "cmp::lt(run_end_encoded(i32, i64), scalar(i64)) 1m rows",
+      "op": "cmp::lt",
+      "inputs": "ree i32\u2192i64, i64 scalar",
+      "size": "1m rows",
+      "family": "Comparisons",
+      "baseline_kind": "arrow",
+      "llvm": {
+        "point": 107599.63981173866,
+        "lower": 106823.16458333333,
+        "upper": 108985.56734234234
+      },
+      "baseline": {
+        "point": 2050520.62,
+        "lower": 2050303.84,
+        "upper": 2050886.92
+      },
+      "speedup": 19.056946878146494,
+      "classification": "llvm-win"
+    },
+    {
+      "name": "cmp::lt(run_end_encoded(i32, dictionary(i8, i64)), scalar(i64)) 1m rows",
+      "op": "cmp::lt",
+      "inputs": "ree i32\u2192dict i8\u2192i64, i64 scalar",
+      "size": "1m rows",
+      "family": "Comparisons",
+      "baseline_kind": "arrow",
+      "llvm": {
+        "point": 109254.5738517248,
+        "lower": 109199.61805555556,
+        "upper": 109362.02614379085
+      },
+      "baseline": {
+        "point": 2275239.1363636367,
+        "lower": 2274474.5,
+        "upper": 2276155.6136363638
+      },
+      "speedup": 20.825115655583307,
+      "classification": "llvm-win"
+    },
+    {
+      "name": "cmp::lt(run_end_encoded(i32, i32), scalar(i32)) 1m rows",
+      "op": "cmp::lt",
+      "inputs": "ree i32\u2192i32, i32 scalar",
+      "size": "1m rows",
+      "family": "Comparisons",
+      "baseline_kind": "arrow",
+      "llvm": {
+        "point": 85866.62990196078,
+        "lower": 85821.0125,
+        "upper": 85905.81798245614
+      },
+      "baseline": {
+        "point": 2368734.7727272725,
+        "lower": 2368274.8181818184,
+        "upper": 2369110.909090909
+      },
+      "speedup": 27.58620869867378,
+      "classification": "llvm-win"
+    },
+    {
+      "name": "cmp::lt(run_end_encoded(i32, dictionary(i8, i32)), scalar(i32)) 1m rows",
+      "op": "cmp::lt",
+      "inputs": "ree i32\u2192dict i8\u2192i32, i32 scalar",
+      "size": "1m rows",
+      "family": "Comparisons",
+      "baseline_kind": "arrow",
+      "llvm": {
+        "point": 90497.17926919571,
+        "lower": 90309.18948101706,
+        "upper": 90746.34407315945
+      },
+      "baseline": {
+        "point": 2746005.2894736845,
+        "lower": 2734023.8947368423,
+        "upper": 2851926.157894737
+      },
+      "speedup": 30.34354564030479,
+      "classification": "llvm-win"
+    },
+    {
+      "name": "cmp::bounds(array(i32), scalar(i32), scalar(i32)) 1m rows",
+      "op": "cmp::bounds",
+      "inputs": "i32, i32 scalar, i32 scalar",
+      "size": "1m rows",
+      "family": "Comparisons",
+      "baseline_kind": "arrow",
+      "llvm": {
+        "point": 27313.658495878324,
+        "lower": 27286.93074074074,
+        "upper": 27322.77797795023
+      },
+      "baseline": {
+        "point": 75126.96679382434,
+        "lower": 74777.15575396825,
+        "upper": 75335.9338430851
+      },
+      "speedup": 2.7505274258723387,
+      "classification": "llvm-win"
+    },
+    {
+      "name": "cmp::contains(array(utf8), scalar(utf8)) 1m rows",
+      "op": "cmp::contains",
+      "inputs": "utf8, utf8 scalar",
+      "size": "1m rows",
+      "family": "Comparisons",
+      "baseline_kind": "arrow",
+      "llvm": {
+        "point": 12735426.25,
+        "lower": 12691043.25,
+        "upper": 12756663.375
+      },
+      "baseline": {
+        "point": 10278921.5,
+        "lower": 10183785.3,
+        "upper": 10302702.8
+      },
+      "speedup": 0.8071124827879239,
+      "classification": "arrow-win"
+    },
+    {
+      "name": "cmp::ends_with(array(utf8), scalar(utf8)) 1m rows",
+      "op": "cmp::ends_with",
+      "inputs": "utf8, utf8 scalar",
+      "size": "1m rows",
+      "family": "Comparisons",
+      "baseline_kind": "arrow",
+      "llvm": {
+        "point": 5673553.333333334,
+        "lower": 5662036.777777778,
+        "upper": 5679840.555555556
+      },
+      "baseline": {
+        "point": 8013188.285714285,
+        "lower": 8009505.642857143,
+        "upper": 8023679.285714285
+      },
+      "speedup": 1.4123755986632043,
+      "classification": "llvm-win"
+    },
+    {
+      "name": "cmp::like(array(utf8), '%abc%') 1m rows",
+      "op": "cmp::like",
+      "inputs": "utf8, '%abc%'",
+      "size": "1m rows",
+      "family": "Comparisons",
+      "baseline_kind": "arrow",
+      "llvm": {
+        "point": 102467082.0,
+        "lower": 102449248.0,
+        "upper": 102485596.0
+      },
+      "baseline": {
+        "point": 10259175.4,
+        "lower": 10237007.0,
+        "upper": 10277559.8
+      },
+      "speedup": 0.10012167029407552,
+      "classification": "arrow-win"
+    },
+    {
+      "name": "cmp::like(array(utf8), '%xyz') 1m rows",
+      "op": "cmp::like",
+      "inputs": "utf8, '%xyz'",
+      "size": "1m rows",
+      "family": "Comparisons",
+      "baseline_kind": "arrow",
+      "llvm": {
+        "point": 4064980.807692308,
+        "lower": 4064495.6923076925,
+        "upper": 4065909.153846154
+      },
+      "baseline": {
+        "point": 1008658.4900352734,
+        "lower": 1008174.6744186047,
+        "upper": 1008883.9444444445
+      },
+      "speedup": 0.2481336414003611,
+      "classification": "arrow-win"
+    },
+    {
+      "name": "cmp::like(array(utf8), 'abc%') 1m rows",
+      "op": "cmp::like",
+      "inputs": "utf8, 'abc%'",
+      "size": "1m rows",
+      "family": "Comparisons",
+      "baseline_kind": "arrow",
+      "llvm": {
+        "point": 3571753.333333333,
+        "lower": 3564076.6,
+        "upper": 3575859.333333333
+      },
+      "baseline": {
+        "point": 909617.6293233082,
+        "lower": 909344.6927083334,
+        "upper": 909900.0701787043
+      },
+      "speedup": 0.2546697782386918,
+      "classification": "arrow-win"
+    },
+    {
+      "name": "cmp::like(array(utf8), '%abc%xyz%') 1m rows",
+      "op": "cmp::like",
+      "inputs": "utf8, '%abc%xyz%'",
+      "size": "1m rows",
+      "family": "Comparisons",
+      "baseline_kind": "arrow",
+      "llvm": {
+        "point": 18479107.333333336,
+        "lower": 18446708.333333332,
+        "upper": 18512424.666666668
+      },
+      "baseline": {
+        "point": 18398044.0,
+        "lower": 18389905.666666668,
+        "upper": 18406820.333333332
+      },
+      "speedup": 0.995613244088522,
+      "classification": "equal"
+    },
+    {
+      "name": "cmp::starts_with(array(utf8), scalar(utf8)) 1m rows",
+      "op": "cmp::starts_with",
+      "inputs": "utf8, utf8 scalar",
+      "size": "1m rows",
+      "family": "Comparisons",
+      "baseline_kind": "arrow",
+      "llvm": {
+        "point": 5952640.0,
+        "lower": 5948171.666666667,
+        "upper": 5961287.333333333
+      },
+      "baseline": {
+        "point": 6916398.5625,
+        "lower": 6910715.4375,
+        "upper": 6920744.125
+      },
+      "speedup": 1.1619043924208419,
+      "classification": "llvm-win"
+    },
+    {
+      "name": "arith::neg_wrapping(array(f64)) 10m rows",
+      "op": "arith::neg_wrapping",
+      "inputs": "f64",
+      "size": "10m rows",
+      "family": "Arithmetic",
+      "baseline_kind": "arrow",
+      "llvm": {
+        "point": 10031197.5,
+        "lower": 9742569.083333332,
+        "upper": 10348988.083333332
+      },
+      "baseline": {
+        "point": 6260413.111111112,
+        "lower": 6183466.333333333,
+        "upper": 6347421.0
+      },
+      "speedup": 0.6240942929407094,
+      "classification": "arrow-win"
+    },
+    {
+      "name": "arith::neg_wrapping(array(i32)) 10m rows",
+      "op": "arith::neg_wrapping",
+      "inputs": "i32",
+      "size": "10m rows",
+      "family": "Arithmetic",
+      "baseline_kind": "arrow",
+      "llvm": {
+        "point": 3874802.653846154,
+        "lower": 3852514.3846153845,
+        "upper": 4369299.923076923
+      },
+      "baseline": {
+        "point": 2708028.5,
+        "lower": 2701553.0555555555,
+        "upper": 2715109.0
+      },
+      "speedup": 0.6988816571889135,
+      "classification": "arrow-win"
+    },
+    {
+      "name": "arith::neg_wrapping(dictionary(i8, i32)) 10m rows",
+      "op": "arith::neg_wrapping",
+      "inputs": "dict i8\u2192i32",
+      "size": "10m rows",
+      "family": "Arithmetic",
+      "baseline_kind": "arrow",
+      "llvm": {
+        "point": 4723657.65,
+        "lower": 4712838.8,
+        "upper": 4738566.55
+      },
+      "baseline": {
+        "point": 9012472.083333332,
+        "lower": 9002873.333333334,
+        "upper": 9016475.5
+      },
+      "speedup": 1.9079435367915225,
+      "classification": "llvm-win"
+    },
+    {
+      "name": "compute::max(array(i32)) 10m rows",
+      "op": "compute::max",
+      "inputs": "i32",
+      "size": "10m rows",
+      "family": "Aggregations",
+      "baseline_kind": "arrow",
+      "llvm": {
+        "point": 2888303.916666667,
+        "lower": 2877733.8333333335,
+        "upper": 2905637.138888889
+      },
+      "baseline": {
+        "point": 357875.83250811463,
+        "lower": 357454.2463768116,
+        "upper": 358394.7883486023
+      },
+      "speedup": 0.12390518547685657,
+      "classification": "arrow-win"
+    },
+    {
+      "name": "compute::min(array(i32)) 10m rows",
+      "op": "compute::min",
+      "inputs": "i32",
+      "size": "10m rows",
+      "family": "Aggregations",
+      "baseline_kind": "arrow",
+      "llvm": {
+        "point": 2850754.1944444445,
+        "lower": 2842443.388888889,
+        "upper": 2860322.388888889
+      },
+      "baseline": {
+        "point": 355732.2564474533,
+        "lower": 355356.78222222225,
+        "upper": 356196.5661083393
+      },
+      "speedup": 0.12478531370424886,
+      "classification": "arrow-win"
+    },
+    {
+      "name": "compute::product(array(i32)) 10m rows",
+      "op": "compute::product",
+      "inputs": "i32",
+      "size": "10m rows",
+      "family": "Aggregations",
+      "baseline_kind": "arrow",
+      "llvm": {
+        "point": 2842032.5833333335,
+        "lower": 2833965.277777778,
+        "upper": 2848968.888888889
+      },
+      "baseline": {
+        "point": 355334.55563607084,
+        "lower": 354927.99004975124,
+        "upper": 356036.8831168831
+      },
+      "speedup": 0.1250283187180457,
+      "classification": "arrow-win"
+    },
+    {
+      "name": "compute::sum(array(i32)) 10m rows",
+      "op": "compute::sum",
+      "inputs": "i32",
+      "size": "10m rows",
+      "family": "Aggregations",
+      "baseline_kind": "arrow",
+      "llvm": {
+        "point": 2895708.611111111,
+        "lower": 2858564.916666667,
+        "upper": 2954262.888888889
+      },
+      "baseline": {
+        "point": 357319.49626623373,
+        "lower": 357093.5720720721,
+        "upper": 357636.44930789375
+      },
+      "speedup": 0.12339621980442529,
+      "classification": "arrow-win"
+    },
+    {
+      "name": "compute::sum(dictionary(i8, i32)) 10m rows",
+      "op": "compute::sum",
+      "inputs": "dict i8\u2192i32",
+      "size": "10m rows",
+      "family": "Aggregations",
+      "baseline_kind": "arrow",
+      "llvm": {
+        "point": 3673410.285714286,
+        "lower": 3662492.714285714,
+        "upper": 3682573.1428571427
+      },
+      "baseline": {
+        "point": 6341488.722222222,
+        "lower": 6264470.222222222,
+        "upper": 6347402.0
+      },
+      "speedup": 1.72632192676216,
+      "classification": "llvm-win"
+    },
+    {
+      "name": "cast::cast(dictionary(i32, utf8) to array(utf8)) 1m rows",
+      "op": "cast::cast",
+      "inputs": "dict i32\u2192utf8 to utf8",
+      "size": "1m rows",
+      "family": "Casts",
+      "baseline_kind": "arrow",
+      "llvm": {
+        "point": 8080209.357142857,
+        "lower": 8073159.714285715,
+        "upper": 8092269.785714285
+      },
+      "baseline": {
+        "point": 6261306.4375,
+        "lower": 6260104.125,
+        "upper": 6262070.375
+      },
+      "speedup": 0.7748940851346929,
+      "classification": "arrow-win"
+    },
+    {
+      "name": "cast::cast(array(i32) to array(i64)) 10m rows",
+      "op": "cast::cast",
+      "inputs": "i32 to i64",
+      "size": "10m rows",
+      "family": "Casts",
+      "baseline_kind": "arrow",
+      "llvm": {
+        "point": 8801823.75,
+        "lower": 8765724.5,
+        "upper": 8824072.0
+      },
+      "baseline": {
+        "point": 8037241.071428571,
+        "lower": 8001917.142857143,
+        "upper": 8066482.285714285
+      },
+      "speedup": 0.9131336072741255,
+      "classification": "arrow-win"
+    },
+    {
+      "name": "cast::cast(array(utf8) to dictionary(i32, utf8)) 1m rows",
+      "op": "cast::cast",
+      "inputs": "utf8 to dict i32\u2192utf8",
+      "size": "1m rows",
+      "family": "Casts",
+      "baseline_kind": "arrow",
+      "llvm": {
+        "point": 50224883.5,
+        "lower": 47581236.0,
+        "upper": 53737336.0
+      },
+      "baseline": {
+        "point": 52884585.0,
+        "lower": 52516140.0,
+        "upper": 53244193.0
+      },
+      "speedup": 1.0529558520528972,
+      "classification": "equal"
+    },
+    {
+      "name": "cast::cast(array(i8) to array(i16)) 10m rows",
+      "op": "cast::cast",
+      "inputs": "i8 to i16",
+      "size": "10m rows",
+      "family": "Casts",
+      "baseline_kind": "arrow",
+      "llvm": {
+        "point": 407939.2649189104,
+        "lower": 406410.73983739835,
+        "upper": 409375.16034722223
+      },
+      "baseline": {
+        "point": 431728.05349462363,
+        "lower": 423951.1733047386,
+        "upper": 437009.71376811597
+      },
+      "speedup": 1.058314535082672,
+      "classification": "llvm-win"
+    },
+    {
+      "name": "cast::cast(dictionary(i8, i64) to array(i64)) 10m rows",
+      "op": "cast::cast",
+      "inputs": "dict i8\u2192i64 to i64",
+      "size": "10m rows",
+      "family": "Casts",
+      "baseline_kind": "arrow",
+      "llvm": {
+        "point": 7884250.5,
+        "lower": 7857589.214285715,
+        "upper": 7936655.714285715
+      },
+      "baseline": {
+        "point": 8439032.333333332,
+        "lower": 8235300.333333333,
+        "upper": 8467254.333333334
+      },
+      "speedup": 1.0703658303770704,
+      "classification": "llvm-win"
+    },
+    {
+      "name": "cast::cast(array(u64) to dictionary(i16, u64)) 10m rows",
+      "op": "cast::cast",
+      "inputs": "u64 to dict i16\u2192u64",
+      "size": "10m rows",
+      "family": "Casts",
+      "baseline_kind": "arrow",
+      "llvm": {
+        "point": 30168768.25,
+        "lower": 30131315.75,
+        "upper": 30192052.0
+      },
+      "baseline": {
+        "point": 108221228.5,
+        "lower": 107958247.0,
+        "upper": 108401667.0
+      },
+      "speedup": 3.587194134119148,
+      "classification": "llvm-win"
+    },
+    {
+      "name": "cast::cast(run_end_encoded(i64, i64) to array(i64)) 100k runs",
+      "op": "cast::cast",
+      "inputs": "ree i64\u2192i64 to i64",
+      "size": "100k runs",
+      "family": "Casts",
+      "baseline_kind": "arrow",
+      "llvm": {
+        "point": 416726.4570273999,
+        "lower": 416303.2365591398,
+        "upper": 420943.68888888886
+      },
+      "baseline": {
+        "point": 4048683.3846153845,
+        "lower": 4041992.0,
+        "upper": 4068736.6923076925
+      },
+      "speedup": 9.715445987028327,
+      "classification": "llvm-win"
+    },
+    {
+      "name": "select::concat(array(i32) x10) 10m rows",
+      "op": "select::concat",
+      "inputs": "i32 x10",
+      "size": "10m rows",
+      "family": "Selection",
+      "baseline_kind": "arrow",
+      "llvm": {
+        "point": 4256899.916666667,
+        "lower": 4252980.041666667,
+        "upper": 4264632.666666667
+      },
+      "baseline": {
+        "point": 2761667.5,
+        "lower": 2756337.263157895,
+        "upper": 2765654.710526316
+      },
+      "speedup": 0.6487508642586323,
+      "classification": "arrow-win"
+    },
+    {
+      "name": "select::concat(array(i32) x5, dictionary(i8, i32) x5) 10m rows",
+      "op": "select::concat",
+      "inputs": "i32 x5, dict i8\u2192i32 x5",
+      "size": "10m rows",
+      "family": "Selection",
+      "baseline_kind": "arrow",
+      "llvm": {
+        "point": 4176300.75,
+        "lower": 4170731.1666666665,
+        "upper": 4181791.8333333335
+      },
+      "baseline": {
+        "point": 6727795.0,
+        "lower": 6723997.25,
+        "upper": 6732031.6875
+      },
+      "speedup": 1.6109460028710816,
+      "classification": "llvm-win"
+    },
+    {
+      "name": "select::concat(fixed_size_list(bool, 8) x2) 2m rows",
+      "op": "select::concat",
+      "inputs": "bool[8] x2",
+      "size": "2m rows",
+      "family": "Selection",
+      "baseline_kind": "arrow",
+      "llvm": {
+        "point": 83256.91029325081,
+        "lower": 83203.74797453704,
+        "upper": 83356.84890243903
+      },
+      "baseline": {
+        "point": 193983.8925084175,
+        "lower": 193928.96271929826,
+        "upper": 194037.82804232804
+      },
+      "speedup": 2.3299434464377757,
+      "classification": "llvm-win"
+    },
+    {
+      "name": "select::filter(run_end_encoded(i64, i32), array(bool)) 1m runs",
+      "op": "select::filter",
+      "inputs": "ree i64\u2192i32, bool",
+      "size": "1m runs",
+      "family": "Selection",
+      "baseline_kind": "arrow",
+      "llvm": {
+        "point": 77144687.0,
+        "lower": 77106430.0,
+        "upper": 77171647.0
+      },
+      "baseline": {
+        "point": 40315006.75,
+        "lower": 40281767.25,
+        "upper": 40338222.5
+      },
+      "speedup": 0.5225895433343323,
+      "classification": "arrow-win"
+    },
+    {
+      "name": "select::filter(array(i32), array(bool)) 10m rows",
+      "op": "select::filter",
+      "inputs": "i32, bool",
+      "size": "10m rows",
+      "family": "Selection",
+      "baseline_kind": "arrow",
+      "llvm": {
+        "point": 5082098.35,
+        "lower": 5067777.1,
+        "upper": 5090843.75
+      },
+      "baseline": {
+        "point": 3759166.8571428573,
+        "lower": 3758339.5714285714,
+        "upper": 3760277.5
+      },
+      "speedup": 0.7396879395580485,
+      "classification": "arrow-win"
+    },
+    {
+      "name": "select::take(run_end_encoded(i64, i32), array(u64)) 100k rows",
+      "op": "select::take",
+      "inputs": "ree i64\u2192i32, u64",
+      "size": "100k rows",
+      "family": "Selection",
+      "baseline_kind": "arrow",
+      "llvm": {
+        "point": 2659573.3157894737,
+        "lower": 2659342.052631579,
+        "upper": 2659721.210526316
+      },
+      "baseline": {
+        "point": 1877701.1346153845,
+        "lower": 1877418.4117647058,
+        "upper": 1878060.0
+      },
+      "speedup": 0.706015932506077,
+      "classification": "arrow-win"
+    },
+    {
+      "name": "select::take(array(bool), array(u64)) 1m rows",
+      "op": "select::take",
+      "inputs": "bool, u64",
+      "size": "1m rows",
+      "family": "Selection",
+      "baseline_kind": "arrow",
+      "llvm": {
+        "point": 782269.826923077,
+        "lower": 782089.9276960784,
+        "upper": 782420.8962264151
+      },
+      "baseline": {
+        "point": 750443.1686613476,
+        "lower": 750046.341764214,
+        "upper": 750723.1383300887
+      },
+      "speedup": 0.9593149867649707,
+      "classification": "arrow-win"
+    },
+    {
+      "name": "select::take(array(i32), array(u64)) 1m rows",
+      "op": "select::take",
+      "inputs": "i32, u64",
+      "size": "1m rows",
+      "family": "Selection",
+      "baseline_kind": "arrow",
+      "llvm": {
+        "point": 1534669.2884615385,
+        "lower": 1532270.5291666668,
+        "upper": 1537068.75
+      },
+      "baseline": {
+        "point": 2032875.8199999998,
+        "lower": 2029925.5,
+        "upper": 2034881.38
+      },
+      "speedup": 1.324634457263362,
+      "classification": "llvm-win"
+    },
+    {
+      "name": "select::take(fixed_size_list(bool, 1024), array(u64)) 4096 rows",
+      "op": "select::take",
+      "inputs": "bool[1024], u64",
+      "size": "4096 rows",
+      "family": "Selection",
+      "baseline_kind": "arrow",
+      "llvm": {
+        "point": 22053.752264273007,
+        "lower": 22046.513998059192,
+        "upper": 22081.967400533722
+      },
+      "baseline": {
+        "point": 1842242.904,
+        "lower": 1842076.4514285713,
+        "upper": 1842620.4366666665
+      },
+      "speedup": 83.53421594312667,
+      "classification": "llvm-win"
+    },
+    {
+      "name": "sort::multicol_sort_to_indices(array(u64) x7) 8 word key 1m rows",
+      "op": "sort::multicol_sort_to_indices",
+      "inputs": "u64 x7",
+      "size": "8 word key 1m rows",
+      "family": "Sorting",
+      "baseline_kind": "arrow",
+      "llvm": {
+        "point": 42451785.25,
+        "lower": 42351623.0,
+        "upper": 42548939.5
+      },
+      "baseline": {
+        "point": 46737850.5,
+        "lower": 46714266.5,
+        "upper": 46800846.25
+      },
+      "speedup": 1.1009631332288905,
+      "classification": "llvm-win"
+    },
+    {
+      "name": "sort::multicol_sort_to_indices(array(u64) x3) 4 word key 1m rows",
+      "op": "sort::multicol_sort_to_indices",
+      "inputs": "u64 x3",
+      "size": "4 word key 1m rows",
+      "family": "Sorting",
+      "baseline_kind": "arrow",
+      "llvm": {
+        "point": 22545633.5,
+        "lower": 22494165.333333332,
+        "upper": 22598582.666666664
+      },
+      "baseline": {
+        "point": 40976013.75,
+        "lower": 40959570.5,
+        "upper": 40985454.0
+      },
+      "speedup": 1.8174700546782152,
+      "classification": "llvm-win"
+    },
+    {
+      "name": "sort::multicol_sort_to_indices(array(i8), array(i32), array(nullable i64)) 1m rows",
+      "op": "sort::multicol_sort_to_indices",
+      "inputs": "i8, i32, nullable i64",
+      "size": "1m rows",
+      "family": "Sorting",
+      "baseline_kind": "arrow",
+      "llvm": {
+        "point": 29354562.25,
+        "lower": 29324633.5,
+        "upper": 29372909.0
+      },
+      "baseline": {
+        "point": 85093931.5,
+        "lower": 84759285.5,
+        "upper": 85254833.0
+      },
+      "speedup": 2.8988315606716295,
+      "classification": "llvm-win"
+    },
+    {
+      "name": "sort::multicol_sort_to_indices(array(i8), array(i32)) 2 word key 1m rows",
+      "op": "sort::multicol_sort_to_indices",
+      "inputs": "i8, i32",
+      "size": "2 word key 1m rows",
+      "family": "Sorting",
+      "baseline_kind": "arrow",
+      "llvm": {
+        "point": 16900810.666666664,
+        "lower": 16896110.0,
+        "upper": 16905230.666666668
+      },
+      "baseline": {
+        "point": 68181530.0,
+        "lower": 68121522.0,
+        "upper": 68249241.5
+      },
+      "speedup": 4.034216544090036,
+      "classification": "llvm-win"
+    },
+    {
+      "name": "sort::sort_to_indices(array(nullable u64)) 1m rows",
+      "op": "sort::sort_to_indices",
+      "inputs": "nullable u64",
+      "size": "1m rows",
+      "family": "Sorting",
+      "baseline_kind": "arrow",
+      "llvm": {
+        "point": 15225401.875,
+        "lower": 15209910.375,
+        "upper": 15232656.75
+      },
+      "baseline": {
+        "point": 6653847.1875,
+        "lower": 6649960.0,
+        "upper": 6658488.375
+      },
+      "speedup": 0.4370227624944054,
+      "classification": "arrow-win"
+    },
+    {
+      "name": "sort::sort_to_indices(array(u64)) 1m rows",
+      "op": "sort::sort_to_indices",
+      "inputs": "u64",
+      "size": "1m rows",
+      "family": "Sorting",
+      "baseline_kind": "arrow",
+      "llvm": {
+        "point": 26574968.5,
+        "lower": 26523847.5,
+        "upper": 26808117.25
+      },
+      "baseline": {
+        "point": 13045745.5,
+        "lower": 13035467.625,
+        "upper": 13060215.25
+      },
+      "speedup": 0.4909035169693616,
+      "classification": "arrow-win"
+    },
+    {
+      "name": "vec::dot(scalar(fixed_size_list(f32, 768)), fixed_size_list(f32, 768)) 16384 rows",
+      "op": "vec::dot",
+      "inputs": "f32[768] scalar, f32[768]",
+      "size": "16384 rows",
+      "family": "Vector ops",
+      "baseline_kind": "reference",
+      "llvm": {
+        "point": 903078.9505360624,
+        "lower": 901647.4166666666,
+        "upper": 903970.0272248243
+      },
+      "baseline": {
+        "point": 5222583.75,
+        "lower": 5222169.0,
+        "upper": 5223093.699999999
+      },
+      "speedup": 5.7830865694521005,
+      "classification": "llvm-win"
+    },
+    {
+      "name": "vec::norm(fixed_size_list(f32, 768)) 16384 rows",
+      "op": "vec::norm",
+      "inputs": "f32[768]",
+      "size": "16384 rows",
+      "family": "Vector ops",
+      "baseline_kind": "reference",
+      "llvm": {
+        "point": 6285003.0,
+        "lower": 6252120.388888889,
+        "upper": 6482936.222222222
+      },
+      "baseline": {
+        "point": 15173527.125,
+        "lower": 15165824.0,
+        "upper": 15177826.5
+      },
+      "speedup": 2.414243418022235,
+      "classification": "llvm-win"
+    },
+    {
+      "name": "logical_nulls(run_end_encoded(i32, i32)) 1000 runs",
+      "op": "logical_nulls",
+      "inputs": "ree i32\u2192i32",
+      "size": "1000 runs",
+      "family": "Other",
+      "baseline_kind": "arrow",
+      "llvm": {
+        "point": 5542.928596799779,
+        "lower": 5541.077782552643,
+        "upper": 5543.901750521824
+      },
+      "baseline": {
+        "point": 1457.7418114874818,
+        "lower": 1457.4465345650913,
+        "upper": 1458.261361605176
+      },
+      "speedup": 0.2629912664451626,
+      "classification": "arrow-win"
+    },
+    {
+      "name": "logical_nulls(dictionary(i8, i32)) 100m rows",
+      "op": "logical_nulls",
+      "inputs": "dict i8\u2192i32",
+      "size": "100m rows",
+      "family": "Other",
+      "baseline_kind": "arrow",
+      "llvm": {
+        "point": 46742341.5,
+        "lower": 46738489.25,
+        "upper": 46746685.0
+      },
+      "baseline": {
+        "point": 347547588.0,
+        "lower": 347480572.5,
+        "upper": 347635773.0
+      },
+      "speedup": 7.4353910575917554,
+      "classification": "llvm-win"
+    }
+  ],
+  "unpaired": [
+    {
+      "name": "BooleanArray::from(Vec(bool)) 16m rows/rust batched",
+      "estimate": {
+        "point": 4825308.458333334,
+        "lower": 3968060.25,
+        "upper": 5332297.916666667
+      }
+    },
+    {
+      "name": "BooleanArray::from(Vec(u8) mapped to bool) 16m rows/rust",
+      "estimate": {
+        "point": 4458361.083333334,
+        "lower": 4452820.208333334,
+        "upper": 4463195.916666667
+      }
+    },
+    {
+      "name": "cmp::ComparisonKernel::call(array(i32), array(i32)) 1 row (llvm)",
+      "estimate": {
+        "point": 347.6522739144401,
+        "lower": 345.4138987043581,
+        "upper": 349.22874752679184
+      }
+    },
+    {
+      "name": "cmp::ComparisonKernel::compile(array(i32), array(i32)) 1 row/llvm compile",
+      "estimate": {
+        "point": 9557282.416666666,
+        "lower": 9554183.166666666,
+        "upper": 9560563.5
+      }
+    },
+    {
+      "name": "cmp::lt(array(i32), array(i64)) x1000 rayon 100k rows (llvm)",
+      "estimate": {
+        "point": 1491825.1333333333,
+        "lower": 1488461.1341463414,
+        "upper": 1503200.0825396825
+      }
+    },
+    {
+      "name": "cmp::lt(array(i32), array(i64)) x1000 serial 100k rows (llvm)",
+      "estimate": {
+        "point": 8306093.666666666,
+        "lower": 8303070.333333333,
+        "upper": 8310734.383333332
+      }
+    },
+    {
+      "name": "compute::hash(array(i32)) 100m rows (llvm)",
+      "estimate": {
+        "point": 87400352.5,
+        "lower": 87279521.0,
+        "upper": 87508209.5
+      }
+    },
+    {
+      "name": "compute::hash(array(i64)) 100m rows (llvm)",
+      "estimate": {
+        "point": 97606270.5,
+        "lower": 97335980.0,
+        "upper": 97773348.5
+      }
+    },
+    {
+      "name": "compute::hash_unchained(array(i32)) 100m rows (llvm)",
+      "estimate": {
+        "point": 151475498.0,
+        "lower": 151389732.5,
+        "upper": 151687986.0
+      }
+    },
+    {
+      "name": "compute::hash_unchained(array(i64)) 100m rows (llvm)",
+      "estimate": {
+        "point": 151470334.0,
+        "lower": 151168834.5,
+        "upper": 151602446.0
+      }
+    },
+    {
+      "name": "iter::iter_nonnull_i64(dictionary(i8, i32)) 100m rows (llvm)",
+      "estimate": {
+        "point": 260680212.5,
+        "lower": 260631471.5,
+        "upper": 260779874.0
+      }
+    },
+    {
+      "name": "nearest_neighbor_avx512_f32x8_256(fixed_array(f32, 8), slice(f32), slice(f32))/manual avx512",
+      "estimate": {
+        "point": 123.58227735707742,
+        "lower": 123.49305527763882,
+        "upper": 123.72741130324923
+      }
+    },
+    {
+      "name": "starts_with first-4-bytes prototype (array(utf8)) 1m rows/custom",
+      "estimate": {
+        "point": 15258814.25,
+        "lower": 15246835.75,
+        "upper": 15279334.0
+      }
+    },
+    {
+      "name": "vec::nearest_neighbor(scalar(fixed_size_list(f32, 8)), fixed_size_list(f32, 8), array(f32)) 256 rows (llvm)",
+      "estimate": {
+        "point": 1863.438668787353,
+        "lower": 1860.5392525431225,
+        "upper": 1864.7916744260033
+      }
+    },
+    {
+      "name": "vec::norm(fixed_size_list(f32, 3)) 16384 rows (llvm)",
+      "estimate": {
+        "point": 23021.427507139942,
+        "lower": 23017.596990424077,
+        "upper": 23023.791412978557
+      }
+    },
+    {
+      "name": "vec::norm(fixed_size_list(f32, 32)) 16384 rows (llvm)",
+      "estimate": {
+        "point": 48268.65717120182,
+        "lower": 48171.12147716229,
+        "upper": 48296.05272108843
+      }
+    },
+    {
+      "name": "vec::norm(fixed_size_list(f32, 64)) 16384 rows (llvm)",
+      "estimate": {
+        "point": 79388.63069756332,
+        "lower": 79288.6812937063,
+        "upper": 79672.92307692308
+      }
+    },
+    {
+      "name": "vec::norm(fixed_size_list(f32, 8)) 16384 rows (llvm)",
+      "estimate": {
+        "point": 24321.907207629767,
+        "lower": 24315.408449477352,
+        "upper": 24329.610176619008
+      }
+    }
+  ]
+}

@@ -14,5 +14,9 @@
   {
     "label": "Intel Core Ultra 7 155H \u00b7 Linux (x86_64) \u00b7 native build",
     "file": "benchmark-results-linux-native.json"
+  },
+  {
+    "label": "AMD Ryzen 7 9700X \u00b7 Linux (x86_64, AVX-512) \u00b7 native build",
+    "file": "benchmark-results-zen5-native.json"
   }
 ]

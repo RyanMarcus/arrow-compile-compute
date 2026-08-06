@@ -294,6 +294,7 @@ def build_report_data(criterion_dir, manifest):
             "completed_at": manifest["completed_at"],
             "commands": manifest["commands"],
             "host": manifest.get("host"),
+            "rustflags": manifest.get("rustflags"),
         },
         "equal_margin": EQUAL_MARGIN,
         "results": results,
@@ -325,6 +326,19 @@ def write_manifest(run_dir, manifest):
     with (run_dir / MANIFEST_NAME).open("w") as fh:
         json.dump(manifest, fh, indent=2)
         fh.write("\n")
+
+
+def with_native_target(rustflags):
+    """Benchmark runs build for the host CPU by default, so the ahead-of-time
+    baseline (arrow) competes with the full instruction set, like the JIT does.
+
+    An explicit `-C target-cpu=...` in RUSTFLAGS is respected — e.g. pass
+    `-C target-cpu=generic` (x86-64 baseline) to measure arrow as shipped.
+    """
+    if rustflags and "target-cpu" in rustflags:
+        return rustflags
+    native = "-C target-cpu=native"
+    return f"{rustflags} {native}" if rustflags else native
 
 
 def host_info():
@@ -399,11 +413,13 @@ def run_benchmarks(bench_names, runs_dir=DEFAULT_RUNS_DIR):
         "criterion_dir": "criterion",
         "commands": commands,
         "host": host_info(),
+        "rustflags": with_native_target(os.environ.get("RUSTFLAGS")),
     }
     write_manifest(run_dir, manifest)
 
     environment = os.environ.copy()
     environment["CRITERION_HOME"] = str(criterion_dir)
+    environment["RUSTFLAGS"] = with_native_target(environment.get("RUSTFLAGS"))
     try:
         for command in commands:
             subprocess.run(command, cwd=REPO_ROOT, env=environment, check=True)

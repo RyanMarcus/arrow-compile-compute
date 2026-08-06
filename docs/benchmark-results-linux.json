@@ -22,26 +22,6 @@
   "equal_margin": 1.035,
   "results": [
     {
-      "name": "cmp::lt(array(i32), array(i32)) 1 row",
-      "op": "cmp::lt",
-      "inputs": "i32, i32",
-      "size": "1 row",
-      "family": "Comparisons",
-      "baseline_kind": "arrow",
-      "llvm": {
-        "point": 493.46289419219414,
-        "lower": 492.4244872436218,
-        "upper": 494.9854927463732
-      },
-      "baseline": {
-        "point": 62.02419854368199,
-        "lower": 61.88358690950514,
-        "upper": 62.09717413121901
-      },
-      "speedup": 0.12569171719631828,
-      "classification": "arrow-win"
-    },
-    {
       "name": "cmp::lt(array(i64), scalar(i64)) 1m rows",
       "op": "cmp::lt",
       "inputs": "i64, i64 scalar",
