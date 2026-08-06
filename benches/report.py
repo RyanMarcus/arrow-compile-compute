@@ -24,7 +24,7 @@ from pathlib import Path
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 DEFAULT_RUNS_DIR = REPO_ROOT / "target" / "criterion-runs"
-DEFAULT_OUTPUT = REPO_ROOT / "docs" / "benchmark-results.json"
+DEFAULT_OUTPUT = REPO_ROOT / "docs" / "benchmark-results-ARM.json"
 MANIFEST_NAME = "manifest.json"
 
 IMPL_RE = re.compile(r"(?<![a-z])(llvm|arrow)(?![a-z])")
@@ -267,11 +267,16 @@ def collect(criterion_dir):
         )
 
     family_order = {name: index for index, name in enumerate(FAMILIES.values())}
-    # Ascending speedup within each family: the results that most need
+    # Fixed group order within each family: the family's primary operator
+    # first, remaining operators alphabetically — stable across runs. Rows
+    # inside a group sort ascending by speedup, so the results that most need
     # attention (LLVM losses) come first.
+    primary_ops = {"cmp::lt": 0}
     results.sort(
         key=lambda row: (
             family_order.get(row["family"], len(family_order)),
+            primary_ops.get(row["op"], 1),
+            row["op"],
             row["speedup"],
         )
     )
