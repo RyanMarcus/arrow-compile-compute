@@ -54,6 +54,7 @@ use self::{
     error_types::DSLError,
 };
 use inkwell::{
+    attributes::AttributeLoc,
     builder::Builder,
     context::Context,
     module::Module,
@@ -248,14 +249,15 @@ pub(crate) fn link_req_helpers(
     Ok(())
 }
 
-pub(crate) fn create_native_target_machine() -> Result<TargetMachine, ArrowKernelError> {
+fn optimize_module(module: &Module) -> Result<(), ArrowKernelError> {
+    // first, create a target machine
     Target::initialize_native(&inkwell::targets::InitializationConfig::default()).unwrap();
     let triple = TargetMachine::get_default_triple();
     let cpu = TargetMachine::get_host_cpu_name().to_string();
     let features = TargetMachine::get_host_cpu_features().to_string();
     let target =
         Target::from_triple(&triple).map_err(|e| ArrowKernelError::LLVMError(e.to_string()))?;
-    target
+    let machine = target
         .create_target_machine(
             &triple,
             &cpu,
@@ -264,22 +266,29 @@ pub(crate) fn create_native_target_machine() -> Result<TargetMachine, ArrowKerne
             RelocMode::Default,
             CodeModel::Default,
         )
-        .ok_or_else(|| ArrowKernelError::LLVMError("failed to create native target machine".into()))
-}
+        .ok_or_else(|| {
+            ArrowKernelError::LLVMError("failed to create native target machine".into())
+        })?;
 
-pub(crate) fn configure_module_for_native_target(
-    module: &Module,
-) -> Result<TargetMachine, ArrowKernelError> {
-    let machine = create_native_target_machine()?;
     module.set_triple(&machine.get_triple());
-    let data_layout = machine.get_target_data().get_data_layout();
-    module.set_data_layout(&data_layout);
-    Ok(machine)
-}
+    module.set_data_layout(&machine.get_target_data().get_data_layout());
 
-fn optimize_module(module: &Module) -> Result<(), ArrowKernelError> {
-    let machine = configure_module_for_native_target(module)?;
+    // tag each function with the host CPU and features
+    let context = module.get_context();
+    let cpu = TargetMachine::get_host_cpu_name();
+    let features = TargetMachine::get_host_cpu_features();
+    for function in module.get_functions() {
+        function.add_attribute(
+            AttributeLoc::Function,
+            context.create_string_attribute("target-cpu", cpu.to_str().unwrap()),
+        );
+        function.add_attribute(
+            AttributeLoc::Function,
+            context.create_string_attribute("target-features", features.to_str().unwrap()),
+        );
+    }
 
+    // run the optimization passes
     module
         .run_passes("default<O3>", &machine, PassBuilderOptions::create())
         .map_err(|e| ArrowKernelError::LLVMError(e.to_string()))
