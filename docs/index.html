@@ -66,13 +66,47 @@
   tr.equal td.badge { color: var(--equal-fg); }
   details { margin-top: 2rem; }
   summary { cursor: pointer; color: #888; }
+  #machine-picker { margin: .8rem 0 .4rem; }
+  .segmented {
+    display: inline-flex;
+    border: 1px solid #8885;
+    border-radius: 10px;
+    overflow: hidden;
+    background: var(--equal-bg);
+  }
+  .segmented button {
+    appearance: none;
+    border: none;
+    background: transparent;
+    font: inherit;
+    font-size: .95rem;
+    padding: .55rem 1.1rem;
+    cursor: pointer;
+    color: inherit;
+    opacity: .75;
+    transition: background .15s, opacity .15s;
+  }
+  .segmented button + button { border-left: 1px solid #8885; }
+  .segmented button:hover { opacity: 1; }
+  .segmented button[aria-pressed="true"] {
+    background: var(--llvm-bg);
+    color: var(--llvm-fg);
+    font-weight: 600;
+    opacity: 1;
+  }
+  .segmented .chip {
+    display: block;
+    font-size: .72rem;
+    opacity: .7;
+    letter-spacing: .02em;
+  }
 </style>
 </head>
 <body>
 <h1>JIT vs Arrow::compute Benchmark Results</h1>
-<p id="machine-picker" class="meta" hidden>
-  <label for="machine">Machine:&nbsp;</label><select id="machine"></select>
-</p>
+<div id="machine-picker" hidden>
+  <div id="machine" class="segmented" role="group" aria-label="Benchmark machine"></div>
+</div>
 <p id="meta" class="meta">Loading benchmark results...</p>
 <p id="host" class="meta" hidden></p>
 <p class="classification"><b>Timing:</b> every LLVM number is a warm public-API call — the
@@ -103,7 +137,7 @@ See <a href="#reproduce">how to reproduce these results</a>.</p>
 <pre>
 python3 benches/report.py --run          # run the full suite into an isolated
                                          # Criterion dir and write
-                                         # docs/benchmark-results.json
+                                         # docs/benchmark-results-ARM.json
 python3 -m http.server -d docs 8321      # view this page at localhost:8321
 </pre>
 <p class="classification">Each run records its git revision, machine specs, and timestamps in a
@@ -304,21 +338,35 @@ re-benchmarking. Tests: <code>python3 -m pytest benches/test_report.py</code>.</
         throw new Error("empty runs manifest");
       }
       const picker = document.getElementById("machine-picker");
-      const select = document.getElementById("machine");
+      const group = document.getElementById("machine");
       runs.forEach((run, index) => {
-        const option = document.createElement("option");
-        option.value = run.file;
-        option.textContent = run.label;
-        if (index === 0) option.selected = true;
-        select.appendChild(option);
+        const button = document.createElement("button");
+        button.type = "button";
+        button.setAttribute("aria-pressed", index === 0 ? "true" : "false");
+        // "CPU · details" labels split into a bold line and a smaller chip.
+        const [main, ...rest] = run.label.split("·").map((part) => part.trim());
+        button.appendChild(document.createTextNode(main));
+        if (rest.length > 0) {
+          const chip = document.createElement("span");
+          chip.className = "chip";
+          chip.textContent = rest.join(" · ");
+          button.appendChild(chip);
+        }
+        button.addEventListener("click", () => {
+          group.querySelectorAll("button").forEach((other) =>
+            other.setAttribute("aria-pressed", "false")
+          );
+          button.setAttribute("aria-pressed", "true");
+          loadRun(run.file);
+        });
+        group.appendChild(button);
       });
       if (runs.length > 1) {
         picker.hidden = false;
       }
-      select.addEventListener("change", () => loadRun(select.value));
       loadRun(runs[0].file);
     })
-    .catch(() => loadRun("./benchmark-results.json"));
+    .catch(() => loadRun("./benchmark-results-ARM.json"));
 </script>
 </body>
 </html>

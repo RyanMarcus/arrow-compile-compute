@@ -24,7 +24,7 @@ from pathlib import Path
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 DEFAULT_RUNS_DIR = REPO_ROOT / "target" / "criterion-runs"
-DEFAULT_OUTPUT = REPO_ROOT / "docs" / "benchmark-results.json"
+DEFAULT_OUTPUT = REPO_ROOT / "docs" / "benchmark-results-ARM.json"
 MANIFEST_NAME = "manifest.json"
 
 IMPL_RE = re.compile(r"(?<![a-z])(llvm|arrow)(?![a-z])")

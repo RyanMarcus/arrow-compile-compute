@@ -402,6 +402,126 @@
       "classification": "llvm-win"
     },
     {
+      "name": "cmp::contains(array(utf8), scalar(utf8)) 1m rows",
+      "op": "cmp::contains",
+      "inputs": "utf8, utf8 scalar",
+      "size": "1m rows",
+      "family": "Comparisons",
+      "baseline_kind": "arrow",
+      "llvm": {
+        "point": 12094109.375,
+        "lower": 12049343.75,
+        "upper": 12203119.875
+      },
+      "baseline": {
+        "point": 9750993.0,
+        "lower": 9714250.0,
+        "upper": 9792368.0
+      },
+      "speedup": 0.8062597002931438,
+      "classification": "arrow-win"
+    },
+    {
+      "name": "cmp::ends_with(array(utf8), scalar(utf8)) 1m rows",
+      "op": "cmp::ends_with",
+      "inputs": "utf8, utf8 scalar",
+      "size": "1m rows",
+      "family": "Comparisons",
+      "baseline_kind": "arrow",
+      "llvm": {
+        "point": 5121631.25,
+        "lower": 5083391.7,
+        "upper": 5172954.2
+      },
+      "baseline": {
+        "point": 5149618.75,
+        "lower": 5131558.35,
+        "upper": 5171470.85
+      },
+      "speedup": 1.005464567563313,
+      "classification": "equal"
+    },
+    {
+      "name": "cmp::like(array(utf8), '%xyz') 1m rows",
+      "op": "cmp::like",
+      "inputs": "utf8, '%xyz'",
+      "size": "1m rows",
+      "family": "Comparisons",
+      "baseline_kind": "arrow",
+      "llvm": {
+        "point": 5992858.833333334,
+        "lower": 5983203.666666667,
+        "upper": 6006250.0
+      },
+      "baseline": {
+        "point": 985370.0770774789,
+        "lower": 977557.1129032258,
+        "upper": 993175.2870967742
+      },
+      "speedup": 0.164424042761808,
+      "classification": "arrow-win"
+    },
+    {
+      "name": "cmp::like(array(utf8), 'abc%') 1m rows",
+      "op": "cmp::like",
+      "inputs": "utf8, 'abc%'",
+      "size": "1m rows",
+      "family": "Comparisons",
+      "baseline_kind": "arrow",
+      "llvm": {
+        "point": 5918987.5,
+        "lower": 5911962.5,
+        "upper": 5929204.1
+      },
+      "baseline": {
+        "point": 1038558.7693452381,
+        "lower": 1031398.4375,
+        "upper": 1043045.0496713852
+      },
+      "speedup": 0.17546223392856264,
+      "classification": "arrow-win"
+    },
+    {
+      "name": "cmp::like(array(utf8), '%abc%') 1m rows",
+      "op": "cmp::like",
+      "inputs": "utf8, '%abc%'",
+      "size": "1m rows",
+      "family": "Comparisons",
+      "baseline_kind": "arrow",
+      "llvm": {
+        "point": 18845361.166666664,
+        "lower": 18609187.333333336,
+        "upper": 19065854.0
+      },
+      "baseline": {
+        "point": 9650329.833333332,
+        "lower": 9630222.166666666,
+        "upper": 9664416.666666666
+      },
+      "speedup": 0.512079856044503,
+      "classification": "arrow-win"
+    },
+    {
+      "name": "cmp::like(array(utf8), '%abc%xyz%') 1m rows",
+      "op": "cmp::like",
+      "inputs": "utf8, '%abc%xyz%'",
+      "size": "1m rows",
+      "family": "Comparisons",
+      "baseline_kind": "arrow",
+      "llvm": {
+        "point": 19358937.5,
+        "lower": 19349791.666666668,
+        "upper": 19385076.333333336
+      },
+      "baseline": {
+        "point": 16548078.125,
+        "lower": 16530135.375,
+        "upper": 16560448.0
+      },
+      "speedup": 0.854803014111699,
+      "classification": "arrow-win"
+    },
+    {
       "name": "cmp::starts_with(array(utf8), scalar(utf8)) 1m rows",
       "op": "cmp::starts_with",
       "inputs": "utf8, utf8 scalar",
@@ -409,16 +529,16 @@
       "family": "Comparisons",
       "baseline_kind": "arrow",
       "llvm": {
-        "point": 7158091.1875,
-        "lower": 6871539.125,
-        "upper": 7495838.5
+        "point": 5500443.75,
+        "lower": 5485166.7,
+        "upper": 5530477.1
       },
       "baseline": {
-        "point": 5111775.5,
-        "lower": 5090013.888888889,
-        "upper": 5125963.0
+        "point": 4745670.454545454,
+        "lower": 4736878.7272727275,
+        "upper": 4768928.0
       },
-      "speedup": 0.7141255072199372,
+      "speedup": 0.8627795629298917,
       "classification": "arrow-win"
     },
     {
@@ -1194,9 +1314,9 @@
     {
       "name": "starts_with first-4-bytes prototype (array(utf8)) 1m rows/custom",
       "estimate": {
-        "point": 4142274.0384615385,
-        "lower": 4137304.4615384615,
-        "upper": 4159639.423076923
+        "point": 3959192.708333333,
+        "lower": 3946413.1666666665,
+        "upper": 3985239.5833333335
       }
     },
     {
