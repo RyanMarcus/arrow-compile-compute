@@ -98,13 +98,18 @@ pub fn criterion_benchmark(c: &mut Criterion) {
         let theirs = arrow_arith::aggregate::sum(decoded.as_primitive::<Int32Type>()).unwrap();
         assert_eq!(ours, theirs);
 
-        c.bench_function("compute::sum(dictionary(i8, i32)) 10m rows/llvm warm", |b| {
-            b.iter(|| black_box(arrow_compile_compute::compute::sum(black_box(&data)).unwrap()))
-        });
+        c.bench_function(
+            "compute::sum(dictionary(i8, i32)) 10m rows/llvm warm",
+            |b| {
+                b.iter(|| black_box(arrow_compile_compute::compute::sum(black_box(&data)).unwrap()))
+            },
+        );
         c.bench_function("compute::sum(dictionary(i8, i32)) 10m rows/arrow", |b| {
             b.iter(|| {
                 let decoded = arrow_cast::cast(black_box(&data), &DataType::Int32).unwrap();
-                black_box(arrow_arith::aggregate::sum(decoded.as_primitive::<Int32Type>()))
+                black_box(arrow_arith::aggregate::sum(
+                    decoded.as_primitive::<Int32Type>(),
+                ))
             })
         });
     }
