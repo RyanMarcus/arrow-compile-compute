@@ -1,7 +1,7 @@
 # Zen 5 benchmark findings: why arrow wins on the AMD machine
 
 Follow-up to `cross-platform-findings.md`, covering the third machine
-(`benchmark-results-zen5-native.json`). Scope: the 20 benchmarks where the
+(`benchmark-results-zen5-native.json`). Scope: the 22 benchmarks where the
 arrow baseline beats the JIT on AMD, and why.
 
 ## Setup
@@ -10,60 +10,78 @@ arrow baseline beats the JIT on AMD, and why.
 |---|---|
 | CPU | AMD Ryzen 7 9700X (Zen 5), 8 cores / 16 threads, 32 MB L3 |
 | Memory | 123 GB |
-| OS | Arch Linux 7.1.4, x86_64 |
+| OS | Arch Linux (kernel 7.1.6-arch1-1), x86_64 |
 | SIMD | full AVX-512 (F/DQ/BW/VL/VBMI/VBMI2/VNNI/BITALG/VPOPCNTDQ/VP2INTERSECT) |
-| Revision | `107db50`, clean tree |
+| Revision | `107db50`, **dirty tree** |
 
-Scoreboard: 36 llvm wins, 20 arrow wins, 4 equal out of 60 paired benchmarks.
+Scoreboard: 37 llvm wins, 22 arrow wins, 1 equal out of 60 paired benchmarks.
 
 The run's manifest does not record `rustflags` — `report.py` only started writing
 that field after this run — so the "native build" label was verified another way:
 the benchmark binary the run used contains 30,361 `zmm` references, 506 `kmov`
 and 208 `vpternlog`, while the sibling binary from the previous non-native build
-contains none. The run was a genuine AVX-512 build.
+contains none. The run was a genuine AVX-512 build. The manifest also records
+`"dirty": true`, so the tree carried uncommitted changes on top of `107db50`;
+nothing below depends on a specific working-tree state, but the run is not
+reproducible from the revision alone.
 
-Of the 20 losses, **one is specific to this machine**. The rest are pre-existing
+Of the 22 losses, **one is specific to this machine**. The rest are pre-existing
 costs that the Zen 5 numbers merely make more visible, because native arrow is
 much faster here than on the other two machines.
 
 ## Every losing row, and what causes it
 
-One mechanism is AMD-specific. Everything else costs us the same on every
-machine — Zen 5 only made it visible, because native arrow is fast enough here
+One mechanism is AMD-specific. Most of the rest cost us the same on every
+machine — Zen 5 only made them visible, because native arrow is fast enough here
 that our fixed overheads stopped hiding behind other work.
 
 | benchmark | ratio | cause | AMD-specific? |
 |---|---|---|---|
 | `cmp::like('%abc%')` | 0.10× | AVX-512 masked-load assist (F1) | **yes** |
-| `compute::sum/min/max/product(i32)` | 0.12× | output zero-fill (F2) | no |
-| `cmp::like('%xyz')` / `('abc%')` | 0.25× | per-row callback overhead (F4) | no |
+| `compute::max/product/min/sum(i32)` | 0.11–0.12× | output zero-fill (F2) | no |
+| `cmp::like('abc%')` | 0.23× | per-row callback overhead (F4) | no |
 | `logical_nulls(ree)` | 0.26× | per-element REE walk (F5) | no |
+| `cmp::like('%xyz')` | 0.28× | per-row callback overhead (F4) | no |
 | `sort_to_indices(nullable u64)` | 0.44× | comparator (F3) + null pre-pass | no |
-| `sort_to_indices(u64)` | 0.49× | comparator shape (F3) | no |
-| `select::filter(ree, bool)` | 0.52× | branch mispredicts on REE (F5) | no |
-| `arith::neg_wrapping(f64/i32)` | 0.62/0.70× | output zero-fill (F2) | no |
-| `select::concat(i32 x10)` | 0.65× | output zero-fill (F2) | no |
-| `select::take(ree, u64)` | 0.71× | binary search per index (F5) | no |
+| `sort_to_indices(u64)` | 0.51× | comparator shape (F3) | no |
+| `select::filter(ree, bool)` | 0.53× | branch mispredicts on REE (F5) | no |
+| `arith::neg_wrapping(f64)` | 0.61× | output zero-fill (F2) | no |
+| `arith::neg_wrapping(i32)` | 0.64× | output zero-fill (F2) | no |
+| `select::concat(i32 x10)` | 0.67× | output zero-fill (F2) | no |
+| `select::take(ree, u64)` | 0.70× | binary search per index (F5) | no |
 | `select::filter(i32, bool)` | 0.74× | instruction count (F6) | no |
-| `cast(dict(i32,utf8) → utf8)` | 0.77× | per-row callback overhead (F4) | no |
-| `cmp::contains(utf8)` | 0.81× | per-row callback overhead (F4) | no |
-| `cast(i32 → i64)` | 0.91× | output zero-fill (F2) | no |
+| `cast(dict(i32,utf8) → utf8)` | 0.79× | per-row callback overhead (F4) | no |
+| `cmp::contains(utf8)` | 0.80× | per-row callback overhead (F4) | no |
+| `cmp::lt(i32, i32 scalar)` 10m | 0.81× | **not investigated** | no |
+| `cast(i32 → i64)` | 0.90× | output zero-fill (F2) | no |
+| `select::take(bool, u64)` | 0.91× | **not investigated** | no |
+| `cmp::like('%abc%xyz%')` | 0.96× | catch-all `match_like`, near parity | no |
 
-Six mechanisms in total. Fixing F2 alone turns five of these rows into ties or
-wins.
+Six mechanisms account for 19 of the 22 rows. The three uninvestigated ones are
+the tail: `cmp::lt(i32, scalar)` and `select::take(bool, u64)` follow an
+x86-native pattern rather than an AMD one — both are also arrow wins on Meteor
+Lake's native build (0.71× and 0.75×) while staying LLVM wins on the M4 (1.78×
+and 1.11×), i.e. the "native arrow overtakes on dense work" effect already
+recorded in `cross-platform-findings.md`. The `%abc%xyz%` row is within 5% of
+parity on all three machines.
+
+Fixing F2 turns four *measured* rows into ties or wins (`sum`, both
+`neg_wrapping`s, and `cast(i32 → i64)`); `min`/`max`/`product` share `sum`'s
+mechanism and should follow, which would be seven of the eight F2 rows.
+`concat` is the exception — it stays a loss at 0.94× (see Finding 2).
 
 ## Finding 1 — `cmp::like('%abc%')` is 6.8× slower *only* on Zen 5 (AMD-specific)
 
 | | llvm | arrow | ratio |
 |---|---|---|---|
-| Zen 5 | **102.47 ms** | 10.26 ms | **0.10×** |
+| Zen 5 | **104.69 ms** | 10.11 ms | **0.10×** |
 | Meteor Lake | 17.84 ms | 12.25 ms | 0.69× |
 | Apple M4 | 16.84 ms | 9.83 ms | 0.58× |
 
 Our absolute time is 6× worse on AMD than on the other two machines, while
 arrow's is *better* there. Two rows in the same bench file do the same work with
-the same `memchr` `Finder` over the same data — `cmp::contains` takes 12.9 ms,
-`cmp::like('%abc%')` takes 102 ms.
+the same `memchr` `Finder` over the same data — `cmp::contains` takes 12.56 ms,
+`cmp::like('%abc%')` takes 104.69 ms.
 
 **Root cause.** `perf` puts **71.4%** of the benchmark inside one libc
 instruction, reached via `equal_same_length<u8,u8>` ← `[u8] == Vec<u8>` ← the
@@ -105,7 +123,7 @@ Measured cost of a zero-length `bcmp`, varying only the second pointer:
 So the penalty is a property of the **page**, not the pointer value: any masked
 AVX-512 load whose 32-byte footprint touches an unreadable page costs ~250
 cycles, a 50× penalty, even when the mask suppresses every element. Two such
-calls per row × 1m rows ≈ 90 ms of the 102 ms.
+calls per row × 1m rows ≈ 90 ms of the 105 ms.
 
 ### That it is an assist, measured
 
@@ -229,6 +247,14 @@ own `assert_eq!` against arrow still passes):
 | `arith::neg_wrapping(i32)` | 4.114 ms | **2.441 ms** | 2.440 ms | 0.59× | **1.00×** |
 | `arith::neg_wrapping(f64)` | 8.827 ms | **5.317 ms** | 5.334 ms | 0.60× | **1.00×** |
 
+The `stock` column comes from this patch session, not from the published run;
+`benchmark-results-zen5-native.json` has `sum` at 2.532 ms, `neg_wrapping(i32)`
+at 4.096 ms and `neg_wrapping(f64)` at 8.799 ms. The LLVM side agrees to ~1%,
+but arrow's `neg_wrapping(i32)` drifted more (2.440 ms here, 2.608 ms in the
+published run), which is why the `before` ratio reads 0.59× here and 0.64× in
+the table above. The paired before/after *within* a session is the meaningful
+comparison.
+
 All three land on top of arrow. There is no residual gap to explain, no
 loop-throughput deficit, and nothing architecture-specific: the reduce loop and
 the element-wise loops were already running at the machine's memory bandwidth.
@@ -267,7 +293,7 @@ explained by L3 eviction. That number did not reproduce; the stable value is
 L3-eviction story was fitted to a bad measurement and should be disregarded.
 
 **Why the AMD ratio looks worse than Intel's (0.12× vs 0.14×):** our absolute
-time *improved* on AMD (6.49 → 2.90 ms). Arrow improved more (0.94 → 0.30 ms),
+time *improved* on AMD (6.49 → 2.53 ms). Arrow improved more (0.94 → 0.29 ms),
 because Zen 5's 32 MB L3 and AVX-512 make the scan bandwidth-bound. The ratio
 worsened because arrow got faster, not because we got slower.
 
@@ -327,8 +353,8 @@ costs 16.32 ms (1.45× win); giving it up gets the full 2.05×.
 
 ## Finding 4 — Prefix/suffix LIKE is all per-row overhead
 
-`'abc%'` 3.57 ms vs arrow 0.91 ms; `'%xyz'` 4.06 ms vs 1.01 ms — universal
-(0.25–0.35× on all three machines), not AMD-specific, and **not** related to
+`'abc%'` 3.89 ms vs arrow 0.91 ms; `'%xyz'` 3.56 ms vs 1.01 ms — universal
+(0.16–0.35× on all three machines, worst on the M4), not AMD-specific, and **not** related to
 Finding 1: these patterns have a 3-byte non-empty needle, so their memcmp calls
 are ordinary ~1.2 ns ones.
 
@@ -342,19 +368,19 @@ bulk vectorized loop over the offsets.
 
 This is the existing action item to route prefix/suffix-shaped LIKE patterns to
 `StringStartEndKernel`, which already beats arrow on the long-string dataset
-(5.69 ms vs 6.91 ms).
+(5.67 ms vs 6.93 ms).
 
 ### The same pattern shows up in two more rows
 
-`cmp::contains(utf8)` (0.81×) is the same `filter_bytes` path with a `memchr`
+`cmp::contains(utf8)` (0.80×) is the same `filter_bytes` path with a `memchr`
 search in the closure, so it carries the same per-row toll — just diluted,
 because the substring search itself is expensive enough to hide some of it.
 
-`cast(dictionary(i32, utf8) → utf8)` (0.77×, 8.16 ms vs 6.31 ms) is the same
+`cast(dictionary(i32, utf8) → utf8)` (0.79×, 8.03 ms vs 6.34 ms) is the same
 *shape* on the writer side. Our profile is led by `str_writer_append_bytes`
 (9.4%) plus libc `memmove`, i.e. a Rust callback invoked once per string out of
 JIT-compiled code. Arrow's `take_bytes` (19.6%) computes all the offsets in bulk
-first and then copies. Over 1m rows the 1.85 ms difference is about 1.9 ns of
+first and then copies. Over 1m rows the 1.69 ms difference is about 1.7 ns of
 per-row call overhead.
 
 The general lesson across all three: **anything that crosses the
@@ -377,7 +403,7 @@ It stops holding the moment the operation varies *within* a run. Then we are
 forced back to 20m units of work, and our per-element path is slower than
 arrow's, which decodes the whole array in bulk and then operates densely.
 
-**`select::filter(ree, bool)` — 0.52×, and it's branch mispredictions.** The
+**`select::filter(ree, bool)` — 0.53×, and it's branch mispredictions.** The
 filter mask is random per element, so it varies inside every run. Measured over
 ~20m logical elements:
 
@@ -403,7 +429,7 @@ bulk; we walk all ~5000 logical positions one at a time. The dictionary version
 of the same operation at 100m rows is a **7.4× win**, which is the contrast that
 makes the point: dictionaries don't force per-element work on us, REE does.
 
-**`select::take(ree, indices)` — 0.71×.** Random access into a run-end array
+**`select::take(ree, indices)` — 0.70×.** Random access into a run-end array
 requires finding which run an index falls in, and `runend.rs:318` does that with
 a binary search per index. Over 1m runs that's ~20 dependent, cache-missing
 loads for every single index. This one is inherent to the layout rather than a
@@ -439,7 +465,7 @@ at the emitted loop, but a long way behind F2 in value.
 ## Finding 3b — The nullable sort adds a null pre-pass on top of the comparator
 
 **Not AMD-specific.** `sort_to_indices(nullable u64)` is 0.44×, slightly worse
-than the non-null 0.49×. Profiling shows the same shared `quicksort::<(u32, …)>`
+than the non-null 0.51×. Profiling shows the same shared `quicksort::<(u32, …)>`
 on both sides, so Finding 3's comparator problem applies unchanged. The extra
 loss is a pre-pass: `sort::sort_primitive…` accounts for **13.6%** of our
 runtime against **4.4%** for arrow's whole `sort_to_indices` entry point. That
@@ -472,5 +498,12 @@ second, smaller item.
    answer varies inside a run — the kernel could pick at runtime (F5).
 6. **Look at the dense filter loop's instruction count** — 9.2 instructions per
    element against arrow's 5.8, with no branch or memory problem to blame (F6).
-7. Make `report.py` record `rustflags` in the manifest — this run's build
-   flavour had to be recovered by disassembling the benchmark binary.
+7. ~~Make `report.py` record `rustflags` in the manifest~~ — **done**; the field
+   is written as of `report.py:416`. This run predates it, which is why its build
+   flavour had to be recovered by disassembling the benchmark binary. Runs
+   published before that change (all five currently on the site) still have no
+   `rustflags` in their manifest.
+8. **Investigate the three uninvestigated losing rows** — `cmp::lt(i32, scalar)`
+   at 10m, `select::take(bool, u64)`, and the catch-all `%abc%xyz%` LIKE. The
+   first two look like the same x86-native-arrow effect seen on Meteor Lake
+   rather than anything of ours, but neither has been profiled.
