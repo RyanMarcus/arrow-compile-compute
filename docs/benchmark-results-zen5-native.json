@@ -2,9 +2,9 @@
   "schema_version": 2,
   "run": {
     "revision": "107db50",
-    "dirty": false,
-    "started_at": "2026-08-06T17:42:23.587044+00:00",
-    "completed_at": "2026-08-06T18:09:25.317589+00:00",
+    "dirty": true,
+    "started_at": "2026-08-11T20:01:45.198306+00:00",
+    "completed_at": "2026-08-11T20:28:09.981177+00:00",
     "commands": [
       [
         "cargo",
@@ -12,7 +12,7 @@
       ]
     ],
     "host": {
-      "os": "Linux 7.1.4-arch1-1",
+      "os": "Linux 7.1.6-arch1-1",
       "arch": "x86_64",
       "cpu": "AMD Ryzen 7 9700X 8-Core Processor",
       "cores": 16,
@@ -22,44 +22,24 @@
   "equal_margin": 1.035,
   "results": [
     {
-      "name": "cmp::lt(array(i32), array(i32)) 10m rows",
+      "name": "cmp::lt(array(i32), scalar(i32)) 10m rows",
       "op": "cmp::lt",
-      "inputs": "i32, i32",
+      "inputs": "i32, i32 scalar",
       "size": "10m rows",
       "family": "Comparisons",
       "baseline_kind": "arrow",
       "llvm": {
-        "point": 1498591.3229166665,
-        "lower": 1474394.2236842106,
-        "upper": 1540534.3333333333
+        "point": 755936.9673108553,
+        "lower": 738397.513095238,
+        "upper": 777835.5414329126
       },
       "baseline": {
-        "point": 1473019.9388698628,
-        "lower": 1465516.4411764706,
-        "upper": 1487112.0185185184
+        "point": 614045.0206023651,
+        "lower": 607617.5,
+        "upper": 619128.8456662472
       },
-      "speedup": 0.982936385887358,
-      "classification": "equal"
-    },
-    {
-      "name": "cmp::lt(array(f32), array(f32)) 10m rows",
-      "op": "cmp::lt",
-      "inputs": "f32, f32",
-      "size": "10m rows",
-      "family": "Comparisons",
-      "baseline_kind": "arrow",
-      "llvm": {
-        "point": 1483503.2399858208,
-        "lower": 1474301.4605297665,
-        "upper": 1486330.653846154
-      },
-      "baseline": {
-        "point": 1485080.7582846005,
-        "lower": 1483991.1141598916,
-        "upper": 1486334.4375
-      },
-      "speedup": 1.0010633736794499,
-      "classification": "equal"
+      "speedup": 0.812296589736507,
+      "classification": "arrow-win"
     },
     {
       "name": "cmp::lt(array(i64), scalar(i64)) 1m rows",
@@ -69,36 +49,56 @@
       "family": "Comparisons",
       "baseline_kind": "arrow",
       "llvm": {
-        "point": 51065.75220006592,
-        "lower": 51043.69696969697,
-        "upper": 51094.85240963855
+        "point": 50030.7087282135,
+        "lower": 50025.70248296008,
+        "upper": 50035.94642857143
       },
       "baseline": {
-        "point": 54719.777784015765,
-        "lower": 54702.10858585859,
-        "upper": 54775.71256038648
+        "point": 52313.45101214574,
+        "lower": 52308.62343714906,
+        "upper": 52323.34711779449
       },
-      "speedup": 1.0715553071583879,
+      "speedup": 1.045626822844605,
       "classification": "llvm-win"
     },
     {
-      "name": "cmp::lt(array(i32), scalar(i32)) 10m rows",
+      "name": "cmp::lt(array(f32), array(f32)) 10m rows",
       "op": "cmp::lt",
-      "inputs": "i32, i32 scalar",
+      "inputs": "f32, f32",
       "size": "10m rows",
       "family": "Comparisons",
       "baseline_kind": "arrow",
       "llvm": {
-        "point": 598947.8161650737,
-        "lower": 595966.2605633803,
-        "upper": 600772.0097402597
+        "point": 1414384.3576799142,
+        "lower": 1401958.1715384615,
+        "upper": 1421934.9586956522
       },
       "baseline": {
-        "point": 663839.6742788461,
-        "lower": 636959.4857142858,
-        "upper": 668275.7326007326
+        "point": 1479848.1820839979,
+        "lower": 1450213.62688734,
+        "upper": 1529696.141025641
       },
-      "speedup": 1.1083430916056431,
+      "speedup": 1.0462843243766264,
+      "classification": "llvm-win"
+    },
+    {
+      "name": "cmp::lt(array(i32), array(i32)) 10m rows",
+      "op": "cmp::lt",
+      "inputs": "i32, i32",
+      "size": "10m rows",
+      "family": "Comparisons",
+      "baseline_kind": "arrow",
+      "llvm": {
+        "point": 1217414.0560897435,
+        "lower": 1216189.290909091,
+        "upper": 1219449.5192307692
+      },
+      "baseline": {
+        "point": 1289661.1701902747,
+        "lower": 1288894.3714285714,
+        "upper": 1291683.6857019563
+      },
+      "speedup": 1.0593447346357938,
       "classification": "llvm-win"
     },
     {
@@ -109,16 +109,16 @@
       "family": "Comparisons",
       "baseline_kind": "arrow",
       "llvm": {
-        "point": 27533.15763546798,
-        "lower": 27523.691816979317,
-        "upper": 27538.06002690725
+        "point": 27346.939140620536,
+        "lower": 27340.920205920207,
+        "upper": 27352.323573573573
       },
       "baseline": {
-        "point": 32532.351531550652,
-        "lower": 32500.33309264816,
-        "upper": 34135.41583009671
+        "point": 34727.26641296469,
+        "lower": 34406.11400983911,
+        "upper": 34907.911180773255
       },
-      "speedup": 1.1815699442203735,
+      "speedup": 1.2698776354601813,
       "classification": "llvm-win"
     },
     {
@@ -129,16 +129,16 @@
       "family": "Comparisons",
       "baseline_kind": "arrow",
       "llvm": {
-        "point": 812930.1634366924,
-        "lower": 812029.3426966292,
-        "upper": 813886.1825810185
+        "point": 830944.4007034632,
+        "lower": 828866.4750639386,
+        "upper": 833128.25
       },
       "baseline": {
-        "point": 1420819.1510416665,
-        "lower": 1419952.71875,
-        "upper": 1421826.3281853283
+        "point": 1361341.6222727273,
+        "lower": 1360735.8416666668,
+        "upper": 1362155.0
       },
-      "speedup": 1.747775165624438,
+      "speedup": 1.6383065113866089,
       "classification": "llvm-win"
     },
     {
@@ -149,16 +149,16 @@
       "family": "Comparisons",
       "baseline_kind": "arrow",
       "llvm": {
-        "point": 206519.0194353519,
-        "lower": 206480.76623376625,
-        "upper": 206556.85128205127
+        "point": 205288.85144963145,
+        "lower": 205266.78333333333,
+        "upper": 205309.5617977528
       },
       "baseline": {
-        "point": 441637.4475768872,
-        "lower": 441600.31746031746,
-        "upper": 441701.44444444444
+        "point": 441257.22246168583,
+        "lower": 441167.5743464052,
+        "upper": 441383.28985507245
       },
-      "speedup": 2.1384831711112016,
+      "speedup": 2.1494456194078824,
       "classification": "llvm-win"
     },
     {
@@ -169,16 +169,16 @@
       "family": "Comparisons",
       "baseline_kind": "arrow",
       "llvm": {
-        "point": 172132.31666666668,
-        "lower": 172117.5288650393,
-        "upper": 172160.0
+        "point": 171712.42422614785,
+        "lower": 171695.4387755102,
+        "upper": 171725.3333333333
       },
       "baseline": {
-        "point": 442017.118627451,
-        "lower": 441968.9582007993,
-        "upper": 442075.9555555555
+        "point": 443187.3091838327,
+        "lower": 443144.6896551724,
+        "upper": 443223.1904761905
       },
-      "speedup": 2.5678915336009496,
+      "speedup": 2.580985686860657,
       "classification": "llvm-win"
     },
     {
@@ -189,16 +189,16 @@
       "family": "Comparisons",
       "baseline_kind": "arrow",
       "llvm": {
-        "point": 4222920.041666667,
-        "lower": 4219290.791666666,
-        "upper": 4229793.333333333
+        "point": 4073851.192307692,
+        "lower": 4027905.3846153845,
+        "upper": 4129846.6153846155
       },
       "baseline": {
-        "point": 14628920.625,
-        "lower": 14610990.75,
-        "upper": 14684415.5
+        "point": 14009749.0,
+        "lower": 13949085.0,
+        "upper": 14043324.5
       },
-      "speedup": 3.4641718243915363,
+      "speedup": 3.438944708253807,
       "classification": "llvm-win"
     },
     {
@@ -209,16 +209,16 @@
       "family": "Comparisons",
       "baseline_kind": "arrow",
       "llvm": {
-        "point": 463606.61937762506,
-        "lower": 463308.3478236731,
-        "upper": 464011.2248062015
+        "point": 480338.98964646464,
+        "lower": 480112.73873873876,
+        "upper": 480897.428525641
       },
       "baseline": {
-        "point": 2096995.8541666665,
-        "lower": 2096125.0833333335,
-        "upper": 2098178.708333333
+        "point": 2126277.5416666665,
+        "lower": 2124762.625,
+        "upper": 2127301.3541666665
       },
-      "speedup": 4.523222418570742,
+      "speedup": 4.4266186745149145,
       "classification": "llvm-win"
     },
     {
@@ -229,16 +229,16 @@
       "family": "Comparisons",
       "baseline_kind": "arrow",
       "llvm": {
-        "point": 2626946.175,
-        "lower": 2444138.6,
-        "upper": 2804688.8
+        "point": 2249786.75,
+        "lower": 2221133.4166666665,
+        "upper": 2271027.8333333335
       },
       "baseline": {
-        "point": 12101432.375,
-        "lower": 12077454.875,
-        "upper": 12132249.875
+        "point": 12160074.375,
+        "lower": 12116082.0,
+        "upper": 12235430.75
       },
-      "speedup": 4.606654102838632,
+      "speedup": 5.404989772919589,
       "classification": "llvm-win"
     },
     {
@@ -249,16 +249,16 @@
       "family": "Comparisons",
       "baseline_kind": "arrow",
       "llvm": {
-        "point": 2383390.925,
-        "lower": 2362034.95,
-        "upper": 2385248.9
+        "point": 2240650.3260869565,
+        "lower": 2227754.3913043477,
+        "upper": 2251961.9565217393
       },
       "baseline": {
-        "point": 15791322.0,
-        "lower": 15783469.75,
-        "upper": 15800703.25
+        "point": 14901358.875,
+        "lower": 14799543.0,
+        "upper": 14998911.875
       },
-      "speedup": 6.625569408006369,
+      "speedup": 6.6504615653365,
       "classification": "llvm-win"
     },
     {
@@ -269,16 +269,16 @@
       "family": "Comparisons",
       "baseline_kind": "arrow",
       "llvm": {
-        "point": 279045.0256313131,
-        "lower": 277041.9587912088,
-        "upper": 280768.0888813406
+        "point": 272908.69211986684,
+        "lower": 272828.56100657105,
+        "upper": 273078.9840425532
       },
       "baseline": {
-        "point": 2540768.272727273,
-        "lower": 2513507.0454545454,
-        "upper": 2542038.1818181816
+        "point": 2289027.5454545454,
+        "lower": 2288891.340909091,
+        "upper": 2289254.090909091
       },
-      "speedup": 9.105226896551995,
+      "speedup": 8.387521583406217,
       "classification": "llvm-win"
     },
     {
@@ -289,16 +289,16 @@
       "family": "Comparisons",
       "baseline_kind": "arrow",
       "llvm": {
-        "point": 293634.15183423914,
-        "lower": 293484.73146645026,
-        "upper": 293792.86687784275
+        "point": 299698.4451754386,
+        "lower": 299550.1713362069,
+        "upper": 299855.2154356061
       },
       "baseline": {
-        "point": 3980958.9615384615,
-        "lower": 3978479.346153846,
-        "upper": 3984029.346153846
+        "point": 3989662.4615384615,
+        "lower": 3983612.3076923075,
+        "upper": 3999417.3846153845
       },
-      "speedup": 13.55754750144245,
+      "speedup": 13.312256121992819,
       "classification": "llvm-win"
     },
     {
@@ -309,16 +309,16 @@
       "family": "Comparisons",
       "baseline_kind": "arrow",
       "llvm": {
-        "point": 107599.63981173866,
-        "lower": 106823.16458333333,
-        "upper": 108985.56734234234
+        "point": 106262.68283410138,
+        "lower": 105915.84936708861,
+        "upper": 106641.83148148148
       },
       "baseline": {
-        "point": 2050520.62,
-        "lower": 2050303.84,
-        "upper": 2050886.92
+        "point": 2045530.74,
+        "lower": 2045290.88,
+        "upper": 2045820.68
       },
-      "speedup": 19.056946878146494,
+      "speedup": 19.249756221509184,
       "classification": "llvm-win"
     },
     {
@@ -329,16 +329,16 @@
       "family": "Comparisons",
       "baseline_kind": "arrow",
       "llvm": {
-        "point": 109254.5738517248,
-        "lower": 109199.61805555556,
-        "upper": 109362.02614379085
+        "point": 110072.66319444444,
+        "lower": 109997.989802014,
+        "upper": 110126.28703703704
       },
       "baseline": {
-        "point": 2275239.1363636367,
-        "lower": 2274474.5,
-        "upper": 2276155.6136363638
+        "point": 2264265.0434782607,
+        "lower": 2264170.7391304346,
+        "upper": 2264586.9565217393
       },
-      "speedup": 20.825115655583307,
+      "speedup": 20.570639228365124,
       "classification": "llvm-win"
     },
     {
@@ -349,16 +349,16 @@
       "family": "Comparisons",
       "baseline_kind": "arrow",
       "llvm": {
-        "point": 85866.62990196078,
-        "lower": 85821.0125,
-        "upper": 85905.81798245614
+        "point": 86136.68135017244,
+        "lower": 86028.30096174512,
+        "upper": 86242.60454545454
       },
       "baseline": {
-        "point": 2368734.7727272725,
-        "lower": 2368274.8181818184,
-        "upper": 2369110.909090909
+        "point": 2351188.909090909,
+        "lower": 2350592.8181818184,
+        "upper": 2351846.9545454546
       },
-      "speedup": 27.58620869867378,
+      "speedup": 27.296023856927967,
       "classification": "llvm-win"
     },
     {
@@ -369,16 +369,16 @@
       "family": "Comparisons",
       "baseline_kind": "arrow",
       "llvm": {
-        "point": 90497.17926919571,
-        "lower": 90309.18948101706,
-        "upper": 90746.34407315945
+        "point": 90738.17471590909,
+        "lower": 90583.89411157025,
+        "upper": 90853.47727272726
       },
       "baseline": {
-        "point": 2746005.2894736845,
-        "lower": 2734023.8947368423,
-        "upper": 2851926.157894737
+        "point": 2658544.421052632,
+        "lower": 2654982.789473684,
+        "upper": 2666147.3684210526
       },
-      "speedup": 30.34354564030479,
+      "speedup": 29.299073178143956,
       "classification": "llvm-win"
     },
     {
@@ -389,16 +389,16 @@
       "family": "Comparisons",
       "baseline_kind": "arrow",
       "llvm": {
-        "point": 27313.658495878324,
-        "lower": 27286.93074074074,
-        "upper": 27322.77797795023
+        "point": 26722.407302038882,
+        "lower": 26710.39536679537,
+        "upper": 26733.650204750207
       },
       "baseline": {
-        "point": 75126.96679382434,
-        "lower": 74777.15575396825,
-        "upper": 75335.9338430851
+        "point": 73163.77678571429,
+        "lower": 73111.63957307061,
+        "upper": 73198.73076923077
       },
-      "speedup": 2.7505274258723387,
+      "speedup": 2.737918629813415,
       "classification": "llvm-win"
     },
     {
@@ -409,16 +409,16 @@
       "family": "Comparisons",
       "baseline_kind": "arrow",
       "llvm": {
-        "point": 12735426.25,
-        "lower": 12691043.25,
-        "upper": 12756663.375
+        "point": 12558927.625,
+        "lower": 12547265.75,
+        "upper": 12571751.625
       },
       "baseline": {
-        "point": 10278921.5,
-        "lower": 10183785.3,
-        "upper": 10302702.8
+        "point": 10048880.3,
+        "lower": 10043757.8,
+        "upper": 10057255.2
       },
-      "speedup": 0.8071124827879239,
+      "speedup": 0.8001384035366634,
       "classification": "arrow-win"
     },
     {
@@ -429,16 +429,16 @@
       "family": "Comparisons",
       "baseline_kind": "arrow",
       "llvm": {
-        "point": 5673553.333333334,
-        "lower": 5662036.777777778,
-        "upper": 5679840.555555556
+        "point": 5702839.944444444,
+        "lower": 5697349.111111111,
+        "upper": 5708261.777777778
       },
       "baseline": {
-        "point": 8013188.285714285,
-        "lower": 8009505.642857143,
-        "upper": 8023679.285714285
+        "point": 8061041.357142857,
+        "lower": 8055763.571428572,
+        "upper": 8067864.785714285
       },
-      "speedup": 1.4123755986632043,
+      "speedup": 1.4135135188206904,
       "classification": "llvm-win"
     },
     {
@@ -449,36 +449,16 @@
       "family": "Comparisons",
       "baseline_kind": "arrow",
       "llvm": {
-        "point": 102467082.0,
-        "lower": 102449248.0,
-        "upper": 102485596.0
+        "point": 104694116.5,
+        "lower": 104673502.0,
+        "upper": 104739085.0
       },
       "baseline": {
-        "point": 10259175.4,
-        "lower": 10237007.0,
-        "upper": 10277559.8
+        "point": 10105588.7,
+        "lower": 10098778.8,
+        "upper": 10117397.899999999
       },
-      "speedup": 0.10012167029407552,
-      "classification": "arrow-win"
-    },
-    {
-      "name": "cmp::like(array(utf8), '%xyz') 1m rows",
-      "op": "cmp::like",
-      "inputs": "utf8, '%xyz'",
-      "size": "1m rows",
-      "family": "Comparisons",
-      "baseline_kind": "arrow",
-      "llvm": {
-        "point": 4064980.807692308,
-        "lower": 4064495.6923076925,
-        "upper": 4065909.153846154
-      },
-      "baseline": {
-        "point": 1008658.4900352734,
-        "lower": 1008174.6744186047,
-        "upper": 1008883.9444444445
-      },
-      "speedup": 0.2481336414003611,
+      "speedup": 0.09652489593338322,
       "classification": "arrow-win"
     },
     {
@@ -489,16 +469,36 @@
       "family": "Comparisons",
       "baseline_kind": "arrow",
       "llvm": {
-        "point": 3571753.333333333,
-        "lower": 3564076.6,
-        "upper": 3575859.333333333
+        "point": 3892835.846153846,
+        "lower": 3892418.230769231,
+        "upper": 3893246.269230769
       },
       "baseline": {
-        "point": 909617.6293233082,
-        "lower": 909344.6927083334,
-        "upper": 909900.0701787043
+        "point": 906612.4249902838,
+        "lower": 906527.8260869565,
+        "upper": 906806.0076799141
       },
-      "speedup": 0.2546697782386918,
+      "speedup": 0.23289253922330796,
+      "classification": "arrow-win"
+    },
+    {
+      "name": "cmp::like(array(utf8), '%xyz') 1m rows",
+      "op": "cmp::like",
+      "inputs": "utf8, '%xyz'",
+      "size": "1m rows",
+      "family": "Comparisons",
+      "baseline_kind": "arrow",
+      "llvm": {
+        "point": 3555566.4000000004,
+        "lower": 3554687.066666667,
+        "upper": 3555845.933333333
+      },
+      "baseline": {
+        "point": 1006847.255,
+        "lower": 1006745.3076923077,
+        "upper": 1007068.3600386101
+      },
+      "speedup": 0.28317492678522327,
       "classification": "arrow-win"
     },
     {
@@ -509,17 +509,17 @@
       "family": "Comparisons",
       "baseline_kind": "arrow",
       "llvm": {
-        "point": 18479107.333333336,
-        "lower": 18446708.333333332,
-        "upper": 18512424.666666668
+        "point": 19240403.666666664,
+        "lower": 19224165.0,
+        "upper": 19376990.0
       },
       "baseline": {
-        "point": 18398044.0,
-        "lower": 18389905.666666668,
-        "upper": 18406820.333333332
+        "point": 18423499.666666664,
+        "lower": 18402695.666666668,
+        "upper": 18435094.833333336
       },
-      "speedup": 0.995613244088522,
-      "classification": "equal"
+      "speedup": 0.9575422629299999,
+      "classification": "arrow-win"
     },
     {
       "name": "cmp::starts_with(array(utf8), scalar(utf8)) 1m rows",
@@ -529,16 +529,16 @@
       "family": "Comparisons",
       "baseline_kind": "arrow",
       "llvm": {
-        "point": 5952640.0,
-        "lower": 5948171.666666667,
-        "upper": 5961287.333333333
+        "point": 5665533.888888889,
+        "lower": 5662101.777777778,
+        "upper": 5669525.222222222
       },
       "baseline": {
-        "point": 6916398.5625,
-        "lower": 6910715.4375,
-        "upper": 6920744.125
+        "point": 6934447.375,
+        "lower": 6927183.75,
+        "upper": 6944970.75
       },
-      "speedup": 1.1619043924208419,
+      "speedup": 1.2239706814921139,
       "classification": "llvm-win"
     },
     {
@@ -549,16 +549,16 @@
       "family": "Arithmetic",
       "baseline_kind": "arrow",
       "llvm": {
-        "point": 10031197.5,
-        "lower": 9742569.083333332,
-        "upper": 10348988.083333332
+        "point": 8798915.5,
+        "lower": 8790105.666666668,
+        "upper": 8806470.5
       },
       "baseline": {
-        "point": 6260413.111111112,
-        "lower": 6183466.333333333,
-        "upper": 6347421.0
+        "point": 5358108.05,
+        "lower": 5334442.1,
+        "upper": 5375790.7
       },
-      "speedup": 0.6240942929407094,
+      "speedup": 0.6089509610587804,
       "classification": "arrow-win"
     },
     {
@@ -569,16 +569,16 @@
       "family": "Arithmetic",
       "baseline_kind": "arrow",
       "llvm": {
-        "point": 3874802.653846154,
-        "lower": 3852514.3846153845,
-        "upper": 4369299.923076923
+        "point": 4095529.153846154,
+        "lower": 4087664.769230769,
+        "upper": 4099131.307692308
       },
       "baseline": {
-        "point": 2708028.5,
-        "lower": 2701553.0555555555,
-        "upper": 2715109.0
+        "point": 2608035.05,
+        "lower": 2599346.25,
+        "upper": 2614019.275
       },
-      "speedup": 0.6988816571889135,
+      "speedup": 0.6368005090504036,
       "classification": "arrow-win"
     },
     {
@@ -589,16 +589,16 @@
       "family": "Arithmetic",
       "baseline_kind": "arrow",
       "llvm": {
-        "point": 4723657.65,
-        "lower": 4712838.8,
-        "upper": 4738566.55
+        "point": 5019172.954545455,
+        "lower": 5001038.454545455,
+        "upper": 5032145.454545454
       },
       "baseline": {
-        "point": 9012472.083333332,
-        "lower": 9002873.333333334,
-        "upper": 9016475.5
+        "point": 8681896.083333332,
+        "lower": 8654809.333333334,
+        "upper": 8705073.77083333
       },
-      "speedup": 1.9079435367915225,
+      "speedup": 1.729746347049238,
       "classification": "llvm-win"
     },
     {
@@ -609,16 +609,16 @@
       "family": "Aggregations",
       "baseline_kind": "arrow",
       "llvm": {
-        "point": 2888303.916666667,
-        "lower": 2877733.8333333335,
-        "upper": 2905637.138888889
+        "point": 2551105.025,
+        "lower": 2547445.1500000004,
+        "upper": 2554498.1
       },
       "baseline": {
-        "point": 357875.83250811463,
-        "lower": 357454.2463768116,
-        "upper": 358394.7883486023
+        "point": 291989.3485260771,
+        "lower": 291190.975,
+        "upper": 292321.79047619045
       },
-      "speedup": 0.12390518547685657,
+      "speedup": 0.11445602813866008,
       "classification": "arrow-win"
     },
     {
@@ -629,16 +629,16 @@
       "family": "Aggregations",
       "baseline_kind": "arrow",
       "llvm": {
-        "point": 2850754.1944444445,
-        "lower": 2842443.388888889,
-        "upper": 2860322.388888889
+        "point": 2541129.075,
+        "lower": 2536616.325,
+        "upper": 2547911.8
       },
       "baseline": {
-        "point": 355732.2564474533,
-        "lower": 355356.78222222225,
-        "upper": 356196.5661083393
+        "point": 293117.71294642857,
+        "lower": 292611.96428571426,
+        "upper": 293643.50872093026
       },
-      "speedup": 0.12478531370424886,
+      "speedup": 0.11534939953667192,
       "classification": "arrow-win"
     },
     {
@@ -649,16 +649,16 @@
       "family": "Aggregations",
       "baseline_kind": "arrow",
       "llvm": {
-        "point": 2842032.5833333335,
-        "lower": 2833965.277777778,
-        "upper": 2848968.888888889
+        "point": 2553067.2,
+        "lower": 2546066.85,
+        "upper": 2557881.0
       },
       "baseline": {
-        "point": 355334.55563607084,
-        "lower": 354927.99004975124,
-        "upper": 356036.8831168831
+        "point": 293143.76407469343,
+        "lower": 292339.765625,
+        "upper": 293603.76966089464
       },
-      "speedup": 0.1250283187180457,
+      "speedup": 0.11482023037806972,
       "classification": "arrow-win"
     },
     {
@@ -669,16 +669,16 @@
       "family": "Aggregations",
       "baseline_kind": "arrow",
       "llvm": {
-        "point": 2895708.611111111,
-        "lower": 2858564.916666667,
-        "upper": 2954262.888888889
+        "point": 2531638.25,
+        "lower": 2527068.925,
+        "upper": 2537854.9000000004
       },
       "baseline": {
-        "point": 357319.49626623373,
-        "lower": 357093.5720720721,
-        "upper": 357636.44930789375
+        "point": 292944.59970238095,
+        "lower": 292391.4451219512,
+        "upper": 293556.34231739416
       },
-      "speedup": 0.12339621980442529,
+      "speedup": 0.11571345143895695,
       "classification": "arrow-win"
     },
     {
@@ -689,16 +689,16 @@
       "family": "Aggregations",
       "baseline_kind": "arrow",
       "llvm": {
-        "point": 3673410.285714286,
-        "lower": 3662492.714285714,
-        "upper": 3682573.1428571427
+        "point": 4035130.5,
+        "lower": 4033818.769230769,
+        "upper": 4035959.0
       },
       "baseline": {
-        "point": 6341488.722222222,
-        "lower": 6264470.222222222,
-        "upper": 6347402.0
+        "point": 5791662.666666666,
+        "lower": 5787543.888888889,
+        "upper": 5794712.888888889
       },
-      "speedup": 1.72632192676216,
+      "speedup": 1.4353098782472256,
       "classification": "llvm-win"
     },
     {
@@ -709,16 +709,16 @@
       "family": "Casts",
       "baseline_kind": "arrow",
       "llvm": {
-        "point": 8080209.357142857,
-        "lower": 8073159.714285715,
-        "upper": 8092269.785714285
+        "point": 8029419.071428571,
+        "lower": 8020727.142857143,
+        "upper": 8039355.642857143
       },
       "baseline": {
-        "point": 6261306.4375,
-        "lower": 6260104.125,
-        "upper": 6262070.375
+        "point": 6335103.75,
+        "lower": 6334198.875,
+        "upper": 6336607.1875
       },
-      "speedup": 0.7748940851346929,
+      "speedup": 0.7889865622461373,
       "classification": "arrow-win"
     },
     {
@@ -729,16 +729,16 @@
       "family": "Casts",
       "baseline_kind": "arrow",
       "llvm": {
-        "point": 8801823.75,
-        "lower": 8765724.5,
-        "upper": 8824072.0
+        "point": 8594593.833333332,
+        "lower": 8584370.666666666,
+        "upper": 8598896.166666666
       },
       "baseline": {
-        "point": 8037241.071428571,
-        "lower": 8001917.142857143,
-        "upper": 8066482.285714285
+        "point": 7751329.642857143,
+        "lower": 7744585.571428571,
+        "upper": 7757644.285714285
       },
-      "speedup": 0.9131336072741255,
+      "speedup": 0.9018843465056292,
       "classification": "arrow-win"
     },
     {
@@ -749,16 +749,16 @@
       "family": "Casts",
       "baseline_kind": "arrow",
       "llvm": {
-        "point": 50224883.5,
-        "lower": 47581236.0,
-        "upper": 53737336.0
+        "point": 45073998.0,
+        "lower": 45002063.0,
+        "upper": 45146679.0
       },
       "baseline": {
-        "point": 52884585.0,
-        "lower": 52516140.0,
-        "upper": 53244193.0
+        "point": 45438078.5,
+        "lower": 45390213.75,
+        "upper": 45546354.0
       },
-      "speedup": 1.0529558520528972,
+      "speedup": 1.0080773953089317,
       "classification": "equal"
     },
     {
@@ -769,16 +769,16 @@
       "family": "Casts",
       "baseline_kind": "arrow",
       "llvm": {
-        "point": 407939.2649189104,
-        "lower": 406410.73983739835,
-        "upper": 409375.16034722223
+        "point": 333382.5119047619,
+        "lower": 331777.193196005,
+        "upper": 334141.1367798868
       },
       "baseline": {
-        "point": 431728.05349462363,
-        "lower": 423951.1733047386,
-        "upper": 437009.71376811597
+        "point": 347296.6051767677,
+        "lower": 346683.38095238095,
+        "upper": 348261.25333333336
       },
-      "speedup": 1.058314535082672,
+      "speedup": 1.0417361222474102,
       "classification": "llvm-win"
     },
     {
@@ -789,16 +789,16 @@
       "family": "Casts",
       "baseline_kind": "arrow",
       "llvm": {
-        "point": 7884250.5,
-        "lower": 7857589.214285715,
-        "upper": 7936655.714285715
+        "point": 7125656.0,
+        "lower": 7121090.285714285,
+        "upper": 7141391.142857143
       },
       "baseline": {
-        "point": 8439032.333333332,
-        "lower": 8235300.333333333,
-        "upper": 8467254.333333334
+        "point": 7574990.285714285,
+        "lower": 7566445.0,
+        "upper": 7584027.285714285
       },
-      "speedup": 1.0703658303770704,
+      "speedup": 1.063058655331423,
       "classification": "llvm-win"
     },
     {
@@ -809,16 +809,16 @@
       "family": "Casts",
       "baseline_kind": "arrow",
       "llvm": {
-        "point": 30168768.25,
-        "lower": 30131315.75,
-        "upper": 30192052.0
+        "point": 30002662.75,
+        "lower": 29963875.0,
+        "upper": 30037267.5
       },
       "baseline": {
-        "point": 108221228.5,
-        "lower": 107958247.0,
-        "upper": 108401667.0
+        "point": 106482335.5,
+        "lower": 106395783.0,
+        "upper": 106635783.0
       },
-      "speedup": 3.587194134119148,
+      "speedup": 3.5490961714723137,
       "classification": "llvm-win"
     },
     {
@@ -829,16 +829,16 @@
       "family": "Casts",
       "baseline_kind": "arrow",
       "llvm": {
-        "point": 416726.4570273999,
-        "lower": 416303.2365591398,
-        "upper": 420943.68888888886
+        "point": 404523.2721302863,
+        "lower": 404432.4756554307,
+        "upper": 404620.4828042328
       },
       "baseline": {
-        "point": 4048683.3846153845,
-        "lower": 4041992.0,
-        "upper": 4068736.6923076925
+        "point": 4010246.884615385,
+        "lower": 4007983.3846153845,
+        "upper": 4012243.6923076925
       },
-      "speedup": 9.715445987028327,
+      "speedup": 9.913513414189406,
       "classification": "llvm-win"
     },
     {
@@ -849,16 +849,16 @@
       "family": "Selection",
       "baseline_kind": "arrow",
       "llvm": {
-        "point": 4256899.916666667,
-        "lower": 4252980.041666667,
-        "upper": 4264632.666666667
+        "point": 4091040.0,
+        "lower": 4087235.153846154,
+        "upper": 4095808.923076923
       },
       "baseline": {
-        "point": 2761667.5,
-        "lower": 2756337.263157895,
-        "upper": 2765654.710526316
+        "point": 2746558.2105263155,
+        "lower": 2742823.3157894737,
+        "upper": 2750952.210526316
       },
-      "speedup": 0.6487508642586323,
+      "speedup": 0.6713594124052357,
       "classification": "arrow-win"
     },
     {
@@ -869,16 +869,16 @@
       "family": "Selection",
       "baseline_kind": "arrow",
       "llvm": {
-        "point": 4176300.75,
-        "lower": 4170731.1666666665,
-        "upper": 4181791.8333333335
+        "point": 4174648.958333333,
+        "lower": 4170892.791666667,
+        "upper": 4179352.791666667
       },
       "baseline": {
-        "point": 6727795.0,
-        "lower": 6723997.25,
-        "upper": 6732031.6875
+        "point": 6560814.0625,
+        "lower": 6557133.4375,
+        "upper": 6564676.25
       },
-      "speedup": 1.6109460028710816,
+      "speedup": 1.5715846117799825,
       "classification": "llvm-win"
     },
     {
@@ -889,16 +889,16 @@
       "family": "Selection",
       "baseline_kind": "arrow",
       "llvm": {
-        "point": 83256.91029325081,
-        "lower": 83203.74797453704,
-        "upper": 83356.84890243903
+        "point": 79580.78556312108,
+        "lower": 79556.92307692308,
+        "upper": 79597.62882588425
       },
       "baseline": {
-        "point": 193983.8925084175,
-        "lower": 193928.96271929826,
-        "upper": 194037.82804232804
+        "point": 193396.71846347232,
+        "lower": 193044.6568627451,
+        "upper": 193673.34065934067
       },
-      "speedup": 2.3299434464377757,
+      "speedup": 2.4301936339906556,
       "classification": "llvm-win"
     },
     {
@@ -909,16 +909,16 @@
       "family": "Selection",
       "baseline_kind": "arrow",
       "llvm": {
-        "point": 77144687.0,
-        "lower": 77106430.0,
-        "upper": 77171647.0
+        "point": 79689378.0,
+        "lower": 79470077.0,
+        "upper": 80007976.0
       },
       "baseline": {
-        "point": 40315006.75,
-        "lower": 40281767.25,
-        "upper": 40338222.5
+        "point": 42558477.0,
+        "lower": 42467584.5,
+        "upper": 42753635.5
       },
-      "speedup": 0.5225895433343323,
+      "speedup": 0.5340545762573276,
       "classification": "arrow-win"
     },
     {
@@ -929,16 +929,16 @@
       "family": "Selection",
       "baseline_kind": "arrow",
       "llvm": {
-        "point": 5082098.35,
-        "lower": 5067777.1,
-        "upper": 5090843.75
+        "point": 5159750.449999999,
+        "lower": 5150957.9,
+        "upper": 5171426.35
       },
       "baseline": {
-        "point": 3759166.8571428573,
-        "lower": 3758339.5714285714,
-        "upper": 3760277.5
+        "point": 3836914.076923077,
+        "lower": 3834625.115384615,
+        "upper": 3848732.0
       },
-      "speedup": 0.7396879395580485,
+      "speedup": 0.7436239628455438,
       "classification": "arrow-win"
     },
     {
@@ -949,16 +949,16 @@
       "family": "Selection",
       "baseline_kind": "arrow",
       "llvm": {
-        "point": 2659573.3157894737,
-        "lower": 2659342.052631579,
-        "upper": 2659721.210526316
+        "point": 2654786.6052631577,
+        "lower": 2654540.8947368423,
+        "upper": 2654883.0789473685
       },
       "baseline": {
-        "point": 1877701.1346153845,
-        "lower": 1877418.4117647058,
-        "upper": 1878060.0
+        "point": 1861944.569440931,
+        "lower": 1861479.7450980393,
+        "upper": 1862143.7789473685
       },
-      "speedup": 0.706015932506077,
+      "speedup": 0.7013537606938334,
       "classification": "arrow-win"
     },
     {
@@ -969,16 +969,16 @@
       "family": "Selection",
       "baseline_kind": "arrow",
       "llvm": {
-        "point": 782269.826923077,
-        "lower": 782089.9276960784,
-        "upper": 782420.8962264151
+        "point": 815800.810483871,
+        "lower": 815638.4133333333,
+        "upper": 815900.0677083334
       },
       "baseline": {
-        "point": 750443.1686613476,
-        "lower": 750046.341764214,
-        "upper": 750723.1383300887
+        "point": 744695.4310344828,
+        "lower": 744471.5128205129,
+        "upper": 744843.5944444444
       },
-      "speedup": 0.9593149867649707,
+      "speedup": 0.9128397783679402,
       "classification": "arrow-win"
     },
     {
@@ -989,16 +989,16 @@
       "family": "Selection",
       "baseline_kind": "arrow",
       "llvm": {
-        "point": 1534669.2884615385,
-        "lower": 1532270.5291666668,
-        "upper": 1537068.75
+        "point": 1534800.4135367763,
+        "lower": 1531878.303030303,
+        "upper": 1537330.9090909092
       },
       "baseline": {
-        "point": 2032875.8199999998,
-        "lower": 2029925.5,
-        "upper": 2034881.38
+        "point": 2010575.94,
+        "lower": 2007124.08,
+        "upper": 2015560.7200000002
       },
-      "speedup": 1.324634457263362,
+      "speedup": 1.3099917893342574,
       "classification": "llvm-win"
     },
     {
@@ -1009,16 +1009,16 @@
       "family": "Selection",
       "baseline_kind": "arrow",
       "llvm": {
-        "point": 22053.752264273007,
-        "lower": 22046.513998059192,
-        "upper": 22081.967400533722
+        "point": 22766.33766629016,
+        "lower": 22760.542858935743,
+        "upper": 22771.163042796186
       },
       "baseline": {
-        "point": 1842242.904,
-        "lower": 1842076.4514285713,
-        "upper": 1842620.4366666665
+        "point": 1834703.5695238095,
+        "lower": 1834076.5,
+        "upper": 1835136.9387777778
       },
-      "speedup": 83.53421594312667,
+      "speedup": 80.58843703440421,
       "classification": "llvm-win"
     },
     {
@@ -1029,16 +1029,16 @@
       "family": "Sorting",
       "baseline_kind": "arrow",
       "llvm": {
-        "point": 42451785.25,
-        "lower": 42351623.0,
-        "upper": 42548939.5
+        "point": 39711111.0,
+        "lower": 39668283.0,
+        "upper": 39769578.5
       },
       "baseline": {
-        "point": 46737850.5,
-        "lower": 46714266.5,
-        "upper": 46800846.25
+        "point": 45860313.0,
+        "lower": 45842740.0,
+        "upper": 45876964.0
       },
-      "speedup": 1.1009631332288905,
+      "speedup": 1.1548483999855859,
       "classification": "llvm-win"
     },
     {
@@ -1049,16 +1049,16 @@
       "family": "Sorting",
       "baseline_kind": "arrow",
       "llvm": {
-        "point": 22545633.5,
-        "lower": 22494165.333333332,
-        "upper": 22598582.666666664
+        "point": 21012447.666666668,
+        "lower": 20992083.0,
+        "upper": 21046802.0
       },
       "baseline": {
-        "point": 40976013.75,
-        "lower": 40959570.5,
-        "upper": 40985454.0
+        "point": 40079038.75,
+        "lower": 40074114.5,
+        "upper": 40086878.5
       },
-      "speedup": 1.8174700546782152,
+      "speedup": 1.9073950539127258,
       "classification": "llvm-win"
     },
     {
@@ -1069,16 +1069,16 @@
       "family": "Sorting",
       "baseline_kind": "arrow",
       "llvm": {
-        "point": 29354562.25,
-        "lower": 29324633.5,
-        "upper": 29372909.0
+        "point": 28409434.25,
+        "lower": 28398163.0,
+        "upper": 28425234.0
       },
       "baseline": {
-        "point": 85093931.5,
-        "lower": 84759285.5,
-        "upper": 85254833.0
+        "point": 80396339.5,
+        "lower": 80137869.0,
+        "upper": 80532059.0
       },
-      "speedup": 2.8988315606716295,
+      "speedup": 2.8299169491557192,
       "classification": "llvm-win"
     },
     {
@@ -1089,16 +1089,16 @@
       "family": "Sorting",
       "baseline_kind": "arrow",
       "llvm": {
-        "point": 16900810.666666664,
-        "lower": 16896110.0,
-        "upper": 16905230.666666668
+        "point": 16687690.875,
+        "lower": 16683732.25,
+        "upper": 16690989.625
       },
       "baseline": {
-        "point": 68181530.0,
-        "lower": 68121522.0,
-        "upper": 68249241.5
+        "point": 65826229.0,
+        "lower": 65816536.0,
+        "upper": 65838797.0
       },
-      "speedup": 4.034216544090036,
+      "speedup": 3.944597817221971,
       "classification": "llvm-win"
     },
     {
@@ -1109,16 +1109,16 @@
       "family": "Sorting",
       "baseline_kind": "arrow",
       "llvm": {
-        "point": 15225401.875,
-        "lower": 15209910.375,
-        "upper": 15232656.75
+        "point": 15057332.75,
+        "lower": 15053851.125,
+        "upper": 15061667.25
       },
       "baseline": {
-        "point": 6653847.1875,
-        "lower": 6649960.0,
-        "upper": 6658488.375
+        "point": 6566192.25,
+        "lower": 6559221.625,
+        "upper": 6572557.25
       },
-      "speedup": 0.4370227624944054,
+      "speedup": 0.43607937468207975,
       "classification": "arrow-win"
     },
     {
@@ -1129,16 +1129,16 @@
       "family": "Sorting",
       "baseline_kind": "arrow",
       "llvm": {
-        "point": 26574968.5,
-        "lower": 26523847.5,
-        "upper": 26808117.25
+        "point": 24252552.166666664,
+        "lower": 24247569.333333332,
+        "upper": 24262659.166666664
       },
       "baseline": {
-        "point": 13045745.5,
-        "lower": 13035467.625,
-        "upper": 13060215.25
+        "point": 12450450.0,
+        "lower": 12444665.2,
+        "upper": 12454661.899999999
       },
-      "speedup": 0.4909035169693616,
+      "speedup": 0.5133665898103796,
       "classification": "arrow-win"
     },
     {
@@ -1149,16 +1149,16 @@
       "family": "Vector ops",
       "baseline_kind": "reference",
       "llvm": {
-        "point": 903078.9505360624,
-        "lower": 901647.4166666666,
-        "upper": 903970.0272248243
+        "point": 874100.5427350427,
+        "lower": 869519.6417449788,
+        "upper": 877022.6666666667
       },
       "baseline": {
-        "point": 5222583.75,
-        "lower": 5222169.0,
-        "upper": 5223093.699999999
+        "point": 5199282.65,
+        "lower": 5198968.0,
+        "upper": 5199666.4
       },
-      "speedup": 5.7830865694521005,
+      "speedup": 5.948151723749708,
       "classification": "llvm-win"
     },
     {
@@ -1169,16 +1169,16 @@
       "family": "Vector ops",
       "baseline_kind": "reference",
       "llvm": {
-        "point": 6285003.0,
-        "lower": 6252120.388888889,
-        "upper": 6482936.222222222
+        "point": 6582837.25,
+        "lower": 6579370.125,
+        "upper": 6588587.375
       },
       "baseline": {
-        "point": 15173527.125,
-        "lower": 15165824.0,
-        "upper": 15177826.5
+        "point": 15204651.625,
+        "lower": 15199386.75,
+        "upper": 15219212.75
       },
-      "speedup": 2.414243418022235,
+      "speedup": 2.309741384689406,
       "classification": "llvm-win"
     },
     {
@@ -1189,16 +1189,16 @@
       "family": "Other",
       "baseline_kind": "arrow",
       "llvm": {
-        "point": 5542.928596799779,
-        "lower": 5541.077782552643,
-        "upper": 5543.901750521824
+        "point": 5551.8109834729985,
+        "lower": 5551.485726938276,
+        "upper": 5552.5974426083285
       },
       "baseline": {
-        "point": 1457.7418114874818,
-        "lower": 1457.4465345650913,
-        "upper": 1458.261361605176
+        "point": 1464.9514814800305,
+        "lower": 1464.790646319835,
+        "upper": 1465.399791862495
       },
-      "speedup": 0.2629912664451626,
+      "speedup": 0.26386912051598943,
       "classification": "arrow-win"
     },
     {
@@ -1209,16 +1209,16 @@
       "family": "Other",
       "baseline_kind": "arrow",
       "llvm": {
-        "point": 46742341.5,
-        "lower": 46738489.25,
-        "upper": 46746685.0
+        "point": 46690798.0,
+        "lower": 46663291.5,
+        "upper": 46712100.5
       },
       "baseline": {
-        "point": 347547588.0,
-        "lower": 347480572.5,
-        "upper": 347635773.0
+        "point": 347257808.0,
+        "lower": 347197920.0,
+        "upper": 347354514.0
       },
-      "speedup": 7.4353910575917554,
+      "speedup": 7.437392867005614,
       "classification": "llvm-win"
     }
   ],
@@ -1226,145 +1226,145 @@
     {
       "name": "BooleanArray::from(Vec(bool)) 16m rows/rust batched",
       "estimate": {
-        "point": 4825308.458333334,
-        "lower": 3968060.25,
-        "upper": 5332297.916666667
+        "point": 3477056.8928571427,
+        "lower": 3474225.3571428573,
+        "upper": 3478995.4642857146
       }
     },
     {
       "name": "BooleanArray::from(Vec(u8) mapped to bool) 16m rows/rust",
       "estimate": {
-        "point": 4458361.083333334,
-        "lower": 4452820.208333334,
-        "upper": 4463195.916666667
+        "point": 3879111.25,
+        "lower": 3856204.0714285714,
+        "upper": 3908912.9285714286
       }
     },
     {
       "name": "cmp::ComparisonKernel::call(array(i32), array(i32)) 1 row (llvm)",
       "estimate": {
-        "point": 347.6522739144401,
-        "lower": 345.4138987043581,
-        "upper": 349.22874752679184
+        "point": 370.8729778599678,
+        "lower": 370.43803014174466,
+        "upper": 371.2203283582763
       }
     },
     {
       "name": "cmp::ComparisonKernel::compile(array(i32), array(i32)) 1 row/llvm compile",
       "estimate": {
-        "point": 9557282.416666666,
-        "lower": 9554183.166666666,
-        "upper": 9560563.5
+        "point": 9378981.083333332,
+        "lower": 9376818.75,
+        "upper": 9381235.333333334
       }
     },
     {
       "name": "cmp::lt(array(i32), array(i64)) x1000 rayon 100k rows (llvm)",
       "estimate": {
-        "point": 1491825.1333333333,
-        "lower": 1488461.1341463414,
-        "upper": 1503200.0825396825
+        "point": 1272034.4196787148,
+        "lower": 1270301.5416666667,
+        "upper": 1273165.2441860465
       }
     },
     {
       "name": "cmp::lt(array(i32), array(i64)) x1000 serial 100k rows (llvm)",
       "estimate": {
-        "point": 8306093.666666666,
-        "lower": 8303070.333333333,
-        "upper": 8310734.383333332
+        "point": 8138943.928571429,
+        "lower": 8138133.714285714,
+        "upper": 8139742.571428572
       }
     },
     {
       "name": "compute::hash(array(i32)) 100m rows (llvm)",
       "estimate": {
-        "point": 87400352.5,
-        "lower": 87279521.0,
-        "upper": 87508209.5
+        "point": 88243619.0,
+        "lower": 87809610.0,
+        "upper": 89056855.0
       }
     },
     {
       "name": "compute::hash(array(i64)) 100m rows (llvm)",
       "estimate": {
-        "point": 97606270.5,
-        "lower": 97335980.0,
-        "upper": 97773348.5
+        "point": 96006220.0,
+        "lower": 95493573.0,
+        "upper": 96521176.0
       }
     },
     {
       "name": "compute::hash_unchained(array(i32)) 100m rows (llvm)",
       "estimate": {
-        "point": 151475498.0,
-        "lower": 151389732.5,
-        "upper": 151687986.0
+        "point": 154056623.5,
+        "lower": 153298250.0,
+        "upper": 154705490.5
       }
     },
     {
       "name": "compute::hash_unchained(array(i64)) 100m rows (llvm)",
       "estimate": {
-        "point": 151470334.0,
-        "lower": 151168834.5,
-        "upper": 151602446.0
+        "point": 167916987.5,
+        "lower": 167699204.0,
+        "upper": 168004411.0
       }
     },
     {
       "name": "iter::iter_nonnull_i64(dictionary(i8, i32)) 100m rows (llvm)",
       "estimate": {
-        "point": 260680212.5,
-        "lower": 260631471.5,
-        "upper": 260779874.0
+        "point": 261518020.5,
+        "lower": 261351012.0,
+        "upper": 261601266.0
       }
     },
     {
       "name": "nearest_neighbor_avx512_f32x8_256(fixed_array(f32, 8), slice(f32), slice(f32))/manual avx512",
       "estimate": {
-        "point": 123.58227735707742,
-        "lower": 123.49305527763882,
-        "upper": 123.72741130324923
+        "point": 122.83187991839114,
+        "lower": 122.82450974036152,
+        "upper": 122.8406600249066
       }
     },
     {
       "name": "starts_with first-4-bytes prototype (array(utf8)) 1m rows/custom",
       "estimate": {
-        "point": 15258814.25,
-        "lower": 15246835.75,
-        "upper": 15279334.0
+        "point": 15343791.375,
+        "lower": 15331743.75,
+        "upper": 15363070.0
       }
     },
     {
       "name": "vec::nearest_neighbor(scalar(fixed_size_list(f32, 8)), fixed_size_list(f32, 8), array(f32)) 256 rows (llvm)",
       "estimate": {
-        "point": 1863.438668787353,
-        "lower": 1860.5392525431225,
-        "upper": 1864.7916744260033
+        "point": 1846.3945702270657,
+        "lower": 1846.1949193942355,
+        "upper": 1846.6071203130919
       }
     },
     {
       "name": "vec::norm(fixed_size_list(f32, 3)) 16384 rows (llvm)",
       "estimate": {
-        "point": 23021.427507139942,
-        "lower": 23017.596990424077,
-        "upper": 23023.791412978557
+        "point": 22923.833231334153,
+        "lower": 22914.17899929528,
+        "upper": 22957.94192464512
       }
     },
     {
       "name": "vec::norm(fixed_size_list(f32, 32)) 16384 rows (llvm)",
       "estimate": {
-        "point": 48268.65717120182,
-        "lower": 48171.12147716229,
-        "upper": 48296.05272108843
+        "point": 48480.98015873016,
+        "lower": 48475.765650080255,
+        "upper": 48488.56953601954
       }
     },
     {
       "name": "vec::norm(fixed_size_list(f32, 64)) 16384 rows (llvm)",
       "estimate": {
-        "point": 79388.63069756332,
-        "lower": 79288.6812937063,
-        "upper": 79672.92307692308
+        "point": 90240.40406022548,
+        "lower": 90173.76322652758,
+        "upper": 90330.93083003952
       }
     },
     {
       "name": "vec::norm(fixed_size_list(f32, 8)) 16384 rows (llvm)",
       "estimate": {
-        "point": 24321.907207629767,
-        "lower": 24315.408449477352,
-        "upper": 24329.610176619008
+        "point": 24222.331219512198,
+        "lower": 24217.601845748188,
+        "upper": 24226.78706307573
       }
     }
   ]
