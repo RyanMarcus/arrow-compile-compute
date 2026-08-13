@@ -78,12 +78,15 @@ LIKE closure. The chain:
 4. On Zen 5, glibc's IFUNC resolves `bcmp` to `__memcmp_evex_movbe`. Its
    `len <= 32` path is:
 
+   <!-- raw: AVX-512 mask register syntax would otherwise parse as a Liquid tag -->
+   {% raw %}
    ```asm
    bzhi     %edx,%eax,%eax              ; len -> mask (0 here)
    kmovd    %eax,%k2
    vmovdqu8 (%rsi),%ymm18{%k2}{z}       ; 32-byte masked load from 0x1
    vpcmpnequb (%rdi),%ymm18,%k1{%k2}    ; 71% of all samples land here
    ```
+   {% endraw %}
 
 5. AVX-512 fault suppression makes the load architecturally legal, but Zen 5
    resolves the suppressed fault with a **microcode assist** (measured below).
