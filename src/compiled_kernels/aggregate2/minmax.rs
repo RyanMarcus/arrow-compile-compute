@@ -5,7 +5,7 @@ use arrow_schema::DataType;
 
 use crate::{
     compiled_kernels::{
-        aggregate2::Aggregator,
+        aggregate2::{passthrough_output_type, Aggregator},
         dsl2::{
             compile, DSLArgument, DSLBitwiseBinOp, DSLBuffer, DSLComparison, DSLContext,
             DSLFunction, DSLStmt, DSLType, DSLValue, RunnableDSLFunction,
@@ -89,7 +89,7 @@ impl Kernel for MinMaxAggKernel {
             func.add_body(
                 DSLStmt::for_each(&mut ctx, &[tic_arg, dat_arg, val_arg], |loop_vars| {
                     let ticket = loop_vars[0].expr();
-                    let data = loop_vars[1].expr();
+                    let data = loop_vars[1].expr().primitive_cast(buf.ty)?;
                     let valid = loop_vars[2].expr();
                     let used = use_arg.expr().at(&ticket)?;
                     let cur = buf_arg.expr().at(&ticket)?;
@@ -127,7 +127,7 @@ impl Kernel for MinMaxAggKernel {
             func.add_body(
                 DSLStmt::for_each(&mut ctx, &[tic_arg, dat_arg], |loop_vars| {
                     let ticket = loop_vars[0].expr();
-                    let data = loop_vars[1].expr();
+                    let data = loop_vars[1].expr().primitive_cast(buf.ty)?;
                     let used = use_arg.expr().at(&ticket)?;
                     let cur = buf_arg.expr().at(&ticket)?;
 
@@ -291,27 +291,34 @@ pub struct MinMaxAggregator<const IS_MIN: bool> {
     used: DSLBuffer,
     buf: DSLBuffer,
     ss: Vec<StringSaver>,
+    output_type: DataType,
 }
 
 impl<const IS_MIN: bool> MinMaxAggregator<IS_MIN> {
     pub fn new(pt: PrimitiveType) -> Self {
+        let output_type = match pt {
+            PrimitiveType::P64x2 => DataType::Binary,
+            _ => pt.as_arrow_type(),
+        };
         Self {
             used: DSLBuffer::new(PrimitiveType::U8, 0),
             buf: DSLBuffer::new(pt, 0),
             ss: Vec::new(),
+            output_type,
         }
     }
 }
 
 impl<const IS_MIN: bool> Aggregator for MinMaxAggregator<IS_MIN> {
-    fn create(tys: &[&DataType]) -> Result<Box<Self>, ArrowKernelError> {
-        if tys.len() != 1 {
-            return Err(ArrowKernelError::ArgumentMismatch(
-                "minmax agg must have exactly one input type".to_string(),
-            ));
-        }
+    fn output_type(tys: &[&DataType]) -> Result<DataType, ArrowKernelError> {
+        passthrough_output_type(tys, if IS_MIN { "min" } else { "max" })
+    }
 
-        Ok(Box::new(Self::new(PrimitiveType::for_arrow_type(tys[0]))))
+    fn create(tys: &[&DataType]) -> Result<Box<Self>, ArrowKernelError> {
+        let output_type = Self::output_type(tys)?;
+        let mut aggregator = Self::new(PrimitiveType::for_arrow_type(&output_type));
+        aggregator.output_type = output_type;
+        Ok(Box::new(aggregator))
     }
     fn ensure_capacity(&mut self, capacity: usize) {
         self.used.ensure_capacity(capacity);
@@ -346,6 +353,13 @@ impl<const IS_MIN: bool> Aggregator for MinMaxAggregator<IS_MIN> {
     }
 
     fn merge(&mut self, mut other: Self) -> Result<(), ArrowKernelError> {
+        if self.output_type != other.output_type {
+            return Err(ArrowKernelError::ArgumentMismatch(format!(
+                "cannot merge aggregators with output types {} and {}",
+                self.output_type, other.output_type
+            )));
+        }
+
         if self.buf.len < other.buf.len {
             self.ensure_capacity(other.buf.len as usize);
         } else if other.buf.len < self.buf.len {
@@ -366,7 +380,19 @@ impl<const IS_MIN: bool> Aggregator for MinMaxAggregator<IS_MIN> {
     }
 
     fn finish(self: Box<Self>) -> Result<ArrayRef, ArrowKernelError> {
-        Ok(self.buf.into_array())
+        let Self {
+            buf,
+            ss,
+            output_type,
+            ..
+        } = *self;
+        let result = buf.into_array();
+        drop(ss);
+        if result.data_type() == &output_type {
+            Ok(result)
+        } else {
+            crate::arrow_interface::cast::cast(&result, &output_type)
+        }
     }
 }
 

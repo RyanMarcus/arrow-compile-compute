@@ -158,7 +158,17 @@ pub struct CountAggregator {
 }
 
 impl Aggregator for CountAggregator {
-    fn create(_tys: &[&DataType]) -> Result<Box<Self>, ArrowKernelError> {
+    fn output_type(tys: &[&DataType]) -> Result<DataType, ArrowKernelError> {
+        if !tys.is_empty() {
+            return Err(ArrowKernelError::ArgumentMismatch(
+                "count takes no input types".to_string(),
+            ));
+        }
+        Ok(DataType::UInt64)
+    }
+
+    fn create(tys: &[&DataType]) -> Result<Box<Self>, ArrowKernelError> {
+        Self::output_type(tys)?;
         Ok(Box::new(Self {
             buf: DSLBuffer::new(PrimitiveType::U64, 0),
         }))
