@@ -53,10 +53,12 @@ use list_writer::{ListWriter, ListWriterEmitter, ListWriterRuntime};
 use run_end_writer::{RunEndWriter, RunEndWriterEmitter, RunEndWriterRuntime};
 use view_writer::{StringViewWriter, StringViewWriterEmitter, StringViewWriterRuntime};
 
+pub(crate) use string_writer::str_writer_reserve;
+
 use crate::{
     compiled_iter::{IteratorHolder, IteratorSource},
     compiled_writers::string_writer::{StringWriter, StringWriterEmitter, StringWriterRuntime},
-    normalized_base_type, ArrowKernelError, ListItemType, PrimitiveType,
+    increment_pointer, normalized_base_type, ArrowKernelError, ListItemType, PrimitiveType,
 };
 
 pub use boolean_writer::{BooleanWriter, BooleanWriterEmitter, BooleanWriterRuntime};
@@ -216,13 +218,28 @@ pub trait Writer {
         runtime_ptr: PointerValue<'ctx>,
         values: VectorValue<'ctx>,
     ) -> Result<(), ArrowKernelError> {
-        self.llvm_write_block(codegen, runtime_ptr, values, values.get_type().get_size())
+        self.llvm_write_block(
+            codegen,
+            runtime_ptr,
+            values,
+            values.get_type().get_size(),
+            None,
+        )
     }
 
     /// Whether this writer supports `llvm_write_block_masked`. The vectorizer
     /// consults this before turning a conditional emit into a masked block.
     fn supports_masked_block(&self) -> bool {
         false
+    }
+
+    /// Byte offset of the write-head pointer inside this writer's runtime
+    /// struct, for writers whose block writes just advance a raw pointer.
+    /// The block loop caches that pointer in a stack slot LLVM can promote
+    /// to a register — through the runtime struct, the store of the advanced
+    /// head may alias the data stores, so it cannot be hoisted out.
+    fn write_head_offset(&self) -> Option<usize> {
+        None
     }
 
     /// Writes only the lanes of `values` whose bit in `mask` is set, packed
@@ -234,6 +251,7 @@ pub trait Writer {
         _runtime_ptr: PointerValue<'ctx>,
         _values: VectorValue<'ctx>,
         _mask: VectorValue<'ctx>,
+        _head_slot: Option<PointerValue<'ctx>>,
     ) -> Result<(), ArrowKernelError> {
         Err(ArrowKernelError::InternalError(
             "this writer does not support masked block writes".into(),
@@ -241,13 +259,17 @@ pub trait Writer {
     }
 
     /// Writes a flat block containing `logical_len` values. Composite writers
-    /// interpret the vector lanes using their static child shape.
+    /// interpret the vector lanes using their static child shape. `head_slot`,
+    /// when present, is a stack slot holding the current write head that a
+    /// writer exposing `write_head_offset` must use instead of its runtime
+    /// struct field.
     fn llvm_write_block<'ctx, 'borrow>(
         &'borrow self,
         codegen: WriterCodegen<'ctx, 'borrow>,
         runtime_ptr: PointerValue<'ctx>,
         values: VectorValue<'ctx>,
         logical_len: u32,
+        _head_slot: Option<PointerValue<'ctx>>,
     ) -> Result<(), ArrowKernelError> {
         if values.get_type().get_size() != logical_len {
             return Err(ArrowKernelError::InternalError(format!(
@@ -747,6 +769,7 @@ impl<'ctx> BoundWriter<'ctx> {
         builder: &'call Builder<'ctx>,
         values: VectorValue<'ctx>,
         logical_len: u32,
+        head_slot: Option<PointerValue<'ctx>>,
     ) {
         self.writer
             .llvm_write_block(
@@ -758,12 +781,24 @@ impl<'ctx> BoundWriter<'ctx> {
                 self.runtime_ptr,
                 values,
                 logical_len,
+                head_slot,
             )
             .unwrap();
     }
 
     pub fn supports_masked_block(&self) -> bool {
         self.writer.supports_masked_block()
+    }
+
+    /// Pointer to the write-head cell inside the runtime struct, for writers
+    /// that expose one.
+    pub fn llvm_write_head_cell<'call>(
+        &'call self,
+        ctx: &'ctx Context,
+        builder: &'call Builder<'ctx>,
+    ) -> Option<PointerValue<'ctx>> {
+        let offset = self.writer.write_head_offset()?;
+        Some(increment_pointer!(ctx, builder, self.runtime_ptr, offset))
     }
 
     pub fn llvm_ingest_block_masked<'call>(
@@ -773,6 +808,7 @@ impl<'ctx> BoundWriter<'ctx> {
         builder: &'call Builder<'ctx>,
         values: VectorValue<'ctx>,
         mask: VectorValue<'ctx>,
+        head_slot: Option<PointerValue<'ctx>>,
     ) -> Result<(), ArrowKernelError> {
         self.writer.llvm_write_block_masked(
             WriterCodegen {
@@ -783,6 +819,7 @@ impl<'ctx> BoundWriter<'ctx> {
             self.runtime_ptr,
             values,
             mask,
+            head_slot,
         )
     }
 }

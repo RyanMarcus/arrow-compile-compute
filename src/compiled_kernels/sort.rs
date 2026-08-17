@@ -6,7 +6,7 @@ use arrow_array::{
         Float16Type, Float32Type, Float64Type, Int16Type, Int32Type, Int64Type, Int8Type,
         UInt16Type, UInt32Type, UInt64Type, UInt8Type,
     },
-    Array, ArrayRef, ArrowNativeTypeOp, ArrowPrimitiveType, BinaryArray, Datum, UInt32Array,
+    Array, ArrayRef, ArrowPrimitiveType, BinaryArray, Datum, UInt32Array,
 };
 use itertools::Itertools;
 
@@ -145,11 +145,79 @@ fn sort_indices_from_normalized(keys: &BinaryArray) -> UInt32Array {
     UInt32Array::from(indices)
 }
 
+/// Order-preserving packed sort keys: the value's bits are transformed so
+/// plain unsigned order matches `ArrowNativeTypeOp::compare` (IEEE total
+/// order for floats — the same transform `total_cmp` uses), then packed with
+/// the row index in the low 32 bits. The packed keys sort with no comparator
+/// at all, and ties resolve on the ascending index, so the output stays
+/// deterministic. Descending order inverts the key bits before packing,
+/// which reverses the value order while leaving the tie-break ascending.
+trait PackedSortKey {
+    type Packed: Ord + Copy;
+    fn pack(self, index: u32, descending: bool) -> Self::Packed;
+    fn unpack_index(packed: Self::Packed) -> u32;
+}
+
+macro_rules! packed_sort_key {
+    ($t:ty, $u:ty, $packed:ty, |$v:ident| $key:expr) => {
+        impl PackedSortKey for $t {
+            type Packed = $packed;
+            #[inline]
+            fn pack(self, index: u32, descending: bool) -> $packed {
+                let $v = self;
+                let key: $u = $key;
+                let key = if descending { !key } else { key };
+                ((key as $packed) << 32) | index as $packed
+            }
+            #[inline]
+            fn unpack_index(packed: $packed) -> u32 {
+                packed as u32
+            }
+        }
+    };
+}
+
+packed_sort_key!(u8, u8, u64, |v| v);
+packed_sort_key!(u16, u16, u64, |v| v);
+packed_sort_key!(u32, u32, u64, |v| v);
+packed_sort_key!(u64, u64, u128, |v| v);
+packed_sort_key!(i8, u8, u64, |v| (v as u8) ^ 0x80);
+packed_sort_key!(i16, u16, u64, |v| (v as u16) ^ 0x8000);
+packed_sort_key!(i32, u32, u64, |v| (v as u32) ^ 0x8000_0000);
+packed_sort_key!(i64, u64, u128, |v| (v as u64) ^ (1 << 63));
+packed_sort_key!(half::f16, u16, u64, |v| {
+    let bits = v.to_bits();
+    if bits & 0x8000 != 0 {
+        !bits
+    } else {
+        bits | 0x8000
+    }
+});
+packed_sort_key!(f32, u32, u64, |v| {
+    let bits = v.to_bits();
+    if bits & 0x8000_0000 != 0 {
+        !bits
+    } else {
+        bits | 0x8000_0000
+    }
+});
+packed_sort_key!(f64, u64, u128, |v| {
+    let bits = v.to_bits();
+    if bits >> 63 != 0 {
+        !bits
+    } else {
+        bits | (1 << 63)
+    }
+});
+
 /// Single column fast-path sort
 fn sort_primitive<T: ArrowPrimitiveType>(
     data: &dyn Datum,
     opts: &SortOptions,
-) -> Result<UInt32Array, ArrowKernelError> {
+) -> Result<UInt32Array, ArrowKernelError>
+where
+    T::Native: PackedSortKey,
+{
     let (values, is_scalar) = data.get();
     if is_scalar {
         return Ok(UInt32Array::from(vec![0]));
@@ -160,44 +228,46 @@ fn sort_primitive<T: ArrowPrimitiveType>(
     let mut nulls = Vec::new();
 
     if let Some(validity) = values.nulls() {
-        for index in 0..values.len() as u32 {
-            let index_usize = index as usize;
-            if validity.is_valid(index_usize) {
-                // safety: `index_usize` is in bounds by construction and marked valid above
-                let value = unsafe { values.value_unchecked(index_usize) };
-                valids.push((index, value));
-            } else {
-                nulls.push(index);
+        // partition via word-wise set-bit iteration rather than testing
+        // validity one row at a time; null gaps are recovered from the
+        // jumps between consecutive valid indices
+        let mut expected = 0u32;
+        for index_usize in validity.valid_indices() {
+            let index = index_usize as u32;
+            for gap in expected..index {
+                nulls.push(gap);
             }
+            // safety: `index_usize` comes from the validity bitmap, so it is
+            // in bounds and marked valid
+            let value = unsafe { values.value_unchecked(index_usize) };
+            valids.push(value.pack(index, opts.descending));
+            expected = index + 1;
+        }
+        for gap in expected..values.len() as u32 {
+            nulls.push(gap);
         }
     } else {
-        for index in 0..values.len() as u32 {
-            let index_usize = index as usize;
-            // safety: `index_usize` is in bounds by construction
-            let value = unsafe { values.value_unchecked(index_usize) };
-            valids.push((index, value));
+        for (index, value) in values.values().iter().enumerate() {
+            valids.push(value.pack(index as u32, opts.descending));
         }
     }
 
-    // `descending` is hoisted out of the comparator: re-testing it on every
-    // comparison measurably slows the sort. The index tie-break stays — it
-    // makes the output deterministic, which arrow does not guarantee.
-    if opts.descending {
-        valids.sort_unstable_by(|(lhs_idx, lhs_val), (rhs_idx, rhs_val)| {
-            T::Native::compare(*rhs_val, *lhs_val).then_with(|| lhs_idx.cmp(rhs_idx))
-        });
-    } else {
-        valids.sort_unstable_by(|(lhs_idx, lhs_val), (rhs_idx, rhs_val)| {
-            T::Native::compare(*lhs_val, *rhs_val).then_with(|| lhs_idx.cmp(rhs_idx))
-        });
-    }
+    valids.sort_unstable();
 
     let mut indices = Vec::with_capacity(values.len());
     if opts.nulls_first {
         indices.extend(nulls);
-        indices.extend(valids.into_iter().map(|(index, _)| index));
+        indices.extend(
+            valids
+                .into_iter()
+                .map(<T::Native as PackedSortKey>::unpack_index),
+        );
     } else {
-        indices.extend(valids.into_iter().map(|(index, _)| index));
+        indices.extend(
+            valids
+                .into_iter()
+                .map(<T::Native as PackedSortKey>::unpack_index),
+        );
         indices.extend(nulls);
     }
 

@@ -166,12 +166,17 @@ impl Writer for PrimitiveWriter {
         f(&mut emitter)
     }
 
+    fn write_head_offset(&self) -> Option<usize> {
+        Some(PrimitiveWriterRuntime::OFFSET_ALLOC_PTR)
+    }
+
     fn llvm_write_block<'ctx, 'borrow>(
         &'borrow self,
         codegen: WriterCodegen<'ctx, 'borrow>,
         runtime_ptr: PointerValue<'ctx>,
         values: VectorValue<'ctx>,
         logical_len: u32,
+        head_slot: Option<PointerValue<'ctx>>,
     ) -> Result<(), ArrowKernelError> {
         if values.get_type().get_size() != logical_len {
             return Err(ArrowKernelError::InternalError(format!(
@@ -179,12 +184,14 @@ impl Writer for PrimitiveWriter {
                 values.get_type().get_size()
             )));
         }
-        let curr_alloc_ptr_ptr = increment_pointer!(
-            codegen.ctx,
-            codegen.builder,
-            runtime_ptr,
-            PrimitiveWriterRuntime::OFFSET_ALLOC_PTR
-        );
+        let curr_alloc_ptr_ptr = head_slot.unwrap_or_else(|| {
+            increment_pointer!(
+                codegen.ctx,
+                codegen.builder,
+                runtime_ptr,
+                PrimitiveWriterRuntime::OFFSET_ALLOC_PTR
+            )
+        });
         let curr_alloc_ptr = codegen
             .builder
             .build_load(
@@ -219,11 +226,13 @@ impl Writer for PrimitiveWriter {
         runtime_ptr: PointerValue<'ctx>,
         values: VectorValue<'ctx>,
         mask: VectorValue<'ctx>,
+        head_slot: Option<PointerValue<'ctx>>,
     ) -> Result<(), ArrowKernelError> {
         let ctx = codegen.ctx;
         let b = codegen.builder;
-        let curr_alloc_ptr_ptr =
-            increment_pointer!(ctx, b, runtime_ptr, PrimitiveWriterRuntime::OFFSET_ALLOC_PTR);
+        let curr_alloc_ptr_ptr = head_slot.unwrap_or_else(|| {
+            increment_pointer!(ctx, b, runtime_ptr, PrimitiveWriterRuntime::OFFSET_ALLOC_PTR)
+        });
         let curr_alloc_ptr = b
             .build_load(
                 ctx.ptr_type(AddressSpace::default()),
@@ -384,7 +393,7 @@ mod tests {
         }
         let values = [8_i32, 9, 10].map(|value| ctx.i32_type().const_int(value as u64, true));
         let values = VectorType::const_vector(&values);
-        writer.llvm_write_block(codegen, dest, values, 3).unwrap();
+        writer.llvm_write_block(codegen, dest, values, 3, None).unwrap();
         build.build_return(None).unwrap();
         llvm_mod.verify().unwrap();
 

@@ -137,9 +137,13 @@ fn filter_bytes<F: Fn(&[u8]) -> bool>(
             builder.append(false);
         }
     } else {
-        for bytes in crate::arrow_interface::iter::iter_nonnull_bytes(arr)? {
-            builder.append(f(bytes));
-        }
+        // collect_bool packs 64 results into a register word per store,
+        // instead of a read-modify-write on the buffer for every row
+        let mut iter = crate::arrow_interface::iter::iter_nonnull_bytes(arr)?;
+        let values = arrow_buffer::BooleanBuffer::collect_bool(arr.len(), |_| {
+            f(iter.next().expect("iterator shorter than array"))
+        });
+        return Ok(BooleanArray::new(values, nulls));
     }
     Ok(BooleanArray::new(builder.finish(), nulls))
 }

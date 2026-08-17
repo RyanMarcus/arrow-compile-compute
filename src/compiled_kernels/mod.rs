@@ -37,8 +37,6 @@ pub use ht::{HashFunction, HashKernel};
 use inkwell::execution_engine::ExecutionEngine;
 pub use interleave::InterleaveKernel;
 pub use list_len::ListLenKernel;
-pub(crate) use llvm_utils::llvm_add_str_writer_append_bytes;
-use llvm_utils::str_writer_append_bytes;
 pub use null_utils::intersect_and_copy_nulls;
 pub use partition::PartitionKernel;
 pub use reduction::{ReductionKernel, ReductionKernelType};
@@ -218,8 +216,11 @@ pub(crate) fn link_req_helpers(
     module: &Module,
     ee: &ExecutionEngine,
 ) -> Result<(), ArrowKernelError> {
-    if let Some(func) = module.get_function("str_writer_append_bytes") {
-        ee.add_global_mapping(&func, str_writer_append_bytes as *const () as usize);
+    if let Some(func) = module.get_function("str_writer_reserve") {
+        ee.add_global_mapping(
+            &func,
+            crate::compiled_writers::str_writer_reserve as *const () as usize,
+        );
     }
 
     if let Some(func) = module.get_function("str_view_writer_append_bytes") {

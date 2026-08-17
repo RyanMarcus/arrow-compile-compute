@@ -20,7 +20,10 @@ use inkwell::{
     },
     module::{Linkage, Module},
     types::{BasicType, BasicTypeEnum, VectorType},
-    values::{BasicValue, BasicValueEnum, FunctionValue, InstructionOpcode, IntValue, VectorValue},
+    values::{
+        BasicValue, BasicValueEnum, FunctionValue, InstructionOpcode, IntValue, PointerValue,
+        VectorValue,
+    },
     AddressSpace, FloatPredicate, IntPredicate, OptimizationLevel,
 };
 use itertools::Itertools;
@@ -153,6 +156,9 @@ pub struct DSLCompilationContext<'ctx, 'a> {
     pub output_specs: Vec<WriterSpec>,
     /// Holds each initialized output writer in return-value order.
     pub outputs: Vec<BoundWriter<'ctx>>,
+    /// Stack slots caching each output's write head inside a block loop,
+    /// keyed by output index. See `Writer::write_head_offset`.
+    pub head_slots: HashMap<usize, PointerValue<'ctx>>,
     /// Records whether compilation emitted a vectorized loop.
     pub did_vectorize: &'a mut bool,
 }
@@ -426,6 +432,7 @@ pub fn compile_inner<'ctx, 'args>(
         output_specs,
         lengths,
         outputs: writers,
+        head_slots: HashMap::new(),
         did_vectorize,
     };
 
@@ -672,6 +679,7 @@ fn compile_stmt<'ctx, 'a>(
                 ctx.b,
                 value.into_vector_value(),
                 logical_len as u32,
+                ctx.head_slots.get(&(index as usize)).copied(),
             );
         }
         DSLStmt::EmitBlockMasked { index, value, mask } => {
@@ -691,6 +699,7 @@ fn compile_stmt<'ctx, 'a>(
                 ctx.b,
                 value.into_vector_value(),
                 mask.into_vector_value(),
+                ctx.head_slots.get(&(index as usize)).copied(),
             )?;
         }
         DSLStmt::Set {
@@ -880,6 +889,21 @@ fn compile_stmt<'ctx, 'a>(
                 .map(|(i, llvm_type)| build_entry_alloca(ctx, llvm_type, &format!("iter_buf{}", i)))
                 .collect_vec();
 
+            // cache each eligible output's write head in a stack slot for the
+            // duration of the loop; LLVM promotes the slot to a register,
+            // which it cannot do for the runtime struct field (the data
+            // stores may alias it)
+            for (out_idx, output) in ctx.outputs.iter().enumerate() {
+                if let Some(cell) = output.llvm_write_head_cell(ctx.ctx, ctx.b) {
+                    let ptr_type = ctx.ctx.ptr_type(AddressSpace::default());
+                    let slot =
+                        build_entry_alloca(ctx, ptr_type.into(), &format!("head_slot{}", out_idx));
+                    let head = ctx.b.build_load(ptr_type, cell, "head_in").unwrap();
+                    ctx.b.build_store(slot, head).unwrap();
+                    ctx.head_slots.insert(out_idx, slot);
+                }
+            }
+
             let loop_header = ctx.ctx.append_basic_block(*ctx.func, "bloop_header");
             let loop_body = ctx.ctx.append_basic_block(*ctx.func, "bloop_body");
             let loop_end = ctx.ctx.append_basic_block(*ctx.func, "bloop_end");
@@ -940,6 +964,17 @@ fn compile_stmt<'ctx, 'a>(
                 ctx.b.build_unconditional_branch(loop_header).unwrap();
             }
             ctx.b.position_at_end(loop_end);
+
+            // write the cached heads back so the scalar tail loop (and
+            // everything after) sees the advanced pointers
+            for (out_idx, slot) in std::mem::take(&mut ctx.head_slots).into_iter() {
+                let cell = ctx.outputs[out_idx]
+                    .llvm_write_head_cell(ctx.ctx, ctx.b)
+                    .unwrap();
+                let ptr_type = ctx.ctx.ptr_type(AddressSpace::default());
+                let head = ctx.b.build_load(ptr_type, slot, "head_out").unwrap();
+                ctx.b.build_store(cell, head).unwrap();
+            }
         }
         DSLStmt::Reduce(dslred) => {
             let body_type = dslred.body.get_type();

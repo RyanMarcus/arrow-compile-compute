@@ -385,6 +385,9 @@ impl std::fmt::Display for PrimitiveType {
 }
 
 impl PrimitiveType {
+    // called per element from ArrowIter::next — without the hint this sits
+    // in another codegen unit and costs a real function call per row
+    #[inline]
     fn width(&self) -> usize {
         match self {
             PrimitiveType::I8 | PrimitiveType::U8 => 1,
@@ -721,23 +724,34 @@ fn ree_logical_nulls<K: RunEndIndexType>(
 ) -> Result<Option<NullBuffer>, ArrowKernelError> {
     let arr = arr.as_run::<K>();
     if let Some(re_nulls) = arr.values().logical_nulls() {
-        // expand the per-run validity in bulk: one append_n per run, rather
-        // than materializing an REE boolean array and casting it
+        // expand the per-run validity in bulk, batching consecutive valid
+        // runs into a single append so the call count scales with the number
+        // of null runs rather than the number of runs
         let run_ends = arr.run_ends();
         let offset = run_ends.offset();
         let end_limit = offset + arr.len();
         let mut builder = BooleanBufferBuilder::new(arr.len());
+        let mut valid_start = offset;
         let mut prev = offset;
         for (run_idx, end) in run_ends.values().iter().enumerate() {
             let end = end.as_usize().min(end_limit);
             if end <= prev {
                 continue;
             }
-            builder.append_n(end - prev, re_nulls.is_valid(run_idx));
+            if re_nulls.is_null(run_idx) {
+                if valid_start < prev {
+                    builder.append_n(prev - valid_start, true);
+                }
+                builder.append_n(end - prev, false);
+                valid_start = end;
+            }
             prev = end;
             if prev >= end_limit {
                 break;
             }
+        }
+        if valid_start < end_limit {
+            builder.append_n(end_limit - valid_start, true);
         }
         Ok(Some(NullBuffer::new(builder.finish())))
     } else {
