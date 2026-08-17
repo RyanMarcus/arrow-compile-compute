@@ -204,6 +204,12 @@ pub fn compile_inner<'ctx, 'args>(
     did_vectorize: &mut bool,
 ) -> Result<JitFunction<'ctx, unsafe extern "C" fn(*mut c_void) -> u64>, ArrowKernelError> {
     let module = ctx.create_module("dsl2");
+    if f.nontemporal_outputs {
+        // writers consult this module-level flag when emitting block stores
+        module
+            .add_global_metadata("acc.nontemporal", &ctx.metadata_node(&[]))
+            .unwrap();
+    }
     let args: Vec<_> = args.into_iter().collect();
 
     // validate parameters
@@ -440,6 +446,13 @@ pub fn compile_inner<'ctx, 'args>(
         compile_stmt(&mut dsl_ctx, stmt)?;
     }
 
+    if f.nontemporal_outputs && cfg!(target_arch = "x86_64") {
+        // non-temporal stores are weakly ordered on x86; fence before the
+        // results become visible to the caller
+        let sfence = Intrinsic::find("llvm.x86.sse.sfence").unwrap();
+        let sfence = sfence.get_declaration(&module, &[]).unwrap();
+        b.build_call(sfence, &[], "sfence").unwrap();
+    }
     b.build_return(Some(&ctx.i64_type().const_zero())).unwrap();
 
     // add the wrapper function so we can extract a function with a consistent sig

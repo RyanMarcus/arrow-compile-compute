@@ -136,6 +136,21 @@ impl Writer for PrimitiveWriter {
             alloc.set_len(units)
         };
 
+        // large outputs land on fresh mmaps whose 2 MB alignment is luck;
+        // asking for huge pages explicitly removes a bimodal ~12% TLB
+        // penalty on write-heavy kernels. Best effort: advise the
+        // page-aligned interior and ignore failures.
+        #[cfg(target_os = "linux")]
+        if units * 16 >= (2 << 20) {
+            unsafe {
+                let start = (alloc.as_ptr() as usize).next_multiple_of(4096);
+                let end = (alloc.as_ptr() as usize + units * 16) & !4095;
+                if end > start {
+                    libc::madvise(start as *mut _, end - start, libc::MADV_HUGEPAGE);
+                }
+            }
+        }
+
         let mut pwr = PrimitiveWriterRuntime {
             alloc,
             alloc_ptr: std::ptr::null_mut(),
@@ -202,7 +217,21 @@ impl Writer for PrimitiveWriter {
             .unwrap()
             .into_pointer_value();
         let store = codegen.builder.build_store(curr_alloc_ptr, values).unwrap();
-        store.set_alignment(1).unwrap();
+        if codegen.module.get_global_metadata("acc.nontemporal").is_empty() {
+            store.set_alignment(1).unwrap();
+        } else {
+            // skip read-for-ownership on output lines the kernel fully
+            // overwrites; block starts stay 16-byte aligned (the allocation
+            // is, and blocks advance by multiples of 16 bytes)
+            store.set_alignment(16).unwrap();
+            let one = codegen.ctx.i32_type().const_int(1, false);
+            store
+                .set_metadata(
+                    codegen.ctx.metadata_node(&[one.into()]),
+                    codegen.ctx.get_kind_id("nontemporal"),
+                )
+                .unwrap();
+        }
         let new_alloc_ptr = increment_pointer!(
             codegen.ctx,
             codegen.builder,

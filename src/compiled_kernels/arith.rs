@@ -12,12 +12,23 @@ use crate::{
     ArrowKernelError, Kernel, PrimitiveType,
 };
 
+/// Outputs at least this large will be evicted from cache before any reuse,
+/// so their kernels are compiled with non-temporal block stores. Part of the
+/// cache key: each shape lazily compiles a small and a large variant.
+const NT_OUTPUT_BYTES: usize = 32 << 20;
+
+fn is_large_output(datum: &dyn Datum) -> bool {
+    let (arr, _) = datum.get();
+    let width = PrimitiveType::for_arrow_type(&crate::normalized_base_type(arr.data_type())).width();
+    arr.len().saturating_mul(width) >= NT_OUTPUT_BYTES
+}
+
 pub struct BinOpKernel(RunnableDSLFunction);
 unsafe impl Sync for BinOpKernel {}
 unsafe impl Send for BinOpKernel {}
 
 impl Kernel for BinOpKernel {
-    type Key = (DataType, bool, DataType, bool, DSLArithBinOp);
+    type Key = (DataType, bool, DataType, bool, bool, DSLArithBinOp);
 
     type Input<'a>
         = (&'a dyn Datum, &'a dyn Datum)
@@ -49,6 +60,9 @@ impl Kernel for BinOpKernel {
         let arg1 = func.add_arg(&mut ctx, DSLType::array_like(*arr1, "n"));
         let arg2 = func.add_arg(&mut ctx, DSLType::array_like(*arr2, "n"));
         func.add_ret(WriterSpec::Primitive(res), "n");
+        if is_large_output(if arr1.get().1 { *arr2 } else { *arr1 }) {
+            func.set_nontemporal_outputs();
+        }
 
         func.add_body(
             DSLStmt::for_each(&mut ctx, &[arg1, arg2], |loop_vars| {
@@ -74,6 +88,7 @@ impl Kernel for BinOpKernel {
             is_scalar1,
             arr2.data_type().clone(),
             is_scalar2,
+            is_large_output(if is_scalar1 { i.1 } else { i.0 }),
             *p,
         ))
     }
@@ -84,7 +99,7 @@ unsafe impl Sync for UnaryOpKernel {}
 unsafe impl Send for UnaryOpKernel {}
 
 impl Kernel for UnaryOpKernel {
-    type Key = (DataType, bool, DSLUnaryOp);
+    type Key = (DataType, bool, bool, DSLUnaryOp);
 
     type Input<'a>
         = &'a dyn Datum
@@ -120,6 +135,9 @@ impl Kernel for UnaryOpKernel {
         let mut func = DSLFunction::new("arith_unaryop");
         let arg = func.add_arg(&mut ctx, DSLType::array_like(*arr, "n"));
         func.add_ret(WriterSpec::Primitive(out_pt), "n");
+        if is_large_output(*arr) {
+            func.set_nontemporal_outputs();
+        }
 
         func.add_body(
             DSLStmt::for_each(&mut ctx, &[arg], |loop_vars| {
@@ -143,7 +161,7 @@ impl Kernel for UnaryOpKernel {
         p: &Self::Params,
     ) -> Result<Self::Key, ArrowKernelError> {
         let (arr, is_scalar) = i.get();
-        Ok((arr.data_type().clone(), is_scalar, *p))
+        Ok((arr.data_type().clone(), is_scalar, is_large_output(*i), *p))
     }
 }
 

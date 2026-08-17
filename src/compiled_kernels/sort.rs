@@ -154,9 +154,9 @@ fn sort_indices_from_normalized(keys: &BinaryArray) -> UInt32Array {
 /// which reverses the value order while leaving the tie-break ascending.
 trait PackedSortKey {
     type Packed: Ord + Copy;
-    /// Number of 8-bit digit passes an LSD radix sort needs to cover the
-    /// value bits (the index bits below them start in order and stay in
-    /// order because the radix passes are stable).
+    /// Number of digit passes an LSD radix sort needs to cover the value
+    /// bits (the index bits below them start in order and stay in order
+    /// because the radix passes are stable).
     const KEY_PASSES: usize;
     fn pack(self, index: u32, descending: bool) -> Self::Packed;
     fn unpack_index(packed: Self::Packed) -> u32;
@@ -167,7 +167,7 @@ macro_rules! packed_sort_key {
     ($t:ty, $u:ty, $packed:ty, |$v:ident| $key:expr) => {
         impl PackedSortKey for $t {
             type Packed = $packed;
-            const KEY_PASSES: usize = std::mem::size_of::<$u>();
+            const KEY_PASSES: usize = (<$u>::BITS as usize).div_ceil(RADIX_DIGIT_BITS);
             #[inline]
             fn pack(self, index: u32, descending: bool) -> $packed {
                 let $v = self;
@@ -181,7 +181,7 @@ macro_rules! packed_sort_key {
             }
             #[inline]
             fn digit(packed: $packed, pass: usize) -> usize {
-                (packed >> (32 + 8 * pass)) as usize & 0xff
+                (packed >> (32 + RADIX_DIGIT_BITS * pass)) as usize & (RADIX_BINS - 1)
             }
         }
     };
@@ -190,6 +190,11 @@ macro_rules! packed_sort_key {
 /// Above this length an LSD radix sort over the packed keys beats the
 /// comparison sort.
 const RADIX_SORT_THRESHOLD: usize = 50_000;
+
+/// 11-bit digits: 6 passes cover a 64-bit key (vs 8 with bytes), trading a
+/// 16 KB histogram for 25% less scatter traffic.
+const RADIX_DIGIT_BITS: usize = 11;
+const RADIX_BINS: usize = 1 << RADIX_DIGIT_BITS;
 
 /// Stable LSD radix sort over the value digits of packed sort keys. The index
 /// bits below the value are already in ascending order in the input, and
@@ -206,16 +211,16 @@ fn radix_sort_packed<K: PackedSortKey>(keys: &mut Vec<K::Packed>) {
     };
 
     for pass in 0..K::KEY_PASSES {
-        let mut counts = [0usize; 256];
+        let mut counts = [0usize; RADIX_BINS];
         for key in src.iter() {
             counts[K::digit(*key, pass)] += 1;
         }
         if counts.iter().any(|count| *count == n) {
             continue;
         }
-        let mut cursors = [0usize; 256];
+        let mut cursors = [0usize; RADIX_BINS];
         let mut sum = 0;
-        for digit in 0..256 {
+        for digit in 0..RADIX_BINS {
             cursors[digit] = sum;
             sum += counts[digit];
         }
@@ -281,23 +286,34 @@ where
     let mut nulls = Vec::new();
 
     if let Some(validity) = values.nulls() {
-        // partition via word-wise set-bit iteration rather than testing
-        // validity one row at a time; null gaps are recovered from the
-        // jumps between consecutive valid indices
-        let mut expected = 0u32;
-        for index_usize in validity.valid_indices() {
-            let index = index_usize as u32;
-            for gap in expected..index {
-                nulls.push(gap);
+        // one word-wise pass over the validity buffer builds both lists:
+        // set bits pack valids, cleared bits push nulls
+        nulls.reserve(validity.null_count());
+        let chunks = validity.inner().bit_chunks();
+        let mut base = 0usize;
+        for chunk in chunks.iter().chain(std::iter::once(chunks.remainder_bits())) {
+            let bits_in_chunk = 64.min(values.len() - base);
+            if bits_in_chunk == 0 {
+                break;
             }
-            // safety: `index_usize` comes from the validity bitmap, so it is
-            // in bounds and marked valid
-            let value = unsafe { values.value_unchecked(index_usize) };
-            valids.push(value.pack(index, opts.descending));
-            expected = index + 1;
-        }
-        for gap in expected..values.len() as u32 {
-            nulls.push(gap);
+            let mut set = chunk;
+            while set != 0 {
+                let index = base + set.trailing_zeros() as usize;
+                // safety: set bits come from the validity bitmap, so the
+                // index is in bounds and marked valid
+                let value = unsafe { values.value_unchecked(index) };
+                valids.push(value.pack(index as u32, opts.descending));
+                set &= set - 1;
+            }
+            let mut clear = !chunk & (u64::MAX >> (64 - bits_in_chunk as u32));
+            while clear != 0 {
+                nulls.push((base + clear.trailing_zeros() as usize) as u32);
+                clear &= clear - 1;
+            }
+            base += 64;
+            if base >= values.len() {
+                break;
+            }
         }
     } else {
         for (index, value) in values.values().iter().enumerate() {
