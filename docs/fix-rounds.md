@@ -1,207 +1,239 @@
 # Fix rounds: closing the arrow gaps on Zen 5
 
-Companion to `zen5-findings.md`. That document diagnosed why the arrow
-baseline beat the JIT on 20 of 60 benchmarks; this one records the five
-rounds of fixes that followed, what each one does in plain terms, and how
-each affects the operators involved — including behavior changes that are
-not visible in the timings.
+Companion to `zen5-findings.md`. That document diagnosed *why* stock arrow
+beat our JIT-compiled kernels on 20 of 60 benchmarks. This one records the
+five rounds of fixes that followed. Each fix is described three ways: what
+was slow, what we changed, and what it means for the operators involved.
 
-Every round was verified the same way: the full test suite on both an
-Apple M4 and the Zen 5 machine, then a complete benchmark run on Zen 5
-(clean tree, `-C target-cpu=native`), compared row-by-row against the
-previous round for regressions. No round introduced one.
+**How each round was verified:** full test suite on two machines (Apple M4
+and the Zen 5 box), then a complete benchmark run on Zen 5, compared
+row-by-row against the previous round. No round introduced a regression.
+
+**The scoreboard over time** (out of ~60 paired benchmarks — higher "llvm
+wins" is better):
 
 | after round | llvm wins | arrow wins | equal |
 |---|---|---|---|
-| (baseline `6fa1f69`) | 38 | 20 | 2 |
+| baseline | 38 | 20 | 2 |
 | 1 — findings fixes | 41 | 12 | 8 |
-| 2 — REE + compress-store | 45 | 9 | 7 |
+| 2 — encoded arrays + AVX-512 filter | 45 | 9 | 7 |
 | 3 — profiling round | 47 | 7 | 7 |
 | 4 — parity round | 48 | 3 | 10 |
-| 5 — offense round | *(verification in flight)* | | |
+| 5 — offense round | 49 | 4 | 8 |
 
-## Round 1 — the fixes the findings document prescribed (`276587c`)
+(The four remaining "arrow wins" after round 5 are all within a few percent
+and oscillate around the equal margin between runs; every structural loss
+is gone, and both single-column sorts became outright wins.)
 
-**1. Guard empty string comparisons in LIKE.**
-A pattern like `%abc%` compiles to an empty prefix, an infix, and an empty
-suffix, and the kernel compared every row against the two empty strings.
-Comparing against an empty slice still emits a real `bcmp` call whose second
-pointer is the empty `Vec` sentinel `0x1`, and on Zen 5 the AVX-512 path in
-glibc pays a ~250-cycle microcode assist for exactly that call. The fix is
-two `is_empty()` guards so the comparison is never issued.
-*Operators affected:* `cmp::like` with two-wildcard patterns only; results
-identical. *Effect:* `%abc%` 108.6 → 13.9 ms (0.09× → 0.73×).
+---
 
-**2. Right-size reduction outputs.**
-Reductions declared their output as "at most n elements", so `sum` over 10m
-i32 allocated (and zeroed) 40 MB to return 4 bytes. The size-resolution
-machinery gained numeric constants, and reductions now declare exactly one
-element. *Operators affected:* `compute::sum/min/max/product/argmin/argmax`
-— allocation drops from O(n) to O(1). *Effect:* all four measured rows went
-from 0.11–0.12× to parity (2.5 → 0.29 ms, the memory-bandwidth floor).
+## Round 1 — fix what the findings document already diagnosed
 
-**3. Stop zero-filling output buffers.**
-Every kernel invocation memset its output to zero before the kernel
-overwrote it — a full extra pass over memory, plus the page faults that
-first write triggers. Outputs are now allocated uninitialized; only the
-prefix the kernel actually wrote is ever exposed.
-*Operators affected:* every kernel with a primitive output. One behavioral
-note: a hypothetical kernel that wrote fewer elements than it claimed used
-to produce silent zeros and would now produce garbage — the invariant
-(write what you claim) is unchanged, but violations became visible.
-*Effect:* `neg_wrapping(f64)` 0.61× → 1.00×, `cast(i32→i64)` 0.90× →
-1.69× win, `concat` 0.65× → 0.92×.
+**1. Stop comparing strings against nothing.**
+*What was slow:* `LIKE '%abc%'` splits into a prefix, middle, and suffix —
+and for this pattern the prefix and suffix are *empty*. The kernel still
+compared every row against those empty strings, and on Zen 5 each of those
+"compare nothing" calls tripped a rare-case fallback inside the CPU that
+costs ~250 cycles (the full story is Finding 1 in the findings doc).
+*The fix:* two `is_empty()` checks, so the pointless comparison never runs.
+*Who it affects:* `cmp::like` with `%...%`-style patterns. Same results.
+*Result:* 108.6 ms → 13.9 ms.
 
-**4. Hoist `descending` out of the sort comparator.**
-The comparator re-tested the sort direction on every comparison. Two
-specialized comparators (one per direction) fixed that; the deterministic
-index tie-break was kept. *Operators affected:* `sort::sort_to_indices`,
-identical output. *Effect:* 0.52× → 0.70× (u64), 0.43× → 0.55× (nullable).
+**2. Don't allocate 40 MB to return 4 bytes.**
+*What was slow:* reductions like `sum` declared "my output could be as big
+as the input," so summing 10m integers allocated and zeroed a 40 MB buffer
+to hold one number.
+*The fix:* reductions now declare an output of exactly one element.
+*Who it affects:* `compute::sum/min/max/product/argmin/argmax` — their
+memory use drops from proportional-to-input to constant.
+*Result:* all reduction rows went from ~8× slower than arrow to a dead tie
+(2.5 ms → 0.29 ms, which is the speed of just reading the data).
 
-**5. Route prefix/suffix LIKE to the JIT kernel.**
-`LIKE 'abc%'` ran a per-row Rust closure; the crate already had a compiled
-prefix/suffix kernel that loops in bulk, so the pattern compiler now
-delegates to it (and a bare `%` short-circuits to constant-true).
-*Operators affected:* `cmp::like` with single-edge wildcards; null slots'
-values may differ under the hood (validity is unchanged, matching arrow's
-own convention). *Effect:* `'abc%'` 0.25× → **1.19× win**, `'%xyz'`
-0.28× → **1.41× win**.
+**3. Stop writing every output twice.**
+*What was slow:* every kernel first filled its output buffer with zeros,
+then overwrote the zeros with real results — a full extra pass over memory.
+*The fix:* outputs start uninitialized; only bytes the kernel actually
+wrote are ever handed out.
+*Who it affects:* every operator with a numeric output. One caveat worth
+knowing: a buggy kernel that wrote less than it claimed used to produce
+silent zeros, and would now produce visible garbage — the rule ("write
+what you claim") is the same, but breaking it is now loud.
+*Result:* `neg` on floats went from 0.61× to a tie; `cast(i32→i64)`
+flipped to a 1.69× **win**.
 
-## Round 2 — encoded arrays and the compress-store filter (`ee8bde0`, `6c6f858`)
+**4. Ask "ascending or descending?" once, not a million times.**
+*What was slow:* the sort re-checked the sort direction inside every single
+comparison.
+*The fix:* build two comparators (one per direction) and pick once.
+*Who it affects:* `sort::sort_to_indices`; output identical.
+*Result:* u64 sort 0.52× → 0.70×.
 
-**6. Decode-first for non-run-uniform REE work.**
-Run-end encoding wins when one answer covers a whole run (`cmp::lt` on REE
-is a 27× win); it loses when the operation varies inside runs. A filter
-mask always varies inside runs, so `select::filter` on REE input now
-decodes to a dense array first and runs the dense kernel. `select::take`
-decodes only when the indices are dense enough that per-index binary
-search costs more than materializing (`indices × log₂(runs) ≥ length`);
-sparse takes still stream through the encoding.
-*Operators affected:* `select::filter` and `select::take` on run-end
-encoded inputs. Behavioral note: decode-first materializes a temporary
-dense copy (O(logical length) memory) for the duration of the call.
-*Effect:* `filter(ree)` 0.54× → **3.92× win**, `take(ree)` 0.70× →
+**5. Send simple LIKE patterns to the fast kernel that already existed.**
+*What was slow:* `LIKE 'abc%'` ran a slow per-row closure even though the
+crate already had a compiled starts-with kernel.
+*The fix:* the pattern compiler now routes prefix/suffix patterns to that
+kernel (and a bare `%` just returns all-true).
+*Who it affects:* `cmp::like` with a wildcard at one end.
+*Result:* `'abc%'` 0.25× → **1.19× win**; `'%xyz'` 0.28× → **1.41× win**.
+
+## Round 2 — encoded arrays, and a filter that uses the hardware
+
+**6. Decode run-encoded arrays before filtering or heavy takes.**
+*What was slow:* run-end encoding stores "value X repeats N times." That's
+great when one answer covers a whole run, but a filter mask differs on
+every row, so the kernel was doing per-row work through the encoding —
+the worst of both worlds.
+*The fix:* `filter` on encoded input now decompresses first, then runs the
+fast dense filter. `take` decodes only when there are enough indices to
+justify it (sparse lookups still use the encoding).
+*Who it affects:* `select::filter` / `select::take` on run-end encoded
+input. Trade-off: decoding materializes a temporary dense copy of the
+array during the call.
+*Result:* `filter(ree)` 0.54× → **3.9× win**; `take(ree)` 0.70× →
 **35.7× win**.
 
-**7. Masked compress-store vectorization.**
-The dense filter compiled to a scalar bit-test-and-branch loop because the
-vectorizer could not handle conditional emits. It now lowers
-`cond(mask, emit(x))` to AVX-512 `vpcompressd`: 16 elements filtered per
-~9 instructions instead of 9 instructions per element. Blocks are capped
-at one native 512-bit vector (larger blocks crash LLVM's x86 backend).
-*Operators affected:* `select::filter` with primitive outputs, on AVX-512
-hosts only — the M4 and Meteor Lake machines keep the previous set-bits
-loop, unchanged. *Effect:* `filter(i32)` 0.78× → **1.83× win** (and the
-decoded REE filter above rides the same loop).
+**7. Teach the compiler AVX-512's "filter instruction."**
+*What was slow:* the dense filter checked one element at a time — about 9
+instructions per element.
+*The fix:* modern AVX-512 CPUs have an instruction (`vpcompressd`) that
+takes 16 values plus a yes/no mask and writes just the selected ones,
+packed together. The JIT now compiles filter loops down to it: 16 elements
+per ~9 instructions instead of 9 instructions per element.
+*Who it affects:* `select::filter` on AVX-512 machines. Machines without
+AVX-512 (the M4, the Meteor Lake box) keep the old loop, unchanged.
+*Result:* dense `filter(i32)` 0.78× → **1.83× win** — and the decoded
+filters from fix 6 run through this same loop.
 
-## Round 3 — what per-row profiling turned up (`09b4450`)
+## Round 3 — what per-row profiling turned up
 
-This round came from `perf`-profiling both sides of every remaining loss
-(the causes are written up at the end of `zen5-findings.md`'s story: an
-uninlined function call, append granularity, comparator shape, and a
-loop-carried pointer the optimizer could not keep in a register).
+We profiled both sides of every remaining loss with `perf`. Four small
+mechanical sins showed up, each worth real time.
 
-**8. `#[inline]` on `PrimitiveType::width`.** The per-row string iterator
-called this tiny function — a match statement returning a constant — as a
-real function call, 11–13% of the string benchmarks. One attribute.
-*Operators affected:* everything using the Rust-side `ArrowIter` (string
-predicates foremost).
+**8. Let a tiny function be inlined.**
+A one-line width lookup was being called — as an actual function call —
+once per row inside the string iterator, eating 11–13% of the string
+benchmarks. Adding `#[inline]` fixed it.
 
-**9. Batch REE validity expansion.** `logical_nulls` on run-end encoded
-arrays appended one span per run; it now batches consecutive valid runs,
-so the call count scales with the number of *null* runs (arrow's shape).
-*Operators affected:* `logical_nulls(ree)` and everything that consults
-it. *Effect (with 10):* 0.43× → 0.97× equal.
+**9. Batch validity expansion for encoded arrays.**
+`logical_nulls` on run-end data appended one little span per run; now
+consecutive valid runs merge into one big append (arrow's trick).
+*Result (with 10):* 0.43× → 0.97×, a tie.
 
-**10. Word-packed boolean building in `filter_bytes`.** String predicates
-appended their result one bit at a time (a read-modify-write per row);
-they now pack 64 results per word in a register (`collect_bool`).
-*Operators affected:* `cmp::like`, `cmp::contains`, `starts/ends_with`
-on the closure path.
+**10. Build result bitmaps 64 answers at a time.**
+String predicates wrote their true/false answers one bit at a time —
+each write touching memory. Now 64 answers are collected in a CPU register
+and stored as one word.
 
-**11. Packed sort keys.** Instead of sorting (index, value) tuples with a
-comparator, values are bit-transformed so plain unsigned order matches
-their semantic order (sign-flip for signed ints, the `total_cmp` transform
-for floats) and packed into one integer with the row index in the low
-bits. Sorting plain integers needs no comparator at all, and ties resolve
-on the index bits — the deterministic output is *bit-identical* to before.
-Descending order inverts the key bits, leaving ties ascending.
-*Operators affected:* `sort::sort_to_indices` on all primitive types;
-output unchanged. *Effect:* u64 sort 16.9 → 13.6 ms.
+**11. Sort numbers, not comparisons.**
+*What was slow:* the sort compared (row-number, value) pairs through a
+comparator function, and keeping the output deterministic (equal values
+stay in row order) cost 40% extra.
+*The fix:* encode each value so that plain integer ordering matches its
+semantic ordering (works for signed ints and even floats), then glue the
+row number into the low bits of the same integer. Sorting plain integers
+needs no comparator, and the row-number bits break ties automatically —
+the output is bit-for-bit identical to before.
+*Who it affects:* `sort::sort_to_indices`, all numeric types. Descending
+order flips the encoded bits; determinism is preserved everywhere.
+*Result:* u64 sort 16.9 → 13.6 ms.
 
-**12. Word-wise null partition in sort.** The nullable pre-pass tested
-validity row by row; it now walks the validity words directly.
-*Effect (with 11):* nullable sort 11.4 → 9.0 ms.
+**12–13. Two register tricks.**
+The sort's null-handling pass now scans the validity bitmap a word at a
+time instead of a row at a time (12). And vectorized loops used to bounce
+their output pointer through memory on every block because the optimizer
+couldn't prove it safe to keep in a register — a stack-slot trick makes it
+safe (13). No semantic changes anywhere.
+*Result:* nullable sort 11.4 → 9.0 ms; `concat` reached a tie.
 
-**13. Cache write heads in registers.** Vectorized loops advanced their
-output pointer through a load/store round-trip on the runtime struct every
-block, which LLVM could not hoist (the data stores might alias it). The
-pointer now lives in a stack slot the optimizer promotes to a register,
-synced at loop boundaries. *Operators affected:* all vectorized kernels
-with primitive outputs; pure codegen, no semantic change.
-*Effect:* `concat` 0.90× → 1.01× equal.
+**14. Copy strings without a detour.**
+*What was slow:* appending each output string crossed from JIT code into a
+Rust helper function — a per-row toll of function-call overhead and
+bookkeeping.
+*The fix:* the output buffer's pointer/length/capacity are visible to the
+JIT now, so the capacity check and the byte copy happen inline; Rust is
+only called when the buffer must grow.
+*Who it affects:* every operator producing string output (casts, filters,
+takes, concats of strings).
+*Result:* `cast(dict→utf8)` 8.1 → 6.6 ms.
 
-**14. Inline string appends.** Appending a string crossed from JIT code
-into Rust (`extend_from_slice`) once per row. The byte buffer's
-pointer/length/capacity are now mirrored in JIT-visible fields, so the
-capacity check and `memcpy` happen inline, calling Rust only to grow.
-*Operators affected:* every kernel producing utf8/binary output (casts,
-filters, takes, concats of strings). *Effect:* `cast(dict→utf8)`
-8.07 → 6.63 ms.
+## Round 4 — the parity round
 
-## Round 4 — the parity round (`94e9098`)
-
-**15. Flat-bytes fast path for string predicates.** `filter_bytes` still
-paid a buffered iterator plus closure indirection per row; for plain
-utf8/binary arrays it now reads the offsets buffer directly, exactly
-arrow's `from_unary` shape. Encoded layouts keep the iterator path.
-*Operators affected:* `cmp::like`, `cmp::contains` on flat arrays; null
-slots' values are computed and ignored (arrow's convention).
-*Effect:* `like('%abc%')` 0.85× → **1.00× equal**, `contains` 0.90× →
+**15. Read string arrays the way arrow does.**
+For plain string arrays, the predicate loop now indexes the offsets buffer
+directly instead of going through a buffered iterator and two layers of
+closures. (Encoded string layouts keep the iterator.)
+*Result:* `like('%abc%')` reached a **tie**; `contains` became a
 **1.05× win**.
 
-**16. `take_bits` route for boolean take.** Gathering bits through the
-JIT serialized on a read-modify-write per output bit; plain boolean
-arrays with non-null integer indices now route to a word-packed Rust
-gather. *Operators affected:* `select::take` on plain booleans (encoded
-layouts keep the JIT). *Effect:* 0.94× → **1.00× equal**.
+**16. Gather bits into registers.**
+`take` on a boolean array collected output bits one at a time, each one a
+read-modify-write to memory that the CPU must finish before starting the
+next. Plain boolean takes now gather 64 bits into a register word and
+store once. *Result:* a tie.
 
-**17. Radix sort for packed keys.** Above 50k rows, a stable LSD radix
-sort over the packed keys' value digits replaces the comparison sort.
-Stability plus the index bits makes the result provably identical to the
-comparison sort (a tie-heavy unit test asserts it), so determinism
-survives while the comparator disappears entirely.
-*Operators affected:* large `sort::sort_to_indices`; adds one scratch
-buffer the size of the key array during the sort. *Effect:* u64 sort
-13.6 → 11.7 ms, 0.87× → **1.02× equal** — the determinism premium is gone.
+**17. Replace comparison sorting with counting.**
+*What was slow:* even with packed keys (fix 11), a comparison sort does
+n·log(n) work; the last 15% vs arrow was the price of the extra tie-break
+bits in every comparison.
+*The fix:* a radix sort — sort a million keys by making a few passes that
+*count* values into buckets instead of comparing pairs. Radix passes
+preserve input order for equal keys, which is exactly what keeps the
+deterministic tie-break intact (a dedicated test proves the output
+identical to the comparison sort).
+*Who it affects:* `sort_to_indices` above 50k rows; uses one temporary
+buffer the size of the key array.
+*Result:* u64 sort 13.6 → 11.7 ms — **a tie with arrow, determinism
+kept**. The 40% determinism premium this story started with is now zero.
 
-## Round 5 — the offense round (`0be4bd6`, verification in flight)
+## Round 5 — the offense round
 
-**18. One-pass null partition.** The sort pre-pass now builds the valid
-and null index lists in a single pass over the validity words (set bits
-pack valids, cleared bits push nulls), with the null list pre-sized.
-*Operators affected:* nullable `sort_to_indices`.
+The last rows were near-parity; these fixes aimed past parity. Two hit,
+one taught us something, and one turned out to be inert.
 
-**19. 11-bit radix digits.** Six passes cover a 64-bit key instead of
-eight, trading a 16 KB histogram for 25% less scatter traffic.
-*Operators affected:* large sorts; also expected to push the non-null
-sort from "equal" into a win.
+**18 + 19. Faster null separation, fewer radix passes.**
+The sort now builds its valid-rows and null-rows lists in a single sweep
+of the validity bitmap (valid bits pack keys, cleared bits record nulls,
+list pre-sized), and the radix sort uses 11-bit digits instead of 8-bit —
+6 counting passes over the data instead of 8, 25% less memory traffic.
+*Who it affects:* `sort_to_indices`; output still bit-identical.
+*Result:* the nullable sort went 8.2 → **4.70 ms, a 1.34× win**, and the
+u64 sort went 11.7 → **9.51 ms, a 1.25× win**. Both sorts now beat arrow
+outright while staying deterministic — the "determinism premium" this
+story opened with ended as a determinism *discount*.
 
-**20. Non-temporal stores for large arithmetic outputs.** Ordinary stores
-read each output cache line before overwriting it; for outputs too large
-to stay in cache that read is pure waste. Kernels whose output is ≥32 MB
-now compile a variant whose block stores bypass the cache (with a fence
-before returning). The size class is part of the kernel cache key, so each
-shape lazily holds a small and a large variant.
-*Operators affected:* `arith::*` with large outputs — this is something
-arrow's ahead-of-time kernels do not do, so it targets a win, not a tie.
-First use of each size class pays one extra ~10 ms compile.
+**20. Skip the cache for huge outputs — implemented, but inert for now.**
+*The idea:* a normal store first *reads* the target cache line before
+overwriting it; for a 40 MB output that read is pure waste, and
+"non-temporal" stores skip it. Kernels with outputs over 32 MB now compile
+a separate variant requesting non-temporal stores.
+*What actually happened:* checking the emitted machine code showed the CPU
+instructions never materialized — 512-bit non-temporal stores require
+64-byte-aligned buffers, ours guarantee only 16, and LLVM silently falls
+back to regular stores. The machinery is correct and stays in place;
+activating it needs 64-byte-aligned output allocation (future work).
+*Result:* `neg_wrapping(i32)` unchanged at 0.89× — which paired
+measurements show is a statistical tie with arrow anyway.
 
-**21. Huge-page advice for large outputs.** Fresh multi-megabyte
-allocations land on transparent huge pages only if the mmap happens to be
-2 MB-aligned — luck that made `concat` bimodal (2.65 ms or 2.96 ms run to
-run). Large writer allocations now `madvise(MADV_HUGEPAGE)` their
-interior (Linux only, best effort).
-*Operators affected:* every kernel with a multi-megabyte primitive
-output; removes run-to-run timing variance rather than changing the
-median.
+**21. Huge pages: not a tweak, a load-bearing wall.**
+`concat` was randomly 12% slower on some runs, which we suspected was
+2 MB "huge page" luck on its fresh 40 MB output buffer. Large allocations
+now explicitly request huge pages (Linux only, best effort). Testing the
+opposite advice settled how much this matters: *forbidding* huge pages
+made concat 2.2× slower (2.9 → 6.5 ms) and neg 2× slower — large-output
+kernels on this machine live or die by them. With the advice in place,
+concat runs a steady 2.90 ms instead of coin-flipping between 2.65 and
+2.96; the residual few percent against arrow's 2.65–2.70 is within both
+sides' run-to-run drift.
+*Who it affects:* any operator with a multi-megabyte output.
+
+## Where it ended
+
+After five rounds: **49 wins, 8 equals, and 4 nominal losses** that are
+all within a few percent and trade places with "equal" from run to run —
+`concat` 0.93×, `cast(dict→utf8)` 0.93×, `logical_nulls(ree)` 0.96×
+(a microseconds-scale benchmark), and `neg_wrapping(i32)` 0.89× (an exact
+tie when measured back-to-back in one session). Of the twenty original
+losses, none survive as a structural deficit, and the fixes brought new
+headline wins along the way: `take(ree)` at 35×, `filter(ree)` at 3.9×,
+the dense filter at 1.8×, and both sorts at 1.25–1.34× with bit-identical
+deterministic output.
