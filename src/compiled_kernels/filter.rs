@@ -36,17 +36,30 @@ impl Kernel for FilterKernel {
     type Output = ArrayRef;
 
     fn call(&self, inp: Self::Input<'_>) -> Result<Self::Output, ArrowKernelError> {
-        if inp.0.len() != inp.1.len() {
+        let (data, mask) = inp;
+        if data.len() != mask.len() {
             return Err(ArrowKernelError::SizeMismatch);
         }
 
-        let mut res = self.0.run(&dsl_args!(inp.0, inp.1))?[0].clone();
-        let base_dt = normalized_base_type(inp.0.data_type());
+        // arrow semantics: a null mask entry selects nothing. The generated
+        // code reads the mask's value bits only, so fold the validity in
+        // before filtering.
+        let pruned;
+        let mask = match mask.nulls() {
+            Some(nulls) => {
+                pruned = BooleanArray::new(mask.values() & nulls.inner(), None);
+                &pruned
+            }
+            None => mask,
+        };
+
+        let mut res = self.0.run(&dsl_args!(data, mask))?[0].clone();
+        let base_dt = normalized_base_type(data.data_type());
         res = coalesce_type(res, &base_dt)?;
 
-        if has_any_nulls(inp.0) {
-            let indices = inp.1.values().set_indices().collect::<Vec<_>>();
-            res = copy_selected_nulls(inp.0, res, &indices)?;
+        if has_any_nulls(data) {
+            let indices = mask.values().set_indices().collect::<Vec<_>>();
+            res = copy_selected_nulls(data, res, &indices)?;
         }
 
         Ok(res)

@@ -129,3 +129,20 @@ fn interleave_invalid_indices_do_not_panic() {
         assert!(inner.is_err(), "interleave with bad element index returned Ok");
     }
 }
+
+#[test]
+fn nullable_filter_mask_matches_arrow() {
+    use arrow_buffer::{BooleanBuffer, NullBuffer};
+    let data = Int32Array::from(vec![10, 20, 30, 40, 50, 60]);
+    // value bits all true, but slots 1 and 4 are null — arrow excludes them
+    let values = BooleanBuffer::from(vec![true, true, true, true, true, true]);
+    let validity = NullBuffer::from(vec![true, false, true, true, false, true]);
+    let mask = BooleanArray::new(values, Some(validity));
+
+    let arrow = arrow_select::filter::filter(&data, &mask).unwrap();
+    let ours = select::filter(&data, &mask).unwrap();
+    assert_eq!(
+        ours.as_primitive::<Int32Type>(),
+        arrow.as_primitive::<Int32Type>()
+    );
+}
