@@ -1,4 +1,4 @@
-use arrow_array::{cast::AsArray, Array, BooleanArray, Datum};
+use arrow_array::{cast::AsArray, Array, BinaryArray, BooleanArray, Datum, Scalar};
 use arrow_buffer::BooleanBufferBuilder;
 use arrow_schema::DataType;
 use itertools::Itertools;
@@ -228,22 +228,31 @@ pub fn compile_string_like(
         (1, false) => {
             // single wildcard, no any chars
             if seq[0].is_wildcard() {
-                // suffix
+                // suffix — routed to the JIT suffix kernel: the closure path
+                // pays a per-row Rust callback, the kernel loops in bulk
                 let pattern = seq
                     .into_iter()
                     .skip(1)
                     .map(|i| i.into_literal())
                     .collect_vec();
-                Box::new(move |arr| filter_bytes(arr, |bytes| bytes.ends_with(&pattern)))
+                if pattern.is_empty() {
+                    // bare '%' matches every non-null row
+                    Box::new(move |arr| filter_bytes(arr, |_| true))
+                } else {
+                    let needle = Scalar::new(BinaryArray::from(vec![pattern.as_slice()]));
+                    Box::new(move |arr| crate::arrow_interface::cmp::ends_with(arr, &needle))
+                }
             } else if seq.last().unwrap().is_wildcard() {
-                // prefix
+                // prefix — routed to the JIT prefix kernel; the pattern is
+                // never empty here (a bare '%' hits the suffix arm above)
                 let seq_len = seq.len();
                 let pattern = seq
                     .into_iter()
                     .take(seq_len - 1)
                     .map(|i| i.into_literal())
                     .collect_vec();
-                Box::new(move |arr| filter_bytes(arr, |bytes| bytes.starts_with(&pattern)))
+                let needle = Scalar::new(BinaryArray::from(vec![pattern.as_slice()]));
+                Box::new(move |arr| crate::arrow_interface::cmp::starts_with(arr, &needle))
             } else {
                 // prefix and suffix
                 let wildcard_idx = seq.iter().position(|c| c.is_wildcard()).unwrap();
@@ -374,11 +383,14 @@ pub fn compile_string_like(
             let finder = Finder::new(&infix).into_owned();
             let min_len = prefix.len() + infix.len() + suffix.len();
 
+            // the emptiness guards matter: comparing against an empty slice
+            // still emits bcmp(p, 0x1, 0), and on Zen 5 a masked AVX-512 load
+            // from the dangling pointer costs ~250 cycles per call
             Box::new(move |arr| {
                 filter_bytes(arr, |b| {
                     b.len() >= min_len
-                        && b[..prefix.len()] == prefix
-                        && b[b.len() - suffix.len()..] == suffix
+                        && (prefix.is_empty() || b[..prefix.len()] == prefix)
+                        && (suffix.is_empty() || b[b.len() - suffix.len()..] == suffix)
                         && finder
                             .find(&b[prefix.len()..b.len() - suffix.len()])
                             .is_some()

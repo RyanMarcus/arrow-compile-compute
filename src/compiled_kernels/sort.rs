@@ -179,11 +179,18 @@ fn sort_primitive<T: ArrowPrimitiveType>(
         }
     }
 
-    valids.sort_unstable_by(|(lhs_idx, lhs_val), (rhs_idx, rhs_val)| {
-        let cmp = T::Native::compare(*lhs_val, *rhs_val);
-        let cmp = if opts.descending { cmp.reverse() } else { cmp };
-        cmp.then_with(|| lhs_idx.cmp(rhs_idx))
-    });
+    // `descending` is hoisted out of the comparator: re-testing it on every
+    // comparison measurably slows the sort. The index tie-break stays — it
+    // makes the output deterministic, which arrow does not guarantee.
+    if opts.descending {
+        valids.sort_unstable_by(|(lhs_idx, lhs_val), (rhs_idx, rhs_val)| {
+            T::Native::compare(*rhs_val, *lhs_val).then_with(|| lhs_idx.cmp(rhs_idx))
+        });
+    } else {
+        valids.sort_unstable_by(|(lhs_idx, lhs_val), (rhs_idx, rhs_val)| {
+            T::Native::compare(*lhs_val, *rhs_val).then_with(|| lhs_idx.cmp(rhs_idx))
+        });
+    }
 
     let mut indices = Vec::with_capacity(values.len());
     if opts.nulls_first {

@@ -124,14 +124,24 @@ impl PrimitiveWriter {
 
 impl Writer for PrimitiveWriter {
     fn allocate(&self, size: usize) -> AnyRuntime {
+        let units = (self.pt.width() * size).div_ceil(16);
+        let mut alloc = Vec::with_capacity(units);
+        // SAFETY: this storage is only ever exposed through to_array, which
+        // slices to the prefix the kernel wrote via alloc_ptr. Zero-filling
+        // here would memset (and page in) the whole output buffer just for
+        // the kernel to overwrite it.
+        #[allow(clippy::uninit_vec)]
+        unsafe {
+            alloc.set_len(units)
+        };
+
         let mut pwr = PrimitiveWriterRuntime {
-            alloc: Vec::new(),
+            alloc,
             alloc_ptr: std::ptr::null_mut(),
             max_len: size,
             pt: self.pt,
         };
 
-        pwr.alloc.resize((self.pt.width() * size).div_ceil(16), 0);
         pwr.alloc_ptr = pwr.alloc.as_mut_ptr() as *mut u8;
         pwr.into()
     }
