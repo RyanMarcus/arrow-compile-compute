@@ -15,6 +15,25 @@ use crate::{
     increment_pointer, ArrowKernelError, PrimitiveType,
 };
 
+/// Whether masked compress-stores are profitable for this element type on
+/// the host: 32/64-bit lanes need AVX-512F, 8/16-bit lanes additionally need
+/// VBMI2. Without the right extension LLVM scalarizes the intrinsic into a
+/// branch per lane — worse than the scalar loop it replaces.
+pub(crate) fn compress_store_available(pt: PrimitiveType) -> bool {
+    static FEATURES: std::sync::LazyLock<(bool, bool)> = std::sync::LazyLock::new(|| {
+        let features = inkwell::targets::TargetMachine::get_host_cpu_features().to_string();
+        (
+            features.contains("+avx512f"),
+            features.contains("+avx512vbmi2"),
+        )
+    });
+    let (avx512f, vbmi2) = *FEATURES;
+    match pt.width() {
+        1 | 2 => avx512f && vbmi2,
+        _ => avx512f,
+    }
+}
+
 pub struct PrimitiveWriter {
     pt: PrimitiveType,
 }
@@ -59,6 +78,13 @@ impl WriterRuntime for PrimitiveWriterRuntime {
     }
 
     fn to_array(self, len: usize) -> Result<ArrayRef, ArrowKernelError> {
+        // storage is allocated uninitialized: a kernel that wrote fewer
+        // elements than it exposes would hand out stale heap bytes
+        debug_assert!(
+            len <= self.len(),
+            "primitive writer exposes {len} elements but only {} were written",
+            self.len()
+        );
         let mut buf = Buffer::from(self.alloc);
         let sliced = buf.slice_with_length(0, len * self.pt.width());
         if len > 0 && buf.len() > len * self.pt.width() * 2 {
@@ -246,7 +272,7 @@ impl Writer for PrimitiveWriter {
     }
 
     fn supports_masked_block(&self) -> bool {
-        true
+        compress_store_available(self.pt)
     }
 
     fn llvm_write_block_masked<'ctx, 'borrow>(

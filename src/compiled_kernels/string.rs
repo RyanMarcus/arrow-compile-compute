@@ -129,35 +129,26 @@ fn filter_bytes<F: Fn(&[u8]) -> bool>(
     // flat byte arrays skip the buffered iterator and read the offsets
     // directly, like arrow's from_unary; values under nulls are computed
     // and ignored, which arrow's own kernels also do
+    fn flat_bytes<T, F>(
+        arr: &arrow_array::GenericByteArray<T>,
+        nulls: Option<arrow_buffer::NullBuffer>,
+        f: F,
+    ) -> BooleanArray
+    where
+        T: arrow_array::types::ByteArrayType,
+        T::Native: AsRef<[u8]>,
+        F: Fn(&[u8]) -> bool,
+    {
+        let values = arrow_buffer::BooleanBuffer::collect_bool(arr.len(), |i| {
+            f(unsafe { arr.value_unchecked(i) }.as_ref())
+        });
+        BooleanArray::new(values, nulls)
+    }
     match arr.data_type() {
-        DataType::Utf8 => {
-            let arr = arr.as_string::<i32>();
-            let values = arrow_buffer::BooleanBuffer::collect_bool(arr.len(), |i| {
-                f(unsafe { arr.value_unchecked(i) }.as_bytes())
-            });
-            return Ok(BooleanArray::new(values, nulls));
-        }
-        DataType::LargeUtf8 => {
-            let arr = arr.as_string::<i64>();
-            let values = arrow_buffer::BooleanBuffer::collect_bool(arr.len(), |i| {
-                f(unsafe { arr.value_unchecked(i) }.as_bytes())
-            });
-            return Ok(BooleanArray::new(values, nulls));
-        }
-        DataType::Binary => {
-            let arr = arr.as_binary::<i32>();
-            let values = arrow_buffer::BooleanBuffer::collect_bool(arr.len(), |i| {
-                f(unsafe { arr.value_unchecked(i) })
-            });
-            return Ok(BooleanArray::new(values, nulls));
-        }
-        DataType::LargeBinary => {
-            let arr = arr.as_binary::<i64>();
-            let values = arrow_buffer::BooleanBuffer::collect_bool(arr.len(), |i| {
-                f(unsafe { arr.value_unchecked(i) })
-            });
-            return Ok(BooleanArray::new(values, nulls));
-        }
+        DataType::Utf8 => return Ok(flat_bytes(arr.as_string::<i32>(), nulls, f)),
+        DataType::LargeUtf8 => return Ok(flat_bytes(arr.as_string::<i64>(), nulls, f)),
+        DataType::Binary => return Ok(flat_bytes(arr.as_binary::<i32>(), nulls, f)),
+        DataType::LargeBinary => return Ok(flat_bytes(arr.as_binary::<i64>(), nulls, f)),
         _ => {}
     }
 

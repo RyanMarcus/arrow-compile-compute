@@ -557,10 +557,15 @@ pub mod select {
                         let idx = idxes.as_primitive::<$idx_type>();
                         if idx.null_count() == 0 {
                             // same contract as the kernel path: validate every
-                            // index up front, then gather unchecked
+                            // index up front (one fused min/max pass), then
+                            // gather unchecked
                             let values = idx.values();
-                            let lo = values.iter().min().copied().unwrap_or_default();
-                            let hi = values.iter().max().copied().unwrap_or_default();
+                            let mut lo = values.first().copied().unwrap_or_default();
+                            let mut hi = lo;
+                            for &value in values.iter() {
+                                lo = lo.min(value);
+                                hi = hi.max(value);
+                            }
                             if !values.is_empty()
                                 && ((lo as i64) < 0 || hi as usize >= bools.len())
                             {
@@ -588,11 +593,22 @@ pub mod select {
                 }
             }
         }
-        if matches!(data.data_type(), arrow_schema::DataType::RunEndEncoded(_, _)) {
+        if let arrow_schema::DataType::RunEndEncoded(run_ends, _) = data.data_type() {
             // random access into an REE array binary-searches the run ends
             // once per index; when the indices are dense enough that those
             // searches cost more than materializing the array, decode first
-            let runs = data.to_data().child_data()[0].len().max(2);
+            use arrow_array::cast::AsArray;
+            use arrow_array::types::{Int16Type, Int32Type, Int64Type};
+            let runs = match run_ends.data_type() {
+                arrow_schema::DataType::Int16 => {
+                    data.as_run::<Int16Type>().run_ends().values().len()
+                }
+                arrow_schema::DataType::Int32 => {
+                    data.as_run::<Int32Type>().run_ends().values().len()
+                }
+                _ => data.as_run::<Int64Type>().run_ends().values().len(),
+            }
+            .max(2);
             let probe_cost = (usize::BITS - runs.leading_zeros()) as usize;
             if idxes.len().saturating_mul(probe_cost) >= data.len() {
                 let decoded =

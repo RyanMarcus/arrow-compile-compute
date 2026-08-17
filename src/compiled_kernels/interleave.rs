@@ -87,9 +87,12 @@ impl Kernel for InterleaveKernel {
             .iter()
             .zip(element_indices.values().iter())
         {
-            let array = values
-                .get(*array_idx as usize)
-                .ok_or(ArrowKernelError::OutOfBounds(values.len()))?;
+            let array = values.get(*array_idx as usize).ok_or_else(|| {
+                ArrowKernelError::UnsupportedArguments(format!(
+                    "interleave array index {array_idx} out of range for {} arrays",
+                    values.len()
+                ))
+            })?;
             if *element_idx as usize >= array.len() {
                 return Err(ArrowKernelError::OutOfBounds(array.len()));
             }

@@ -19,12 +19,23 @@ use crate::{
     PrimitiveType,
 };
 
+/// Sorted outputs (and packed sort keys) hold row numbers in 32 bits.
+fn check_row_count(len: usize) -> Result<(), ArrowKernelError> {
+    if len > u32::MAX as usize {
+        return Err(ArrowKernelError::UnsupportedArguments(
+            "sort supports at most u32::MAX rows".to_string(),
+        ));
+    }
+    Ok(())
+}
+
 pub fn sort_multi_col(data: &[(&dyn Datum, SortOptions)]) -> Result<UInt32Array, ArrowKernelError> {
     if data.is_empty() {
         return Err(ArrowKernelError::ArgumentMismatch(
             "sort requires at least one column".to_string(),
         ));
     }
+    check_row_count(data[0].0.get().0.len())?;
 
     // try the fast path
     if let Some((keys, words)) = normalize_fixed_width_columns(data)? {
@@ -74,6 +85,7 @@ pub fn sort_col(data: &dyn Datum, opts: SortOptions) -> Result<UInt32Array, Arro
     if is_scalar {
         return Ok(UInt32Array::from(vec![0]));
     }
+    check_row_count(arr.len())?;
 
     let pt = PrimitiveType::for_arrow_type(arr.data_type());
     let arr = crate::arrow_interface::cast::cast(arr, &pt.as_arrow_type())?;
@@ -109,6 +121,7 @@ pub fn top_k(
     }
 
     let normed = normalize_columns(data)?;
+    check_row_count(normed.len())?;
     let mut indices = (0..normed.len() as u32).collect_vec();
     if k == 0 || indices.is_empty() {
         return Ok(UInt32Array::from(Vec::<u32>::new()));
@@ -282,12 +295,6 @@ where
     }
 
     let values = values.as_primitive::<T>();
-    if values.len() > u32::MAX as usize {
-        // output indices (and the packed sort keys) hold row numbers in 32 bits
-        return Err(ArrowKernelError::UnsupportedArguments(
-            "sort_to_indices supports at most u32::MAX rows".to_string(),
-        ));
-    }
     let mut valids = Vec::with_capacity(values.len());
     let mut nulls = Vec::new();
 
@@ -470,10 +477,14 @@ mod test {
         use super::{radix_sort_packed, PackedSortKey};
         let mut rng = fastrand::Rng::with_seed(7);
         for descending in [false, true] {
-            // heavy ties exercise stability; full-range values exercise digits
+            // heavy ties exercise stability; full-range values exercise
+            // digits; hard-coded boundaries exercise the sign transforms
             for values in [
                 (0..100_000).map(|_| rng.u64(0..50)).collect_vec(),
-                (0..100_000).map(|_| rng.u64(..)).collect_vec(),
+                (0..100_000)
+                    .map(|_| rng.u64(..))
+                    .chain([0, 1, u64::MAX, u64::MAX - 1, 1 << 63])
+                    .collect_vec(),
             ] {
                 let packed = values
                     .iter()
@@ -486,6 +497,53 @@ mod test {
                 radix_sort_packed::<u64>(&mut actual);
                 assert_eq!(actual, expected);
             }
+        }
+    }
+
+    #[test]
+    fn test_radix_float_edges_match_comparison_sort() {
+        use super::{radix_sort_packed, PackedSortKey};
+        let mut rng = fastrand::Rng::with_seed(11);
+        for descending in [false, true] {
+            let values: Vec<f64> = (0..100_000)
+                .map(|_| f64::from_bits(rng.u64(..)))
+                .chain([
+                    f64::NAN,
+                    -f64::NAN,
+                    f64::INFINITY,
+                    f64::NEG_INFINITY,
+                    0.0,
+                    -0.0,
+                    f64::MIN,
+                    f64::MAX,
+                    f64::MIN_POSITIVE,
+                ])
+                .collect();
+            let packed = values
+                .iter()
+                .enumerate()
+                .map(|(i, v)| v.pack(i as u32, descending))
+                .collect_vec();
+            let mut expected = packed.clone();
+            expected.sort_unstable();
+            let mut actual = packed;
+            radix_sort_packed::<f64>(&mut actual);
+            assert_eq!(actual, expected);
+
+            let values32: Vec<f32> = (0..100_000)
+                .map(|_| f32::from_bits(rng.u32(..)))
+                .chain([f32::NAN, -f32::NAN, f32::INFINITY, f32::NEG_INFINITY, -0.0])
+                .collect();
+            let packed = values32
+                .iter()
+                .enumerate()
+                .map(|(i, v)| v.pack(i as u32, descending))
+                .collect_vec();
+            let mut expected = packed.clone();
+            expected.sort_unstable();
+            let mut actual = packed;
+            radix_sort_packed::<f32>(&mut actual);
+            assert_eq!(actual, expected);
         }
     }
 

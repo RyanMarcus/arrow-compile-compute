@@ -9,8 +9,9 @@ was slow, what we changed, and what it means for the operators involved.
 and the Zen 5 box), then a complete benchmark run on Zen 5, compared
 row-by-row against the previous round. No round introduced a regression.
 
-**The scoreboard over time** (out of ~60 paired benchmarks — higher "llvm
-wins" is better):
+**The scoreboard over time** (higher "llvm wins" is better; the baseline
+suite had 60 paired benchmarks, and round 1 added a `%abc%xyz` LIKE pair,
+so later rows sum to 61):
 
 | after round | llvm wins | arrow wins | equal |
 |---|---|---|---|
@@ -52,8 +53,9 @@ memory use drops from proportional-to-input to constant.
 **3. Stop writing every output twice.**
 *What was slow:* every kernel first filled its output buffer with zeros,
 then overwrote the zeros with real results — a full extra pass over memory.
-*The fix:* outputs start uninitialized; only bytes the kernel actually
-wrote are ever handed out.
+*The fix:* outputs start uninitialized. Consumers only read up to the
+declared output length, which every kernel fully writes — and a debug
+assertion now verifies the written count covers what is exposed.
 *Who it affects:* every operator with a numeric output. One caveat worth
 knowing: a buggy kernel that wrote less than it claimed used to produce
 silent zeros, and would now produce visible garbage — the rule ("write

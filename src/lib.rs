@@ -4,13 +4,12 @@ use std::sync::Arc;
 
 use arrow_array::{
     cast::AsArray,
-    types::{Int16Type, Int32Type, Int64Type, RunEndIndexType},
     Array, ArrayRef, BinaryArray, BinaryViewArray, BooleanArray, Date32Array, Date64Array, Datum,
     FixedSizeBinaryArray, Float16Array, Float32Array, Float64Array, Int16Array, Int32Array,
     Int64Array, Int8Array, LargeBinaryArray, LargeStringArray, NullArray, StringArray,
     StringViewArray, UInt16Array, UInt32Array, UInt64Array, UInt8Array,
 };
-use arrow_buffer::{ArrowNativeType, BooleanBufferBuilder, NullBuffer};
+use arrow_buffer::NullBuffer;
 use arrow_schema::{DataType, Field};
 use inkwell::{
     attributes::{Attribute, AttributeLoc},
@@ -719,45 +718,6 @@ impl Datum for ArrayDatum {
     }
 }
 
-fn ree_logical_nulls<K: RunEndIndexType>(
-    arr: &dyn Array,
-) -> Result<Option<NullBuffer>, ArrowKernelError> {
-    let arr = arr.as_run::<K>();
-    if let Some(re_nulls) = arr.values().logical_nulls() {
-        // expand the per-run validity in bulk, batching consecutive valid
-        // runs into a single append so the call count scales with the number
-        // of null runs rather than the number of runs
-        let run_ends = arr.run_ends();
-        let offset = run_ends.offset();
-        let end_limit = offset + arr.len();
-        let mut builder = BooleanBufferBuilder::new(arr.len());
-        let mut valid_start = offset;
-        let mut prev = offset;
-        for (run_idx, end) in run_ends.values().iter().enumerate() {
-            let end = end.as_usize().min(end_limit);
-            if end <= prev {
-                continue;
-            }
-            if re_nulls.is_null(run_idx) {
-                if valid_start < prev {
-                    builder.append_n(prev - valid_start, true);
-                }
-                builder.append_n(end - prev, false);
-                valid_start = end;
-            }
-            prev = end;
-            if prev >= end_limit {
-                break;
-            }
-        }
-        if valid_start < end_limit {
-            builder.append_n(end_limit - valid_start, true);
-        }
-        Ok(Some(NullBuffer::new(builder.finish())))
-    } else {
-        Ok(None)
-    }
-}
 
 pub fn logical_nulls(arr: &dyn Array) -> Result<Option<NullBuffer>, ArrowKernelError> {
     match arr.data_type() {
@@ -778,12 +738,12 @@ pub fn logical_nulls(arr: &dyn Array) -> Result<Option<NullBuffer>, ArrowKernelE
                 (true, true) => Ok(arr.logical_nulls()),
             }
         }
-        DataType::RunEndEncoded(f_re, _f_val) => match f_re.data_type() {
-            DataType::Int16 => ree_logical_nulls::<Int16Type>(arr),
-            DataType::Int32 => ree_logical_nulls::<Int32Type>(arr),
-            DataType::Int64 => ree_logical_nulls::<Int64Type>(arr),
-            _ => unreachable!("invalide run end type"),
-        },
+        // upstream RunArray::logical_nulls already expands per-run validity
+        // in bulk; drop buffers with no actual nulls so nullable-input cache
+        // keys stay on the fast non-null kernels
+        DataType::RunEndEncoded(_, _) => {
+            Ok(arr.logical_nulls().filter(|nulls| nulls.null_count() > 0))
+        }
         _ => Ok(arr.logical_nulls()),
     }
 }
@@ -792,6 +752,7 @@ pub fn logical_nulls(arr: &dyn Array) -> Result<Option<NullBuffer>, ArrowKernelE
 mod tests {
 
     use super::*;
+    use arrow_array::types::Int16Type;
     use arrow_array::{
         types::Int8Type, Array, DictionaryArray, Int16Array, Int32Array, Int8Array, RunArray,
         StringArray,

@@ -204,8 +204,10 @@ pub fn compile_inner<'ctx, 'args>(
     did_vectorize: &mut bool,
 ) -> Result<JitFunction<'ctx, unsafe extern "C" fn(*mut c_void) -> u64>, ArrowKernelError> {
     let module = ctx.create_module("dsl2");
-    if f.nontemporal_outputs {
-        // writers consult this module-level flag when emitting block stores
+    if f.nontemporal_outputs && cfg!(target_arch = "x86_64") {
+        // writers consult this module-level flag when emitting block stores.
+        // x86-only: the sfence below pairs with it, and non-temporal
+        // lowering on other targets has not been reasoned about
         module
             .add_global_metadata("acc.nontemporal", &ctx.metadata_node(&[]))
             .unwrap();

@@ -30,9 +30,16 @@ fn sliced_string_like_matches_arrow() {
 #[test]
 fn sliced_string_contains_matches_arrow() {
     let arr = sliced_strings();
-    let ours = cmp::contains(&arr, b"abc").unwrap();
+    // row-dependent needle: matches differ across the slice boundary, so a
+    // fast path ignoring the offset cannot pass by accident
+    let ours = cmp::contains(&arr, b"row2").unwrap();
     let arrow =
-        arrow_string::like::contains(&arr, &StringArray::new_scalar("abc")).unwrap();
+        arrow_string::like::contains(&arr, &StringArray::new_scalar("row2")).unwrap();
+    assert_eq!(ours, arrow);
+    assert!(ours.true_count() > 0 && ours.true_count() < ours.len());
+
+    let ours = cmp::like(&arr, b"%row2%", None).unwrap();
+    let arrow = arrow_string::like::like(&arr, &StringArray::new_scalar("%row2%")).unwrap();
     assert_eq!(ours, arrow);
 }
 
@@ -114,20 +121,15 @@ fn sliced_nullable_sort_matches_arrow() {
 fn interleave_invalid_indices_do_not_panic() {
     let a = Int32Array::from(vec![1, 2, 3]);
     let b = Int32Array::from(vec![4, 5, 6]);
-    // array index out of range
-    let result = std::panic::catch_unwind(|| {
-        select::interleave(&[&a, &b], &[(0, 0), (5, 0)])
-    });
-    if let Ok(inner) = result {
-        assert!(inner.is_err(), "interleave with bad array index returned Ok");
-    }
-    // element index out of range
-    let result = std::panic::catch_unwind(|| {
-        select::interleave(&[&a, &b], &[(0, 0), (1, 99)])
-    });
-    if let Ok(inner) = result {
-        assert!(inner.is_err(), "interleave with bad element index returned Ok");
-    }
+    // both invalid shapes must return Err — a panic fails the test harness
+    assert!(
+        select::interleave(&[&a, &b], &[(0, 0), (5, 0)]).is_err(),
+        "interleave with bad array index returned Ok"
+    );
+    assert!(
+        select::interleave(&[&a, &b], &[(0, 0), (1, 99)]).is_err(),
+        "interleave with bad element index returned Ok"
+    );
 }
 
 #[test]

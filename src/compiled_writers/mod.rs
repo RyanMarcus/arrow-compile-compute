@@ -62,6 +62,7 @@ use crate::{
 };
 
 pub use boolean_writer::{BooleanWriter, BooleanWriterEmitter, BooleanWriterRuntime};
+pub(crate) use primitive_writer::compress_store_available;
 pub use primitive_writer::{PrimitiveWriter, PrimitiveWriterEmitter, PrimitiveWriterRuntime};
 pub use view_writer::ViewBufferWriter;
 

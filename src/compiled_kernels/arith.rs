@@ -17,10 +17,30 @@ use crate::{
 /// cache key: each shape lazily compiles a small and a large variant.
 const NT_OUTPUT_BYTES: usize = 32 << 20;
 
-fn is_large_output(datum: &dyn Datum) -> bool {
-    let (arr, _) = datum.get();
-    let width = PrimitiveType::for_arrow_type(&crate::normalized_base_type(arr.data_type())).width();
-    arr.len().saturating_mul(width) >= NT_OUTPUT_BYTES
+/// Classified from the *promoted* output type (`dominant` for binops, the
+/// op-aware type for unary ops), so `sqrt` of a small int array whose f64
+/// output is huge still counts. Shared by `compile` and `get_key_for_input`
+/// so the cached variant always matches the key.
+fn is_large_output(rows: usize, out: Option<PrimitiveType>) -> bool {
+    out.map(|pt| rows.saturating_mul(pt.width()) >= NT_OUTPUT_BYTES)
+        .unwrap_or(false)
+}
+
+fn binop_result_type(arr1: &dyn arrow_array::Array, arr2: &dyn arrow_array::Array) -> Option<PrimitiveType> {
+    PrimitiveType::dominant(
+        PrimitiveType::for_arrow_type(arr1.data_type()),
+        PrimitiveType::for_arrow_type(arr2.data_type()),
+    )
+}
+
+fn unary_result_type(pt: PrimitiveType, op: DSLUnaryOp) -> PrimitiveType {
+    // `Neg`/`Abs` preserve the input type, but `sqrt` always returns a float
+    // and promotes integer inputs to `f64` (matching pyarrow)
+    match op {
+        DSLUnaryOp::Neg | DSLUnaryOp::Abs => pt,
+        DSLUnaryOp::Sqrt if pt.is_float() => pt,
+        DSLUnaryOp::Sqrt => PrimitiveType::F64,
+    }
 }
 
 pub struct BinOpKernel(RunnableDSLFunction);
@@ -60,7 +80,12 @@ impl Kernel for BinOpKernel {
         let arg1 = func.add_arg(&mut ctx, DSLType::array_like(*arr1, "n"));
         let arg2 = func.add_arg(&mut ctx, DSLType::array_like(*arr2, "n"));
         func.add_ret(WriterSpec::Primitive(res), "n");
-        if is_large_output(if arr1.get().1 { *arr2 } else { *arr1 }) {
+        let rows = if arr1.get().1 {
+            arr2.get().0.len()
+        } else {
+            arr1.get().0.len()
+        };
+        if is_large_output(rows, Some(res)) {
             func.set_nontemporal_outputs();
         }
 
@@ -83,12 +108,13 @@ impl Kernel for BinOpKernel {
     ) -> Result<Self::Key, ArrowKernelError> {
         let (arr1, is_scalar1) = i.0.get();
         let (arr2, is_scalar2) = i.1.get();
+        let rows = if is_scalar1 { arr2.len() } else { arr1.len() };
         Ok((
             arr1.data_type().clone(),
             is_scalar1,
             arr2.data_type().clone(),
             is_scalar2,
-            is_large_output(if is_scalar1 { i.1 } else { i.0 }),
+            is_large_output(rows, binop_result_type(arr1, arr2)),
             *p,
         ))
     }
@@ -121,21 +147,13 @@ impl Kernel for UnaryOpKernel {
 
     fn compile(arr: &Self::Input<'_>, params: Self::Params) -> Result<Self, ArrowKernelError> {
         let pt = PrimitiveType::for_arrow_type(arr.get().0.data_type());
-
-        // `Neg`/`Abs` preserve the input type, but `sqrt` always returns a float
-        // and promotes integer inputs to `f64` (matching pyarrow), so the output
-        // type is op-aware.
-        let out_pt = match params {
-            DSLUnaryOp::Neg | DSLUnaryOp::Abs => pt,
-            DSLUnaryOp::Sqrt if pt.is_float() => pt,
-            DSLUnaryOp::Sqrt => PrimitiveType::F64,
-        };
+        let out_pt = unary_result_type(pt, params);
 
         let mut ctx = DSLContext::new();
         let mut func = DSLFunction::new("arith_unaryop");
         let arg = func.add_arg(&mut ctx, DSLType::array_like(*arr, "n"));
         func.add_ret(WriterSpec::Primitive(out_pt), "n");
-        if is_large_output(*arr) {
+        if is_large_output(arr.get().0.len(), Some(out_pt)) {
             func.set_nontemporal_outputs();
         }
 
@@ -161,7 +179,13 @@ impl Kernel for UnaryOpKernel {
         p: &Self::Params,
     ) -> Result<Self::Key, ArrowKernelError> {
         let (arr, is_scalar) = i.get();
-        Ok((arr.data_type().clone(), is_scalar, is_large_output(*i), *p))
+        let out_pt = unary_result_type(PrimitiveType::for_arrow_type(arr.data_type()), *p);
+        Ok((
+            arr.data_type().clone(),
+            is_scalar,
+            is_large_output(arr.len(), Some(out_pt)),
+            *p,
+        ))
     }
 }
 
