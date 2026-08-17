@@ -28,7 +28,12 @@ pub fn vectorize_for_each(ctx: &DSLCompilationContext, f: &DSLForEach) -> Option
             _ => None,
         }))
         .max()?;
-    let rows = 64_usize.min(4096_usize.checked_div(widest_row)?.max(1));
+    let mut rows = 64_usize.min(4096_usize.checked_div(widest_row)?.max(1));
+    // masked emits lower to compress-stores, which the x86 backend cannot
+    // split across registers — keep the block within one 512-bit vector
+    if f.body.iter().any(|stmt| matches!(stmt, DSLStmt::If { .. })) {
+        rows = rows.min((512 / widest_row).max(1));
+    }
     if rows < 2 {
         return None;
     }
