@@ -4,6 +4,14 @@ Follow-up to `cross-platform-findings.md`, covering the third machine
 (`benchmark-results-zen5-native.json`). Scope: the 22 benchmarks where the
 arrow baseline beats the JIT on AMD, and why.
 
+> **Status:** this document is the *diagnosis*, frozen at the revision it
+> analyzes. Every recommended action below has since been implemented,
+> along with a dozen further fixes the follow-up profiling uncovered — see
+> `fix-rounds.md` for the full remediation story. After those rounds the
+> Zen 5 scoreboard went from 38 wins / 20 losses / 2 equal to 49 / 4 / 8,
+> with no loss remaining beyond a few percent. The loss table below
+> describes the pre-fix code.
+
 **How to read the ratios.** A ratio in this document is the JIT's speed as a
 multiple of arrow's — `arrow ms ÷ llvm ms`, the same number the benchmark page
 reports. `0.10×` means the JIT ran at a tenth of arrow's speed; anything above
@@ -539,6 +547,9 @@ architectural, and it is the least dramatic of the findings here — worth a
 look at the emitted loop, but a long way behind F2 in value.
 
 ## Recommended actions, in order
+
+*(All items below are now done — outcomes noted per item, details in
+`fix-rounds.md`.)*
 
 1. **Guard the zero-length comparisons in `compile_string_like`**
    (`string.rs:380-381`). Two lines, semantics-preserving, verified on Zen 5:
