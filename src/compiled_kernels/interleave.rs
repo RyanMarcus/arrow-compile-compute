@@ -80,6 +80,21 @@ impl Kernel for InterleaveKernel {
         let (values, array_indices, element_indices) = inp;
         let output_type = validate_values(values)?;
 
+        // validate every (array, element) pair before the generated code
+        // gathers through them; unchecked, a bad index reads garbage
+        for (array_idx, element_idx) in array_indices
+            .values()
+            .iter()
+            .zip(element_indices.values().iter())
+        {
+            let array = values
+                .get(*array_idx as usize)
+                .ok_or(ArrowKernelError::OutOfBounds(values.len()))?;
+            if *element_idx as usize >= array.len() {
+                return Err(ArrowKernelError::OutOfBounds(array.len()));
+            }
+        }
+
         let values_arg = DSLArgument::two_d(values.iter().map(|value| value as &dyn Datum));
         let mut result = self.0.run(&[
             values_arg,

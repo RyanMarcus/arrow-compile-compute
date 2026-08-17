@@ -282,6 +282,12 @@ where
     }
 
     let values = values.as_primitive::<T>();
+    if values.len() > u32::MAX as usize {
+        // output indices (and the packed sort keys) hold row numbers in 32 bits
+        return Err(ArrowKernelError::UnsupportedArguments(
+            "sort_to_indices supports at most u32::MAX rows".to_string(),
+        ));
+    }
     let mut valids = Vec::with_capacity(values.len());
     let mut nulls = Vec::new();
 
