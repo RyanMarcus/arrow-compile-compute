@@ -21,6 +21,10 @@ pub fn vectorize_for_each(ctx: &DSLCompilationContext, f: &DSLForEach) -> Option
         .filter_map(|value| value.ty.fixed_width_bits())
         .chain(f.body.iter().filter_map(|stmt| match stmt {
             DSLStmt::Emit { value, .. } => value.get_type().fixed_width_bits(),
+            DSLStmt::If { then, else_, .. } if else_.is_empty() => match then.as_slice() {
+                [DSLStmt::Emit { value, .. }] => value.get_type().fixed_width_bits(),
+                _ => None,
+            },
             _ => None,
         }))
         .max()?;
@@ -57,6 +61,22 @@ pub fn vectorize_for_each(ctx: &DSLCompilationContext, f: &DSLForEach) -> Option
                 body.push(DSLStmt::EmitBlock {
                     index: index.clone(),
                     value: expr,
+                });
+            }
+            DSLStmt::If { cond, then, else_ } if else_.is_empty() => {
+                // a conditional emit becomes a masked block write, for
+                // writers that support it (compress-store on the output)
+                let [DSLStmt::Emit { index, value }] = then.as_slice() else {
+                    return None;
+                };
+                let out_idx = index.as_u32()?;
+                if !ctx.outputs.get(out_idx as usize)?.supports_masked_block() {
+                    return None;
+                }
+                body.push(DSLStmt::EmitBlockMasked {
+                    index: index.clone(),
+                    value: value.try_vectorize(&loop_var_types)?,
+                    mask: cond.try_vectorize(&loop_var_types)?,
                 });
             }
             _ => return None,

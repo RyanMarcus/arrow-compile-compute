@@ -219,6 +219,27 @@ pub trait Writer {
         self.llvm_write_block(codegen, runtime_ptr, values, values.get_type().get_size())
     }
 
+    /// Whether this writer supports `llvm_write_block_masked`. The vectorizer
+    /// consults this before turning a conditional emit into a masked block.
+    fn supports_masked_block(&self) -> bool {
+        false
+    }
+
+    /// Writes only the lanes of `values` whose bit in `mask` is set, packed
+    /// contiguously. Only writers reporting `supports_masked_block` implement
+    /// this.
+    fn llvm_write_block_masked<'ctx, 'borrow>(
+        &'borrow self,
+        _codegen: WriterCodegen<'ctx, 'borrow>,
+        _runtime_ptr: PointerValue<'ctx>,
+        _values: VectorValue<'ctx>,
+        _mask: VectorValue<'ctx>,
+    ) -> Result<(), ArrowKernelError> {
+        Err(ArrowKernelError::InternalError(
+            "this writer does not support masked block writes".into(),
+        ))
+    }
+
     /// Writes a flat block containing `logical_len` values. Composite writers
     /// interpret the vector lanes using their static child shape.
     fn llvm_write_block<'ctx, 'borrow>(
@@ -739,5 +760,29 @@ impl<'ctx> BoundWriter<'ctx> {
                 logical_len,
             )
             .unwrap();
+    }
+
+    pub fn supports_masked_block(&self) -> bool {
+        self.writer.supports_masked_block()
+    }
+
+    pub fn llvm_ingest_block_masked<'call>(
+        &'call self,
+        ctx: &'ctx Context,
+        module: &'call Module<'ctx>,
+        builder: &'call Builder<'ctx>,
+        values: VectorValue<'ctx>,
+        mask: VectorValue<'ctx>,
+    ) -> Result<(), ArrowKernelError> {
+        self.writer.llvm_write_block_masked(
+            WriterCodegen {
+                ctx,
+                module,
+                builder,
+            },
+            self.runtime_ptr,
+            values,
+            mask,
+        )
     }
 }

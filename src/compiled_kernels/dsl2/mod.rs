@@ -951,6 +951,14 @@ pub enum DSLStmt {
         index: DSLExpr,
         value: DSLExpr,
     },
+
+    /// exclusively added by the vectorizer: emit only the lanes of `value`
+    /// whose bit in `mask` is set, packed contiguously
+    EmitBlockMasked {
+        index: DSLExpr,
+        value: DSLExpr,
+        mask: DSLExpr,
+    },
     Set {
         buf: DSLValue,
         index: DSLExpr,
@@ -1205,6 +1213,11 @@ impl DSLStmt {
             DSLStmt::Emit { index, value } | DSLStmt::EmitBlock { index, value } => {
                 index.accessed_parameters(params);
                 value.accessed_parameters(params);
+            }
+            DSLStmt::EmitBlockMasked { index, value, mask } => {
+                index.accessed_parameters(params);
+                value.accessed_parameters(params);
+                mask.accessed_parameters(params);
             }
             DSLStmt::Set {
                 buf, index, value, ..

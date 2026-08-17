@@ -1,3 +1,5 @@
+use std::sync::LazyLock;
+
 use arrow_array::{Array, ArrayRef, BooleanArray};
 use arrow_schema::DataType;
 
@@ -10,6 +12,12 @@ use crate::compiled_writers::WriterSpec;
 use crate::{normalized_base_type, ArrowKernelError};
 
 use crate::compiled_kernels::Kernel;
+
+static HOST_HAS_AVX512: LazyLock<bool> = LazyLock::new(|| {
+    inkwell::targets::TargetMachine::get_host_cpu_features()
+        .to_string()
+        .contains("+avx512f")
+});
 
 pub struct FilterKernel(RunnableDSLFunction);
 unsafe impl Sync for FilterKernel {}
@@ -51,9 +59,15 @@ impl Kernel for FilterKernel {
         let mut func = DSLFunction::new("filter");
         let arr_arg = func.add_arg(&mut ctx, DSLType::array_like(arr, "n"));
 
-        if matches!(arr.data_type(), DataType::RunEndEncoded(_, _)) {
+        // conditional emits vectorize into a masked compress-store, but only
+        // for primitive outputs, and only profitably on AVX-512 — elsewhere
+        // the set-bits loop beats a scalar per-element branch
+        let spec = WriterSpec::for_base_type_of_datum(arr);
+        let masked = *HOST_HAS_AVX512 && matches!(spec, WriterSpec::Primitive(_));
+
+        if matches!(arr.data_type(), DataType::RunEndEncoded(_, _)) || masked {
             let fil_arg = func.add_arg(&mut ctx, DSLType::array_like(filt, "n"));
-            func.add_ret(WriterSpec::for_base_type_of_datum(arr), "<= n");
+            func.add_ret(spec, "<= n");
 
             func.add_body(
                 DSLStmt::for_each(&mut ctx, &[arr_arg, fil_arg], |loop_vars| {
@@ -65,7 +79,7 @@ impl Kernel for FilterKernel {
             );
         } else {
             let fil_arg = func.add_arg(&mut ctx, DSLType::set_bits("m"));
-            func.add_ret(WriterSpec::for_base_type_of_datum(arr), "m");
+            func.add_ret(spec, "m");
 
             func.add_body(
                 DSLStmt::for_each(&mut ctx, &[fil_arg], |loop_vars| {

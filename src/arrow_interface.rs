@@ -545,6 +545,18 @@ pub mod select {
     /// assert_eq!(res.len(), 2);
     /// ```
     pub fn take(data: &dyn Array, idxes: &dyn Array) -> Result<ArrayRef, ArrowKernelError> {
+        if matches!(data.data_type(), arrow_schema::DataType::RunEndEncoded(_, _)) {
+            // random access into an REE array binary-searches the run ends
+            // once per index; when the indices are dense enough that those
+            // searches cost more than materializing the array, decode first
+            let runs = data.to_data().child_data()[0].len().max(2);
+            let probe_cost = (usize::BITS - runs.leading_zeros()) as usize;
+            if idxes.len().saturating_mul(probe_cost) >= data.len() {
+                let decoded =
+                    crate::cast::cast(data, &crate::normalized_base_type(data.data_type()))?;
+                return TAKE_PROGRAM_CACHE.get((&decoded, idxes), ());
+            }
+        }
         TAKE_PROGRAM_CACHE.get((data, idxes), ())
     }
 
@@ -568,6 +580,14 @@ pub mod select {
     /// assert_eq!(res.len(), 2);
     /// ```
     pub fn filter(data: &dyn Array, filter: &BooleanArray) -> Result<ArrayRef, ArrowKernelError> {
+        if matches!(data.data_type(), arrow_schema::DataType::RunEndEncoded(_, _)) {
+            // a filter mask varies within runs, so streaming through the
+            // encoding does per-element work anyway — decoding first and
+            // filtering densely is strictly better
+            let decoded =
+                crate::cast::cast(data, &crate::normalized_base_type(data.data_type()))?;
+            return FILTER_PROGRAM_CACHE.get((&decoded, filter), ());
+        }
         FILTER_PROGRAM_CACHE.get((data, filter), ())
     }
 

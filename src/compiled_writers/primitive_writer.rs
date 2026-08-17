@@ -2,6 +2,7 @@ use arrow_array::{make_array, ArrayRef};
 use arrow_buffer::Buffer;
 use arrow_data::ArrayDataBuilder;
 use inkwell::{
+    intrinsics::Intrinsic,
     values::{BasicValue, BasicValueEnum, PointerValue, VectorValue},
     AddressSpace,
 };
@@ -205,6 +206,68 @@ impl Writer for PrimitiveWriter {
             .builder
             .build_store(curr_alloc_ptr_ptr, new_alloc_ptr)
             .unwrap();
+        Ok(())
+    }
+
+    fn supports_masked_block(&self) -> bool {
+        true
+    }
+
+    fn llvm_write_block_masked<'ctx, 'borrow>(
+        &'borrow self,
+        codegen: WriterCodegen<'ctx, 'borrow>,
+        runtime_ptr: PointerValue<'ctx>,
+        values: VectorValue<'ctx>,
+        mask: VectorValue<'ctx>,
+    ) -> Result<(), ArrowKernelError> {
+        let ctx = codegen.ctx;
+        let b = codegen.builder;
+        let curr_alloc_ptr_ptr =
+            increment_pointer!(ctx, b, runtime_ptr, PrimitiveWriterRuntime::OFFSET_ALLOC_PTR);
+        let curr_alloc_ptr = b
+            .build_load(
+                ctx.ptr_type(AddressSpace::default()),
+                curr_alloc_ptr_ptr,
+                "primitive_masked_ptr",
+            )
+            .unwrap()
+            .into_pointer_value();
+
+        let compress = Intrinsic::find("llvm.masked.compressstore").unwrap();
+        let compress = compress
+            .get_declaration(codegen.module, &[values.get_type().into()])
+            .ok_or_else(|| {
+                ArrowKernelError::InternalError("no compressstore for vector type".into())
+            })?;
+        b.build_call(
+            compress,
+            &[values.into(), curr_alloc_ptr.into(), mask.into()],
+            "compressstore",
+        )
+        .unwrap();
+
+        // advance the write head by the number of selected lanes
+        let lanes = mask.get_type().get_size();
+        let mask_int_ty = ctx.custom_width_int_type(lanes);
+        let mask_int = b
+            .build_bit_cast(mask, mask_int_ty, "mask_int")
+            .unwrap()
+            .into_int_value();
+        let ctpop = Intrinsic::find("llvm.ctpop").unwrap();
+        let ctpop = ctpop
+            .get_declaration(codegen.module, &[mask_int_ty.into()])
+            .unwrap();
+        let count = b
+            .build_call(ctpop, &[mask_int.into()], "mask_count")
+            .unwrap()
+            .try_as_basic_value()
+            .unwrap_basic()
+            .into_int_value();
+        let count = b
+            .build_int_z_extend_or_bit_cast(count, ctx.i64_type(), "mask_count64")
+            .unwrap();
+        let new_alloc_ptr = increment_pointer!(ctx, b, curr_alloc_ptr, self.pt.width(), count);
+        b.build_store(curr_alloc_ptr_ptr, new_alloc_ptr).unwrap();
         Ok(())
     }
 }

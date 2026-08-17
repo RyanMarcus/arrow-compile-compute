@@ -674,6 +674,25 @@ fn compile_stmt<'ctx, 'a>(
                 logical_len as u32,
             );
         }
+        DSLStmt::EmitBlockMasked { index, value, mask } => {
+            let index = index.as_u32().ok_or_else(|| {
+                ArrowKernelError::DSLTypeMismatch(
+                    "masked block emit requires const index",
+                    DSLType::scalar_of(PrimitiveType::U32),
+                    index.get_type(),
+                )
+            })?;
+
+            let value = compile_expr(ctx, value)?;
+            let mask = compile_expr(ctx, mask)?;
+            ctx.outputs[index as usize].llvm_ingest_block_masked(
+                ctx.ctx,
+                ctx.module,
+                ctx.b,
+                value.into_vector_value(),
+                mask.into_vector_value(),
+            )?;
+        }
         DSLStmt::Set {
             buf,
             index,

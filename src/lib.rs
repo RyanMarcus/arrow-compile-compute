@@ -4,15 +4,13 @@ use std::sync::Arc;
 
 use arrow_array::{
     cast::AsArray,
-    make_array,
     types::{Int16Type, Int32Type, Int64Type, RunEndIndexType},
     Array, ArrayRef, BinaryArray, BinaryViewArray, BooleanArray, Date32Array, Date64Array, Datum,
     FixedSizeBinaryArray, Float16Array, Float32Array, Float64Array, Int16Array, Int32Array,
-    Int64Array, Int8Array, LargeBinaryArray, LargeStringArray, NullArray, PrimitiveArray,
-    StringArray, StringViewArray, UInt16Array, UInt32Array, UInt64Array, UInt8Array,
+    Int64Array, Int8Array, LargeBinaryArray, LargeStringArray, NullArray, StringArray,
+    StringViewArray, UInt16Array, UInt32Array, UInt64Array, UInt8Array,
 };
-use arrow_buffer::NullBuffer;
-use arrow_data::ArrayDataBuilder;
+use arrow_buffer::{ArrowNativeType, BooleanBufferBuilder, NullBuffer};
 use arrow_schema::{DataType, Field};
 use inkwell::{
     attributes::{Attribute, AttributeLoc},
@@ -718,40 +716,30 @@ impl Datum for ArrayDatum {
     }
 }
 
-fn make_ree_unchecked(res: &dyn Array, data: &dyn Array, len: usize) -> ArrayRef {
-    let ree_array_type = DataType::RunEndEncoded(
-        Arc::new(Field::new(
-            "run_ends",
-            res.data_type().clone(),
-            res.is_nullable(),
-        )),
-        Arc::new(Field::new(
-            "values",
-            data.data_type().clone(),
-            data.is_nullable(),
-        )),
-    );
-    let builder = ArrayDataBuilder::new(ree_array_type)
-        .len(len)
-        .add_child_data(res.to_data())
-        .add_child_data(data.to_data());
-
-    let array_data = unsafe { builder.build_unchecked() };
-    make_array(array_data)
-}
-
 fn ree_logical_nulls<K: RunEndIndexType>(
     arr: &dyn Array,
 ) -> Result<Option<NullBuffer>, ArrowKernelError> {
     let arr = arr.as_run::<K>();
-    let res = PrimitiveArray::<K>::new(arr.run_ends().inner().clone(), None);
     if let Some(re_nulls) = arr.values().logical_nulls() {
-        let re_nulls = BooleanArray::new(re_nulls.into_inner(), None);
-        let re_nulls = make_ree_unchecked(&res, &re_nulls, arr.len());
-        let re_nulls = crate::arrow_interface::cast::cast(&re_nulls, &DataType::Boolean)?;
-        let re_nulls = re_nulls.as_boolean().clone().into_parts().0;
-        let re_nulls = NullBuffer::new(re_nulls);
-        Ok(Some(re_nulls))
+        // expand the per-run validity in bulk: one append_n per run, rather
+        // than materializing an REE boolean array and casting it
+        let run_ends = arr.run_ends();
+        let offset = run_ends.offset();
+        let end_limit = offset + arr.len();
+        let mut builder = BooleanBufferBuilder::new(arr.len());
+        let mut prev = offset;
+        for (run_idx, end) in run_ends.values().iter().enumerate() {
+            let end = end.as_usize().min(end_limit);
+            if end <= prev {
+                continue;
+            }
+            builder.append_n(end - prev, re_nulls.is_valid(run_idx));
+            prev = end;
+            if prev >= end_limit {
+                break;
+            }
+        }
+        Ok(Some(NullBuffer::new(builder.finish())))
     } else {
         Ok(None)
     }
