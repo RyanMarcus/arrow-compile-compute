@@ -556,10 +556,20 @@ pub mod select {
                     ($idx_type:ty) => {{
                         let idx = idxes.as_primitive::<$idx_type>();
                         if idx.null_count() == 0 {
+                            // same contract as the kernel path: validate every
+                            // index up front, then gather unchecked
+                            let values = idx.values();
+                            let lo = values.iter().min().copied().unwrap_or_default();
+                            let hi = values.iter().max().copied().unwrap_or_default();
+                            if !values.is_empty()
+                                && ((lo as i64) < 0 || hi as usize >= bools.len())
+                            {
+                                return Err(ArrowKernelError::OutOfBounds(bools.len()));
+                            }
                             let bits = bools.values();
                             let out =
-                                arrow_buffer::BooleanBuffer::collect_bool(idx.len(), |i| {
-                                    bits.value(unsafe { idx.value_unchecked(i) } as usize)
+                                arrow_buffer::BooleanBuffer::collect_bool(idx.len(), |i| unsafe {
+                                    bits.value_unchecked(idx.value_unchecked(i) as usize)
                                 });
                             return Ok(std::sync::Arc::new(BooleanArray::new(out, None)) as ArrayRef);
                         }
