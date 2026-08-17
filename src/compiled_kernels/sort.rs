@@ -154,14 +154,20 @@ fn sort_indices_from_normalized(keys: &BinaryArray) -> UInt32Array {
 /// which reverses the value order while leaving the tie-break ascending.
 trait PackedSortKey {
     type Packed: Ord + Copy;
+    /// Number of 8-bit digit passes an LSD radix sort needs to cover the
+    /// value bits (the index bits below them start in order and stay in
+    /// order because the radix passes are stable).
+    const KEY_PASSES: usize;
     fn pack(self, index: u32, descending: bool) -> Self::Packed;
     fn unpack_index(packed: Self::Packed) -> u32;
+    fn digit(packed: Self::Packed, pass: usize) -> usize;
 }
 
 macro_rules! packed_sort_key {
     ($t:ty, $u:ty, $packed:ty, |$v:ident| $key:expr) => {
         impl PackedSortKey for $t {
             type Packed = $packed;
+            const KEY_PASSES: usize = std::mem::size_of::<$u>();
             #[inline]
             fn pack(self, index: u32, descending: bool) -> $packed {
                 let $v = self;
@@ -173,8 +179,55 @@ macro_rules! packed_sort_key {
             fn unpack_index(packed: $packed) -> u32 {
                 packed as u32
             }
+            #[inline]
+            fn digit(packed: $packed, pass: usize) -> usize {
+                (packed >> (32 + 8 * pass)) as usize & 0xff
+            }
         }
     };
+}
+
+/// Above this length an LSD radix sort over the packed keys beats the
+/// comparison sort.
+const RADIX_SORT_THRESHOLD: usize = 50_000;
+
+/// Stable LSD radix sort over the value digits of packed sort keys. The index
+/// bits below the value are already in ascending order in the input, and
+/// stable passes keep equal-valued keys in that order, so the result is
+/// identical to fully sorting the packed keys.
+fn radix_sort_packed<K: PackedSortKey>(keys: &mut Vec<K::Packed>) {
+    let n = keys.len();
+    let mut src = std::mem::take(keys);
+    let mut dst: Vec<K::Packed> = Vec::with_capacity(n);
+    // SAFETY: every pass writes all n slots before anything reads them
+    #[allow(clippy::uninit_vec)]
+    unsafe {
+        dst.set_len(n)
+    };
+
+    for pass in 0..K::KEY_PASSES {
+        let mut counts = [0usize; 256];
+        for key in src.iter() {
+            counts[K::digit(*key, pass)] += 1;
+        }
+        if counts.iter().any(|count| *count == n) {
+            continue;
+        }
+        let mut cursors = [0usize; 256];
+        let mut sum = 0;
+        for digit in 0..256 {
+            cursors[digit] = sum;
+            sum += counts[digit];
+        }
+        for key in src.iter() {
+            let digit = K::digit(*key, pass);
+            dst[cursors[digit]] = *key;
+            cursors[digit] += 1;
+        }
+        std::mem::swap(&mut src, &mut dst);
+    }
+
+    *keys = src;
 }
 
 packed_sort_key!(u8, u8, u64, |v| v);
@@ -252,7 +305,11 @@ where
         }
     }
 
-    valids.sort_unstable();
+    if valids.len() >= RADIX_SORT_THRESHOLD {
+        radix_sort_packed::<T::Native>(&mut valids);
+    } else {
+        valids.sort_unstable();
+    }
 
     let mut indices = Vec::with_capacity(values.len());
     if opts.nulls_first {
@@ -384,6 +441,30 @@ mod test {
         let inputs = columns.iter().map(|column| column.as_ref()).collect_vec();
         let actual = sort::multicol_sort_to_indices(&inputs, options).unwrap();
         assert_eq!(actual, expected);
+    }
+
+    #[test]
+    fn test_radix_matches_comparison_sort() {
+        use super::{radix_sort_packed, PackedSortKey};
+        let mut rng = fastrand::Rng::with_seed(7);
+        for descending in [false, true] {
+            // heavy ties exercise stability; full-range values exercise digits
+            for values in [
+                (0..100_000).map(|_| rng.u64(0..50)).collect_vec(),
+                (0..100_000).map(|_| rng.u64(..)).collect_vec(),
+            ] {
+                let packed = values
+                    .iter()
+                    .enumerate()
+                    .map(|(i, v)| v.pack(i as u32, descending))
+                    .collect_vec();
+                let mut expected = packed.clone();
+                expected.sort_unstable();
+                let mut actual = packed;
+                radix_sort_packed::<u64>(&mut actual);
+                assert_eq!(actual, expected);
+            }
+        }
     }
 
     #[test]

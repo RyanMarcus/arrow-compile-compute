@@ -545,6 +545,39 @@ pub mod select {
     /// assert_eq!(res.len(), 2);
     /// ```
     pub fn take(data: &dyn Array, idxes: &dyn Array) -> Result<ArrayRef, ArrowKernelError> {
+        // gathering bits through the JIT serializes on a read-modify-write
+        // per output bit; packing 64 gathered bits per word in a register
+        // (arrow's take_bits shape) retires far more per cycle
+        if matches!(data.data_type(), arrow_schema::DataType::Boolean) {
+            use arrow_array::cast::AsArray;
+            let bools = data.as_boolean();
+            if bools.nulls().is_none() {
+                macro_rules! take_bits {
+                    ($idx_type:ty) => {{
+                        let idx = idxes.as_primitive::<$idx_type>();
+                        if idx.null_count() == 0 {
+                            let bits = bools.values();
+                            let out =
+                                arrow_buffer::BooleanBuffer::collect_bool(idx.len(), |i| {
+                                    bits.value(unsafe { idx.value_unchecked(i) } as usize)
+                                });
+                            return Ok(std::sync::Arc::new(BooleanArray::new(out, None)) as ArrayRef);
+                        }
+                    }};
+                }
+                match idxes.data_type() {
+                    arrow_schema::DataType::UInt32 => {
+                        take_bits!(arrow_array::types::UInt32Type)
+                    }
+                    arrow_schema::DataType::UInt64 => {
+                        take_bits!(arrow_array::types::UInt64Type)
+                    }
+                    arrow_schema::DataType::Int32 => take_bits!(arrow_array::types::Int32Type),
+                    arrow_schema::DataType::Int64 => take_bits!(arrow_array::types::Int64Type),
+                    _ => {}
+                }
+            }
+        }
         if matches!(data.data_type(), arrow_schema::DataType::RunEndEncoded(_, _)) {
             // random access into an REE array binary-searches the run ends
             // once per index; when the indices are dense enough that those
