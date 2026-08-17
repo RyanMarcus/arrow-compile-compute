@@ -4,6 +4,11 @@ Follow-up to `cross-platform-findings.md`, covering the third machine
 (`benchmark-results-zen5-native.json`). Scope: the 22 benchmarks where the
 arrow baseline beats the JIT on AMD, and why.
 
+**How to read the ratios.** A ratio in this document is the JIT's speed as a
+multiple of arrow's — `arrow ms ÷ llvm ms`, the same number the benchmark page
+reports. `0.10×` means the JIT ran at a tenth of arrow's speed; anything above
+`1.0×` is a JIT win.
+
 ## Setup
 
 | | value |
@@ -14,26 +19,36 @@ arrow baseline beats the JIT on AMD, and why.
 | SIMD | full AVX-512 (F/DQ/BW/VL/VBMI/VBMI2/VNNI/BITALG/VPOPCNTDQ/VP2INTERSECT) |
 | Revision | `107db50`, **dirty tree** |
 
-Scoreboard: 37 llvm wins, 22 arrow wins, 1 equal out of 60 paired benchmarks.
+Scoreboard: **37 llvm wins, 22 arrow wins, 1 equal** out of 60 paired
+benchmarks.
 
-The run's manifest does not record `rustflags` — `report.py` only started writing
-that field after this run — so the "native build" label was verified another way:
-the benchmark binary the run used contains 30,361 `zmm` references, 506 `kmov`
-and 208 `vpternlog`, while the sibling binary from the previous non-native build
-contains none. The run was a genuine AVX-512 build. The manifest also records
-`"dirty": true`, so the tree carried uncommitted changes on top of `107db50`;
-nothing below depends on a specific working-tree state, but the run is not
-reproducible from the revision alone.
+Two caveats about the run itself:
 
-Of the 22 losses, **one is specific to this machine**. The rest are pre-existing
-costs that the Zen 5 numbers merely make more visible, because native arrow is
-much faster here than on the other two machines.
+- **The build really was AVX-512-native.** The run's manifest does not record
+  `rustflags` — `report.py` only started writing that field after this run —
+  so the build flavour was verified by disassembling the benchmark binary the
+  run used: it contains 30,361 references to `zmm` (AVX-512) registers, 506
+  `kmov` mask-register moves and 208 `vpternlog` instructions, while the
+  sibling binary from the previous non-native build contains none.
+- **The tree was dirty.** The manifest records `"dirty": true`, so the tree
+  carried uncommitted changes on top of `107db50`. Nothing below depends on a
+  specific working-tree state, but the run is not reproducible from the
+  revision alone.
+- **The published results have since been refreshed.** The
+  `benchmark-results-zen5-native.json` on the site now comes from a clean
+  re-run at `6fa1f69` (scoreboard 38 llvm / 20 arrow / 2 equal — the
+  difference from the 37 / 22 / 1 above is drift on near-parity rows, e.g.
+  `%abc%xyz%` moved from 0.96× to 1.07×). The analysis in this document is of
+  the `107db50` run; its headline losses persist unchanged in the refreshed
+  run (`%abc%` 0.09×, `sum` 0.12×, both `neg_wrapping`s within 0.02×).
 
 ## Every losing row, and what causes it
 
-One mechanism is AMD-specific. Most of the rest cost us the same on every
-machine — Zen 5 only made them visible, because native arrow is fast enough here
-that our fixed overheads stopped hiding behind other work.
+Six mechanisms — Findings 1 through 6 below — account for 19 of the 22 losing
+rows. Only **one** of the six is specific to this machine (Finding 1). The
+rest are fixed costs of ours that every machine pays; Zen 5 merely makes them
+visible, because native arrow is much faster here than on the other two
+machines, so those overheads stopped hiding behind other work.
 
 | benchmark | ratio | cause | AMD-specific? |
 |---|---|---|---|
@@ -57,13 +72,12 @@ that our fixed overheads stopped hiding behind other work.
 | `select::take(bool, u64)` | 0.91× | **not investigated** | no |
 | `cmp::like('%abc%xyz%')` | 0.96× | catch-all `match_like`, near parity | no |
 
-Six mechanisms account for 19 of the 22 rows. The three uninvestigated ones are
-the tail: `cmp::lt(i32, scalar)` and `select::take(bool, u64)` follow an
-x86-native pattern rather than an AMD one — both are also arrow wins on Meteor
-Lake's native build (0.71× and 0.75×) while staying LLVM wins on the M4 (1.78×
-and 1.11×), i.e. the "native arrow overtakes on dense work" effect already
-recorded in `cross-platform-findings.md`. The `%abc%xyz%` row is within 5% of
-parity on all three machines.
+The three uninvestigated rows are the tail: `cmp::lt(i32, scalar)` and
+`select::take(bool, u64)` follow an x86-native pattern rather than an AMD one —
+both are also arrow wins on Meteor Lake's native build (0.71× and 0.75×) while
+staying LLVM wins on the M4 (1.78× and 1.11×), i.e. the "native arrow overtakes
+on dense work" effect already recorded in `cross-platform-findings.md`. The
+`%abc%xyz%` row is within 5% of parity on all three machines.
 
 Fixing F2 turns four *measured* rows into ties or wins (`sum`, both
 `neg_wrapping`s, and `cast(i32 → i64)`); `min`/`max`/`product` share `sum`'s
@@ -72,6 +86,13 @@ mechanism and should follow, which would be seven of the eight F2 rows.
 
 ## Finding 1 — `cmp::like('%abc%')` is 6.8× slower *only* on Zen 5 (AMD-specific)
 
+**The short version:** for `%abc%`-shaped patterns the kernel compares every
+row against an *empty* prefix and an *empty* suffix. Each comparison compiles
+to a real `bcmp` call whose second pointer is unmapped, and on Zen 5 the
+AVX-512 code inside glibc's `bcmp` pays a ~250-cycle microcode penalty for
+exactly that call. A comparison that does no work at all becomes the most
+expensive thing in the kernel.
+
 | | llvm | arrow | ratio |
 |---|---|---|---|
 | Zen 5 | **104.69 ms** | 10.11 ms | **0.10×** |
@@ -79,22 +100,27 @@ mechanism and should follow, which would be seven of the eight F2 rows.
 | Apple M4 | 16.84 ms | 9.83 ms | 0.58× |
 
 Our absolute time is 6× worse on AMD than on the other two machines, while
-arrow's is *better* there. Two rows in the same bench file do the same work with
-the same `memchr` `Finder` over the same data — `cmp::contains` takes 12.56 ms,
-`cmp::like('%abc%')` takes 104.69 ms.
+arrow's is *better* there. Two rows in the same bench file do the same work
+with the same `memchr` `Finder` over the same data — `cmp::contains` takes
+12.56 ms, `cmp::like('%abc%')` takes 104.69 ms.
 
 **Root cause.** `perf` puts **71.4%** of the benchmark inside one libc
 instruction, reached via `equal_same_length<u8,u8>` ← `[u8] == Vec<u8>` ← the
-LIKE closure. The chain:
+LIKE closure. The chain from SQL pattern to stalled pipeline:
 
 1. `%abc%` lowers to the `(2, false)` branch of `compile_string_like`
-   (`string.rs:359`) with `prefix = []`, `infix = "abc"`, `suffix = []`.
+   (`string.rs:359`) with `prefix = []`, `infix = "abc"`, `suffix = []` — the
+   text before the first `%` and after the last one, both empty for this
+   pattern.
 2. The per-row closure evaluates `b[..prefix.len()] == prefix` and
-   `b[b.len() - suffix.len()..] == suffix` (`string.rs:380-381`). `core` has no
-   zero-length short circuit for slice equality, so each becomes `bcmp(p, q, 0)`.
-3. An empty `Vec<u8>`'s `as_ptr()` is the dangling sentinel `0x1` — unmapped.
-4. On Zen 5, glibc's IFUNC resolves `bcmp` to `__memcmp_evex_movbe`. Its
-   `len <= 32` path is:
+   `b[b.len() - suffix.len()..] == suffix` (`string.rs:380-381`). Rust's
+   `core` has no zero-length short circuit for slice equality, so comparing
+   against an empty slice still emits a real library call: `bcmp(p, q, 0)`.
+3. An empty `Vec<u8>` never allocates, so its `as_ptr()` is the dangling
+   sentinel `0x1` — an address no page is mapped at.
+4. glibc picks its `bcmp` implementation per CPU (IFUNC dispatch). On Zen 5 it
+   selects `__memcmp_evex_movbe`, an AVX-512 implementation whose short-length
+   (`len <= 32`) path is:
 
    <!-- raw: AVX-512 mask register syntax would otherwise parse as a Liquid tag -->
    {% raw %}
@@ -106,8 +132,15 @@ LIKE closure. The chain:
    ```
    {% endraw %}
 
-5. AVX-512 fault suppression makes the load architecturally legal, but Zen 5
-   resolves the suppressed fault with a **microcode assist** (measured below).
+   It turns the length into a per-byte lane mask and issues one *masked*
+   32-byte load — masked-off lanes are guaranteed not to fault, which is what
+   lets glibc read a 32-byte window it only partly owns. With `len = 0` the
+   mask is all-zero: a 32-byte load from `0x1` with every lane masked off.
+5. That load is architecturally legal — AVX-512 promises fault suppression for
+   masked-off lanes — but on Zen 5, honouring the promise is expensive. The
+   core resolves the suppressed fault with a **microcode assist**: it cancels
+   the instruction mid-flight, flushes the pipeline, and completes the load in
+   an on-chip microcode routine (measured below).
 
 Measured cost of a zero-length `bcmp`, varying only the second pointer:
 
@@ -120,15 +153,21 @@ Measured cost of a zero-length `bcmp`, varying only the second pointer:
 | empty `Vec` dangling `0x1` | **59.21 ns** | 4.73 ns |
 | mapped, len 3 / 16 / 64 | ~1.2 ns | 4.6–6.3 ns |
 
-So the penalty is a property of the **page**, not the pointer value: any masked
-AVX-512 load whose 32-byte footprint touches an unreadable page costs ~250
-cycles, a 50× penalty, even when the mask suppresses every element. Two such
-calls per row × 1m rows ≈ 90 ms of the 105 ms.
+The second row is the informative one: that pointer is valid, resident and
+readable — it merely sits 8 bytes before the end of its page, so the 32-byte
+window runs off the mapping. The penalty is therefore a property of the
+**page**, not the pointer value: any masked AVX-512 load whose 32-byte
+footprint touches an unreadable page costs ~250 cycles, a 50× penalty, even
+when the mask suppresses every element. Two such calls per row × 1m rows
+≈ 90 ms of the 105 ms.
 
 ### That it is an assist, measured
 
-Running 20m zero-length `bcmp` calls twice — identical code, the second pointer
-mapped in one process and unmapped in the other:
+Running 20m zero-length `bcmp` calls twice — identical code, the second
+pointer mapped in one process and unmapped in the other. The two Zen counters
+here: `ex_ret_ucode_ops` counts retired micro-ops that came out of the
+microcode sequencer rather than the ordinary decoders, and
+`bp_redirects.resync` counts retire-time pipeline restarts.
 
 | counter | mapped | unmapped | per call |
 |---|---|---|---|
@@ -150,16 +189,17 @@ instruction rather than the instruction itself decoding to microcode. And the
 cycle figure fixes an earlier estimate: 255 cycles/call at the 4.30 GHz this
 loop actually ran at, not the ~300 implied by assuming max boost.
 
-Meteor Lake has no AVX-512, so glibc there selects `__memcmp_avx2_movbe`, which
-never issues a masked load — hence no penalty on Intel, and none on the M4.
+Meteor Lake has no AVX-512, so glibc there selects `__memcmp_avx2_movbe`,
+which never issues a masked load — hence no penalty on Intel, and none on the
+M4.
 
 **Confirmation.** Forcing glibc to skip its AVX-512 memcmp
 (`GLIBC_TUNABLES=glibc.cpu.hwcaps=-AVX512VL`) takes `%abc%` from 102.37 ms to
 **15.47 ms** while arrow is unchanged (10.25 → 10.03 ms). Sweeping every string
-benchmark under both dispatch modes, `%abc%` is the *only* one affected (6.82×);
-`'abc%'` and `'%xyz'` are 0.76×/0.83× — i.e. the EVEX memcmp is a **win** at
-normal lengths. The pathology is exclusively the zero-length call against an
-unmapped pointer.
+benchmark under both dispatch modes, `%abc%` is the *only* one affected
+(6.82×); `'abc%'` and `'%xyz'` are 0.76×/0.83× — i.e. the EVEX memcmp is a
+**win** at normal lengths. The pathology is exclusively the zero-length call
+against an unmapped pointer.
 
 **Fix.** Do not emit zero-length comparisons. Guarding both sides —
 
@@ -176,7 +216,7 @@ bench's own `assert_eq!(arrow, llvm)` still passes. That moves the row from
 ### Which LIKE shapes the guard actually helps
 
 Benchmarking four extra pattern shapes, paired before/after in one session
-(1m rows, short-string dataset):
+(1m rows, short-string dataset; times in ms):
 
 | pattern | branch | before | guarded | arrow | effect |
 |---|---|---|---|---|---|
@@ -209,15 +249,21 @@ operand landing on an unreadable page is enough.
 The `starts_with`/`ends_with` sites at `string.rs:237`/`246` were *expected* to
 carry the same hazard for a bare `%` pattern, but do not: profiling `'%'` shows
 the closure itself at 29.8% and **no libc memcmp frame at all** — LLVM inlines
-that comparison instead of emitting a call. Guarding them is a 1.3× cleanup, not
-an assist fix. That is an optimizer accident rather than a structural guarantee,
-so the guard is still worth having, just not urgent.
+that comparison instead of emitting a call. Guarding them is a 1.3× cleanup,
+not an assist fix. That is an optimizer accident rather than a structural
+guarantee, so the guard is still worth having, just not urgent.
 
 More generally: on Zen 5, any slice compared against an empty `Vec` in a hot
 loop is a ~60 ns landmine whenever it compiles to a real `bcmp` call, and so is
 any AVX-512 masked load near the end of an allocation.
 
 ## Finding 2 — One `resize(.., 0)` accounts for *all* of the reduction and neg losses
+
+**The short version:** every kernel invocation allocates its output buffer
+with a `resize` that also writes a zero over every byte, before the kernel
+writes its real output. A reduction that returns 4 bytes first allocates and
+zeroes 40 MB. Deleting the zero-fill closes the entire gap — this is the
+highest-value fix in the document, and it is not AMD-specific.
 
 `PrimitiveWriter::allocate` (`compiled_writers/primitive_writer.rs:135`) does
 
@@ -238,8 +284,8 @@ Reductions declare their output as `"<= n"` (`reduction.rs:129`), so
 4 bytes**.
 
 **Proof: delete the memset and the entire gap disappears.** Patching that one
-line to allocate without zeroing, rebuilding, and re-running (the benches'
-own `assert_eq!` against arrow still passes):
+line to allocate without zeroing, rebuilding, and re-running (the benches' own
+`assert_eq!` against arrow still passes):
 
 | 10m rows | stock | zero-fill removed | arrow | before | after |
 |---|---|---|---|---|---|
@@ -260,7 +306,9 @@ loop-throughput deficit, and nothing architecture-specific: the reduce loop and
 the element-wise loops were already running at the machine's memory bandwidth.
 
 **Why the two shapes differ in how much they gain.** The memset is not just a
-memset — on a freshly `mmap`ed buffer it is also what *faults the pages in*.
+memset — on a freshly `mmap`ed buffer, writing the zeroes is also what *faults
+the pages in* (the first touch of each new page takes a page fault that maps
+it).
 
 - **Reductions never write their output** (one scalar, then truncate). Remove
   the memset and those 40 MB are never touched at all, so both the memset *and*
@@ -273,8 +321,8 @@ memset — on a freshly `mmap`ed buffer it is also what *faults the pages in*.
   both sides now do one allocation and one write.
 
 Separating allocation from memset with `MALLOC_MMAP_THRESHOLD_=1G` (glibc
-recycles the buffer instead of `mmap`/`munmap`ing it) gives the same picture
-from the other direction:
+recycles the buffer instead of `mmap`/`munmap`ing it, so the pages stay
+mapped between calls) gives the same picture from the other direction:
 
 | 10m rows | stock, default | stock, recycled | no zero-fill |
 |---|---|---|---|
@@ -306,25 +354,31 @@ worsened because arrow got faster, not because we got slower.
 | `select::filter(i32, bool)` | 0.74× | 4.765 ms | 3.730 ms | 0.78× |
 
 `cast` flips from a loss to a 1.64× win and `concat` goes from 0.65× to roughly
-even. `filter` barely moves (0.74 → 0.78), so its loss has a different cause and
-still needs its own look.
+even. `filter` barely moves (0.74 → 0.78), so its loss has a different cause
+and still needs its own look (that cause is Finding 6).
 
 **Caveat on the fix.** The patch used here (`reserve_exact` + `set_len`) was a
-measurement instrument, not a shippable change: it exposes uninitialised memory,
-which is fine when the kernel writes every element it hands back but not in
-general — a writer that returns a buffer longer than it wrote would leak
+measurement instrument, not a shippable change: it exposes uninitialised
+memory, which is fine when the kernel writes every element it hands back but
+not in general — a writer that returns a buffer longer than it wrote would leak
 uninitialised bytes into an Arrow array. A real fix wants either `MaybeUninit`
-discipline in the writer, or a right-sized allocation. For reductions the latter
-is the better answer anyway: give them capacity 1 instead of `"<= n"`, which
-needs a numeric-constant variant in `SizeTerm` (`dsl2/resolver.rs:8` currently
-has only `Term`, `Add` and `AtLeast`).
+discipline in the writer, or a right-sized allocation. For reductions the
+latter is the better answer anyway: give them capacity 1 instead of `"<= n"`,
+which needs a numeric-constant variant in `SizeTerm` (`dsl2/resolver.rs:8`
+currently has only `Term`, `Add` and `AtLeast`).
 
 ## Finding 3 — The sort comparator does two things arrow's doesn't
 
-`sort::sort_to_indices(u64)` at 1m rows: 24.24 ms vs arrow 12.44 ms. Both sides
-end up in the *same* `core::slice::sort::unstable::quicksort::<(u32, u64)>`
-monomorphization, so the algorithm and the tuple are identical — the difference
-is the closure at `sort.rs:182`:
+**The short version:** both sides run the identical compiled sort routine; the
+whole gap lives in the comparison closure we hand it, which re-tests the
+`descending` flag on every comparison and adds an index tie-break that arrow
+doesn't have.
+
+`sort::sort_to_indices(u64)` at 1m rows: 24.24 ms vs arrow 12.44 ms. Both
+sides end up in the *same* monomorphization —
+`core::slice::sort::unstable::quicksort::<(u32, u64)>`, one compiled instance
+shared by both crates — so the algorithm and the tuple layout are identical.
+The difference is the closure at `sort.rs:182`:
 
 ```rust
 let cmp = T::Native::compare(*lhs_val, *rhs_val);
@@ -351,24 +405,43 @@ deterministic, which arrow's `sort_unstable_by` does not guarantee. Keeping
 determinism via a `(u64 value, u32 index)` layout and a plain `sort_unstable()`
 costs 16.32 ms (1.45× win); giving it up gets the full 2.05×.
 
+### Finding 3b — The nullable sort adds a null pre-pass on top of the comparator
+
+**Not AMD-specific.** `sort_to_indices(nullable u64)` is 0.44×, slightly worse
+than the non-null 0.51×. Profiling shows the same shared `quicksort::<(u32, …)>`
+on both sides, so Finding 3's comparator problem applies unchanged. The extra
+loss is a pre-pass: `sort::sort_primitive…` accounts for **13.6%** of our
+runtime against **4.4%** for arrow's whole `sort_to_indices` entry point. That
+pre-pass (`sort.rs:160-179`) tests validity one row at a time and pushes into
+two separate vectors. Fixing the comparator helps this row too; the pre-pass is
+a second, smaller item.
+
 ## Finding 4 — Prefix/suffix LIKE is all per-row overhead
 
+**The short version:** these kernels call from JIT-compiled code back into
+Rust once per row, and each crossing costs a few nanoseconds — closure
+dispatch, an iterator call, a per-row append. Arrow runs one bulk vectorised
+loop over the offsets instead. Against that, a few nanoseconds per row is the
+whole loss.
+
 `'abc%'` 3.89 ms vs arrow 0.91 ms; `'%xyz'` 3.56 ms vs 1.01 ms — universal
-(0.16–0.35× on all three machines, worst on the M4), not AMD-specific, and **not** related to
-Finding 1: these patterns have a 3-byte non-empty needle, so their memcmp calls
-are ordinary ~1.2 ns ones.
+(0.16–0.35× on all three machines, worst on the M4), not AMD-specific, and
+**not** related to Finding 1: these patterns have a 3-byte non-empty needle,
+so their memcmp calls are ordinary ~1.2 ns ones.
 
-A standalone loop does the entire `%abc%` matching job in 9.49 ms, while the
-kernel's `contains` — same search, same data — takes 12.93 ms. That ~3.4 ns/row
-gap is `filter_bytes`'s fixed cost, and it is *all* of the `'abc%'` time. The
-profile shows where it goes: a libc memcmp call per row (~44%), `ArrowIter<&[u8]>`
-(4.5%), the boxed closure (3.1%), `PrimitiveType::width` (2.1% — a function call
-in the hot loop), plus a per-row `BooleanBufferBuilder::append`. Arrow uses a
-bulk vectorized loop over the offsets.
+The fixed cost can be isolated: a standalone loop does the entire `%abc%`
+matching job in 9.49 ms, while the kernel's `contains` — same search, same
+data — takes 12.93 ms. The ~3.4 ns/row difference is the fixed per-row cost of
+the `filter_bytes` scaffolding, and at `'abc%'`'s ~3.9 ns/row total, that
+scaffolding is essentially *all* of its time. The profile shows where it goes:
+a libc memcmp call per row (~44%), `ArrowIter<&[u8]>` (4.5%), the boxed
+closure (3.1%), `PrimitiveType::width` (2.1% — a function call in the hot
+loop), plus a per-row `BooleanBufferBuilder::append`. Arrow uses a bulk
+vectorized loop over the offsets.
 
-This is the existing action item to route prefix/suffix-shaped LIKE patterns to
-`StringStartEndKernel`, which already beats arrow on the long-string dataset
-(5.67 ms vs 6.93 ms).
+This is the existing action item to route prefix/suffix-shaped LIKE patterns
+to `StringStartEndKernel`, which already beats arrow on the long-string
+dataset (5.67 ms vs 6.93 ms).
 
 ### The same pattern shows up in two more rows
 
@@ -379,19 +452,21 @@ because the substring search itself is expensive enough to hide some of it.
 `cast(dictionary(i32, utf8) → utf8)` (0.79×, 8.03 ms vs 6.34 ms) is the same
 *shape* on the writer side. Our profile is led by `str_writer_append_bytes`
 (9.4%) plus libc `memmove`, i.e. a Rust callback invoked once per string out of
-JIT-compiled code. Arrow's `take_bytes` (19.6%) computes all the offsets in bulk
-first and then copies. Over 1m rows the 1.69 ms difference is about 1.7 ns of
-per-row call overhead.
+JIT-compiled code. Arrow's `take_bytes` (19.6%) computes all the offsets in
+bulk first and then copies. Over 1m rows the 1.69 ms difference is about
+1.7 ns of per-row call overhead.
 
-The general lesson across all three: **anything that crosses the
-JIT-to-Rust boundary once per row costs a few nanoseconds per row**, and against
-a bulk-vectorised arrow kernel that is enough to lose. The fix in each case is to
-hoist the boundary out of the loop — do the work per batch, not per element.
+The general lesson across all three: **anything that crosses the JIT-to-Rust
+boundary once per row costs a few nanoseconds per row**, and against a
+bulk-vectorised arrow kernel that is enough to lose. The fix in each case is
+to hoist the boundary out of the loop — do the work per batch, not per
+element.
 
 ## Finding 5 — Run-end encoding only pays off when the work is uniform per run
 
-**Not AMD-specific.** Three losing rows are all run-end-encoded (REE) inputs, and
-they share one explanation.
+**Not AMD-specific.** Three losing rows all take run-end-encoded (REE) inputs —
+the layout that stores an array as a sequence of runs, so 20m logical elements
+with 1m distinct runs occupy only 1m entries — and they share one explanation.
 
 The whole point of reading through an encoding is that a 1m-run array standing
 for 20m logical elements should cost 1m units of work, not 20m. That holds when
@@ -404,8 +479,8 @@ forced back to 20m units of work, and our per-element path is slower than
 arrow's, which decodes the whole array in bulk and then operates densely.
 
 **`select::filter(ree, bool)` — 0.53×, and it's branch mispredictions.** The
-filter mask is random per element, so it varies inside every run. Measured over
-~20m logical elements:
+filter mask is random per element, so it varies inside every run. Measured
+over ~20m logical elements (IPC = instructions per cycle):
 
 | | instructions/el | cycles/el | IPC | branch misses/el | miss rate |
 |---|---|---|---|---|---|
@@ -424,17 +499,18 @@ selected indices and then copies, which is straight-line work with almost
 nothing to mispredict.
 
 **`logical_nulls(ree)` — 0.26×.** Same shape at small scale (1000 runs, ~5000
-elements). Arrow takes the 1000-entry validity buffer and expands it per run in
-bulk; we walk all ~5000 logical positions one at a time. The dictionary version
-of the same operation at 100m rows is a **7.4× win**, which is the contrast that
-makes the point: dictionaries don't force per-element work on us, REE does.
+elements). Arrow takes the 1000-entry validity buffer and expands it per run
+in bulk; we walk all ~5000 logical positions one at a time. The dictionary
+version of the same operation at 100m rows is a **7.4× win**, which is the
+contrast that makes the point: dictionaries don't force per-element work on
+us, REE does.
 
 **`select::take(ree, indices)` — 0.70×.** Random access into a run-end array
-requires finding which run an index falls in, and `runend.rs:318` does that with
-a binary search per index. Over 1m runs that's ~20 dependent, cache-missing
-loads for every single index. This one is inherent to the layout rather than a
-bug: arrow pays a different cost (decode everything once, then take densely) and
-happens to come out ahead at this size.
+requires finding which run an index falls in, and `runend.rs:318` does that
+with a binary search per index. Over 1m runs that's ~20 dependent,
+cache-missing loads for every single index. This one is inherent to the layout
+rather than a bug: arrow pays a different cost (decode everything once, then
+take densely) and happens to come out ahead at this size.
 
 **What to take from it.** The encoded-input thesis is sound and the numbers
 elsewhere back it up — but it holds for *run-uniform* operations. For
@@ -445,8 +521,8 @@ rather than always streaming through the encoding.
 ## Finding 6 — Dense `filter` simply emits more instructions per element
 
 **Not AMD-specific.** `select::filter(array(i32), array(bool))` at 10m rows is
-0.74×, and it is the one row that did *not* improve when the output zero-fill was
-removed (0.74 → 0.78). So it has its own cause.
+0.74×, and it is the one row that did *not* improve when the output zero-fill
+was removed (0.74 → 0.78). So it has its own cause.
 
 | | instructions/el | cycles/el | IPC | branch misses/el |
 |---|---|---|---|---|
@@ -455,31 +531,21 @@ removed (0.74 → 0.78). So it has its own cause.
 
 Branch prediction is fine on both sides (under 2% miss rate), and our IPC is
 actually *better* than arrow's. We are simply executing 1.6× more instructions
-to move each element. Nine instructions to test a bit and conditionally copy an
-i32 is a lot; arrow does it in under six.
+to move each element. Nine instructions to test a bit and conditionally copy
+an i32 is a lot; arrow does it in under six.
 
 This is a codegen-quality issue in the filter kernel rather than anything
-architectural, and it is the least dramatic of the findings here — worth a look
-at the emitted loop, but a long way behind F2 in value.
-
-## Finding 3b — The nullable sort adds a null pre-pass on top of the comparator
-
-**Not AMD-specific.** `sort_to_indices(nullable u64)` is 0.44×, slightly worse
-than the non-null 0.51×. Profiling shows the same shared `quicksort::<(u32, …)>`
-on both sides, so Finding 3's comparator problem applies unchanged. The extra
-loss is a pre-pass: `sort::sort_primitive…` accounts for **13.6%** of our
-runtime against **4.4%** for arrow's whole `sort_to_indices` entry point. That
-pre-pass (`sort.rs:160-179`) tests validity one row at a time and pushes into two
-separate vectors. Fixing the comparator helps this row too; the pre-pass is a
-second, smaller item.
+architectural, and it is the least dramatic of the findings here — worth a
+look at the emitted loop, but a long way behind F2 in value.
 
 ## Recommended actions, in order
 
 1. **Guard the zero-length comparisons in `compile_string_like`**
    (`string.rs:380-381`). Two lines, semantics-preserving, verified on Zen 5:
    `%abc%` 102.4 → 13.9 ms and `%abc%xyz` 60.0 → 4.6 ms. It fixes only the
-   two-wildcard branch — no other LIKE shape changes — so it is not a substitute
-   for item 4. Add `%abc%xyz` to the benchmark set while doing this.
+   two-wildcard branch — no other LIKE shape changes — so it is not a
+   substitute for item 4. Add `%abc%xyz` to the benchmark set while doing
+   this.
 2. **Stop zero-filling output buffers** in `PrimitiveWriter::allocate`
    (`primitive_writer.rs:135`), and give reductions a constant-size output
    instead of `"<= n"`. Measured on Zen 5: `compute::sum` 0.12× → 0.97×,
@@ -487,23 +553,25 @@ second, smaller item.
    single highest-value change in this document — it is worth more than
    everything else here combined, and it is not AMD-specific.
 3. **Hoist `descending` out of the sort comparator** and decide explicitly
-   whether the index tie-break is a guarantee worth 1.4×. Fixes both sort rows.
-4. **Get the per-row Rust callback out of the hot loop** for the string paths —
-   route prefix/suffix LIKE to `StringStartEndKernel`, and batch
-   `str_writer_append_bytes` in the dictionary-to-string cast. Covers four rows
-   (F4), worth roughly 2–4× on the LIKE ones.
-5. **Decode-then-operate for non-run-uniform REE work** (filter, take,
-   null expansion). Streaming through the encoding is the right default and wins
+   whether the index tie-break is a guarantee worth 1.4×. Fixes both sort
+   rows.
+4. **Get the per-row Rust callback out of the hot loop** for the string
+   paths — route prefix/suffix LIKE to `StringStartEndKernel`, and batch
+   `str_writer_append_bytes` in the dictionary-to-string cast. Covers four
+   rows (F4), worth roughly 2–4× on the LIKE ones.
+5. **Decode-then-operate for non-run-uniform REE work** (filter, take, null
+   expansion). Streaming through the encoding is the right default and wins
    27× where the operation is run-uniform, but it is the wrong choice when the
    answer varies inside a run — the kernel could pick at runtime (F5).
-6. **Look at the dense filter loop's instruction count** — 9.2 instructions per
-   element against arrow's 5.8, with no branch or memory problem to blame (F6).
-7. ~~Make `report.py` record `rustflags` in the manifest~~ — **done**; the field
-   is written as of `report.py:416`. This run predates it, which is why its build
-   flavour had to be recovered by disassembling the benchmark binary. Runs
-   published before that change (all five currently on the site) still have no
-   `rustflags` in their manifest.
-8. **Investigate the three uninvestigated losing rows** — `cmp::lt(i32, scalar)`
-   at 10m, `select::take(bool, u64)`, and the catch-all `%abc%xyz%` LIKE. The
-   first two look like the same x86-native-arrow effect seen on Meteor Lake
-   rather than anything of ours, but neither has been profiled.
+6. **Look at the dense filter loop's instruction count** — 9.2 instructions
+   per element against arrow's 5.8, with no branch or memory problem to blame
+   (F6).
+7. ~~Make `report.py` record `rustflags` in the manifest~~ — **done**; the
+   field is written as of `report.py:416`. This run predates it, which is why
+   its build flavour had to be recovered by disassembling the benchmark
+   binary. Runs published before that change (all five currently on the site)
+   still have no `rustflags` in their manifest.
+8. **Investigate the three uninvestigated losing rows** — `cmp::lt(i32,
+   scalar)` at 10m, `select::take(bool, u64)`, and the catch-all `%abc%xyz%`
+   LIKE. The first two look like the same x86-native-arrow effect seen on
+   Meteor Lake rather than anything of ours, but neither has been profiled.

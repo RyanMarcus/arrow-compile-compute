@@ -137,7 +137,7 @@ See <a href="#reproduce">how to reproduce these results</a>.</p>
 <pre>
 python3 benches/report.py --run          # run the full suite into an isolated
                                          # Criterion dir and write
-                                         # docs/benchmark-results-ARM.json
+                                         # docs/benchmark-results-m4-native.json
 python3 -m http.server -d docs 8321      # view this page at localhost:8321
 </pre>
 <p class="classification">Runs build with <code>-C target-cpu=native</code> by default, so the
@@ -369,7 +369,7 @@ re-benchmarking. Tests: <code>python3 -m pytest benches/test_report.py</code>.</
       }
       loadRun(runs[0].file);
     })
-    .catch(() => loadRun("./benchmark-results-ARM.json"));
+    .catch(() => loadRun("./benchmark-results-m4-native.json"));
 </script>
 </body>
 </html>
