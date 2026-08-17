@@ -556,27 +556,42 @@ look at the emitted loop, but a long way behind F2 in value.
    `%abc%` 102.4 → 13.9 ms and `%abc%xyz` 60.0 → 4.6 ms. It fixes only the
    two-wildcard branch — no other LIKE shape changes — so it is not a
    substitute for item 4. Add `%abc%xyz` to the benchmark set while doing
-   this.
+   this. — **Done** (round 1): guarded, plus `%abc%xyz` added to the
+   suite; the row later reached parity once the remaining per-row overhead
+   fell (rounds 3–4).
 2. **Stop zero-filling output buffers** in `PrimitiveWriter::allocate`
    (`primitive_writer.rs:135`), and give reductions a constant-size output
    instead of `"<= n"`. Measured on Zen 5: `compute::sum` 0.12× → 0.97×,
    `neg_wrapping` 0.59× → 1.00×, `cast(i32→i64)` 0.91× → 1.64×. This is the
    single highest-value change in this document — it is worth more than
-   everything else here combined, and it is not AMD-specific.
+   everything else here combined, and it is not AMD-specific. — **Done**
+   (round 1): reductions now allocate exactly one element and sit at the
+   read-bandwidth floor; `cast(i32→i64)` became a 1.69× win.
 3. **Hoist `descending` out of the sort comparator** and decide explicitly
    whether the index tie-break is a guarantee worth 1.4×. Fixes both sort
-   rows.
+   rows. — **Done and superseded** (rounds 1, 3–5): the comparator was
+   first hoisted, then replaced entirely by packed integer sort keys and a
+   stable radix sort. Both sort rows are now outright wins (1.25×/1.34×)
+   with the deterministic tie-break preserved bit-for-bit.
 4. **Get the per-row Rust callback out of the hot loop** for the string
    paths — route prefix/suffix LIKE to `StringStartEndKernel`, and batch
    `str_writer_append_bytes` in the dictionary-to-string cast. Covers four
-   rows (F4), worth roughly 2–4× on the LIKE ones.
+   rows (F4), worth roughly 2–4× on the LIKE ones. — **Done** (rounds 1,
+   3–4): prefix/suffix LIKE routes to the JIT kernel (1.2–1.4× wins),
+   string appends are inlined, and flat string arrays skip the per-row
+   iterator; `contains` became a win, `like('%abc%')` parity.
 5. **Decode-then-operate for non-run-uniform REE work** (filter, take, null
    expansion). Streaming through the encoding is the right default and wins
    27× where the operation is run-uniform, but it is the wrong choice when the
-   answer varies inside a run — the kernel could pick at runtime (F5).
+   answer varies inside a run — the kernel could pick at runtime (F5). —
+   **Done** (round 2): `filter(ree)` decodes first (3.9× win), `take(ree)`
+   decodes when indices are dense (35.7× win), and REE null expansion is
+   batched per span.
 6. **Look at the dense filter loop's instruction count** — 9.2 instructions
    per element against arrow's 5.8, with no branch or memory problem to blame
-   (F6).
+   (F6). — **Done** (round 2): the vectorizer now lowers conditional emits
+   to AVX-512 compress-stores; the dense filter processes 16 elements in ~9
+   instructions and became a 1.83× win.
 7. ~~Make `report.py` record `rustflags` in the manifest~~ — **done**; the
    field is written as of `report.py:416`. This run predates it, which is why
    its build flavour had to be recovered by disassembling the benchmark
@@ -586,3 +601,6 @@ look at the emitted loop, but a long way behind F2 in value.
    scalar)` at 10m, `select::take(bool, u64)`, and the catch-all `%abc%xyz%`
    LIKE. The first two look like the same x86-native-arrow effect seen on
    Meteor Lake rather than anything of ours, but neither has been profiled.
+   — **Resolved**: `take(bool, u64)` was root-caused (bit-serial output)
+   and fixed with a word-packed gather (round 4); the other two drifted to
+   wins/equal once the shared overheads above were removed.
