@@ -28,6 +28,7 @@ mod llvm_debug;
 
 pub use arrow_interface::aggregate;
 pub use arrow_interface::arith;
+pub use arrow_interface::boolean;
 pub use arrow_interface::cast;
 pub use arrow_interface::cmp;
 pub use arrow_interface::compute;

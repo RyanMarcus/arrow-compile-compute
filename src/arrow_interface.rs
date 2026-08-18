@@ -1193,6 +1193,39 @@ pub mod arith {
     }
 }
 
+pub mod boolean {
+    use std::sync::LazyLock;
+
+    use arrow_array::{BooleanArray, Datum};
+    use arrow_buffer::BooleanBuffer;
+
+    use crate::{
+        compiled_kernels::{KernelCache, NotKernel},
+        logical_nulls, ArrowKernelError,
+    };
+
+    static NOT_PROGRAM_CACHE: LazyLock<KernelCache<NotKernel>> = LazyLock::new(KernelCache::new);
+
+    pub fn not(inp: &dyn Datum) -> Result<BooleanArray, ArrowKernelError> {
+        let (inp, _) = inp.get();
+        NOT_PROGRAM_CACHE.get(inp, ())
+    }
+
+    pub fn is_not_null(inp: &dyn Datum) -> Result<BooleanArray, ArrowKernelError> {
+        let (inp, _) = inp.get();
+        let validity = logical_nulls(inp)?;
+        let bb = match validity {
+            Some(nb) => nb.into_inner(),
+            None => BooleanBuffer::new_set(inp.len()),
+        };
+        Ok(BooleanArray::from(bb))
+    }
+
+    pub fn is_null(inp: &dyn Datum) -> Result<BooleanArray, ArrowKernelError> {
+        not(&is_not_null(inp)?)
+    }
+}
+
 pub mod vec {
     use std::sync::{Arc, LazyLock};
 

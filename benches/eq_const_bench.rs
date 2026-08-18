@@ -99,12 +99,16 @@ pub fn criterion_benchmark(c: &mut Criterion) {
         let arrow_answer = arrow_ord::cmp::lt(&data1, &data2).unwrap();
         assert_eq!(llvm_answer, arrow_answer);
 
-        c.bench_function("cmp::lt(dictionary(i8, i32), array(i32)) 10m rows/arrow", |b| {
-            b.iter(|| arrow_ord::cmp::lt(&data1, &data2).unwrap())
-        });
-        c.bench_function("cmp::lt(dictionary(i8, i32), array(i32)) 10m rows/llvm warm", |b| {
-            b.iter(|| arrow_compile_compute::cmp::lt(&data1, &data2).unwrap());
-        });
+        c.bench_function(
+            "cmp::lt(dictionary(i8, i32), array(i32)) 10m rows/arrow",
+            |b| b.iter(|| arrow_ord::cmp::lt(&data1, &data2).unwrap()),
+        );
+        c.bench_function(
+            "cmp::lt(dictionary(i8, i32), array(i32)) 10m rows/llvm warm",
+            |b| {
+                b.iter(|| arrow_compile_compute::cmp::lt(&data1, &data2).unwrap());
+            },
+        );
     }
 
     {
@@ -157,9 +161,10 @@ pub fn criterion_benchmark(c: &mut Criterion) {
         c.bench_function("cmp::lt(array(utf8), scalar(utf8)) 1m rows/arrow", |b| {
             b.iter(|| arrow_ord::cmp::lt(&data, &scalar).unwrap())
         });
-        c.bench_function("cmp::lt(array(utf8), scalar(utf8)) 1m rows/llvm warm", |b| {
-            b.iter(|| arrow_compile_compute::cmp::lt(&data, &scalar).unwrap())
-        });
+        c.bench_function(
+            "cmp::lt(array(utf8), scalar(utf8)) 1m rows/llvm warm",
+            |b| b.iter(|| arrow_compile_compute::cmp::lt(&data, &scalar).unwrap()),
+        );
     }
 
     {

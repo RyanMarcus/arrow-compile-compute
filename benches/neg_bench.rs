@@ -70,12 +70,15 @@ pub fn criterion_benchmark(c: &mut Criterion) {
             |b| b.iter(|| arrow_compile_compute::arith::neg_wrapping(black_box(&data)).unwrap()),
         );
 
-        c.bench_function("arith::neg_wrapping(dictionary(i8, i32)) 10m rows/arrow", |b| {
-            b.iter(|| {
-                let decoded = arrow_cast::cast(black_box(&data), &DataType::Int32).unwrap();
-                arrow_arith::numeric::neg_wrapping(&decoded).unwrap()
-            })
-        });
+        c.bench_function(
+            "arith::neg_wrapping(dictionary(i8, i32)) 10m rows/arrow",
+            |b| {
+                b.iter(|| {
+                    let decoded = arrow_cast::cast(black_box(&data), &DataType::Int32).unwrap();
+                    arrow_arith::numeric::neg_wrapping(&decoded).unwrap()
+                })
+            },
+        );
     }
 }
 
