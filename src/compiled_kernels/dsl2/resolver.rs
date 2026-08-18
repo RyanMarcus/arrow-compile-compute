@@ -7,7 +7,6 @@ use num_rational::Ratio;
 #[derive(Debug, Clone, PartialEq)]
 pub enum SizeTerm {
     Term(String),
-    Const(usize),
     Add(Box<SizeTerm>, Box<SizeTerm>),
     AtLeast(Box<SizeTerm>),
 }
@@ -28,12 +27,6 @@ impl SizeTerm {
                 Box::new(SizeTerm::parse(s)?),
             )),
             None => {
-                if input.chars().all(|c| c.is_ascii_digit()) {
-                    return input
-                        .parse()
-                        .map(SizeTerm::Const)
-                        .map_err(|_| format!("invalid constant {}", input));
-                }
                 if !input.chars().all(|c| c.is_alphabetic()) {
                     return Err(format!("invalid term {}", input));
                 }
@@ -46,7 +39,6 @@ impl SizeTerm {
         let mut v = Vec::new();
         match self {
             SizeTerm::Term(s) => v.push(s.as_str()),
-            SizeTerm::Const(_) => {}
             SizeTerm::Add(s1, s2) => {
                 v.extend(s1.terms());
                 v.extend(s2.terms());
@@ -64,7 +56,6 @@ impl SizeTerm {
                 let idx = st[s];
                 v[idx] += 1;
             }
-            SizeTerm::Const(_) => {}
             SizeTerm::Add(s1, s2) => {
                 s1.to_vec(st, v);
                 s2.to_vec(st, v);
@@ -75,19 +66,9 @@ impl SizeTerm {
         }
     }
 
-    pub fn const_offset(&self) -> usize {
-        match self {
-            SizeTerm::Term(_) => 0,
-            SizeTerm::Const(k) => *k,
-            SizeTerm::Add(s1, s2) => s1.const_offset() + s2.const_offset(),
-            SizeTerm::AtLeast(s) => s.const_offset(),
-        }
-    }
-
     pub fn is_exact(&self) -> bool {
         match self {
             SizeTerm::Term(_) => true,
-            SizeTerm::Const(_) => true,
             SizeTerm::Add(s1, s2) => s1.is_exact() && s2.is_exact(),
             SizeTerm::AtLeast(_) => false,
         }
@@ -108,7 +89,6 @@ enum Solution {
 
 pub struct Resolver {
     solutions: Vec<Solution>,
-    const_offsets: Vec<usize>,
     is_input_exact: Vec<bool>,
     is_output_exact: Vec<bool>,
 }
@@ -138,31 +118,23 @@ impl Resolver {
         for out in outputs.iter() {
             let mut slice = vec![0; st.len()];
             out.to_vec(&st, &mut slice);
-            // a constant-only output depends on no input term and resolves
-            // without consulting the database
-            solutions.push(if slice.iter().all(|v| *v == 0) {
-                Solution::Known(vec![Ratio::<i128>::from(0); terms.len()])
-            } else {
-                match db.query(slice) {
-                    Ok(s) => Solution::Known(s),
-                    Err(QueryError::NotInRowSpace) => {
-                        return Err(format!("unable to resolve output: {:?}", out));
-                    }
-                    Err(QueryError::EmptyDatabase) => Solution::Unknown,
-                    Err(e) => {
-                        panic!("unexpected error: {:?}", e)
-                    }
+            solutions.push(match db.query(slice) {
+                Ok(s) => Solution::Known(s),
+                Err(QueryError::NotInRowSpace) => {
+                    return Err(format!("unable to resolve output: {:?}", out));
+                }
+                Err(QueryError::EmptyDatabase) => Solution::Unknown,
+                Err(e) => {
+                    panic!("unexpected error: {:?}", e)
                 }
             });
         }
 
-        let const_offsets = outputs.iter().map(|x| x.const_offset()).collect_vec();
         let is_input_exact = terms.iter().map(|x| x.is_exact()).collect_vec();
         let is_output_exact = outputs.iter().map(|x| x.is_exact()).collect_vec();
 
         Ok(Self {
             solutions,
-            const_offsets,
             is_input_exact,
             is_output_exact,
         })
@@ -195,7 +167,7 @@ impl Resolver {
                     }
 
                     if sum.is_integer() {
-                        let sum = sum.to_integer() as usize + self.const_offsets[idx];
+                        let sum = sum.to_integer() as usize;
                         if is_exact {
                             result_sizes.push(ResolveResult::Exact(sum));
                         } else {
@@ -253,21 +225,6 @@ mod tests {
                 Box::new(SizeTerm::Term("foo".to_string())),
                 Box::new(SizeTerm::Term("bar".to_string())),
             )))),
-        );
-    }
-
-    #[test]
-    fn test_resolve_const() {
-        let terms = vec![SizeTerm::parse("n").unwrap()];
-        let outputs = vec![
-            SizeTerm::parse("1").unwrap(),
-            SizeTerm::parse("n").unwrap(),
-        ];
-
-        let resolver = Resolver::new(terms, outputs).unwrap();
-        assert_eq!(
-            resolver.resolve(&[10]).unwrap(),
-            vec![ResolveResult::Exact(1), ResolveResult::Exact(10)]
         );
     }
 

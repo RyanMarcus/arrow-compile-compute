@@ -214,7 +214,6 @@ impl Writer for BooleanWriter {
         runtime_ptr: PointerValue<'ctx>,
         values: VectorValue<'ctx>,
         logical_len: u32,
-        _head_slot: Option<PointerValue<'ctx>>,
     ) -> Result<(), ArrowKernelError> {
         let packed_type = codegen.ctx.custom_width_int_type(logical_len);
         if values.get_type().get_size() != logical_len {
@@ -807,7 +806,7 @@ mod tests {
             .collect::<Vec<_>>();
         let values = inkwell::types::VectorType::const_vector(&values);
         writer
-            .llvm_write_block(codegen, dest, values, block.len() as u32, None)
+            .llvm_write_block(codegen, dest, values, block.len() as u32)
             .unwrap();
         for value in scalars {
             writer
@@ -821,7 +820,7 @@ mod tests {
                 .unwrap();
         }
         writer
-            .llvm_write_block(codegen, dest, values, block.len() as u32, None)
+            .llvm_write_block(codegen, dest, values, block.len() as u32)
             .unwrap();
         build.build_return(None).unwrap();
         llvm_mod.verify().unwrap();

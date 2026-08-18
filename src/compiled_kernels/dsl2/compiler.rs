@@ -20,10 +20,7 @@ use inkwell::{
     },
     module::{Linkage, Module},
     types::{BasicType, BasicTypeEnum, VectorType},
-    values::{
-        BasicValue, BasicValueEnum, FunctionValue, InstructionOpcode, IntValue, PointerValue,
-        VectorValue,
-    },
+    values::{BasicValue, BasicValueEnum, FunctionValue, InstructionOpcode, IntValue, VectorValue},
     AddressSpace, FloatPredicate, IntPredicate, OptimizationLevel,
 };
 use itertools::Itertools;
@@ -156,9 +153,6 @@ pub struct DSLCompilationContext<'ctx, 'a> {
     pub output_specs: Vec<WriterSpec>,
     /// Holds each initialized output writer in return-value order.
     pub outputs: Vec<BoundWriter<'ctx>>,
-    /// Stack slots caching each output's write head inside a block loop,
-    /// keyed by output index. See `Writer::write_head_offset`.
-    pub head_slots: HashMap<usize, PointerValue<'ctx>>,
     /// Records whether compilation emitted a vectorized loop.
     pub did_vectorize: &'a mut bool,
 }
@@ -204,14 +198,6 @@ pub fn compile_inner<'ctx, 'args>(
     did_vectorize: &mut bool,
 ) -> Result<JitFunction<'ctx, unsafe extern "C" fn(*mut c_void) -> u64>, ArrowKernelError> {
     let module = ctx.create_module("dsl2");
-    if f.nontemporal_outputs && cfg!(target_arch = "x86_64") {
-        // writers consult this module-level flag when emitting block stores.
-        // x86-only: the sfence below pairs with it, and non-temporal
-        // lowering on other targets has not been reasoned about
-        module
-            .add_global_metadata("acc.nontemporal", &ctx.metadata_node(&[]))
-            .unwrap();
-    }
     let args: Vec<_> = args.into_iter().collect();
 
     // validate parameters
@@ -440,7 +426,6 @@ pub fn compile_inner<'ctx, 'args>(
         output_specs,
         lengths,
         outputs: writers,
-        head_slots: HashMap::new(),
         did_vectorize,
     };
 
@@ -448,13 +433,6 @@ pub fn compile_inner<'ctx, 'args>(
         compile_stmt(&mut dsl_ctx, stmt)?;
     }
 
-    if f.nontemporal_outputs && cfg!(target_arch = "x86_64") {
-        // non-temporal stores are weakly ordered on x86; fence before the
-        // results become visible to the caller
-        let sfence = Intrinsic::find("llvm.x86.sse.sfence").unwrap();
-        let sfence = sfence.get_declaration(&module, &[]).unwrap();
-        b.build_call(sfence, &[], "sfence").unwrap();
-    }
     b.build_return(Some(&ctx.i64_type().const_zero())).unwrap();
 
     // add the wrapper function so we can extract a function with a consistent sig
@@ -694,28 +672,7 @@ fn compile_stmt<'ctx, 'a>(
                 ctx.b,
                 value.into_vector_value(),
                 logical_len as u32,
-                ctx.head_slots.get(&(index as usize)).copied(),
             );
-        }
-        DSLStmt::EmitBlockMasked { index, value, mask } => {
-            let index = index.as_u32().ok_or_else(|| {
-                ArrowKernelError::DSLTypeMismatch(
-                    "masked block emit requires const index",
-                    DSLType::scalar_of(PrimitiveType::U32),
-                    index.get_type(),
-                )
-            })?;
-
-            let value = compile_expr(ctx, value)?;
-            let mask = compile_expr(ctx, mask)?;
-            ctx.outputs[index as usize].llvm_ingest_block_masked(
-                ctx.ctx,
-                ctx.module,
-                ctx.b,
-                value.into_vector_value(),
-                mask.into_vector_value(),
-                ctx.head_slots.get(&(index as usize)).copied(),
-            )?;
         }
         DSLStmt::Set {
             buf,
@@ -904,21 +861,6 @@ fn compile_stmt<'ctx, 'a>(
                 .map(|(i, llvm_type)| build_entry_alloca(ctx, llvm_type, &format!("iter_buf{}", i)))
                 .collect_vec();
 
-            // cache each eligible output's write head in a stack slot for the
-            // duration of the loop; LLVM promotes the slot to a register,
-            // which it cannot do for the runtime struct field (the data
-            // stores may alias it)
-            for (out_idx, output) in ctx.outputs.iter().enumerate() {
-                if let Some(cell) = output.llvm_write_head_cell(ctx.ctx, ctx.b) {
-                    let ptr_type = ctx.ctx.ptr_type(AddressSpace::default());
-                    let slot =
-                        build_entry_alloca(ctx, ptr_type.into(), &format!("head_slot{}", out_idx));
-                    let head = ctx.b.build_load(ptr_type, cell, "head_in").unwrap();
-                    ctx.b.build_store(slot, head).unwrap();
-                    ctx.head_slots.insert(out_idx, slot);
-                }
-            }
-
             let loop_header = ctx.ctx.append_basic_block(*ctx.func, "bloop_header");
             let loop_body = ctx.ctx.append_basic_block(*ctx.func, "bloop_body");
             let loop_end = ctx.ctx.append_basic_block(*ctx.func, "bloop_end");
@@ -979,17 +921,6 @@ fn compile_stmt<'ctx, 'a>(
                 ctx.b.build_unconditional_branch(loop_header).unwrap();
             }
             ctx.b.position_at_end(loop_end);
-
-            // write the cached heads back so the scalar tail loop (and
-            // everything after) sees the advanced pointers
-            for (out_idx, slot) in std::mem::take(&mut ctx.head_slots).into_iter() {
-                let cell = ctx.outputs[out_idx]
-                    .llvm_write_head_cell(ctx.ctx, ctx.b)
-                    .unwrap();
-                let ptr_type = ctx.ctx.ptr_type(AddressSpace::default());
-                let head = ctx.b.build_load(ptr_type, slot, "head_out").unwrap();
-                ctx.b.build_store(cell, head).unwrap();
-            }
         }
         DSLStmt::Reduce(dslred) => {
             let body_type = dslred.body.get_type();

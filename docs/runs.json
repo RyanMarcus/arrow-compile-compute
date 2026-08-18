@@ -1,14 +1,18 @@
 [
   {
-    "label": "Apple M4 · macOS (arm64)",
+    "label": "Apple M4 \u00b7 macOS (arm64) \u00b7 default build",
+    "file": "benchmark-results-ARM.json"
+  },
+  {
+    "label": "Apple M4 \u00b7 macOS (arm64) \u00b7 native build",
     "file": "benchmark-results-m4-native.json"
   },
   {
-    "label": "Intel Core Ultra 7 155H · Linux (x86_64)",
-    "file": "benchmark-results-linux-native.json"
+    "label": "Intel Core Ultra 7 155H \u00b7 Linux (x86_64) \u00b7 default build",
+    "file": "benchmark-results-linux.json"
   },
   {
-    "label": "AMD Ryzen 7 9700X · Linux (x86_64, AVX-512)",
-    "file": "benchmark-results-zen5-native.json"
+    "label": "Intel Core Ultra 7 155H \u00b7 Linux (x86_64) \u00b7 native build",
+    "file": "benchmark-results-linux-native.json"
   }
 ]

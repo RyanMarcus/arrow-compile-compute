@@ -145,7 +145,6 @@ impl Writer for FixedSizeListWriter {
         runtime_ptr: PointerValue<'ctx>,
         values: VectorValue<'ctx>,
         logical_len: u32,
-        _head_slot: Option<PointerValue<'ctx>>,
     ) -> Result<(), ArrowKernelError> {
         let expected_lanes = logical_len as usize * self.list_size;
         let actual_lanes = values.get_type().get_size();
@@ -160,7 +159,6 @@ impl Writer for FixedSizeListWriter {
             Self::get_value_ptr(codegen, runtime_ptr),
             values,
             expected_lanes as u32,
-            None,
         )?;
         Self::llvm_increment_num_written(codegen, runtime_ptr, logical_len as u64);
         Ok(())
@@ -259,7 +257,6 @@ impl<'ctx, 'borrow> WriterEmitter<'ctx, 'borrow> for FixedSizeListWriterEmitter<
                 self.value_runtime_ptr,
                 val.into_vector_value(),
                 list_size as u32,
-                None,
             )?,
         }
         Ok(())

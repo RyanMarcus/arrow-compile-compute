@@ -18,10 +18,7 @@ use crate::{
 };
 
 pub fn concat_all(data: &[&dyn Array]) -> Result<ArrayRef, ArrowKernelError> {
-    let first = data.first().ok_or_else(|| {
-        ArrowKernelError::UnsupportedArguments("cannot concat zero arrays".to_string())
-    })?;
-    concat_with_spec(data, &concat_writer_spec(first.data_type()))
+    concat_with_spec(data, &concat_writer_spec(data[0].data_type()))
 }
 
 fn concat_with_spec(data: &[&dyn Array], spec: &WriterSpec) -> Result<ArrayRef, ArrowKernelError> {

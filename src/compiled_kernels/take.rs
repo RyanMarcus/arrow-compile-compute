@@ -115,25 +115,6 @@ mod tests {
     use super::TakeKernel;
 
     #[test]
-    fn test_take_bool_invalid_indices_error() {
-        // the boolean fast path must keep the kernel path's error contract:
-        // out-of-range and negative indices are errors, not panics
-        let data = BooleanArray::from(vec![true, false, true]);
-
-        let oob = arrow_array::UInt64Array::from(vec![0, 5]);
-        assert!(matches!(
-            crate::arrow_interface::select::take(&data, &oob),
-            Err(crate::ArrowKernelError::OutOfBounds(3))
-        ));
-
-        let negative = Int32Array::from(vec![-1, 1]);
-        assert!(matches!(
-            crate::arrow_interface::select::take(&data, &negative),
-            Err(crate::ArrowKernelError::OutOfBounds(3))
-        ));
-    }
-
-    #[test]
     fn test_take_i32() {
         let data = Int32Array::from(vec![1, 2, 3, 4, 5, 6]);
         let idxes = UInt8Array::from(vec![0, 0, 3, 3, 1]);

@@ -1,4 +1,4 @@
-use arrow_array::{cast::AsArray, Array, BinaryArray, BooleanArray, Datum, Scalar};
+use arrow_array::{cast::AsArray, Array, BooleanArray, Datum};
 use arrow_buffer::BooleanBufferBuilder;
 use arrow_schema::DataType;
 use itertools::Itertools;
@@ -125,33 +125,6 @@ fn filter_bytes<F: Fn(&[u8]) -> bool>(
     f: F,
 ) -> Result<BooleanArray, ArrowKernelError> {
     let nulls = logical_nulls(arr)?;
-
-    // flat byte arrays skip the buffered iterator and read the offsets
-    // directly, like arrow's from_unary; values under nulls are computed
-    // and ignored, which arrow's own kernels also do
-    fn flat_bytes<T, F>(
-        arr: &arrow_array::GenericByteArray<T>,
-        nulls: Option<arrow_buffer::NullBuffer>,
-        f: F,
-    ) -> BooleanArray
-    where
-        T: arrow_array::types::ByteArrayType,
-        T::Native: AsRef<[u8]>,
-        F: Fn(&[u8]) -> bool,
-    {
-        let values = arrow_buffer::BooleanBuffer::collect_bool(arr.len(), |i| {
-            f(unsafe { arr.value_unchecked(i) }.as_ref())
-        });
-        BooleanArray::new(values, nulls)
-    }
-    match arr.data_type() {
-        DataType::Utf8 => return Ok(flat_bytes(arr.as_string::<i32>(), nulls, f)),
-        DataType::LargeUtf8 => return Ok(flat_bytes(arr.as_string::<i64>(), nulls, f)),
-        DataType::Binary => return Ok(flat_bytes(arr.as_binary::<i32>(), nulls, f)),
-        DataType::LargeBinary => return Ok(flat_bytes(arr.as_binary::<i64>(), nulls, f)),
-        _ => {}
-    }
-
     let mut builder = BooleanBufferBuilder::new(arr.len());
     if nulls.is_some() {
         let mut last_idx = 0;
@@ -164,13 +137,9 @@ fn filter_bytes<F: Fn(&[u8]) -> bool>(
             builder.append(false);
         }
     } else {
-        // collect_bool packs 64 results into a register word per store,
-        // instead of a read-modify-write on the buffer for every row
-        let mut iter = crate::arrow_interface::iter::iter_nonnull_bytes(arr)?;
-        let values = arrow_buffer::BooleanBuffer::collect_bool(arr.len(), |_| {
-            f(iter.next().expect("iterator shorter than array"))
-        });
-        return Ok(BooleanArray::new(values, nulls));
+        for bytes in crate::arrow_interface::iter::iter_nonnull_bytes(arr)? {
+            builder.append(f(bytes));
+        }
     }
     Ok(BooleanArray::new(builder.finish(), nulls))
 }
@@ -259,31 +228,22 @@ pub fn compile_string_like(
         (1, false) => {
             // single wildcard, no any chars
             if seq[0].is_wildcard() {
-                // suffix — routed to the JIT suffix kernel: the closure path
-                // pays a per-row Rust callback, the kernel loops in bulk
+                // suffix
                 let pattern = seq
                     .into_iter()
                     .skip(1)
                     .map(|i| i.into_literal())
                     .collect_vec();
-                if pattern.is_empty() {
-                    // bare '%' matches every non-null row
-                    Box::new(move |arr| filter_bytes(arr, |_| true))
-                } else {
-                    let needle = Scalar::new(BinaryArray::from(vec![pattern.as_slice()]));
-                    Box::new(move |arr| crate::arrow_interface::cmp::ends_with(arr, &needle))
-                }
+                Box::new(move |arr| filter_bytes(arr, |bytes| bytes.ends_with(&pattern)))
             } else if seq.last().unwrap().is_wildcard() {
-                // prefix — routed to the JIT prefix kernel; the pattern is
-                // never empty here (a bare '%' hits the suffix arm above)
+                // prefix
                 let seq_len = seq.len();
                 let pattern = seq
                     .into_iter()
                     .take(seq_len - 1)
                     .map(|i| i.into_literal())
                     .collect_vec();
-                let needle = Scalar::new(BinaryArray::from(vec![pattern.as_slice()]));
-                Box::new(move |arr| crate::arrow_interface::cmp::starts_with(arr, &needle))
+                Box::new(move |arr| filter_bytes(arr, |bytes| bytes.starts_with(&pattern)))
             } else {
                 // prefix and suffix
                 let wildcard_idx = seq.iter().position(|c| c.is_wildcard()).unwrap();
@@ -414,14 +374,11 @@ pub fn compile_string_like(
             let finder = Finder::new(&infix).into_owned();
             let min_len = prefix.len() + infix.len() + suffix.len();
 
-            // the emptiness guards matter: comparing against an empty slice
-            // still emits bcmp(p, 0x1, 0), and on Zen 5 a masked AVX-512 load
-            // from the dangling pointer costs ~250 cycles per call
             Box::new(move |arr| {
                 filter_bytes(arr, |b| {
                     b.len() >= min_len
-                        && (prefix.is_empty() || b[..prefix.len()] == prefix)
-                        && (suffix.is_empty() || b[b.len() - suffix.len()..] == suffix)
+                        && b[..prefix.len()] == prefix
+                        && b[b.len() - suffix.len()..] == suffix
                         && finder
                             .find(&b[prefix.len()..b.len() - suffix.len()])
                             .is_some()
