@@ -6,7 +6,7 @@ use arrow_array::{
         Float16Type, Float32Type, Float64Type, Int16Type, Int32Type, Int64Type, Int8Type,
         UInt16Type, UInt32Type, UInt64Type, UInt8Type,
     },
-    Array, ArrayRef, ArrowNativeTypeOp, ArrowPrimitiveType, BinaryArray, Datum, UInt32Array,
+    Array, ArrayRef, ArrowPrimitiveType, BinaryArray, Datum, UInt32Array,
 };
 use itertools::Itertools;
 
@@ -19,12 +19,23 @@ use crate::{
     PrimitiveType,
 };
 
+/// Sorted outputs (and packed sort keys) hold row numbers in 32 bits.
+fn check_row_count(len: usize) -> Result<(), ArrowKernelError> {
+    if len > u32::MAX as usize {
+        return Err(ArrowKernelError::UnsupportedArguments(
+            "sort supports at most u32::MAX rows".to_string(),
+        ));
+    }
+    Ok(())
+}
+
 pub fn sort_multi_col(data: &[(&dyn Datum, SortOptions)]) -> Result<UInt32Array, ArrowKernelError> {
     if data.is_empty() {
         return Err(ArrowKernelError::ArgumentMismatch(
             "sort requires at least one column".to_string(),
         ));
     }
+    check_row_count(data[0].0.get().0.len())?;
 
     // try the fast path
     if let Some((keys, words)) = normalize_fixed_width_columns(data)? {
@@ -74,6 +85,7 @@ pub fn sort_col(data: &dyn Datum, opts: SortOptions) -> Result<UInt32Array, Arro
     if is_scalar {
         return Ok(UInt32Array::from(vec![0]));
     }
+    check_row_count(arr.len())?;
 
     let pt = PrimitiveType::for_arrow_type(arr.data_type());
     let arr = crate::arrow_interface::cast::cast(arr, &pt.as_arrow_type())?;
@@ -109,6 +121,7 @@ pub fn top_k(
     }
 
     let normed = normalize_columns(data)?;
+    check_row_count(normed.len())?;
     let mut indices = (0..normed.len() as u32).collect_vec();
     if k == 0 || indices.is_empty() {
         return Ok(UInt32Array::from(Vec::<u32>::new()));
@@ -145,11 +158,137 @@ fn sort_indices_from_normalized(keys: &BinaryArray) -> UInt32Array {
     UInt32Array::from(indices)
 }
 
+/// Order-preserving packed sort keys: the value's bits are transformed so
+/// plain unsigned order matches `ArrowNativeTypeOp::compare` (IEEE total
+/// order for floats — the same transform `total_cmp` uses), then packed with
+/// the row index in the low 32 bits. The packed keys sort with no comparator
+/// at all, and ties resolve on the ascending index, so the output stays
+/// deterministic. Descending order inverts the key bits before packing,
+/// which reverses the value order while leaving the tie-break ascending.
+trait PackedSortKey {
+    type Packed: Ord + Copy;
+    /// Number of digit passes an LSD radix sort needs to cover the value
+    /// bits (the index bits below them start in order and stay in order
+    /// because the radix passes are stable).
+    const KEY_PASSES: usize;
+    fn pack(self, index: u32, descending: bool) -> Self::Packed;
+    fn unpack_index(packed: Self::Packed) -> u32;
+    fn digit(packed: Self::Packed, pass: usize) -> usize;
+}
+
+macro_rules! packed_sort_key {
+    ($t:ty, $u:ty, $packed:ty, |$v:ident| $key:expr) => {
+        impl PackedSortKey for $t {
+            type Packed = $packed;
+            const KEY_PASSES: usize = (<$u>::BITS as usize).div_ceil(RADIX_DIGIT_BITS);
+            #[inline]
+            fn pack(self, index: u32, descending: bool) -> $packed {
+                let $v = self;
+                let key: $u = $key;
+                let key = if descending { !key } else { key };
+                ((key as $packed) << 32) | index as $packed
+            }
+            #[inline]
+            fn unpack_index(packed: $packed) -> u32 {
+                packed as u32
+            }
+            #[inline]
+            fn digit(packed: $packed, pass: usize) -> usize {
+                (packed >> (32 + RADIX_DIGIT_BITS * pass)) as usize & (RADIX_BINS - 1)
+            }
+        }
+    };
+}
+
+/// Above this length an LSD radix sort over the packed keys beats the
+/// comparison sort.
+const RADIX_SORT_THRESHOLD: usize = 50_000;
+
+/// 11-bit digits: 6 passes cover a 64-bit key (vs 8 with bytes), trading a
+/// 16 KB histogram for 25% less scatter traffic.
+const RADIX_DIGIT_BITS: usize = 11;
+const RADIX_BINS: usize = 1 << RADIX_DIGIT_BITS;
+
+/// Stable LSD radix sort over the value digits of packed sort keys. The index
+/// bits below the value are already in ascending order in the input, and
+/// stable passes keep equal-valued keys in that order, so the result is
+/// identical to fully sorting the packed keys.
+fn radix_sort_packed<K: PackedSortKey>(keys: &mut Vec<K::Packed>) {
+    let n = keys.len();
+    let mut src = std::mem::take(keys);
+    let mut dst: Vec<K::Packed> = Vec::with_capacity(n);
+    // SAFETY: every pass writes all n slots before anything reads them
+    #[allow(clippy::uninit_vec)]
+    unsafe {
+        dst.set_len(n)
+    };
+
+    for pass in 0..K::KEY_PASSES {
+        let mut counts = [0usize; RADIX_BINS];
+        for key in src.iter() {
+            counts[K::digit(*key, pass)] += 1;
+        }
+        if counts.iter().any(|count| *count == n) {
+            continue;
+        }
+        let mut cursors = [0usize; RADIX_BINS];
+        let mut sum = 0;
+        for digit in 0..RADIX_BINS {
+            cursors[digit] = sum;
+            sum += counts[digit];
+        }
+        for key in src.iter() {
+            let digit = K::digit(*key, pass);
+            dst[cursors[digit]] = *key;
+            cursors[digit] += 1;
+        }
+        std::mem::swap(&mut src, &mut dst);
+    }
+
+    *keys = src;
+}
+
+packed_sort_key!(u8, u8, u64, |v| v);
+packed_sort_key!(u16, u16, u64, |v| v);
+packed_sort_key!(u32, u32, u64, |v| v);
+packed_sort_key!(u64, u64, u128, |v| v);
+packed_sort_key!(i8, u8, u64, |v| (v as u8) ^ 0x80);
+packed_sort_key!(i16, u16, u64, |v| (v as u16) ^ 0x8000);
+packed_sort_key!(i32, u32, u64, |v| (v as u32) ^ 0x8000_0000);
+packed_sort_key!(i64, u64, u128, |v| (v as u64) ^ (1 << 63));
+packed_sort_key!(half::f16, u16, u64, |v| {
+    let bits = v.to_bits();
+    if bits & 0x8000 != 0 {
+        !bits
+    } else {
+        bits | 0x8000
+    }
+});
+packed_sort_key!(f32, u32, u64, |v| {
+    let bits = v.to_bits();
+    if bits & 0x8000_0000 != 0 {
+        !bits
+    } else {
+        bits | 0x8000_0000
+    }
+});
+packed_sort_key!(f64, u64, u128, |v| {
+    let bits = v.to_bits();
+    if bits >> 63 != 0 {
+        !bits
+    } else {
+        bits | (1 << 63)
+    }
+});
+
 /// Single column fast-path sort
 fn sort_primitive<T: ArrowPrimitiveType>(
     data: &dyn Datum,
     opts: &SortOptions,
-) -> Result<UInt32Array, ArrowKernelError> {
+) -> Result<UInt32Array, ArrowKernelError>
+where
+    T::Native: PackedSortKey,
+{
     let (values, is_scalar) = data.get();
     if is_scalar {
         return Ok(UInt32Array::from(vec![0]));
@@ -160,37 +299,61 @@ fn sort_primitive<T: ArrowPrimitiveType>(
     let mut nulls = Vec::new();
 
     if let Some(validity) = values.nulls() {
-        for index in 0..values.len() as u32 {
-            let index_usize = index as usize;
-            if validity.is_valid(index_usize) {
-                // safety: `index_usize` is in bounds by construction and marked valid above
-                let value = unsafe { values.value_unchecked(index_usize) };
-                valids.push((index, value));
-            } else {
-                nulls.push(index);
+        // one word-wise pass over the validity buffer builds both lists:
+        // set bits pack valids, cleared bits push nulls
+        nulls.reserve(validity.null_count());
+        let chunks = validity.inner().bit_chunks();
+        let mut base = 0usize;
+        for chunk in chunks.iter().chain(std::iter::once(chunks.remainder_bits())) {
+            let bits_in_chunk = 64.min(values.len() - base);
+            if bits_in_chunk == 0 {
+                break;
+            }
+            let mut set = chunk;
+            while set != 0 {
+                let index = base + set.trailing_zeros() as usize;
+                // safety: set bits come from the validity bitmap, so the
+                // index is in bounds and marked valid
+                let value = unsafe { values.value_unchecked(index) };
+                valids.push(value.pack(index as u32, opts.descending));
+                set &= set - 1;
+            }
+            let mut clear = !chunk & (u64::MAX >> (64 - bits_in_chunk as u32));
+            while clear != 0 {
+                nulls.push((base + clear.trailing_zeros() as usize) as u32);
+                clear &= clear - 1;
+            }
+            base += 64;
+            if base >= values.len() {
+                break;
             }
         }
     } else {
-        for index in 0..values.len() as u32 {
-            let index_usize = index as usize;
-            // safety: `index_usize` is in bounds by construction
-            let value = unsafe { values.value_unchecked(index_usize) };
-            valids.push((index, value));
+        for (index, value) in values.values().iter().enumerate() {
+            valids.push(value.pack(index as u32, opts.descending));
         }
     }
 
-    valids.sort_unstable_by(|(lhs_idx, lhs_val), (rhs_idx, rhs_val)| {
-        let cmp = T::Native::compare(*lhs_val, *rhs_val);
-        let cmp = if opts.descending { cmp.reverse() } else { cmp };
-        cmp.then_with(|| lhs_idx.cmp(rhs_idx))
-    });
+    if valids.len() >= RADIX_SORT_THRESHOLD {
+        radix_sort_packed::<T::Native>(&mut valids);
+    } else {
+        valids.sort_unstable();
+    }
 
     let mut indices = Vec::with_capacity(values.len());
     if opts.nulls_first {
         indices.extend(nulls);
-        indices.extend(valids.into_iter().map(|(index, _)| index));
+        indices.extend(
+            valids
+                .into_iter()
+                .map(<T::Native as PackedSortKey>::unpack_index),
+        );
     } else {
-        indices.extend(valids.into_iter().map(|(index, _)| index));
+        indices.extend(
+            valids
+                .into_iter()
+                .map(<T::Native as PackedSortKey>::unpack_index),
+        );
         indices.extend(nulls);
     }
 
@@ -307,6 +470,81 @@ mod test {
         let inputs = columns.iter().map(|column| column.as_ref()).collect_vec();
         let actual = sort::multicol_sort_to_indices(&inputs, options).unwrap();
         assert_eq!(actual, expected);
+    }
+
+    #[test]
+    fn test_radix_matches_comparison_sort() {
+        use super::{radix_sort_packed, PackedSortKey};
+        let mut rng = fastrand::Rng::with_seed(7);
+        for descending in [false, true] {
+            // heavy ties exercise stability; full-range values exercise
+            // digits; hard-coded boundaries exercise the sign transforms
+            for values in [
+                (0..100_000).map(|_| rng.u64(0..50)).collect_vec(),
+                (0..100_000)
+                    .map(|_| rng.u64(..))
+                    .chain([0, 1, u64::MAX, u64::MAX - 1, 1 << 63])
+                    .collect_vec(),
+            ] {
+                let packed = values
+                    .iter()
+                    .enumerate()
+                    .map(|(i, v)| v.pack(i as u32, descending))
+                    .collect_vec();
+                let mut expected = packed.clone();
+                expected.sort_unstable();
+                let mut actual = packed;
+                radix_sort_packed::<u64>(&mut actual);
+                assert_eq!(actual, expected);
+            }
+        }
+    }
+
+    #[test]
+    fn test_radix_float_edges_match_comparison_sort() {
+        use super::{radix_sort_packed, PackedSortKey};
+        let mut rng = fastrand::Rng::with_seed(11);
+        for descending in [false, true] {
+            let values: Vec<f64> = (0..100_000)
+                .map(|_| f64::from_bits(rng.u64(..)))
+                .chain([
+                    f64::NAN,
+                    -f64::NAN,
+                    f64::INFINITY,
+                    f64::NEG_INFINITY,
+                    0.0,
+                    -0.0,
+                    f64::MIN,
+                    f64::MAX,
+                    f64::MIN_POSITIVE,
+                ])
+                .collect();
+            let packed = values
+                .iter()
+                .enumerate()
+                .map(|(i, v)| v.pack(i as u32, descending))
+                .collect_vec();
+            let mut expected = packed.clone();
+            expected.sort_unstable();
+            let mut actual = packed;
+            radix_sort_packed::<f64>(&mut actual);
+            assert_eq!(actual, expected);
+
+            let values32: Vec<f32> = (0..100_000)
+                .map(|_| f32::from_bits(rng.u32(..)))
+                .chain([f32::NAN, -f32::NAN, f32::INFINITY, f32::NEG_INFINITY, -0.0])
+                .collect();
+            let packed = values32
+                .iter()
+                .enumerate()
+                .map(|(i, v)| v.pack(i as u32, descending))
+                .collect_vec();
+            let mut expected = packed.clone();
+            expected.sort_unstable();
+            let mut actual = packed;
+            radix_sort_packed::<f32>(&mut actual);
+            assert_eq!(actual, expected);
+        }
     }
 
     #[test]

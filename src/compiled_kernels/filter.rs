@@ -28,17 +28,30 @@ impl Kernel for FilterKernel {
     type Output = ArrayRef;
 
     fn call(&self, inp: Self::Input<'_>) -> Result<Self::Output, ArrowKernelError> {
-        if inp.0.len() != inp.1.len() {
+        let (data, mask) = inp;
+        if data.len() != mask.len() {
             return Err(ArrowKernelError::SizeMismatch);
         }
 
-        let mut res = self.0.run(&dsl_args!(inp.0, inp.1))?[0].clone();
-        let base_dt = normalized_base_type(inp.0.data_type());
+        // arrow semantics: a null mask entry selects nothing. The generated
+        // code reads the mask's value bits only, so fold the validity in
+        // before filtering.
+        let pruned;
+        let mask = match mask.nulls() {
+            Some(nulls) => {
+                pruned = BooleanArray::new(mask.values() & nulls.inner(), None);
+                &pruned
+            }
+            None => mask,
+        };
+
+        let mut res = self.0.run(&dsl_args!(data, mask))?[0].clone();
+        let base_dt = normalized_base_type(data.data_type());
         res = coalesce_type(res, &base_dt)?;
 
-        if has_any_nulls(inp.0) {
-            let indices = inp.1.values().set_indices().collect::<Vec<_>>();
-            res = copy_selected_nulls(inp.0, res, &indices)?;
+        if has_any_nulls(data) {
+            let indices = mask.values().set_indices().collect::<Vec<_>>();
+            res = copy_selected_nulls(data, res, &indices)?;
         }
 
         Ok(res)
@@ -51,9 +64,21 @@ impl Kernel for FilterKernel {
         let mut func = DSLFunction::new("filter");
         let arr_arg = func.add_arg(&mut ctx, DSLType::array_like(arr, "n"));
 
-        if matches!(arr.data_type(), DataType::RunEndEncoded(_, _)) {
+        // conditional emits vectorize into a masked compress-store, but only
+        // for primitive outputs on hosts whose vector extensions support the
+        // element width — elsewhere the set-bits loop beats a scalar
+        // per-element branch
+        let spec = WriterSpec::for_base_type_of_datum(arr);
+        let masked = match &spec {
+            WriterSpec::Primitive(pt) => {
+                crate::compiled_writers::compress_store_available(*pt)
+            }
+            _ => false,
+        };
+
+        if matches!(arr.data_type(), DataType::RunEndEncoded(_, _)) || masked {
             let fil_arg = func.add_arg(&mut ctx, DSLType::array_like(filt, "n"));
-            func.add_ret(WriterSpec::for_base_type_of_datum(arr), "<= n");
+            func.add_ret(spec, "<= n");
 
             func.add_body(
                 DSLStmt::for_each(&mut ctx, &[arr_arg, fil_arg], |loop_vars| {
@@ -65,7 +90,7 @@ impl Kernel for FilterKernel {
             );
         } else {
             let fil_arg = func.add_arg(&mut ctx, DSLType::set_bits("m"));
-            func.add_ret(WriterSpec::for_base_type_of_datum(arr), "m");
+            func.add_ret(spec, "m");
 
             func.add_body(
                 DSLStmt::for_each(&mut ctx, &[fil_arg], |loop_vars| {
