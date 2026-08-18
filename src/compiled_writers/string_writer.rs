@@ -4,11 +4,15 @@ use arrow_array::{make_array, ArrayRef};
 use arrow_buffer::Buffer;
 use arrow_data::ArrayDataBuilder;
 use arrow_schema::DataType;
-use inkwell::values::{BasicValue, BasicValueEnum, FunctionValue, PointerValue};
+use inkwell::{
+    context::Context,
+    module::{Linkage, Module},
+    values::{BasicValue, BasicValueEnum, FunctionValue, PointerValue},
+    AddressSpace, IntPredicate,
+};
 use repr_offset::ReprOffset;
 
 use crate::{
-    compiled_kernels::llvm_add_str_writer_append_bytes,
     compiled_writers::{
         AnyRuntime, AnyWriterEmitter, PrimitiveWriter, Writer, WriterCodegen, WriterEmitter,
         WriterRuntime,
@@ -62,9 +66,14 @@ impl Writer for StringWriter {
             offset_runtime_ptr: std::ptr::null_mut(),
             offsets: Box::new(self.offset_writer.allocate(size + 1)),
             bytes: Vec::with_capacity(4096),
+            bytes_ptr: std::ptr::null_mut(),
+            bytes_len: 0,
+            bytes_cap: 0,
             curr_offset: 0,
         };
         runtime.offset_runtime_ptr = runtime.offsets.as_ptr();
+        runtime.bytes_ptr = runtime.bytes.as_mut_ptr();
+        runtime.bytes_cap = runtime.bytes.capacity();
         runtime.into()
     }
 
@@ -86,7 +95,7 @@ impl Writer for StringWriter {
     where
         F: Fn(&mut AnyWriterEmitter<'ctx, 'borrow>) -> Result<(), ArrowKernelError>,
     {
-        let extend = llvm_add_str_writer_append_bytes(codegen.ctx, codegen.module);
+        let reserve = llvm_add_str_writer_reserve(codegen.ctx, codegen.module);
 
         let mut emitter = AnyWriterEmitter::String(StringWriterEmitter {
             codegen,
@@ -98,13 +107,8 @@ impl Writer for StringWriter {
                 runtime_ptr,
                 StringWriterRuntime::OFFSET_CURR_OFFSET
             ),
-            vec_ptr: increment_pointer!(
-                codegen.ctx,
-                codegen.builder,
-                runtime_ptr,
-                StringWriterRuntime::OFFSET_BYTES
-            ),
-            extend,
+            runtime_ptr,
+            reserve,
         });
 
         f(&mut emitter)
@@ -118,7 +122,41 @@ pub struct StringWriterRuntime {
     offset_runtime_ptr: *mut c_void,
     offsets: Box<AnyRuntime>,
     bytes: Vec<u8>,
+    // JIT-visible mirror of `bytes`: the kernel appends through these fields
+    // with an inline capacity check and memcpy, calling back into Rust only
+    // to grow. `bytes.len()` is stale until the mirror is synced back.
+    bytes_ptr: *mut u8,
+    bytes_len: usize,
+    bytes_cap: usize,
     curr_offset: u64,
+}
+
+/// Cold path for the JIT's inline string append: syncs the mirrored length
+/// back into the Vec, grows it, and refreshes the mirrored pointer/capacity.
+#[no_mangle]
+pub extern "C" fn str_writer_reserve(runtime: *mut c_void, needed: u64) {
+    let rt = unsafe { &mut *(runtime as *mut StringWriterRuntime) };
+    unsafe { rt.bytes.set_len(rt.bytes_len) };
+    rt.bytes.reserve(needed as usize - rt.bytes.len());
+    rt.bytes_ptr = rt.bytes.as_mut_ptr();
+    rt.bytes_cap = rt.bytes.capacity();
+}
+
+fn llvm_add_str_writer_reserve<'ctx>(
+    ctx: &'ctx Context,
+    module: &Module<'ctx>,
+) -> FunctionValue<'ctx> {
+    let ptr_type = ctx.ptr_type(AddressSpace::default());
+    module
+        .get_function("str_writer_reserve")
+        .unwrap_or_else(|| {
+            module.add_function(
+                "str_writer_reserve",
+                ctx.void_type()
+                    .fn_type(&[ptr_type.into(), ctx.i64_type().into()], false),
+                Some(Linkage::External),
+            )
+        })
 }
 
 impl WriterRuntime for StringWriterRuntime {
@@ -147,6 +185,8 @@ impl WriterRuntime for StringWriterRuntime {
             self.offsets.append_integer(self.curr_offset)?;
         }
         let offsets = self.offsets.to_array(len + 1)?;
+        // safety: the JIT initialized bytes up to the mirrored length
+        unsafe { self.bytes.set_len(self.bytes_len) };
         let data = Buffer::from(self.bytes);
 
         let dt = match offsets.data_type() {
@@ -176,34 +216,87 @@ pub struct StringWriterEmitter<'ctx, 'borrow> {
     offset_writer_ptr: PointerValue<'ctx>,
 
     offset_counter_ptr: PointerValue<'ctx>,
-    vec_ptr: PointerValue<'ctx>,
-    extend: FunctionValue<'ctx>,
+    runtime_ptr: PointerValue<'ctx>,
+    reserve: FunctionValue<'ctx>,
 }
 impl<'ctx, 'borrow> WriterEmitter<'ctx, 'borrow> for StringWriterEmitter<'ctx, 'borrow> {
     fn emit(&mut self, val: BasicValueEnum<'ctx>) -> Result<(), ArrowKernelError> {
         let codegen = self.codegen;
+        let ctx = codegen.ctx;
+        let b = codegen.builder;
         let val = val.into_struct_value();
-        let ptr1 = self
-            .codegen
-            .builder
+        let ptr1 = b
             .build_extract_value(val, 0, "ptr1")
             .unwrap()
             .into_pointer_value();
-        let ptr2 = self
-            .codegen
-            .builder
+        let ptr2 = b
             .build_extract_value(val, 1, "ptr2")
             .unwrap()
             .into_pointer_value();
-        let len = pointer_diff!(codegen.ctx, codegen.builder, ptr1, ptr2);
-        codegen
-            .builder
-            .build_call(
-                self.extend,
-                &[ptr1.into(), len.into(), self.vec_ptr.into()],
-                "extend",
-            )
+        let len = pointer_diff!(ctx, b, ptr1, ptr2);
+
+        // inline append: capacity check + memcpy, with a cold call to grow.
+        // The old path called into Rust for every string just to run
+        // extend_from_slice.
+        let i64_type = ctx.i64_type();
+        let ptr_type = ctx.ptr_type(AddressSpace::default());
+        let len_ptr = increment_pointer!(
+            ctx,
+            b,
+            self.runtime_ptr,
+            StringWriterRuntime::OFFSET_BYTES_LEN
+        );
+        let cap_ptr = increment_pointer!(
+            ctx,
+            b,
+            self.runtime_ptr,
+            StringWriterRuntime::OFFSET_BYTES_CAP
+        );
+        let bytes_len = b
+            .build_load(i64_type, len_ptr, "bytes_len")
+            .unwrap()
+            .into_int_value();
+        let bytes_cap = b
+            .build_load(i64_type, cap_ptr, "bytes_cap")
+            .unwrap()
+            .into_int_value();
+        let needed = b.build_int_add(bytes_len, len, "bytes_needed").unwrap();
+        let fits = b
+            .build_int_compare(IntPredicate::ULE, needed, bytes_cap, "bytes_fit")
             .unwrap();
+
+        let func = b.get_insert_block().unwrap().get_parent().unwrap();
+        let grow_block = ctx.append_basic_block(func, "str_grow");
+        let append_block = ctx.append_basic_block(func, "str_append");
+        b.build_conditional_branch(fits, append_block, grow_block)
+            .unwrap();
+
+        b.position_at_end(grow_block);
+        b.build_call(
+            self.reserve,
+            &[self.runtime_ptr.into(), needed.into()],
+            "reserve",
+        )
+        .unwrap();
+        b.build_unconditional_branch(append_block).unwrap();
+
+        b.position_at_end(append_block);
+        let bytes_ptr = b
+            .build_load(
+                ptr_type,
+                increment_pointer!(
+                    ctx,
+                    b,
+                    self.runtime_ptr,
+                    StringWriterRuntime::OFFSET_BYTES_PTR
+                ),
+                "bytes_ptr",
+            )
+            .unwrap()
+            .into_pointer_value();
+        let dst = increment_pointer!(ctx, b, bytes_ptr, 1, bytes_len);
+        b.build_memcpy(dst, 1, ptr1, 1, len).unwrap();
+        b.build_store(len_ptr, needed).unwrap();
 
         let curr_offset = self
             .codegen

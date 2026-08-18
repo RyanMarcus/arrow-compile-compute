@@ -204,6 +204,19 @@ class ReportTests(unittest.TestCase):
         for name, expected in cases:
             self.assertEqual(expected, report.op_inputs_size(name), name)
 
+    def test_with_native_target_defaults_and_overrides(self):
+        self.assertEqual("-C target-cpu=native", report.with_native_target(None))
+        self.assertEqual("-C target-cpu=native", report.with_native_target(""))
+        self.assertEqual(
+            "-C opt-level=3 -C target-cpu=native",
+            report.with_native_target("-C opt-level=3"),
+        )
+        # An explicit target-cpu wins, e.g. measuring arrow as shipped.
+        self.assertEqual(
+            "-C target-cpu=generic",
+            report.with_native_target("-C target-cpu=generic"),
+        )
+
     def test_rejects_duplicate_normalized_phase(self):
         self.write_estimate("filter_llvm warm", 10)
         self.write_estimate("filter/llvm_warm", 11)
