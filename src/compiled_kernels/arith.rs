@@ -12,12 +12,43 @@ use crate::{
     ArrowKernelError, Kernel, PrimitiveType,
 };
 
+/// Outputs at least this large will be evicted from cache before any reuse,
+/// so their kernels are compiled with non-temporal block stores. Part of the
+/// cache key: each shape lazily compiles a small and a large variant.
+const NT_OUTPUT_BYTES: usize = 32 << 20;
+
+/// Classified from the *promoted* output type (`dominant` for binops, the
+/// op-aware type for unary ops), so `sqrt` of a small int array whose f64
+/// output is huge still counts. Shared by `compile` and `get_key_for_input`
+/// so the cached variant always matches the key.
+fn is_large_output(rows: usize, out: Option<PrimitiveType>) -> bool {
+    out.map(|pt| rows.saturating_mul(pt.width()) >= NT_OUTPUT_BYTES)
+        .unwrap_or(false)
+}
+
+fn binop_result_type(arr1: &dyn arrow_array::Array, arr2: &dyn arrow_array::Array) -> Option<PrimitiveType> {
+    PrimitiveType::dominant(
+        PrimitiveType::for_arrow_type(arr1.data_type()),
+        PrimitiveType::for_arrow_type(arr2.data_type()),
+    )
+}
+
+fn unary_result_type(pt: PrimitiveType, op: DSLUnaryOp) -> PrimitiveType {
+    // `Neg`/`Abs` preserve the input type, but `sqrt` always returns a float
+    // and promotes integer inputs to `f64` (matching pyarrow)
+    match op {
+        DSLUnaryOp::Neg | DSLUnaryOp::Abs => pt,
+        DSLUnaryOp::Sqrt if pt.is_float() => pt,
+        DSLUnaryOp::Sqrt => PrimitiveType::F64,
+    }
+}
+
 pub struct BinOpKernel(RunnableDSLFunction);
 unsafe impl Sync for BinOpKernel {}
 unsafe impl Send for BinOpKernel {}
 
 impl Kernel for BinOpKernel {
-    type Key = (DataType, bool, DataType, bool, DSLArithBinOp);
+    type Key = (DataType, bool, DataType, bool, bool, DSLArithBinOp);
 
     type Input<'a>
         = (&'a dyn Datum, &'a dyn Datum)
@@ -49,6 +80,14 @@ impl Kernel for BinOpKernel {
         let arg1 = func.add_arg(&mut ctx, DSLType::array_like(*arr1, "n"));
         let arg2 = func.add_arg(&mut ctx, DSLType::array_like(*arr2, "n"));
         func.add_ret(WriterSpec::Primitive(res), "n");
+        let rows = if arr1.get().1 {
+            arr2.get().0.len()
+        } else {
+            arr1.get().0.len()
+        };
+        if is_large_output(rows, Some(res)) {
+            func.set_nontemporal_outputs();
+        }
 
         func.add_body(
             DSLStmt::for_each(&mut ctx, &[arg1, arg2], |loop_vars| {
@@ -69,11 +108,13 @@ impl Kernel for BinOpKernel {
     ) -> Result<Self::Key, ArrowKernelError> {
         let (arr1, is_scalar1) = i.0.get();
         let (arr2, is_scalar2) = i.1.get();
+        let rows = if is_scalar1 { arr2.len() } else { arr1.len() };
         Ok((
             arr1.data_type().clone(),
             is_scalar1,
             arr2.data_type().clone(),
             is_scalar2,
+            is_large_output(rows, binop_result_type(arr1, arr2)),
             *p,
         ))
     }
@@ -84,7 +125,7 @@ unsafe impl Sync for UnaryOpKernel {}
 unsafe impl Send for UnaryOpKernel {}
 
 impl Kernel for UnaryOpKernel {
-    type Key = (DataType, bool, DSLUnaryOp);
+    type Key = (DataType, bool, bool, DSLUnaryOp);
 
     type Input<'a>
         = &'a dyn Datum
@@ -106,20 +147,15 @@ impl Kernel for UnaryOpKernel {
 
     fn compile(arr: &Self::Input<'_>, params: Self::Params) -> Result<Self, ArrowKernelError> {
         let pt = PrimitiveType::for_arrow_type(arr.get().0.data_type());
-
-        // `Neg`/`Abs` preserve the input type, but `sqrt` always returns a float
-        // and promotes integer inputs to `f64` (matching pyarrow), so the output
-        // type is op-aware.
-        let out_pt = match params {
-            DSLUnaryOp::Neg | DSLUnaryOp::Abs => pt,
-            DSLUnaryOp::Sqrt if pt.is_float() => pt,
-            DSLUnaryOp::Sqrt => PrimitiveType::F64,
-        };
+        let out_pt = unary_result_type(pt, params);
 
         let mut ctx = DSLContext::new();
         let mut func = DSLFunction::new("arith_unaryop");
         let arg = func.add_arg(&mut ctx, DSLType::array_like(*arr, "n"));
         func.add_ret(WriterSpec::Primitive(out_pt), "n");
+        if is_large_output(arr.get().0.len(), Some(out_pt)) {
+            func.set_nontemporal_outputs();
+        }
 
         func.add_body(
             DSLStmt::for_each(&mut ctx, &[arg], |loop_vars| {
@@ -143,7 +179,13 @@ impl Kernel for UnaryOpKernel {
         p: &Self::Params,
     ) -> Result<Self::Key, ArrowKernelError> {
         let (arr, is_scalar) = i.get();
-        Ok((arr.data_type().clone(), is_scalar, *p))
+        let out_pt = unary_result_type(PrimitiveType::for_arrow_type(arr.data_type()), *p);
+        Ok((
+            arr.data_type().clone(),
+            is_scalar,
+            is_large_output(arr.len(), Some(out_pt)),
+            *p,
+        ))
     }
 }
 

@@ -24,7 +24,7 @@ from pathlib import Path
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 DEFAULT_RUNS_DIR = REPO_ROOT / "target" / "criterion-runs"
-DEFAULT_OUTPUT = REPO_ROOT / "docs" / "benchmark-results-ARM.json"
+DEFAULT_OUTPUT = REPO_ROOT / "docs" / "benchmark-results-m4-native.json"
 MANIFEST_NAME = "manifest.json"
 
 IMPL_RE = re.compile(r"(?<![a-z])(llvm|arrow)(?![a-z])")
@@ -294,6 +294,7 @@ def build_report_data(criterion_dir, manifest):
             "completed_at": manifest["completed_at"],
             "commands": manifest["commands"],
             "host": manifest.get("host"),
+            "rustflags": manifest.get("rustflags"),
         },
         "equal_margin": EQUAL_MARGIN,
         "results": results,
@@ -325,6 +326,19 @@ def write_manifest(run_dir, manifest):
     with (run_dir / MANIFEST_NAME).open("w") as fh:
         json.dump(manifest, fh, indent=2)
         fh.write("\n")
+
+
+def with_native_target(rustflags):
+    """Benchmark runs build for the host CPU by default, so the ahead-of-time
+    baseline (arrow) competes with the full instruction set, like the JIT does.
+
+    An explicit `-C target-cpu=...` in RUSTFLAGS is respected — e.g. pass
+    `-C target-cpu=generic` (x86-64 baseline) to measure arrow as shipped.
+    """
+    if rustflags and "target-cpu" in rustflags:
+        return rustflags
+    native = "-C target-cpu=native"
+    return f"{rustflags} {native}" if rustflags else native
 
 
 def host_info():
@@ -399,11 +413,13 @@ def run_benchmarks(bench_names, runs_dir=DEFAULT_RUNS_DIR):
         "criterion_dir": "criterion",
         "commands": commands,
         "host": host_info(),
+        "rustflags": with_native_target(os.environ.get("RUSTFLAGS")),
     }
     write_manifest(run_dir, manifest)
 
     environment = os.environ.copy()
     environment["CRITERION_HOME"] = str(criterion_dir)
+    environment["RUSTFLAGS"] = with_native_target(environment.get("RUSTFLAGS"))
     try:
         for command in commands:
             subprocess.run(command, cwd=REPO_ROOT, env=environment, check=True)
@@ -417,6 +433,31 @@ def run_benchmarks(bench_names, runs_dir=DEFAULT_RUNS_DIR):
     manifest["completed_at"] = datetime.now(timezone.utc).isoformat()
     write_manifest(run_dir, manifest)
     return run_dir
+
+
+def guard_output_host(output, manifest):
+    """Refuse to overwrite results that were recorded on a different machine.
+
+    `--output` defaults to one specific machine's file, so running without it
+    on any other box silently replaces that machine's results with this one's.
+    Compare the CPU we just benchmarked against whatever the file already holds
+    and stop if they disagree.
+    """
+    if not output.exists():
+        return
+    try:
+        with output.open() as fh:
+            existing = json.load(fh)["run"]["host"]["cpu"]
+    except (json.JSONDecodeError, KeyError, OSError):
+        return
+    current = (manifest.get("host") or {}).get("cpu")
+    if existing and current and existing != current:
+        raise SystemExit(
+            f"refusing to overwrite {output}\n"
+            f"  it holds results from: {existing}\n"
+            f"  this run was on:       {current}\n"
+            f"Pass --output to say where these results should go."
+        )
 
 
 def main():
@@ -441,6 +482,7 @@ def main():
     run_dir = run_benchmarks(args.bench, args.runs_dir) if args.run else args.results
     manifest, criterion_dir = load_manifest(run_dir)
     output = args.output.resolve()
+    guard_output_host(output, manifest)
     output.parent.mkdir(parents=True, exist_ok=True)
     with output.open("w") as fh:
         json.dump(build_report_data(criterion_dir, manifest), fh, indent=2)

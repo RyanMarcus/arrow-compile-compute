@@ -25,6 +25,9 @@ paste = "1.0.15"
 num-rational = { version = "0.4.2" }
 lincomdb = { git = "https://github.com/RyanMarcus/lincomdb" }
 
+[target.'cfg(target_os = "linux")'.dependencies]
+libc = "0.2"
+
 [dev-dependencies]
 float-ord = "0.3.2"
 half = "2.4.1"

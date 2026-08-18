@@ -896,6 +896,7 @@ pub struct DSLFunction {
     params: Vec<DSLValue>,
     body: Vec<DSLStmt>,
     ret: Vec<OutputSpec>,
+    nontemporal_outputs: bool,
 }
 
 impl DSLFunction {
@@ -905,7 +906,15 @@ impl DSLFunction {
             params: Vec::new(),
             body: Vec::new(),
             ret: Vec::new(),
+            nontemporal_outputs: false,
         }
+    }
+
+    /// Marks this function's block writes as non-temporal: the output is
+    /// large enough that its cache lines will be evicted before reuse, so
+    /// skipping read-for-ownership saves a third of the write bandwidth.
+    pub fn set_nontemporal_outputs(&mut self) {
+        self.nontemporal_outputs = true;
     }
 
     pub fn add_arg(&mut self, ctx: &mut DSLContext, ty: DSLType) -> DSLValue {
@@ -950,6 +959,14 @@ pub enum DSLStmt {
     EmitBlock {
         index: DSLExpr,
         value: DSLExpr,
+    },
+
+    /// exclusively added by the vectorizer: emit only the lanes of `value`
+    /// whose bit in `mask` is set, packed contiguously
+    EmitBlockMasked {
+        index: DSLExpr,
+        value: DSLExpr,
+        mask: DSLExpr,
     },
     Set {
         buf: DSLValue,
@@ -1205,6 +1222,11 @@ impl DSLStmt {
             DSLStmt::Emit { index, value } | DSLStmt::EmitBlock { index, value } => {
                 index.accessed_parameters(params);
                 value.accessed_parameters(params);
+            }
+            DSLStmt::EmitBlockMasked { index, value, mask } => {
+                index.accessed_parameters(params);
+                value.accessed_parameters(params);
+                mask.accessed_parameters(params);
             }
             DSLStmt::Set {
                 buf, index, value, ..
