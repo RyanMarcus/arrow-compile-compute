@@ -1,6 +1,2 @@
-# Build for the machine we're running on: this crate's whole premise is
-# runtime-native code (the JIT always targets the host), so the ahead-of-time
-# side — tests, benches, and the arrow baseline — should match. Binaries are
-# not portable across CPUs; unset via RUSTFLAGS (see below) if you need that.
 [build]
 rustflags = ["-C", "target-cpu=native"]
