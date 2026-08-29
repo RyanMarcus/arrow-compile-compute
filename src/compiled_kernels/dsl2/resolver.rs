@@ -259,10 +259,7 @@ mod tests {
     #[test]
     fn test_resolve_const() {
         let terms = vec![SizeTerm::parse("n").unwrap()];
-        let outputs = vec![
-            SizeTerm::parse("1").unwrap(),
-            SizeTerm::parse("n").unwrap(),
-        ];
+        let outputs = vec![SizeTerm::parse("1").unwrap(), SizeTerm::parse("n").unwrap()];
 
         let resolver = Resolver::new(terms, outputs).unwrap();
         assert_eq!(

@@ -58,7 +58,7 @@ pub(crate) use string_writer::str_writer_reserve;
 use crate::{
     compiled_iter::{IteratorHolder, IteratorSource},
     compiled_writers::string_writer::{StringWriter, StringWriterEmitter, StringWriterRuntime},
-    increment_pointer, normalized_base_type, ArrowKernelError, ListItemType, PrimitiveType,
+    normalized_base_type, ArrowKernelError, ListItemType, PrimitiveType,
 };
 
 pub use boolean_writer::{BooleanWriter, BooleanWriterEmitter, BooleanWriterRuntime};
@@ -234,13 +234,31 @@ pub trait Writer {
         false
     }
 
-    /// Byte offset of the write-head pointer inside this writer's runtime
-    /// struct, for writers whose block writes just advance a raw pointer.
-    /// The block loop caches that pointer in a stack slot LLVM can promote
-    /// to a register — through the runtime struct, the store of the advanced
-    /// head may alias the data stores, so it cannot be hoisted out.
-    fn write_head_offset(&self) -> Option<usize> {
+    /// Hoists whatever per-iteration state this writer keeps in its runtime
+    /// struct into a stack slot for the duration of a block loop, returning
+    /// the slot. Updating that state through the runtime struct is a
+    /// loop-carried memory dependency LLVM cannot remove — with opaque
+    /// pointers it cannot prove the block's data stores do not alias the
+    /// struct — whereas a slot that never escapes is promoted to a register.
+    ///
+    /// Writers that return a slot here receive it back in `llvm_write_block`
+    /// and must implement `llvm_end_block_loop` to write it back.
+    fn llvm_begin_block_loop<'ctx, 'borrow>(
+        &'borrow self,
+        _codegen: WriterCodegen<'ctx, 'borrow>,
+        _runtime_ptr: PointerValue<'ctx>,
+    ) -> Option<PointerValue<'ctx>> {
         None
+    }
+
+    /// Writes hoisted state back into the runtime struct so the scalar tail
+    /// loop, and anything after it, observes the block loop's progress.
+    fn llvm_end_block_loop<'ctx, 'borrow>(
+        &'borrow self,
+        _codegen: WriterCodegen<'ctx, 'borrow>,
+        _runtime_ptr: PointerValue<'ctx>,
+        _state: PointerValue<'ctx>,
+    ) {
     }
 
     /// Writes only the lanes of `values` whose bit in `mask` is set, packed
@@ -261,9 +279,9 @@ pub trait Writer {
 
     /// Writes a flat block containing `logical_len` values. Composite writers
     /// interpret the vector lanes using their static child shape. `head_slot`,
-    /// when present, is a stack slot holding the current write head that a
-    /// writer exposing `write_head_offset` must use instead of its runtime
-    /// struct field.
+    /// when present, is the stack slot this writer returned from
+    /// `llvm_begin_block_loop`, and must be used in place of the
+    /// corresponding runtime-struct field.
     fn llvm_write_block<'ctx, 'borrow>(
         &'borrow self,
         codegen: WriterCodegen<'ctx, 'borrow>,
@@ -588,6 +606,7 @@ impl WriterSpec {
         BoundWriter {
             writer,
             runtime_ptr,
+            block_state: None,
         }
     }
 
@@ -698,6 +717,9 @@ impl WriterAllocation {
 pub struct BoundWriter<'ctx> {
     writer: AnyWriter,
     runtime_ptr: PointerValue<'ctx>,
+    /// Set while inside a block loop: writer-private state hoisted to the
+    /// stack by `Writer::llvm_begin_block_loop`.
+    block_state: Option<PointerValue<'ctx>>,
 }
 
 impl<'ctx> BoundWriter<'ctx> {
@@ -770,7 +792,6 @@ impl<'ctx> BoundWriter<'ctx> {
         builder: &'call Builder<'ctx>,
         values: VectorValue<'ctx>,
         logical_len: u32,
-        head_slot: Option<PointerValue<'ctx>>,
     ) {
         self.writer
             .llvm_write_block(
@@ -782,7 +803,7 @@ impl<'ctx> BoundWriter<'ctx> {
                 self.runtime_ptr,
                 values,
                 logical_len,
-                head_slot,
+                self.block_state,
             )
             .unwrap();
     }
@@ -793,13 +814,41 @@ impl<'ctx> BoundWriter<'ctx> {
 
     /// Pointer to the write-head cell inside the runtime struct, for writers
     /// that expose one.
-    pub fn llvm_write_head_cell<'call>(
-        &'call self,
+    /// Lets the writer hoist its per-iteration state before a block loop.
+    pub fn begin_block_loop<'call>(
+        &mut self,
         ctx: &'ctx Context,
+        module: &'call Module<'ctx>,
         builder: &'call Builder<'ctx>,
-    ) -> Option<PointerValue<'ctx>> {
-        let offset = self.writer.write_head_offset()?;
-        Some(increment_pointer!(ctx, builder, self.runtime_ptr, offset))
+    ) {
+        self.block_state = self.writer.llvm_begin_block_loop(
+            WriterCodegen {
+                ctx,
+                module,
+                builder,
+            },
+            self.runtime_ptr,
+        );
+    }
+
+    /// Restores hoisted state after a block loop.
+    pub fn end_block_loop<'call>(
+        &mut self,
+        ctx: &'ctx Context,
+        module: &'call Module<'ctx>,
+        builder: &'call Builder<'ctx>,
+    ) {
+        if let Some(state) = self.block_state.take() {
+            self.writer.llvm_end_block_loop(
+                WriterCodegen {
+                    ctx,
+                    module,
+                    builder,
+                },
+                self.runtime_ptr,
+                state,
+            );
+        }
     }
 
     pub fn llvm_ingest_block_masked<'call>(
@@ -809,7 +858,6 @@ impl<'ctx> BoundWriter<'ctx> {
         builder: &'call Builder<'ctx>,
         values: VectorValue<'ctx>,
         mask: VectorValue<'ctx>,
-        head_slot: Option<PointerValue<'ctx>>,
     ) -> Result<(), ArrowKernelError> {
         self.writer.llvm_write_block_masked(
             WriterCodegen {
@@ -820,7 +868,7 @@ impl<'ctx> BoundWriter<'ctx> {
             self.runtime_ptr,
             values,
             mask,
-            head_slot,
+            self.block_state,
         )
     }
 }

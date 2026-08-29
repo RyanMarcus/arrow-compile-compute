@@ -156,16 +156,22 @@ impl Writer for PrimitiveWriter {
         // SAFETY: this storage is only ever exposed through to_array, which
         // slices to the prefix the kernel wrote via alloc_ptr. Zero-filling
         // here would memset (and page in) the whole output buffer just for
-        // the kernel to overwrite it.
+        // the kernel to overwrite it. On a freshly mmaped buffer that memset
+        // is also what faults every page in, so removing it matters most for
+        // kernels that never write their whole output: a 10m-element i32
+        // reduction went 2.5 ms -> 0.29 ms (870k page faults -> 24k).
         #[allow(clippy::uninit_vec)]
         unsafe {
             alloc.set_len(units)
         };
 
-        // large outputs land on fresh mmaps whose 2 MB alignment is luck;
-        // asking for huge pages explicitly removes a bimodal ~12% TLB
-        // penalty on write-heavy kernels. Best effort: advise the
-        // page-aligned interior and ignore failures.
+        // Large outputs land on fresh mmaps, and whether the kernel gets huge
+        // pages is otherwise luck of the allocation's 2 MB alignment — which
+        // showed up as bimodal timings (concat alternating 2.65/2.96 ms run
+        // to run). These pages are load-bearing, not a micro-optimization:
+        // forcing MADV_NOHUGEPAGE instead makes the same kernels 2x slower
+        // (concat 2.9 -> 6.5 ms, neg 2.6 -> 5.3 ms) on Zen 5. Best effort:
+        // advise the page-aligned interior and ignore failures.
         #[cfg(target_os = "linux")]
         if units * 16 >= (2 << 20) {
             unsafe {
@@ -207,8 +213,62 @@ impl Writer for PrimitiveWriter {
         f(&mut emitter)
     }
 
-    fn write_head_offset(&self) -> Option<usize> {
-        Some(PrimitiveWriterRuntime::OFFSET_ALLOC_PTR)
+    fn llvm_begin_block_loop<'ctx, 'borrow>(
+        &'borrow self,
+        codegen: WriterCodegen<'ctx, 'borrow>,
+        runtime_ptr: PointerValue<'ctx>,
+    ) -> Option<PointerValue<'ctx>> {
+        let ctx = codegen.ctx;
+        let b = codegen.builder;
+        let ptr_type = ctx.ptr_type(AddressSpace::default());
+        let cell = increment_pointer!(
+            ctx,
+            b,
+            runtime_ptr,
+            PrimitiveWriterRuntime::OFFSET_ALLOC_PTR
+        );
+
+        // the slot has to be an entry-block alloca: SROA and mem2reg only
+        // promote those, and a slot that stays in memory defeats the point
+        let entry = b
+            .get_insert_block()
+            .unwrap()
+            .get_parent()
+            .unwrap()
+            .get_first_basic_block()
+            .unwrap();
+        let entry_builder = ctx.create_builder();
+        match entry.get_first_instruction() {
+            Some(first) => entry_builder.position_before(&first),
+            None => entry_builder.position_at_end(entry),
+        }
+        let slot = entry_builder
+            .build_alloca(ptr_type, "alloc_ptr_local")
+            .unwrap();
+
+        // the initial load/store stays here, immediately before the loop
+        let head = b.build_load(ptr_type, cell, "alloc_ptr_in").unwrap();
+        b.build_store(slot, head).unwrap();
+        Some(slot)
+    }
+
+    fn llvm_end_block_loop<'ctx, 'borrow>(
+        &'borrow self,
+        codegen: WriterCodegen<'ctx, 'borrow>,
+        runtime_ptr: PointerValue<'ctx>,
+        state: PointerValue<'ctx>,
+    ) {
+        let ctx = codegen.ctx;
+        let b = codegen.builder;
+        let ptr_type = ctx.ptr_type(AddressSpace::default());
+        let cell = increment_pointer!(
+            ctx,
+            b,
+            runtime_ptr,
+            PrimitiveWriterRuntime::OFFSET_ALLOC_PTR
+        );
+        let head = b.build_load(ptr_type, state, "alloc_ptr_out").unwrap();
+        b.build_store(cell, head).unwrap();
     }
 
     fn llvm_write_block<'ctx, 'borrow>(
@@ -243,21 +303,7 @@ impl Writer for PrimitiveWriter {
             .unwrap()
             .into_pointer_value();
         let store = codegen.builder.build_store(curr_alloc_ptr, values).unwrap();
-        if codegen.module.get_global_metadata("acc.nontemporal").is_empty() {
-            store.set_alignment(1).unwrap();
-        } else {
-            // skip read-for-ownership on output lines the kernel fully
-            // overwrites; block starts stay 16-byte aligned (the allocation
-            // is, and blocks advance by multiples of 16 bytes)
-            store.set_alignment(16).unwrap();
-            let one = codegen.ctx.i32_type().const_int(1, false);
-            store
-                .set_metadata(
-                    codegen.ctx.metadata_node(&[one.into()]),
-                    codegen.ctx.get_kind_id("nontemporal"),
-                )
-                .unwrap();
-        }
+        store.set_alignment(1).unwrap();
         let new_alloc_ptr = increment_pointer!(
             codegen.ctx,
             codegen.builder,
@@ -286,7 +332,12 @@ impl Writer for PrimitiveWriter {
         let ctx = codegen.ctx;
         let b = codegen.builder;
         let curr_alloc_ptr_ptr = head_slot.unwrap_or_else(|| {
-            increment_pointer!(ctx, b, runtime_ptr, PrimitiveWriterRuntime::OFFSET_ALLOC_PTR)
+            increment_pointer!(
+                ctx,
+                b,
+                runtime_ptr,
+                PrimitiveWriterRuntime::OFFSET_ALLOC_PTR
+            )
         });
         let curr_alloc_ptr = b
             .build_load(
@@ -448,7 +499,9 @@ mod tests {
         }
         let values = [8_i32, 9, 10].map(|value| ctx.i32_type().const_int(value as u64, true));
         let values = VectorType::const_vector(&values);
-        writer.llvm_write_block(codegen, dest, values, 3, None).unwrap();
+        writer
+            .llvm_write_block(codegen, dest, values, 3, None)
+            .unwrap();
         build.build_return(None).unwrap();
         llvm_mod.verify().unwrap();
 
