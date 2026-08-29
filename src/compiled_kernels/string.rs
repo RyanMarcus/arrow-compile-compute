@@ -126,9 +126,18 @@ fn filter_bytes<F: Fn(&[u8]) -> bool>(
 ) -> Result<BooleanArray, ArrowKernelError> {
     let nulls = logical_nulls(arr)?;
 
-    // flat byte arrays skip the buffered iterator and read the offsets
-    // directly, like arrow's from_unary; values under nulls are computed
-    // and ignored, which arrow's own kernels also do
+    // Fast path for flat byte arrays only: read the offsets directly instead of
+    // going through the buffered iterator, like arrow's from_unary. Values under
+    // nulls are computed and ignored, which arrow's own kernels also do.
+    // Encoded layouts (dictionary, run-end, view) fall through to the iterator
+    // below, which is what makes them work at all.
+    //
+    // It is worth keeping: the buffered iterator costs a fixed ~2.4 ns/row on
+    // top of the predicate, so on 1m rows (M4, medians of 15) dropping this path
+    // costs 26% on LIKE '%abc%', 28% on `contains`, and 3.9x on an exact-match
+    // LIKE where the predicate itself is nearly free. Stock arrow runs those
+    // same three in 9.4 / 9.8 / 0.74 ms, so without this we would go from
+    // matching or beating arrow on flat utf8 to losing to it on every one.
     fn flat_bytes<T, F>(
         arr: &arrow_array::GenericByteArray<T>,
         nulls: Option<arrow_buffer::NullBuffer>,

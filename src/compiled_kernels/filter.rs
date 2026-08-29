@@ -67,12 +67,19 @@ impl Kernel for FilterKernel {
         // conditional emits vectorize into a masked compress-store, but only
         // for primitive outputs on hosts whose vector extensions support the
         // element width — elsewhere the set-bits loop beats a scalar
-        // per-element branch
+        // per-element branch.
+        //
+        // this choice does not depend on selectivity, which is the natural
+        // thing to suspect: a sweep across selectivities found no crossover
+        // between the two paths. both walk every input lane regardless of how
+        // many survive — only the store is masked — so neither gets cheaper
+        // as the mask empties out. (arrow does beat us at very low
+        // selectivity, since its slice iterator skips whole empty words of
+        // the mask instead of visiting the lanes. that is a real gap, but
+        // it argues for a third path, not for switching between these two.)
         let spec = WriterSpec::for_base_type_of_datum(arr);
         let masked = match &spec {
-            WriterSpec::Primitive(pt) => {
-                crate::compiled_writers::compress_store_available(*pt)
-            }
+            WriterSpec::Primitive(pt) => crate::compiled_writers::compress_store_available(*pt),
             _ => false,
         };
 
