@@ -42,6 +42,7 @@ EQUAL_MARGIN = 1.035
 FAMILIES = {
     "cmp": "Comparisons",
     "arith": "Arithmetic",
+    "boolean": "Boolean",
     "compute": "Aggregations",
     "cast": "Casts",
     "select": "Selection",

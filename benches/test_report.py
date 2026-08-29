@@ -54,6 +54,16 @@ class ReportTests(unittest.TestCase):
         self.assertEqual("llvm-win", row["classification"])
         self.assertEqual({}, unpaired)
 
+    def test_assigns_boolean_family(self):
+        self.write_estimate("boolean__not(dictionary(i8, bool))/llvm warm", 10)
+        self.write_estimate("boolean__not(dictionary(i8, bool))/arrow", 20)
+
+        results, unpaired = report.collect(self.criterion_dir)
+
+        self.assertEqual(1, len(results))
+        self.assertEqual("Boolean", results[0]["family"])
+        self.assertEqual({}, unpaired)
+
     def test_pairs_rust_reference_baseline(self):
         self.write_estimate("vec__norm(fixed_size_list(f32, 768))/llvm warm", 10)
         self.write_estimate("vec__norm(fixed_size_list(f32, 768))_rust reference", 30)
