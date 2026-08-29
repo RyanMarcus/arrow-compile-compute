@@ -246,4 +246,19 @@ mod tests {
         assert_eq!(second, vec![3.0, 4.0]);
         assert_eq!(third, vec![5.0, 6.0]);
     }
+
+    #[test]
+    fn interleave_invalid_indices_do_not_panic() {
+        let a = Int32Array::from(vec![1, 2, 3]);
+        let b = Int32Array::from(vec![4, 5, 6]);
+        // both invalid shapes must return Err — a panic fails the test harness
+        assert!(
+            select::interleave(&[&a, &b], &[(0, 0), (5, 0)]).is_err(),
+            "interleave with bad array index returned Ok"
+        );
+        assert!(
+            select::interleave(&[&a, &b], &[(0, 0), (1, 99)]).is_err(),
+            "interleave with bad element index returned Ok"
+        );
+    }
 }

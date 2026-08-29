@@ -311,4 +311,38 @@ mod tests {
         assert_eq!(actual.data_type(), expected.data_type());
         assert_eq!(actual.as_list::<i64>(), expected.as_list::<i64>());
     }
+
+    #[test]
+    fn sliced_ree_filter_matches_arrow() {
+        let values = Int32Array::from((0..100).collect::<Vec<_>>());
+        let ends = Int32Array::from((1..=100).map(|i| i * 5).collect::<Vec<_>>());
+        let ree = RunArray::<Int32Type>::try_new(&ends, &values).unwrap();
+        let ree = ree.slice(3, 450);
+        let mask = BooleanArray::from((0..450).map(|i| i % 2 == 0).collect::<Vec<_>>());
+
+        let ours = crate::select::filter(&ree, &mask).unwrap();
+        let arrow = arrow_select::filter::filter(&ree, &mask).unwrap();
+        let arrow = arrow_cast::cast(&arrow, &DataType::Int32).unwrap();
+        assert_eq!(
+            ours.as_primitive::<Int32Type>(),
+            arrow.as_primitive::<Int32Type>()
+        );
+    }
+
+    #[test]
+    fn nullable_filter_mask_matches_arrow() {
+        use arrow_buffer::{BooleanBuffer, NullBuffer};
+        let data = Int32Array::from(vec![10, 20, 30, 40, 50, 60]);
+        // value bits all true, but slots 1 and 4 are null — arrow excludes them
+        let values = BooleanBuffer::from(vec![true, true, true, true, true, true]);
+        let validity = NullBuffer::from(vec![true, false, true, true, false, true]);
+        let mask = BooleanArray::new(values, Some(validity));
+
+        let arrow = arrow_select::filter::filter(&data, &mask).unwrap();
+        let ours = crate::select::filter(&data, &mask).unwrap();
+        assert_eq!(
+            ours.as_primitive::<Int32Type>(),
+            arrow.as_primitive::<Int32Type>()
+        );
+    }
 }

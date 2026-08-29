@@ -688,4 +688,39 @@ mod tests {
             BooleanArray::from(vec![Some(true), None, Some(true)])
         );
     }
+
+    fn sliced_strings() -> StringArray {
+        let data: Vec<String> = (0..1000)
+            .map(|i| format!("row{}abc{}", i, "x".repeat(i % 7)))
+            .collect();
+        let arr = StringArray::from(data.iter().map(|s| s.as_str()).collect::<Vec<_>>());
+        arr.slice(13, 700)
+    }
+
+    #[test]
+    fn sliced_string_like_matches_arrow() {
+        let arr = sliced_strings();
+        let ours = crate::cmp::like(&arr, b"%abc%", None).unwrap();
+        let arrow = arrow_string::like::like(&arr, &StringArray::new_scalar("%abc%")).unwrap();
+        assert_eq!(ours, arrow);
+
+        let ours = crate::cmp::like(&arr, b"row1%", None).unwrap();
+        let arrow = arrow_string::like::like(&arr, &StringArray::new_scalar("row1%")).unwrap();
+        assert_eq!(ours, arrow);
+    }
+
+    #[test]
+    fn sliced_string_contains_matches_arrow() {
+        let arr = sliced_strings();
+        // row-dependent needle: matches differ across the slice boundary, so a
+        // fast path ignoring the offset cannot pass by accident
+        let ours = crate::cmp::contains(&arr, b"row2").unwrap();
+        let arrow = arrow_string::like::contains(&arr, &StringArray::new_scalar("row2")).unwrap();
+        assert_eq!(ours, arrow);
+        assert!(ours.true_count() > 0 && ours.true_count() < ours.len());
+
+        let ours = crate::cmp::like(&arr, b"%row2%", None).unwrap();
+        let arrow = arrow_string::like::like(&arr, &StringArray::new_scalar("%row2%")).unwrap();
+        assert_eq!(ours, arrow);
+    }
 }

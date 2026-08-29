@@ -105,7 +105,7 @@ mod tests {
         cast::AsArray,
         types::{Float32Type, Int32Type, Int64Type},
         BooleanArray, FixedSizeListArray, Int32Array, Int64Array, RunArray, StringArray,
-        UInt16Array, UInt32Array, UInt8Array,
+        UInt16Array, UInt32Array, UInt64Array, UInt8Array,
     };
     use arrow_schema::{DataType, Field};
     use itertools::Itertools;
@@ -338,5 +338,16 @@ mod tests {
 
         assert_eq!(actual.data_type(), expected.data_type());
         assert_eq!(actual.as_list::<i32>(), expected.as_list::<i32>());
+    }
+
+    #[test]
+    fn sliced_bool_take_matches_arrow() {
+        let bools = BooleanArray::from((0..500).map(|i| i % 3 == 0).collect::<Vec<_>>());
+        let bools = bools.slice(7, 400);
+        let idx = UInt64Array::from((0..399u64).rev().collect::<Vec<_>>());
+
+        let ours = crate::select::take(&bools, &idx).unwrap();
+        let arrow = arrow_select::take::take(&bools, &idx, None).unwrap();
+        assert_eq!(ours.as_boolean(), arrow.as_boolean());
     }
 }
