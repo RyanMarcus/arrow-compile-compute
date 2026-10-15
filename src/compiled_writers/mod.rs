@@ -812,8 +812,6 @@ impl<'ctx> BoundWriter<'ctx> {
         self.writer.supports_masked_block()
     }
 
-    /// Pointer to the write-head cell inside the runtime struct, for writers
-    /// that expose one.
     /// Lets the writer hoist its per-iteration state before a block loop.
     pub fn begin_block_loop<'call>(
         &mut self,
