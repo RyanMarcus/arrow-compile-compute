@@ -125,42 +125,6 @@ fn filter_bytes<F: Fn(&[u8]) -> bool>(
     f: F,
 ) -> Result<BooleanArray, ArrowKernelError> {
     let nulls = logical_nulls(arr)?;
-
-    // Fast path for flat byte arrays only: read the offsets directly instead of
-    // going through the buffered iterator, like arrow's from_unary. Values under
-    // nulls are computed and ignored, which arrow's own kernels also do.
-    // Encoded layouts (dictionary, run-end, view) fall through to the iterator
-    // below, which is what makes them work at all.
-    //
-    // It is worth keeping: the buffered iterator costs a fixed ~2.4 ns/row on
-    // top of the predicate, so on 1m rows (M4, medians of 15) dropping this path
-    // costs 26% on LIKE '%abc%', 28% on `contains`, and 3.9x on an exact-match
-    // LIKE where the predicate itself is nearly free. Stock arrow runs those
-    // same three in 9.4 / 9.8 / 0.74 ms, so without this we would go from
-    // matching or beating arrow on flat utf8 to losing to it on every one.
-    fn flat_bytes<T, F>(
-        arr: &arrow_array::GenericByteArray<T>,
-        nulls: Option<arrow_buffer::NullBuffer>,
-        f: F,
-    ) -> BooleanArray
-    where
-        T: arrow_array::types::ByteArrayType,
-        T::Native: AsRef<[u8]>,
-        F: Fn(&[u8]) -> bool,
-    {
-        let values = arrow_buffer::BooleanBuffer::collect_bool(arr.len(), |i| {
-            f(unsafe { arr.value_unchecked(i) }.as_ref())
-        });
-        BooleanArray::new(values, nulls)
-    }
-    match arr.data_type() {
-        DataType::Utf8 => return Ok(flat_bytes(arr.as_string::<i32>(), nulls, f)),
-        DataType::LargeUtf8 => return Ok(flat_bytes(arr.as_string::<i64>(), nulls, f)),
-        DataType::Binary => return Ok(flat_bytes(arr.as_binary::<i32>(), nulls, f)),
-        DataType::LargeBinary => return Ok(flat_bytes(arr.as_binary::<i64>(), nulls, f)),
-        _ => {}
-    }
-
     let mut builder = BooleanBufferBuilder::new(arr.len());
     if nulls.is_some() {
         let mut last_idx = 0;
@@ -712,8 +676,8 @@ mod tests {
     #[test]
     fn sliced_string_contains_matches_arrow() {
         let arr = sliced_strings();
-        // row-dependent needle: matches differ across the slice boundary, so a
-        // fast path ignoring the offset cannot pass by accident
+        // row-dependent needle: matches differ across the slice boundary, so
+        // ignoring the slice offset cannot pass by accident
         let ours = crate::cmp::contains(&arr, b"row2").unwrap();
         let arrow = arrow_string::like::contains(&arr, &StringArray::new_scalar("row2")).unwrap();
         assert_eq!(ours, arrow);

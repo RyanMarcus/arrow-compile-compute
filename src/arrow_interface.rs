@@ -545,29 +545,6 @@ pub mod select {
     /// assert_eq!(res.len(), 2);
     /// ```
     pub fn take(data: &dyn Array, idxes: &dyn Array) -> Result<ArrayRef, ArrowKernelError> {
-        if let arrow_schema::DataType::RunEndEncoded(run_ends, _) = data.data_type() {
-            // random access into an REE array binary-searches the run ends
-            // once per index; when the indices are dense enough that those
-            // searches cost more than materializing the array, decode first
-            use arrow_array::cast::AsArray;
-            use arrow_array::types::{Int16Type, Int32Type, Int64Type};
-            let runs = match run_ends.data_type() {
-                arrow_schema::DataType::Int16 => {
-                    data.as_run::<Int16Type>().run_ends().values().len()
-                }
-                arrow_schema::DataType::Int32 => {
-                    data.as_run::<Int32Type>().run_ends().values().len()
-                }
-                _ => data.as_run::<Int64Type>().run_ends().values().len(),
-            }
-            .max(2);
-            let probe_cost = (usize::BITS - runs.leading_zeros()) as usize;
-            if idxes.len().saturating_mul(probe_cost) >= data.len() {
-                let decoded =
-                    crate::cast::cast(data, &crate::normalized_base_type(data.data_type()))?;
-                return TAKE_PROGRAM_CACHE.get((&decoded, idxes), ());
-            }
-        }
         TAKE_PROGRAM_CACHE.get((data, idxes), ())
     }
 
