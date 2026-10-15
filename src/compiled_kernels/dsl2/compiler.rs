@@ -674,6 +674,25 @@ fn compile_stmt<'ctx, 'a>(
                 logical_len as u32,
             );
         }
+        DSLStmt::EmitBlockMasked { index, value, mask } => {
+            let index = index.as_u32().ok_or_else(|| {
+                ArrowKernelError::DSLTypeMismatch(
+                    "masked block emit requires const index",
+                    DSLType::scalar_of(PrimitiveType::U32),
+                    index.get_type(),
+                )
+            })?;
+
+            let value = compile_expr(ctx, value)?;
+            let mask = compile_expr(ctx, mask)?;
+            ctx.outputs[index as usize].llvm_ingest_block_masked(
+                ctx.ctx,
+                ctx.module,
+                ctx.b,
+                value.into_vector_value(),
+                mask.into_vector_value(),
+            )?;
+        }
         DSLStmt::Set {
             buf,
             index,
@@ -861,6 +880,13 @@ fn compile_stmt<'ctx, 'a>(
                 .map(|(i, llvm_type)| build_entry_alloca(ctx, llvm_type, &format!("iter_buf{}", i)))
                 .collect_vec();
 
+            // let each writer hoist whatever per-iteration state it keeps in
+            // its runtime struct; through the struct those updates are a
+            // loop-carried memory dependency LLVM cannot remove
+            for output in ctx.outputs.iter_mut() {
+                output.begin_block_loop(ctx.ctx, ctx.module, ctx.b);
+            }
+
             let loop_header = ctx.ctx.append_basic_block(*ctx.func, "bloop_header");
             let loop_body = ctx.ctx.append_basic_block(*ctx.func, "bloop_body");
             let loop_end = ctx.ctx.append_basic_block(*ctx.func, "bloop_end");
@@ -921,6 +947,12 @@ fn compile_stmt<'ctx, 'a>(
                 ctx.b.build_unconditional_branch(loop_header).unwrap();
             }
             ctx.b.position_at_end(loop_end);
+
+            // writers put their hoisted state back so the scalar tail loop,
+            // and everything after it, sees the block loop's progress
+            for output in ctx.outputs.iter_mut() {
+                output.end_block_loop(ctx.ctx, ctx.module, ctx.b);
+            }
         }
         DSLStmt::Reduce(dslred) => {
             let body_type = dslred.body.get_type();

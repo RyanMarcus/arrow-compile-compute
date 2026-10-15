@@ -38,8 +38,6 @@ pub use ht::{HashFunction, HashKernel};
 use inkwell::execution_engine::ExecutionEngine;
 pub use interleave::InterleaveKernel;
 pub use list_len::ListLenKernel;
-pub(crate) use llvm_utils::llvm_add_str_writer_append_bytes;
-use llvm_utils::str_writer_append_bytes;
 pub use not::NotKernel;
 pub use null_utils::intersect_and_copy_nulls;
 pub use partition::PartitionKernel;
@@ -61,7 +59,7 @@ use inkwell::{
     context::Context,
     module::Module,
     passes::PassBuilderOptions,
-    targets::{CodeModel, RelocMode, Target, TargetMachine},
+    targets::{CodeModel, FileType, RelocMode, Target, TargetMachine},
     values::VectorValue,
     OptimizationLevel,
 };
@@ -220,8 +218,11 @@ pub(crate) fn link_req_helpers(
     module: &Module,
     ee: &ExecutionEngine,
 ) -> Result<(), ArrowKernelError> {
-    if let Some(func) = module.get_function("str_writer_append_bytes") {
-        ee.add_global_mapping(&func, str_writer_append_bytes as *const () as usize);
+    if let Some(func) = module.get_function("str_writer_reserve") {
+        ee.add_global_mapping(
+            &func,
+            crate::compiled_writers::str_writer_reserve as *const () as usize,
+        );
     }
 
     if let Some(func) = module.get_function("str_view_writer_append_bytes") {
@@ -293,7 +294,16 @@ fn optimize_module(module: &Module) -> Result<(), ArrowKernelError> {
     // run the optimization passes
     module
         .run_passes("default<O3>", &machine, PassBuilderOptions::create())
-        .map_err(|e| ArrowKernelError::LLVMError(e.to_string()))
+        .map_err(|e| ArrowKernelError::LLVMError(e.to_string()))?;
+
+    // ACC_DUMP_ASM=1 prints each compiled kernel's final host assembly
+    if std::env::var_os("ACC_DUMP_ASM").is_some() {
+        match machine.write_to_memory_buffer(module, FileType::Assembly) {
+            Ok(buf) => eprintln!("{}", String::from_utf8_lossy(buf.as_slice())),
+            Err(e) => eprintln!("ACC_DUMP_ASM failed: {}", e),
+        }
+    }
+    Ok(())
 }
 
 /// Emit code to convert a vector of numeric values to a different numeric type,

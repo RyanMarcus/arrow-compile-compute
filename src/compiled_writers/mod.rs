@@ -53,6 +53,8 @@ use list_writer::{ListWriter, ListWriterEmitter, ListWriterRuntime};
 use run_end_writer::{RunEndWriter, RunEndWriterEmitter, RunEndWriterRuntime};
 use view_writer::{StringViewWriter, StringViewWriterEmitter, StringViewWriterRuntime};
 
+pub(crate) use string_writer::str_writer_reserve;
+
 use crate::{
     compiled_iter::{IteratorHolder, IteratorSource},
     compiled_writers::string_writer::{StringWriter, StringWriterEmitter, StringWriterRuntime},
@@ -60,6 +62,7 @@ use crate::{
 };
 
 pub use boolean_writer::{BooleanWriter, BooleanWriterEmitter, BooleanWriterRuntime};
+pub(crate) use primitive_writer::compress_store_available;
 pub use primitive_writer::{PrimitiveWriter, PrimitiveWriterEmitter, PrimitiveWriterRuntime};
 pub use view_writer::ViewBufferWriter;
 
@@ -216,17 +219,76 @@ pub trait Writer {
         runtime_ptr: PointerValue<'ctx>,
         values: VectorValue<'ctx>,
     ) -> Result<(), ArrowKernelError> {
-        self.llvm_write_block(codegen, runtime_ptr, values, values.get_type().get_size())
+        self.llvm_write_block(
+            codegen,
+            runtime_ptr,
+            values,
+            values.get_type().get_size(),
+            None,
+        )
+    }
+
+    /// Whether this writer supports `llvm_write_block_masked`. The vectorizer
+    /// consults this before turning a conditional emit into a masked block.
+    fn supports_masked_block(&self) -> bool {
+        false
+    }
+
+    /// Hoists whatever per-iteration state this writer keeps in its runtime
+    /// struct into a stack slot for the duration of a block loop, returning
+    /// the slot. Updating that state through the runtime struct is a
+    /// loop-carried memory dependency LLVM cannot remove — with opaque
+    /// pointers it cannot prove the block's data stores do not alias the
+    /// struct — whereas a slot that never escapes is promoted to a register.
+    ///
+    /// Writers that return a slot here receive it back in `llvm_write_block`
+    /// and must implement `llvm_end_block_loop` to write it back.
+    fn llvm_begin_block_loop<'ctx, 'borrow>(
+        &'borrow self,
+        _codegen: WriterCodegen<'ctx, 'borrow>,
+        _runtime_ptr: PointerValue<'ctx>,
+    ) -> Option<PointerValue<'ctx>> {
+        None
+    }
+
+    /// Writes hoisted state back into the runtime struct so the scalar tail
+    /// loop, and anything after it, observes the block loop's progress.
+    fn llvm_end_block_loop<'ctx, 'borrow>(
+        &'borrow self,
+        _codegen: WriterCodegen<'ctx, 'borrow>,
+        _runtime_ptr: PointerValue<'ctx>,
+        _state: PointerValue<'ctx>,
+    ) {
+    }
+
+    /// Writes only the lanes of `values` whose bit in `mask` is set, packed
+    /// contiguously. Only writers reporting `supports_masked_block` implement
+    /// this.
+    fn llvm_write_block_masked<'ctx, 'borrow>(
+        &'borrow self,
+        _codegen: WriterCodegen<'ctx, 'borrow>,
+        _runtime_ptr: PointerValue<'ctx>,
+        _values: VectorValue<'ctx>,
+        _mask: VectorValue<'ctx>,
+        _head_slot: Option<PointerValue<'ctx>>,
+    ) -> Result<(), ArrowKernelError> {
+        Err(ArrowKernelError::InternalError(
+            "this writer does not support masked block writes".into(),
+        ))
     }
 
     /// Writes a flat block containing `logical_len` values. Composite writers
-    /// interpret the vector lanes using their static child shape.
+    /// interpret the vector lanes using their static child shape. `head_slot`,
+    /// when present, is the stack slot this writer returned from
+    /// `llvm_begin_block_loop`, and must be used in place of the
+    /// corresponding runtime-struct field.
     fn llvm_write_block<'ctx, 'borrow>(
         &'borrow self,
         codegen: WriterCodegen<'ctx, 'borrow>,
         runtime_ptr: PointerValue<'ctx>,
         values: VectorValue<'ctx>,
         logical_len: u32,
+        _head_slot: Option<PointerValue<'ctx>>,
     ) -> Result<(), ArrowKernelError> {
         if values.get_type().get_size() != logical_len {
             return Err(ArrowKernelError::InternalError(format!(
@@ -544,6 +606,7 @@ impl WriterSpec {
         BoundWriter {
             writer,
             runtime_ptr,
+            block_state: None,
         }
     }
 
@@ -654,6 +717,9 @@ impl WriterAllocation {
 pub struct BoundWriter<'ctx> {
     writer: AnyWriter,
     runtime_ptr: PointerValue<'ctx>,
+    /// Set while inside a block loop: writer-private state hoisted to the
+    /// stack by `Writer::llvm_begin_block_loop`.
+    block_state: Option<PointerValue<'ctx>>,
 }
 
 impl<'ctx> BoundWriter<'ctx> {
@@ -737,7 +803,70 @@ impl<'ctx> BoundWriter<'ctx> {
                 self.runtime_ptr,
                 values,
                 logical_len,
+                self.block_state,
             )
             .unwrap();
+    }
+
+    pub fn supports_masked_block(&self) -> bool {
+        self.writer.supports_masked_block()
+    }
+
+    /// Lets the writer hoist its per-iteration state before a block loop.
+    pub fn begin_block_loop<'call>(
+        &mut self,
+        ctx: &'ctx Context,
+        module: &'call Module<'ctx>,
+        builder: &'call Builder<'ctx>,
+    ) {
+        self.block_state = self.writer.llvm_begin_block_loop(
+            WriterCodegen {
+                ctx,
+                module,
+                builder,
+            },
+            self.runtime_ptr,
+        );
+    }
+
+    /// Restores hoisted state after a block loop.
+    pub fn end_block_loop<'call>(
+        &mut self,
+        ctx: &'ctx Context,
+        module: &'call Module<'ctx>,
+        builder: &'call Builder<'ctx>,
+    ) {
+        if let Some(state) = self.block_state.take() {
+            self.writer.llvm_end_block_loop(
+                WriterCodegen {
+                    ctx,
+                    module,
+                    builder,
+                },
+                self.runtime_ptr,
+                state,
+            );
+        }
+    }
+
+    pub fn llvm_ingest_block_masked<'call>(
+        &'call self,
+        ctx: &'ctx Context,
+        module: &'call Module<'ctx>,
+        builder: &'call Builder<'ctx>,
+        values: VectorValue<'ctx>,
+        mask: VectorValue<'ctx>,
+    ) -> Result<(), ArrowKernelError> {
+        self.writer.llvm_write_block_masked(
+            WriterCodegen {
+                ctx,
+                module,
+                builder,
+            },
+            self.runtime_ptr,
+            values,
+            mask,
+            self.block_state,
+        )
     }
 }

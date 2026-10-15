@@ -2,6 +2,7 @@ use arrow_array::{make_array, ArrayRef};
 use arrow_buffer::Buffer;
 use arrow_data::ArrayDataBuilder;
 use inkwell::{
+    intrinsics::Intrinsic,
     values::{BasicValue, BasicValueEnum, PointerValue, VectorValue},
     AddressSpace,
 };
@@ -13,6 +14,25 @@ use crate::{
     },
     increment_pointer, ArrowKernelError, PrimitiveType,
 };
+
+/// Whether masked compress-stores are profitable for this element type on
+/// the host: 32/64-bit lanes need AVX-512F, 8/16-bit lanes additionally need
+/// VBMI2. Without the right extension LLVM scalarizes the intrinsic into a
+/// branch per lane — worse than the scalar loop it replaces.
+pub(crate) fn compress_store_available(pt: PrimitiveType) -> bool {
+    static FEATURES: std::sync::LazyLock<(bool, bool)> = std::sync::LazyLock::new(|| {
+        let features = inkwell::targets::TargetMachine::get_host_cpu_features().to_string();
+        (
+            features.contains("+avx512f"),
+            features.contains("+avx512vbmi2"),
+        )
+    });
+    let (avx512f, vbmi2) = *FEATURES;
+    match pt.width() {
+        1 | 2 => avx512f && vbmi2,
+        _ => avx512f,
+    }
+}
 
 pub struct PrimitiveWriter {
     pt: PrimitiveType,
@@ -58,6 +78,13 @@ impl WriterRuntime for PrimitiveWriterRuntime {
     }
 
     fn to_array(self, len: usize) -> Result<ArrayRef, ArrowKernelError> {
+        // storage is allocated uninitialized: a kernel that wrote fewer
+        // elements than it exposes would hand out stale heap bytes
+        debug_assert!(
+            len <= self.len(),
+            "primitive writer exposes {len} elements but only {} were written",
+            self.len()
+        );
         let mut buf = Buffer::from(self.alloc);
         let sliced = buf.slice_with_length(0, len * self.pt.width());
         if len > 0 && buf.len() > len * self.pt.width() * 2 {
@@ -124,14 +151,45 @@ impl PrimitiveWriter {
 
 impl Writer for PrimitiveWriter {
     fn allocate(&self, size: usize) -> AnyRuntime {
+        let units = (self.pt.width() * size).div_ceil(16);
+        let mut alloc = Vec::with_capacity(units);
+        // SAFETY: this storage is only ever exposed through to_array, which
+        // slices to the prefix the kernel wrote via alloc_ptr. Zero-filling
+        // here would memset (and page in) the whole output buffer just for
+        // the kernel to overwrite it. On a freshly mmaped buffer that memset
+        // is also what faults every page in, so removing it matters most for
+        // kernels that never write their whole output: a 10m-element i32
+        // reduction went 2.5 ms -> 0.29 ms (870k page faults -> 24k).
+        #[allow(clippy::uninit_vec)]
+        unsafe {
+            alloc.set_len(units)
+        };
+
+        // Large outputs land on fresh mmaps, and whether the kernel gets huge
+        // pages is otherwise luck of the allocation's 2 MB alignment — which
+        // showed up as bimodal timings (concat alternating 2.65/2.96 ms run
+        // to run). These pages are load-bearing, not a micro-optimization:
+        // forcing MADV_NOHUGEPAGE instead makes the same kernels 2x slower
+        // (concat 2.9 -> 6.5 ms, neg 2.6 -> 5.3 ms) on Zen 5. Best effort:
+        // advise the page-aligned interior and ignore failures.
+        #[cfg(target_os = "linux")]
+        if units * 16 >= (2 << 20) {
+            unsafe {
+                let start = (alloc.as_ptr() as usize).next_multiple_of(4096);
+                let end = (alloc.as_ptr() as usize + units * 16) & !4095;
+                if end > start {
+                    libc::madvise(start as *mut _, end - start, libc::MADV_HUGEPAGE);
+                }
+            }
+        }
+
         let mut pwr = PrimitiveWriterRuntime {
-            alloc: Vec::new(),
+            alloc,
             alloc_ptr: std::ptr::null_mut(),
             max_len: size,
             pt: self.pt,
         };
 
-        pwr.alloc.resize((self.pt.width() * size).div_ceil(16), 0);
         pwr.alloc_ptr = pwr.alloc.as_mut_ptr() as *mut u8;
         pwr.into()
     }
@@ -155,12 +213,71 @@ impl Writer for PrimitiveWriter {
         f(&mut emitter)
     }
 
+    fn llvm_begin_block_loop<'ctx, 'borrow>(
+        &'borrow self,
+        codegen: WriterCodegen<'ctx, 'borrow>,
+        runtime_ptr: PointerValue<'ctx>,
+    ) -> Option<PointerValue<'ctx>> {
+        let ctx = codegen.ctx;
+        let b = codegen.builder;
+        let ptr_type = ctx.ptr_type(AddressSpace::default());
+        let cell = increment_pointer!(
+            ctx,
+            b,
+            runtime_ptr,
+            PrimitiveWriterRuntime::OFFSET_ALLOC_PTR
+        );
+
+        // the slot has to be an entry-block alloca: SROA and mem2reg only
+        // promote those, and a slot that stays in memory defeats the point
+        let entry = b
+            .get_insert_block()
+            .unwrap()
+            .get_parent()
+            .unwrap()
+            .get_first_basic_block()
+            .unwrap();
+        let entry_builder = ctx.create_builder();
+        match entry.get_first_instruction() {
+            Some(first) => entry_builder.position_before(&first),
+            None => entry_builder.position_at_end(entry),
+        }
+        let slot = entry_builder
+            .build_alloca(ptr_type, "alloc_ptr_local")
+            .unwrap();
+
+        // the initial load/store stays here, immediately before the loop
+        let head = b.build_load(ptr_type, cell, "alloc_ptr_in").unwrap();
+        b.build_store(slot, head).unwrap();
+        Some(slot)
+    }
+
+    fn llvm_end_block_loop<'ctx, 'borrow>(
+        &'borrow self,
+        codegen: WriterCodegen<'ctx, 'borrow>,
+        runtime_ptr: PointerValue<'ctx>,
+        state: PointerValue<'ctx>,
+    ) {
+        let ctx = codegen.ctx;
+        let b = codegen.builder;
+        let ptr_type = ctx.ptr_type(AddressSpace::default());
+        let cell = increment_pointer!(
+            ctx,
+            b,
+            runtime_ptr,
+            PrimitiveWriterRuntime::OFFSET_ALLOC_PTR
+        );
+        let head = b.build_load(ptr_type, state, "alloc_ptr_out").unwrap();
+        b.build_store(cell, head).unwrap();
+    }
+
     fn llvm_write_block<'ctx, 'borrow>(
         &'borrow self,
         codegen: WriterCodegen<'ctx, 'borrow>,
         runtime_ptr: PointerValue<'ctx>,
         values: VectorValue<'ctx>,
         logical_len: u32,
+        head_slot: Option<PointerValue<'ctx>>,
     ) -> Result<(), ArrowKernelError> {
         if values.get_type().get_size() != logical_len {
             return Err(ArrowKernelError::InternalError(format!(
@@ -168,12 +285,14 @@ impl Writer for PrimitiveWriter {
                 values.get_type().get_size()
             )));
         }
-        let curr_alloc_ptr_ptr = increment_pointer!(
-            codegen.ctx,
-            codegen.builder,
-            runtime_ptr,
-            PrimitiveWriterRuntime::OFFSET_ALLOC_PTR
-        );
+        let curr_alloc_ptr_ptr = head_slot.unwrap_or_else(|| {
+            increment_pointer!(
+                codegen.ctx,
+                codegen.builder,
+                runtime_ptr,
+                PrimitiveWriterRuntime::OFFSET_ALLOC_PTR
+            )
+        });
         let curr_alloc_ptr = codegen
             .builder
             .build_load(
@@ -195,6 +314,75 @@ impl Writer for PrimitiveWriter {
             .builder
             .build_store(curr_alloc_ptr_ptr, new_alloc_ptr)
             .unwrap();
+        Ok(())
+    }
+
+    fn supports_masked_block(&self) -> bool {
+        compress_store_available(self.pt)
+    }
+
+    fn llvm_write_block_masked<'ctx, 'borrow>(
+        &'borrow self,
+        codegen: WriterCodegen<'ctx, 'borrow>,
+        runtime_ptr: PointerValue<'ctx>,
+        values: VectorValue<'ctx>,
+        mask: VectorValue<'ctx>,
+        head_slot: Option<PointerValue<'ctx>>,
+    ) -> Result<(), ArrowKernelError> {
+        let ctx = codegen.ctx;
+        let b = codegen.builder;
+        let curr_alloc_ptr_ptr = head_slot.unwrap_or_else(|| {
+            increment_pointer!(
+                ctx,
+                b,
+                runtime_ptr,
+                PrimitiveWriterRuntime::OFFSET_ALLOC_PTR
+            )
+        });
+        let curr_alloc_ptr = b
+            .build_load(
+                ctx.ptr_type(AddressSpace::default()),
+                curr_alloc_ptr_ptr,
+                "primitive_masked_ptr",
+            )
+            .unwrap()
+            .into_pointer_value();
+
+        let compress = Intrinsic::find("llvm.masked.compressstore").unwrap();
+        let compress = compress
+            .get_declaration(codegen.module, &[values.get_type().into()])
+            .ok_or_else(|| {
+                ArrowKernelError::InternalError("no compressstore for vector type".into())
+            })?;
+        b.build_call(
+            compress,
+            &[values.into(), curr_alloc_ptr.into(), mask.into()],
+            "compressstore",
+        )
+        .unwrap();
+
+        // advance the write head by the number of selected lanes
+        let lanes = mask.get_type().get_size();
+        let mask_int_ty = ctx.custom_width_int_type(lanes);
+        let mask_int = b
+            .build_bit_cast(mask, mask_int_ty, "mask_int")
+            .unwrap()
+            .into_int_value();
+        let ctpop = Intrinsic::find("llvm.ctpop").unwrap();
+        let ctpop = ctpop
+            .get_declaration(codegen.module, &[mask_int_ty.into()])
+            .unwrap();
+        let count = b
+            .build_call(ctpop, &[mask_int.into()], "mask_count")
+            .unwrap()
+            .try_as_basic_value()
+            .unwrap_basic()
+            .into_int_value();
+        let count = b
+            .build_int_z_extend_or_bit_cast(count, ctx.i64_type(), "mask_count64")
+            .unwrap();
+        let new_alloc_ptr = increment_pointer!(ctx, b, curr_alloc_ptr, self.pt.width(), count);
+        b.build_store(curr_alloc_ptr_ptr, new_alloc_ptr).unwrap();
         Ok(())
     }
 }
@@ -311,7 +499,9 @@ mod tests {
         }
         let values = [8_i32, 9, 10].map(|value| ctx.i32_type().const_int(value as u64, true));
         let values = VectorType::const_vector(&values);
-        writer.llvm_write_block(codegen, dest, values, 3).unwrap();
+        writer
+            .llvm_write_block(codegen, dest, values, 3, None)
+            .unwrap();
         build.build_return(None).unwrap();
         llvm_mod.verify().unwrap();
 
