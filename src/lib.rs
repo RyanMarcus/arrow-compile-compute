@@ -3,16 +3,12 @@
 use std::sync::Arc;
 
 use arrow_array::{
-    cast::AsArray,
-    make_array,
-    types::{Int16Type, Int32Type, Int64Type, RunEndIndexType},
-    Array, ArrayRef, BinaryArray, BinaryViewArray, BooleanArray, Date32Array, Date64Array, Datum,
-    FixedSizeBinaryArray, Float16Array, Float32Array, Float64Array, Int16Array, Int32Array,
-    Int64Array, Int8Array, LargeBinaryArray, LargeStringArray, NullArray, PrimitiveArray,
-    StringArray, StringViewArray, UInt16Array, UInt32Array, UInt64Array, UInt8Array,
+    cast::AsArray, Array, ArrayRef, BinaryArray, BinaryViewArray, BooleanArray, Date32Array,
+    Date64Array, Datum, FixedSizeBinaryArray, Float16Array, Float32Array, Float64Array, Int16Array,
+    Int32Array, Int64Array, Int8Array, LargeBinaryArray, LargeStringArray, NullArray, StringArray,
+    StringViewArray, UInt16Array, UInt32Array, UInt64Array, UInt8Array,
 };
 use arrow_buffer::NullBuffer;
-use arrow_data::ArrayDataBuilder;
 use arrow_schema::{DataType, Field};
 use inkwell::{
     attributes::{Attribute, AttributeLoc},
@@ -388,6 +384,9 @@ impl std::fmt::Display for PrimitiveType {
 }
 
 impl PrimitiveType {
+    // called per element from ArrowIter::next — without the hint this sits
+    // in another codegen unit and costs a real function call per row
+    #[inline]
     fn width(&self) -> usize {
         match self {
             PrimitiveType::I8 | PrimitiveType::U8 => 1,
@@ -719,45 +718,6 @@ impl Datum for ArrayDatum {
     }
 }
 
-fn make_ree_unchecked(res: &dyn Array, data: &dyn Array, len: usize) -> ArrayRef {
-    let ree_array_type = DataType::RunEndEncoded(
-        Arc::new(Field::new(
-            "run_ends",
-            res.data_type().clone(),
-            res.is_nullable(),
-        )),
-        Arc::new(Field::new(
-            "values",
-            data.data_type().clone(),
-            data.is_nullable(),
-        )),
-    );
-    let builder = ArrayDataBuilder::new(ree_array_type)
-        .len(len)
-        .add_child_data(res.to_data())
-        .add_child_data(data.to_data());
-
-    let array_data = unsafe { builder.build_unchecked() };
-    make_array(array_data)
-}
-
-fn ree_logical_nulls<K: RunEndIndexType>(
-    arr: &dyn Array,
-) -> Result<Option<NullBuffer>, ArrowKernelError> {
-    let arr = arr.as_run::<K>();
-    let res = PrimitiveArray::<K>::new(arr.run_ends().inner().clone(), None);
-    if let Some(re_nulls) = arr.values().logical_nulls() {
-        let re_nulls = BooleanArray::new(re_nulls.into_inner(), None);
-        let re_nulls = make_ree_unchecked(&res, &re_nulls, arr.len());
-        let re_nulls = crate::arrow_interface::cast::cast(&re_nulls, &DataType::Boolean)?;
-        let re_nulls = re_nulls.as_boolean().clone().into_parts().0;
-        let re_nulls = NullBuffer::new(re_nulls);
-        Ok(Some(re_nulls))
-    } else {
-        Ok(None)
-    }
-}
-
 pub fn logical_nulls(arr: &dyn Array) -> Result<Option<NullBuffer>, ArrowKernelError> {
     match arr.data_type() {
         DataType::Dictionary(_k_dt, _v_dt) => {
@@ -777,12 +737,12 @@ pub fn logical_nulls(arr: &dyn Array) -> Result<Option<NullBuffer>, ArrowKernelE
                 (true, true) => Ok(arr.logical_nulls()),
             }
         }
-        DataType::RunEndEncoded(f_re, _f_val) => match f_re.data_type() {
-            DataType::Int16 => ree_logical_nulls::<Int16Type>(arr),
-            DataType::Int32 => ree_logical_nulls::<Int32Type>(arr),
-            DataType::Int64 => ree_logical_nulls::<Int64Type>(arr),
-            _ => unreachable!("invalide run end type"),
-        },
+        // upstream RunArray::logical_nulls already expands per-run validity
+        // in bulk; drop buffers with no actual nulls so nullable-input cache
+        // keys stay on the fast non-null kernels
+        DataType::RunEndEncoded(_, _) => {
+            Ok(arr.logical_nulls().filter(|nulls| nulls.null_count() > 0))
+        }
         _ => Ok(arr.logical_nulls()),
     }
 }
@@ -791,6 +751,7 @@ pub fn logical_nulls(arr: &dyn Array) -> Result<Option<NullBuffer>, ArrowKernelE
 mod tests {
 
     use super::*;
+    use arrow_array::types::Int16Type;
     use arrow_array::{
         types::Int8Type, Array, DictionaryArray, Int16Array, Int32Array, Int8Array, RunArray,
         StringArray,
@@ -869,5 +830,25 @@ mod tests {
         let actual = super::logical_nulls(arr).unwrap();
 
         assert_nullbuffers_equal(actual, expected);
+    }
+
+    #[test]
+    fn sliced_ree_logical_nulls_matches_arrow() {
+        let values = arrow_array::Int32Array::from(
+            (0..100)
+                .map(|i| if i % 4 == 0 { None } else { Some(i) })
+                .collect::<Vec<_>>(),
+        );
+        let ends = arrow_array::Int32Array::from((1..=100).map(|i| i * 3).collect::<Vec<_>>());
+        let ree = arrow_array::RunArray::<arrow_array::types::Int32Type>::try_new(&ends, &values)
+            .unwrap();
+        let ree = ree.slice(17, 200);
+
+        let ours = crate::logical_nulls(&ree).unwrap();
+        let arrow = arrow_array::Array::logical_nulls(&ree);
+        assert_eq!(
+            ours.as_ref().map(|n| n.inner().clone()),
+            arrow.as_ref().map(|n| n.inner().clone())
+        );
     }
 }

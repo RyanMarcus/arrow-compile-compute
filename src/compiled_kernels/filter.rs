@@ -28,17 +28,30 @@ impl Kernel for FilterKernel {
     type Output = ArrayRef;
 
     fn call(&self, inp: Self::Input<'_>) -> Result<Self::Output, ArrowKernelError> {
-        if inp.0.len() != inp.1.len() {
+        let (data, mask) = inp;
+        if data.len() != mask.len() {
             return Err(ArrowKernelError::SizeMismatch);
         }
 
-        let mut res = self.0.run(&dsl_args!(inp.0, inp.1))?[0].clone();
-        let base_dt = normalized_base_type(inp.0.data_type());
+        // arrow semantics: a null mask entry selects nothing. The generated
+        // code reads the mask's value bits only, so fold the validity in
+        // before filtering.
+        let pruned;
+        let mask = match mask.nulls() {
+            Some(nulls) => {
+                pruned = BooleanArray::new(mask.values() & nulls.inner(), None);
+                &pruned
+            }
+            None => mask,
+        };
+
+        let mut res = self.0.run(&dsl_args!(data, mask))?[0].clone();
+        let base_dt = normalized_base_type(data.data_type());
         res = coalesce_type(res, &base_dt)?;
 
-        if has_any_nulls(inp.0) {
-            let indices = inp.1.values().set_indices().collect::<Vec<_>>();
-            res = copy_selected_nulls(inp.0, res, &indices)?;
+        if has_any_nulls(data) {
+            let indices = mask.values().set_indices().collect::<Vec<_>>();
+            res = copy_selected_nulls(data, res, &indices)?;
         }
 
         Ok(res)
@@ -51,9 +64,28 @@ impl Kernel for FilterKernel {
         let mut func = DSLFunction::new("filter");
         let arr_arg = func.add_arg(&mut ctx, DSLType::array_like(arr, "n"));
 
-        if matches!(arr.data_type(), DataType::RunEndEncoded(_, _)) {
+        // conditional emits vectorize into a masked compress-store, but only
+        // for primitive outputs on hosts whose vector extensions support the
+        // element width — elsewhere the set-bits loop beats a scalar
+        // per-element branch.
+        //
+        // this choice does not depend on selectivity, which is the natural
+        // thing to suspect: a sweep across selectivities found no crossover
+        // between the two paths. both walk every input lane regardless of how
+        // many survive — only the store is masked — so neither gets cheaper
+        // as the mask empties out. (arrow does beat us at very low
+        // selectivity, since its slice iterator skips whole empty words of
+        // the mask instead of visiting the lanes. that is a real gap, but
+        // it argues for a third path, not for switching between these two.)
+        let spec = WriterSpec::for_base_type_of_datum(arr);
+        let masked = match &spec {
+            WriterSpec::Primitive(pt) => crate::compiled_writers::compress_store_available(*pt),
+            _ => false,
+        };
+
+        if matches!(arr.data_type(), DataType::RunEndEncoded(_, _)) || masked {
             let fil_arg = func.add_arg(&mut ctx, DSLType::array_like(filt, "n"));
-            func.add_ret(WriterSpec::for_base_type_of_datum(arr), "<= n");
+            func.add_ret(spec, "<= n");
 
             func.add_body(
                 DSLStmt::for_each(&mut ctx, &[arr_arg, fil_arg], |loop_vars| {
@@ -65,7 +97,7 @@ impl Kernel for FilterKernel {
             );
         } else {
             let fil_arg = func.add_arg(&mut ctx, DSLType::set_bits("m"));
-            func.add_ret(WriterSpec::for_base_type_of_datum(arr), "m");
+            func.add_ret(spec, "m");
 
             func.add_body(
                 DSLStmt::for_each(&mut ctx, &[fil_arg], |loop_vars| {
@@ -278,5 +310,39 @@ mod tests {
 
         assert_eq!(actual.data_type(), expected.data_type());
         assert_eq!(actual.as_list::<i64>(), expected.as_list::<i64>());
+    }
+
+    #[test]
+    fn sliced_ree_filter_matches_arrow() {
+        let values = Int32Array::from((0..100).collect::<Vec<_>>());
+        let ends = Int32Array::from((1..=100).map(|i| i * 5).collect::<Vec<_>>());
+        let ree = RunArray::<Int32Type>::try_new(&ends, &values).unwrap();
+        let ree = ree.slice(3, 450);
+        let mask = BooleanArray::from((0..450).map(|i| i % 2 == 0).collect::<Vec<_>>());
+
+        let ours = crate::select::filter(&ree, &mask).unwrap();
+        let arrow = arrow_select::filter::filter(&ree, &mask).unwrap();
+        let arrow = arrow_cast::cast(&arrow, &DataType::Int32).unwrap();
+        assert_eq!(
+            ours.as_primitive::<Int32Type>(),
+            arrow.as_primitive::<Int32Type>()
+        );
+    }
+
+    #[test]
+    fn nullable_filter_mask_matches_arrow() {
+        use arrow_buffer::{BooleanBuffer, NullBuffer};
+        let data = Int32Array::from(vec![10, 20, 30, 40, 50, 60]);
+        // value bits all true, but slots 1 and 4 are null — arrow excludes them
+        let values = BooleanBuffer::from(vec![true, true, true, true, true, true]);
+        let validity = NullBuffer::from(vec![true, false, true, true, false, true]);
+        let mask = BooleanArray::new(values, Some(validity));
+
+        let arrow = arrow_select::filter::filter(&data, &mask).unwrap();
+        let ours = crate::select::filter(&data, &mask).unwrap();
+        assert_eq!(
+            ours.as_primitive::<Int32Type>(),
+            arrow.as_primitive::<Int32Type>()
+        );
     }
 }

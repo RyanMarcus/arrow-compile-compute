@@ -80,6 +80,24 @@ impl Kernel for InterleaveKernel {
         let (values, array_indices, element_indices) = inp;
         let output_type = validate_values(values)?;
 
+        // validate every (array, element) pair before the generated code
+        // gathers through them; unchecked, a bad index reads garbage
+        for (array_idx, element_idx) in array_indices
+            .values()
+            .iter()
+            .zip(element_indices.values().iter())
+        {
+            let array = values.get(*array_idx as usize).ok_or_else(|| {
+                ArrowKernelError::UnsupportedArguments(format!(
+                    "interleave array index {array_idx} out of range for {} arrays",
+                    values.len()
+                ))
+            })?;
+            if *element_idx as usize >= array.len() {
+                return Err(ArrowKernelError::OutOfBounds(array.len()));
+            }
+        }
+
         let values_arg = DSLArgument::two_d(values.iter().map(|value| value as &dyn Datum));
         let mut result = self.0.run(&[
             values_arg,
@@ -227,5 +245,20 @@ mod tests {
         assert_eq!(first, vec![1.0, 2.0]);
         assert_eq!(second, vec![3.0, 4.0]);
         assert_eq!(third, vec![5.0, 6.0]);
+    }
+
+    #[test]
+    fn interleave_invalid_indices_do_not_panic() {
+        let a = Int32Array::from(vec![1, 2, 3]);
+        let b = Int32Array::from(vec![4, 5, 6]);
+        // both invalid shapes must return Err — a panic fails the test harness
+        assert!(
+            select::interleave(&[&a, &b], &[(0, 0), (5, 0)]).is_err(),
+            "interleave with bad array index returned Ok"
+        );
+        assert!(
+            select::interleave(&[&a, &b], &[(0, 0), (1, 99)]).is_err(),
+            "interleave with bad element index returned Ok"
+        );
     }
 }

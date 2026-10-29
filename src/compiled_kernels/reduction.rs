@@ -125,7 +125,9 @@ impl Kernel for ReductionKernel {
         } else {
             normalized_base_type(data_type)
         };
-        func.add_ret(output, "<= n");
+        // reductions write exactly one element; sizing the output "<= n"
+        // would allocate (and page in) an n-element buffer to return one value
+        func.add_ret(output, "1");
 
         let k = if has_nulls {
             dsl2::compile(
