@@ -53,7 +53,6 @@ use list_writer::{ListWriter, ListWriterEmitter, ListWriterRuntime};
 use run_end_writer::{RunEndWriter, RunEndWriterEmitter, RunEndWriterRuntime};
 use view_writer::{StringViewWriter, StringViewWriterEmitter, StringViewWriterRuntime};
 
-pub(crate) use string_writer::str_writer_reserve;
 
 use crate::{
     compiled_iter::{IteratorHolder, IteratorSource},
@@ -240,6 +239,11 @@ pub trait Writer {
     /// loop-carried memory dependency LLVM cannot remove — with opaque
     /// pointers it cannot prove the block's data stores do not alias the
     /// struct — whereas a slot that never escapes is promoted to a register.
+    ///
+    /// This is the same trick as `IteratorHolder::localize_struct`, but it
+    /// cannot reuse it: an iterator only reads its state, so copying the
+    /// struct in once is enough, while a writer's progress must be copied
+    /// back after the loop, since Rust reads it to know how much was written.
     ///
     /// Writers that return a slot here receive it back in `llvm_write_block`
     /// and must implement `llvm_end_block_loop` to write it back.

@@ -11,6 +11,32 @@ use inkwell::{
 use crate::{compiled_writers::ViewBufferWriter, PrimitiveType};
 
 #[no_mangle]
+pub extern "C" fn str_writer_append_bytes(ptr: *const u8, len: u64, vec: *mut c_void) {
+    let bytes = unsafe { std::slice::from_raw_parts(ptr, len as usize) };
+    let vec = unsafe { &mut *(vec as *mut Vec<u8>) };
+    vec.extend_from_slice(bytes);
+}
+
+pub fn llvm_add_str_writer_append_bytes<'ctx>(
+    ctx: &'ctx Context,
+    module: &Module<'ctx>,
+) -> FunctionValue<'ctx> {
+    let ptr_type = ctx.ptr_type(AddressSpace::default());
+    module
+        .get_function("str_writer_append_bytes")
+        .unwrap_or_else(|| {
+            module.add_function(
+                "str_writer_append_bytes",
+                ctx.void_type().fn_type(
+                    &[ptr_type.into(), ctx.i64_type().into(), ptr_type.into()],
+                    false,
+                ),
+                Some(Linkage::External),
+            )
+        })
+}
+
+#[no_mangle]
 pub extern "C" fn str_view_writer_append_bytes(
     str_ptr: *const u8,
     len: u64,
