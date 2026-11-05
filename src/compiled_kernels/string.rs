@@ -1,4 +1,4 @@
-use arrow_array::{cast::AsArray, Array, BooleanArray, Datum};
+use arrow_array::{cast::AsArray, Array, BinaryArray, BooleanArray, Datum, Scalar};
 use arrow_buffer::BooleanBufferBuilder;
 use arrow_schema::DataType;
 use itertools::Itertools;
@@ -137,9 +137,13 @@ fn filter_bytes<F: Fn(&[u8]) -> bool>(
             builder.append(false);
         }
     } else {
-        for bytes in crate::arrow_interface::iter::iter_nonnull_bytes(arr)? {
-            builder.append(f(bytes));
-        }
+        // collect_bool packs 64 results into a register word per store,
+        // instead of a read-modify-write on the buffer for every row
+        let mut iter = crate::arrow_interface::iter::iter_nonnull_bytes(arr)?;
+        let values = arrow_buffer::BooleanBuffer::collect_bool(arr.len(), |_| {
+            f(iter.next().expect("iterator shorter than array"))
+        });
+        return Ok(BooleanArray::new(values, nulls));
     }
     Ok(BooleanArray::new(builder.finish(), nulls))
 }
@@ -228,22 +232,31 @@ pub fn compile_string_like(
         (1, false) => {
             // single wildcard, no any chars
             if seq[0].is_wildcard() {
-                // suffix
+                // suffix — routed to the JIT suffix kernel: the closure path
+                // pays a per-row Rust callback, the kernel loops in bulk
                 let pattern = seq
                     .into_iter()
                     .skip(1)
                     .map(|i| i.into_literal())
                     .collect_vec();
-                Box::new(move |arr| filter_bytes(arr, |bytes| bytes.ends_with(&pattern)))
+                if pattern.is_empty() {
+                    // bare '%' matches every non-null row
+                    Box::new(move |arr| filter_bytes(arr, |_| true))
+                } else {
+                    let needle = Scalar::new(BinaryArray::from(vec![pattern.as_slice()]));
+                    Box::new(move |arr| crate::arrow_interface::cmp::ends_with(arr, &needle))
+                }
             } else if seq.last().unwrap().is_wildcard() {
-                // prefix
+                // prefix — routed to the JIT prefix kernel; the pattern is
+                // never empty here (a bare '%' hits the suffix arm above)
                 let seq_len = seq.len();
                 let pattern = seq
                     .into_iter()
                     .take(seq_len - 1)
                     .map(|i| i.into_literal())
                     .collect_vec();
-                Box::new(move |arr| filter_bytes(arr, |bytes| bytes.starts_with(&pattern)))
+                let needle = Scalar::new(BinaryArray::from(vec![pattern.as_slice()]));
+                Box::new(move |arr| crate::arrow_interface::cmp::starts_with(arr, &needle))
             } else {
                 // prefix and suffix
                 let wildcard_idx = seq.iter().position(|c| c.is_wildcard()).unwrap();
@@ -374,11 +387,14 @@ pub fn compile_string_like(
             let finder = Finder::new(&infix).into_owned();
             let min_len = prefix.len() + infix.len() + suffix.len();
 
+            // the emptiness guards matter: comparing against an empty slice
+            // still emits bcmp(p, 0x1, 0), and on Zen 5 a masked AVX-512 load
+            // from the dangling pointer costs ~250 cycles per call
             Box::new(move |arr| {
                 filter_bytes(arr, |b| {
                     b.len() >= min_len
-                        && b[..prefix.len()] == prefix
-                        && b[b.len() - suffix.len()..] == suffix
+                        && (prefix.is_empty() || b[..prefix.len()] == prefix)
+                        && (suffix.is_empty() || b[b.len() - suffix.len()..] == suffix)
                         && finder
                             .find(&b[prefix.len()..b.len() - suffix.len()])
                             .is_some()
@@ -635,5 +651,40 @@ mod tests {
             result,
             BooleanArray::from(vec![Some(true), None, Some(true)])
         );
+    }
+
+    fn sliced_strings() -> StringArray {
+        let data: Vec<String> = (0..1000)
+            .map(|i| format!("row{}abc{}", i, "x".repeat(i % 7)))
+            .collect();
+        let arr = StringArray::from(data.iter().map(|s| s.as_str()).collect::<Vec<_>>());
+        arr.slice(13, 700)
+    }
+
+    #[test]
+    fn sliced_string_like_matches_arrow() {
+        let arr = sliced_strings();
+        let ours = crate::cmp::like(&arr, b"%abc%", None).unwrap();
+        let arrow = arrow_string::like::like(&arr, &StringArray::new_scalar("%abc%")).unwrap();
+        assert_eq!(ours, arrow);
+
+        let ours = crate::cmp::like(&arr, b"row1%", None).unwrap();
+        let arrow = arrow_string::like::like(&arr, &StringArray::new_scalar("row1%")).unwrap();
+        assert_eq!(ours, arrow);
+    }
+
+    #[test]
+    fn sliced_string_contains_matches_arrow() {
+        let arr = sliced_strings();
+        // row-dependent needle: matches differ across the slice boundary, so
+        // ignoring the slice offset cannot pass by accident
+        let ours = crate::cmp::contains(&arr, b"row2").unwrap();
+        let arrow = arrow_string::like::contains(&arr, &StringArray::new_scalar("row2")).unwrap();
+        assert_eq!(ours, arrow);
+        assert!(ours.true_count() > 0 && ours.true_count() < ours.len());
+
+        let ours = crate::cmp::like(&arr, b"%row2%", None).unwrap();
+        let arrow = arrow_string::like::like(&arr, &StringArray::new_scalar("%row2%")).unwrap();
+        assert_eq!(ours, arrow);
     }
 }

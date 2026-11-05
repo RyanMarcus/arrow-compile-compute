@@ -2,3 +2,8 @@
 Cargo.lock
 .claude
 *.llvm
+
+# Working notes from the Zen 5 benchmarking effort: kept locally, not in the
+# repo. The reasoning that matters lives in comments at the fix sites.
+docs/fix-rounds.md
+docs/zen5-findings.md

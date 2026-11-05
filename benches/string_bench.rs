@@ -116,6 +116,7 @@ pub fn criterion_benchmark(c: &mut Criterion) {
         ("'abc%'", "abc%"),
         ("'%xyz'", "%xyz"),
         ("'%abc%'", "%abc%"),
+        ("'%abc%xyz'", "%abc%xyz"),
         ("'%abc%xyz%'", "%abc%xyz%"),
     ] {
         let pattern_scalar = StringArray::new_scalar(pattern);
