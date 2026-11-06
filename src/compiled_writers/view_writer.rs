@@ -207,7 +207,25 @@ impl<'ctx, 'borrow> WriterEmitter<'ctx, 'borrow> for StringViewWriterEmitter<'ct
             .build_load(ptr_type, views_ptr_ptr, "string_view_output")
             .unwrap()
             .into_pointer_value();
-        let tmp_view_ptr = codegen.builder.build_alloca(i128_type, "tmp_view").unwrap();
+        // entry-block alloca: this runs once per emitted value, and an
+        // alloca in a loop body is not promoted or reclaimed until the
+        // function returns, so it would grow the frame by 16 bytes per row
+        let tmp_view_ptr = {
+            let entry = codegen
+                .builder
+                .get_insert_block()
+                .unwrap()
+                .get_parent()
+                .unwrap()
+                .get_first_basic_block()
+                .unwrap();
+            let eb = codegen.ctx.create_builder();
+            match entry.get_first_instruction() {
+                Some(i) => eb.position_before(&i),
+                None => eb.position_at_end(entry),
+            }
+            eb.build_alloca(i128_type, "tmp_view").unwrap()
+        };
         let view_with_len = codegen
             .builder
             .build_int_z_extend(len, i128_type, "view_with_len")
@@ -354,6 +372,33 @@ mod tests {
         },
         declare_blocks, PrimitiveType,
     };
+
+    /// The scratch slot in `emit` must be an entry-block alloca. Emitted at
+    /// the current insert point it lands in the kernel's loop body, where an
+    /// alloca is neither promoted nor reclaimed until the function returns,
+    /// so the frame grew by 16 bytes per row and large inputs overflowed the
+    /// stack. Runs on a deliberately small stack so a regression trips here
+    /// rather than only on inputs big enough to exhaust the default 8 MB.
+    #[test]
+    fn string_view_writer_stack_use_is_constant_in_row_count() {
+        const ROWS: usize = 200_000;
+        const STACK: usize = 1 << 20;
+
+        let joined = std::thread::Builder::new()
+            .stack_size(STACK)
+            .spawn(|| {
+                let a: arrow_array::StringArray =
+                    (0..ROWS).map(|i| Some(format!("row{i}"))).collect();
+                let b: arrow_array::StringArray =
+                    (0..ROWS).map(|i| Some(format!("other{i}"))).collect();
+                crate::select::concat(&[&a, &b]).unwrap().len()
+            })
+            .unwrap()
+            .join()
+            .unwrap();
+
+        assert_eq!(joined, ROWS * 2);
+    }
 
     #[test]
     fn string_view_writer_spec_compiles_view_writer() {
